@@ -77,3 +77,6 @@ pub mod executor;
 pub use executor::{
     AsyncIo, ExecutorConfig, ExecutorHandle, JoinError, JoinHandle, LocalExecutor, Sleep,
 };
+
+#[cfg(all(test, not(loom)))]
+mod portable_tests;

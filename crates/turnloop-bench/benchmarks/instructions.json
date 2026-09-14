@@ -1,0 +1,13 @@
+{
+  "toolchain": "nightly-2026-08-20",
+  "valgrind": "valgrind-3.22.0",
+  "counts": {
+    "instructions::operations::control": 527,
+    "instructions::operations::idle": 191486,
+    "instructions::operations::notify": 188006,
+    "instructions::operations::timer_cancel": 414171
+  },
+  "controls": [
+    "instructions::operations::control"
+  ]
+}

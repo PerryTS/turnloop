@@ -161,17 +161,33 @@ impl Driver {
 #[test]
 #[ignore = "requires private MySQL 9.6; use scripts/test-servers.py run"]
 fn auth_prepared_transactions_compression_and_infile() {
-    // First connection must encounter an empty caching_sha2 server cache.
+    // Warm both accounts deliberately: this also reproduces CI's earlier TLS
+    // probe and proves the reset works on repeated runs against the same server.
+    drop(Driver::connect("auth_rsa_user", false, false, false));
+    drop(Driver::connect("tls_user", true, false, false));
+    let mut admin = Driver::connect("auth_admin", true, false, false);
+    let reset = admin.query("FLUSH PRIVILEGES");
+    assert!(reset.errors.is_empty(), "cache reset failed: {reset:?}");
+    assert_eq!(reset.completed, [Outcome::Success]);
+    assert_eq!(reset.oks.len(), 1, "server acknowledged the cache reset");
     let mut d = Driver::connect("auth_rsa_user", false, false, true);
     assert_eq!(d.full, 1);
+    assert_eq!(d.fast, 0);
     assert_eq!(d.rsa, 1);
     let cached = Driver::connect("auth_rsa_user", false, false, false);
     assert_eq!(cached.fast, 1);
+    assert_eq!(cached.full, 0);
     assert_eq!(cached.rsa, 0);
     let secure = Driver::connect("tls_user", true, false, false);
     assert_eq!(secure.tls, 1);
     assert_eq!(secure.full, 1);
+    assert_eq!(secure.fast, 0);
     assert_eq!(secure.rsa, 0);
+    let secure_cached = Driver::connect("tls_user", true, false, false);
+    assert_eq!(secure_cached.tls, 1);
+    assert_eq!(secure_cached.fast, 1);
+    assert_eq!(secure_cached.full, 0);
+    assert_eq!(secure_cached.rsa, 0);
     let r=d.query("CREATE TEMPORARY TABLE items(id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY, name TEXT); INSERT INTO items(name) VALUES('one'),('two'); SELECT * FROM items ORDER BY id");
     assert_eq!(r.rows.len(), 2);
     assert!(r.oks.contains(&(2, 1, 0)));

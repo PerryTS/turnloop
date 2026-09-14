@@ -22,6 +22,8 @@ libc.workspace = true
 
 [package.metadata.turnloop-ci]
 role = "contract"
+# Remove when the production IOCP provider instantiates the shared contracts.
+windows-contracts-pending = "WINDOWS_HANDOFF.md"
 
 [[bin]]
 name = "native_child"

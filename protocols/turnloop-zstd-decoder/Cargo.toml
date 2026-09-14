@@ -1,0 +1,46 @@
+[package]
+name = "turnloop-zstd-decoder"
+version.workspace = true
+edition = "2018"
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors = ["Moritz Borcherding <moritz.borcherding@web.de>", "PerryTS contributors"]
+description = "Reusable pure-Rust Zstandard decoder, derived from ruzstd"
+readme = "README.md"
+keywords = ["zstd", "zstandard", "decompression"]
+categories = ["compression"]
+documentation = "https://docs.rs/turnloop-zstd-decoder"
+
+[features]
+default = ["hash", "std"]
+hash = ["dep:twox-hash"]
+std = []
+dict_builder = ["std", "dep:fastrand"]
+fuzz_exports = []
+
+[dependencies]
+twox-hash = { workspace = true, optional = true }
+fastrand = { workspace = true, optional = true }
+
+[dev-dependencies]
+rand.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+zstd.workspace = true
+criterion.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.turnloop-ci]
+role = "codec"
+wasi-tests = ["reuse"]
+
+[[bench]]
+name = "decode_all"
+harness = false
+
+[[test]]
+name = "reuse"
+harness = false

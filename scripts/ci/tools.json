@@ -152,5 +152,10 @@
         "gungraun-runner"
       ]
     }
+  },
+  "h2spec-source": {
+    "commit": "70ac2294010887f48b18e2d64f5cccd48421fad1",
+    "url": "https://codeload.github.com/summerwind/h2spec/tar.gz/70ac2294010887f48b18e2d64f5cccd48421fad1",
+    "sha256": "791b995048c7e2a2895ed2c019eb9abe46015c3a7a6107cb9ea3f5e5f311da39"
   }
 }

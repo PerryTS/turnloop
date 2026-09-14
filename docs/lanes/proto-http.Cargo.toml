@@ -1,0 +1,19 @@
+[workspace]
+members = ["protocols/turnloop-tls", "protocols/turnloop-http", "protocols/turnloop-websocket"]
+resolver = "3"
+exclude = ["protocols/turnloop-http/vendor/ruzstd"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+
+[workspace.dependencies]
+bytes = "1"
+http = "1"
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+
+[patch.crates-io]
+ruzstd = { path = "protocols/turnloop-http/vendor/ruzstd" }

@@ -9,7 +9,7 @@ The Windows parts of turnloop were written and cross-checked on macOS (`cargo ch
    ```powershell
    git clone https://github.com/PerryTS/turnloop.git
    cd turnloop
-   git checkout lane/windows
+   git checkout lane/windows   # phase 1 only; phase 2 starts from main
    rustup show   # installs the pinned nightly-2026-08-20 from rust-toolchain.toml
    ```
 3. Record the environment in the results file:
@@ -43,14 +43,15 @@ Rules:
 - **Console test:** it spawns a child with `CREATE_NEW_CONSOLE`. Run it from a normal interactive session, not over a non-interactive SSH session without a console.
 - **Write the results** to `spikes/iocp/WINDOWS_RESULTS.md`: one row per test with PASS / FAIL / fixed-in-commit, the timer precision numbers, the environment, and anything that contradicts DESIGN.md §7.3.
 
-## Phase 2: port the backend onto the core trait (after `trait-v0` is tagged on `main`)
+## Phase 2: port the backend onto the core trait (ready now)
 
-The integrator tags `trait-v0` on `main` once the core lane's Backend trait and contract tests are merged. Then:
+The core Backend trait is merged on `main` as **revision 1**, tag `trait-v1`, in `crates/turnloop/src/backend/mod.rs`. It is revision 0 plus host-clock and callback-scheduling hooks; `docs/lanes/core.md` describes the changes. A lane on the Mac is adding processes, signals, TTY, pipes and an executor right now, and may bump it to revision 2; watch `main` for a `trait-v2` tag.
 
-1. Merge `main` into a branch `lane/windows-host`.
-2. Port `spikes/iocp/backend_draft/` to `crates/turnloop/src/backend/iocp/` against the trait. The adaptation notes are in `LANE_REPORT.md`.
-3. Run the contract suite on Windows: `cargo test -p turnloop-contract -- --test-threads=1`, plus the Windows-specific variants listed in `spikes/iocp/CONTRACT_TEST_PLAN.md`.
-4. Record results in `WINDOWS_RESULTS.md`.
+1. Create `lane/windows-host` from `main`.
+2. Port `spikes/iocp/backend_draft/` to `crates/turnloop/src/backend/iocp/` against the trait. The adaptation notes are in `docs/lanes/windows.md`. Keep `spikes/iocp` as the mechanism reference.
+3. Run the contract suite on Windows: `cargo test -p turnloop-contract -- --test-threads=1`, including the no-spin contract (DESIGN.md §10 rule 4a), plus the Windows-specific variants listed in `spikes/iocp/CONTRACT_TEST_PLAN.md`.
+4. Record the results in `WINDOWS_RESULTS.md`.
+5. CI: `.github/workflows/ci.yml` also runs on GitHub's `windows-2025` runner. To run the same jobs on this machine, register it as a self-hosted runner with label `turnloop-windows` and set the repository variable `SELF_HOSTED_WINDOWS=true`.
 
 ## Rules (same as LANES.md)
 
