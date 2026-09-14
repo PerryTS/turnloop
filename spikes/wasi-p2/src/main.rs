@@ -4,7 +4,7 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 use wasi::{clocks::monotonic_clock as clock, sockets::network::ErrorCode};
-use windlass_wasi_p2_spike::{BYTES, CAPACITY, Completion, Driver, ResultKind, Timeout};
+use turnloop_wasi_p2_spike::{BYTES, CAPACITY, Completion, Driver, ResultKind, Timeout};
 struct CountAllocator;
 static ALLOCS: AtomicUsize = AtomicUsize::new(0);
 // SAFETY: allocation and deallocation are delegated without changing pointers or layouts.

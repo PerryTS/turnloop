@@ -5,7 +5,7 @@ use std::{
     hint::black_box,
     time::{Duration, Instant},
 };
-use windlass::timer::TimerQueue;
+use turnloop::timer::TimerQueue;
 
 fn report(name: &str, count: usize, before: u64, counter: &Counter) {
     let delta = counter
@@ -25,9 +25,9 @@ fn timers(counter: &Counter) {
         let batches = 100_000 / n;
         let mut queues: Vec<_> = (0..batches).map(|_| TimerQueue::new(n)).collect();
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-        let base = windlass::Instant::now();
+        let base = turnloop::Instant::now();
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-        let base = windlass::Instant::from_duration(Duration::ZERO);
+        let base = turnloop::Instant::from_duration(Duration::ZERO);
         let times: Vec<_> = (0..n)
             .map(|i| base + Duration::from_nanos(((i * 691) % n) as u64))
             .collect();
@@ -74,7 +74,7 @@ fn timers(counter: &Counter) {
     target_os = "freebsd"
 ))]
 fn baselines(counter: &Counter) {
-    use windlass::*;
+    use turnloop::*;
     const N: usize = 10_000;
     let mut l = Loop::new(Config::default()).expect("loop");
     let mut out = Completions::default();
@@ -158,7 +158,7 @@ fn baselines(counter: &Counter) {
         timer_instructions as f64 / timer_count as f64,
         counter.unit()
     );
-    let (_, a, b) = windlass_contract::pair(&mut l);
+    let (_, a, b) = turnloop_contract::pair(&mut l);
     let input = [0x71; 4096];
     let mut output = [0u8; 4096];
     for batch in [64, 4096] {

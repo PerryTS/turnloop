@@ -60,7 +60,7 @@ path dependencies of publishable crates need explicit registry version requireme
 Optional `[package.metadata.turnloop-ci]` describes test capabilities. The role
 may be `core`, `contract`, `protocol` or `bench`. During integration, `*-contract`,
 `*-bench` suffixes and direct `protocols/` members are recognized from metadata;
-that also supports the windlass → turnloop rename. Other crates default to core.
+that also supports the turnloop → turnloop rename. Other crates default to core.
 Use explicit roles for layouts that differ.
 
 Core must mark **real pure-Rust** Miri-compatible library test filters. No default

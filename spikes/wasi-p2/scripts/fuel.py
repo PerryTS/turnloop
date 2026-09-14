@@ -2,7 +2,7 @@
 """Minimum-success fuel thresholds. Trap at T-1, success at T; no host instruction claim."""
 import json, pathlib, subprocess
 root = pathlib.Path(__file__).resolve().parents[3]
-wasm = root / 'spikes/wasi-p2/target/wasm32-wasip2/release/windlass-wasi-p2-spike.wasm'
+wasm = root / 'spikes/wasi-p2/target/wasm32-wasip2/release/turnloop-wasi-p2-spike.wasm'
 def run(mode, n, fuel):
     p = subprocess.run(['wasmtime','run','-W',f'fuel={fuel}',str(wasm),mode,str(n)], capture_output=True, text=True)
     if p.returncode == 0:

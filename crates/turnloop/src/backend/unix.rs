@@ -1,8 +1,8 @@
 //! Shared completion engine for kqueue and epoll. Each direction has an intrusive
 //! FIFO of operations; readiness remains cached until an actual EAGAIN.
-#[cfg(windlass_backend = "epoll")]
+#[cfg(turnloop_backend = "epoll")]
 use super::epoll::Epoll as SystemPoller;
-#[cfg(windlass_backend = "kqueue")]
+#[cfg(turnloop_backend = "kqueue")]
 use super::kqueue::Kqueue as SystemPoller;
 use super::{
     poller::{Poller, Ready, last_error},
@@ -189,9 +189,9 @@ impl Unix {
 // request, and owned descriptors/requests are dropped without outstanding native
 // buffer access. Readiness events contain generation keys, never buffer pointers.
 unsafe impl Backend for Unix {
-    #[cfg(windlass_backend = "kqueue")]
+    #[cfg(turnloop_backend = "kqueue")]
     type Wake = super::kqueue::KqueueWake;
-    #[cfg(windlass_backend = "epoll")]
+    #[cfg(turnloop_backend = "epoll")]
     type Wake = super::epoll::EpollWake;
     type Detached = Detached;
     fn new(config: &Config, pool: BufferPool) -> Result<Self> {
@@ -525,11 +525,11 @@ fn execute(
     }
 }
 fn send_flags() -> i32 {
-    #[cfg(windlass_backend = "epoll")]
+    #[cfg(turnloop_backend = "epoll")]
     {
         libc::MSG_NOSIGNAL
     }
-    #[cfg(windlass_backend = "kqueue")]
+    #[cfg(turnloop_backend = "kqueue")]
     {
         0
     }

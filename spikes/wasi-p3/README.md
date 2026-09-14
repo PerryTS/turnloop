@@ -12,7 +12,7 @@ No tokio or private Rust executor crate is in the guest dependency graph.
 
 ```sh
 cargo build --manifest-path spikes/wasi-p3/Cargo.toml --release --target wasm32-wasip2
-.tools/wasmtime-v46.0.0-aarch64-macos/wasmtime run -S inherit-network=y -W timeout=45s spikes/wasi-p3/target/wasm32-wasip2/release/windlass_wasi_p3_spike.wasm
+.tools/wasmtime-v46.0.0-aarch64-macos/wasmtime run -S inherit-network=y -W timeout=45s spikes/wasi-p3/target/wasm32-wasip2/release/turnloop_wasi_p3_spike.wasm
 cargo clippy --manifest-path spikes/wasi-p3/Cargo.toml --all-targets --target wasm32-wasip2 -- -D warnings
 cargo +stable check --manifest-path spikes/wasi-p3/Cargo.toml --target wasm32-wasip2 --locked
 ```
@@ -73,7 +73,7 @@ instead loops over `waitable-set.wait`/`poll` until the whole future completes.
 `StreamReader::read` and writers expose cancellation APIs and reusable owned buffers;
 `collect` in this experiment is convenience code and allocates.
 
-## Mapping to windlass and the unresolved boundary
+## Mapping to turnloop and the unresolved boundary
 
 A strict synchronous `Backend::turn` needs a persistent set and a single-call
 `wait/poll` interface that returns after one host event, even if it only advances
@@ -111,7 +111,7 @@ rust-toolchain.toml**. This newer toolchain supplies prebuilt wasm32-wasip3 arti
 rustup toolchain install nightly-2026-09-07 --profile minimal --component clippy,rustfmt --target wasm32-wasip3
 cargo +nightly-2026-09-07 build --manifest-path spikes/wasi-p3/Cargo.toml --release --target wasm32-wasip3 --locked
 cargo +nightly-2026-09-07 clippy --manifest-path spikes/wasi-p3/Cargo.toml --all-targets --target wasm32-wasip3 -- -D warnings
-.tools/wasmtime-v46.0.0-aarch64-macos/wasmtime run -S inherit-network=y -W timeout=45s spikes/wasi-p3/target/wasm32-wasip3/release/windlass_wasi_p3_spike.wasm
+.tools/wasmtime-v46.0.0-aarch64-macos/wasmtime run -S inherit-network=y -W timeout=45s spikes/wasi-p3/target/wasm32-wasip3/release/turnloop_wasi_p3_spike.wasm
 ```
 
 All PASS. Pure-target timer/TCP subject counts are identical (257-byte echo, eight

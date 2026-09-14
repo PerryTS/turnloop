@@ -1,4 +1,4 @@
-# windlass
+# turnloop
 
 A host-driven, completion-shaped event loop. Creating a loop creates no thread.
 The host calls `turn(timeout, &mut completions)` and dispatches results itself.
@@ -6,15 +6,15 @@ The host calls `turn(timeout, &mut completions)` and dispatches results itself.
 The core lane implements kqueue on macOS and epoll on Linux, TCP/UDP, timers,
 per-loop notification/posting, handle transfer, and a lazy shared blocking pool.
 IOCP, WASI and browser adapters are developed in the other lanes. Their shared
-contract is [backend/mod.rs](crates/windlass/src/backend/mod.rs), revision 1;
+contract is [backend/mod.rs](crates/turnloop/src/backend/mod.rs), revision 1;
 `Driver<B>` supports an adapter without changing the core. The native `Loop` alias
 currently selects the Unix adapter.
 
 ```rust
 use std::time::Duration;
-use windlass::{Completions, Config, Loop, OpResult, Timeout, Token};
+use turnloop::{Completions, Config, Loop, OpResult, Timeout, Token};
 
-fn main() -> windlass::Result<()> {
+fn main() -> turnloop::Result<()> {
     let mut driver = Loop::new(Config::default())?;
     let timer = driver.timer(driver.now() + Duration::from_millis(1), None, Token(7))?;
     let mut completions = Completions::default();

@@ -9,7 +9,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use windlass_iocp_spike::backend_draft::*;
+use turnloop_iocp_spike::backend_draft::*;
 
 thread_local! { static TRACK: Cell<bool> = const { Cell::new(false) }; static ALLOCS: Cell<usize> = const { Cell::new(0) }; }
 struct Counting;
@@ -53,7 +53,7 @@ impl Drop for CountScope {
 #[test]
 fn zero_allocation_transfers_and_cancel_before_closed() -> io::Result<()> {
     // Buffers declared before backend, so teardown drains before they go out of scope.
-    let payload = *b"windlass";
+    let payload = *b"turnloop";
     let mut buffer = [0u8; 8];
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let client = TcpStream::connect(listener.local_addr()?)?;

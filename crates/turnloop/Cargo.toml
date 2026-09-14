@@ -1,9 +1,14 @@
 [package]
-name = "windlass"
+name = "turnloop"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["event-loop", "networking", "sans-io"]
+categories = ["network-programming", "asynchronous"]
+documentation = "https://docs.rs/turnloop"
 description = "An embeddable event-loop driver, turned by its host"
 
 [features]
@@ -18,4 +23,9 @@ libc.workspace = true
 workspace = true
 
 [target.'cfg(loom)'.dependencies]
-loom = "=0.7.2"
+loom.workspace = true
+
+[package.metadata.turnloop-ci]
+role = "core"
+loom-filters = ["models"]
+miri-filters = ["timer::tests", "table::tests"]

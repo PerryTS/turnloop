@@ -20,10 +20,10 @@ fn main() -> std::io::Result<()> {
     }
     let mut data = [0u8; 8];
     std::io::stdin().read_exact(&mut data)?;
-    if &data != b"windlass" {
+    if &data != b"turnloop" {
         return Err(std::io::Error::other("wrong child input"));
     }
-    std::io::stdout().write_all(b"child-out:windlass\n")?;
+    std::io::stdout().write_all(b"child-out:turnloop\n")?;
     std::io::stdout().flush()?;
     std::io::stderr().write_all(b"child-err")?;
     std::io::stderr().flush()?;

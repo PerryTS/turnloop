@@ -21,9 +21,9 @@ mod tests {
     use std::time::Duration;
     #[test]
     fn cancel_and_expire_match_sorted_reference() {
-        #[cfg(not(windlass_backend = "web"))]
+        #[cfg(not(turnloop_backend = "web"))]
         let base = Instant::now();
-        #[cfg(windlass_backend = "web")]
+        #[cfg(turnloop_backend = "web")]
         let base = Instant::from_duration(Duration::from_secs(1));
         let mut q = TimerQueue::new(1000);
         let mut reference = Vec::new();

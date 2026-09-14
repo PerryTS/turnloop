@@ -27,18 +27,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "windlass-wasi-p2-spike"
+name = "turnloop-wasi-p2-spike"
 version = "0.1.0"
 dependencies = [
  "wasi",
 ]
 
 [[package]]
-name = "windlass-wasm-backend-draft"
+name = "turnloop-wasm-backend-draft"
 version = "0.1.0"
 dependencies = [
  "wasi",
- "windlass-wasi-p2-spike",
+ "turnloop-wasi-p2-spike",
 ]
 
 [[package]]

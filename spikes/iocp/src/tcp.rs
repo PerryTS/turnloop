@@ -304,7 +304,7 @@ pub fn probe() -> io::Result<TcpStats> {
     let mut writing = Operation::new(Rc::clone(&client))?;
     let mut echoing = Operation::new(Rc::clone(&server))?;
     let mut receiving = Operation::new(Rc::clone(&client))?;
-    let message = b"windlass";
+    let message = b"turnloop";
     let mut echoed = 0;
     for _ in 0..128 {
         zero_read(&mut reading)?;

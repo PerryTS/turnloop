@@ -842,7 +842,7 @@ impl<B: Backend> Drop for Driver<B> {
     }
 }
 
-#[cfg(all(test, not(loom), not(windlass_backend = "web")))]
+#[cfg(all(test, not(loom), not(turnloop_backend = "web")))]
 mod clock_contract {
     use super::*;
     use crate::backend::{PollInfo, Wake};

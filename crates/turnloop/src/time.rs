@@ -1,9 +1,9 @@
 //! Native callers retain std::time::Instant. Browser Wasm uses a timestamp from
 //! the backend's monotonic host clock because std's Instant::now is unsupported.
-#[cfg(not(windlass_backend = "web"))]
+#[cfg(not(turnloop_backend = "web"))]
 pub use std::time::Instant;
 
-#[cfg(windlass_backend = "web")]
+#[cfg(turnloop_backend = "web")]
 mod web {
     use std::{
         ops::{Add, Sub},
@@ -52,5 +52,5 @@ mod web {
         }
     }
 }
-#[cfg(windlass_backend = "web")]
+#[cfg(turnloop_backend = "web")]
 pub use web::Instant;

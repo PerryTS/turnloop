@@ -19,7 +19,7 @@ use windows_sys::Win32::{
 static SERIAL: AtomicU64 = AtomicU64::new(0);
 pub(crate) fn pipe_name() -> Vec<u16> {
     format!(
-        "\\\\.\\pipe\\windlass-iocp-{}-{}\0",
+        "\\\\.\\pipe\\turnloop-iocp-{}-{}\0",
         std::process::id(),
         SERIAL.fetch_add(1, Ordering::Relaxed)
     )

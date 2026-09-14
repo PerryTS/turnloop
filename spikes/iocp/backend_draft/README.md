@@ -20,7 +20,7 @@ normal state updates never create exclusive references to memory the OS can writ
 AcceptEx/ConnectEx, child process/job/wait, synchronous stdio and console mechanisms
 are implemented in the sibling spike modules and have their own test binaries.
 They are not yet public operations of this draft. The draft is a compile-checked
-integration starting point, **not a complete windlass Loop or shipping backend**.
+integration starting point, **not a complete turnloop Loop or shipping backend**.
 
 ## Adaptation required when core tags
 

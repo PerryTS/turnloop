@@ -5,7 +5,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use windlass_iocp_spike::port::{Entry, Port, WAKE, Wait};
+use turnloop_iocp_spike::port::{Entry, Port, WAKE, Wait};
 
 #[test]
 fn bounded_wait_and_cross_thread_wake_are_isolated_per_port() -> io::Result<()> {

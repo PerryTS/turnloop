@@ -27,7 +27,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "windlass-wasi-p2-spike"
+name = "turnloop-wasi-p2-spike"
 version = "0.1.0"
 dependencies = [
  "wasi",

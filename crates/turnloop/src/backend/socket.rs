@@ -23,7 +23,7 @@ impl Addr {
                 s.sin_port = a.port().to_be();
                 s.sin_addr.s_addr = u32::from_ne_bytes(a.ip().octets());
                 len = size_of::<libc::sockaddr_in>() as libc::socklen_t;
-                #[cfg(windlass_backend = "kqueue")]
+                #[cfg(turnloop_backend = "kqueue")]
                 {
                     s.sin_len = len as u8;
                 }
@@ -44,7 +44,7 @@ impl Addr {
                 s.sin6_scope_id = a.scope_id();
                 s.sin6_addr.s6_addr = a.ip().octets();
                 len = size_of::<libc::sockaddr_in6>() as libc::socklen_t;
-                #[cfg(windlass_backend = "kqueue")]
+                #[cfg(turnloop_backend = "kqueue")]
                 {
                     s.sin6_len = len as u8;
                 }
@@ -126,7 +126,7 @@ pub(crate) fn configure(fd: RawFd) -> Result<()> {
     if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
         return Err(last_error());
     }
-    #[cfg(windlass_backend = "kqueue")]
+    #[cfg(turnloop_backend = "kqueue")]
     option(fd, libc::SOL_SOCKET, libc::SO_NOSIGPIPE, 1)?;
     Ok(())
 }
@@ -141,7 +141,7 @@ pub(crate) fn create(addr: SocketAddr, udp: bool) -> Result<OwnedFd> {
     } else {
         libc::SOCK_STREAM
     };
-    #[cfg(windlass_backend = "epoll")]
+    #[cfg(turnloop_backend = "epoll")]
     let kind = kind | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK;
     // SAFETY: socket arguments are valid constants and no pointer is supplied.
     let fd = unsafe { libc::socket(domain, kind, 0) };

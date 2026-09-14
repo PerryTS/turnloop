@@ -396,7 +396,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "windlass-web-spike"
+name = "turnloop-web-spike"
 version = "0.1.0"
 dependencies = [
  "js-sys",

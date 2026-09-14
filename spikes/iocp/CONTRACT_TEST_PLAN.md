@@ -1,6 +1,6 @@
 # Windows contract-test plan
 
-The core trait and windlass-contract crate are not available in this clone yet.
+The core trait and turnloop-contract crate are not available in this clone yet.
 The rows below map DESIGN §11/§5a **contract subjects**, not invented test names.
 All Windows runtime tests in this lane are **UNRUN**; cross-check and Clippy only
 verify compilation. Run the standalone probes unchanged on Windows before merge.
@@ -69,4 +69,4 @@ cargo +stable check --manifest-path spikes/iocp/Cargo.toml --all-targets
 `console_child` is a harness helper, not a binary to run against a shared console.
 All actual Windows executions above are **UNRUN** here. Integrator should add these
 standalone tests to its Windows CI arm and wire the adapted tests into
-windlass-contract when the trait is available. No Unix/WASI/web backend changes.
+turnloop-contract when the trait is available. No Unix/WASI/web backend changes.

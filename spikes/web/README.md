@@ -65,7 +65,7 @@ fresh Cargo.lock there with the root seven-day soak, then built it with `--locke
 The resolver explicitly reported `as of 7 days ago`, selecting older bitflags, cc,
 ureq, jiff, etc. The wrapper uses that build's PATH and `--mode no-install` so
 wasm-pack cannot replace it. The guest crate lockfile always honored the soak.
-The tool's many dependencies are build tooling, not windlass runtime dependencies.
+The tool's many dependencies are build tooling, not turnloop runtime dependencies.
 
 ## Worker Poster
 

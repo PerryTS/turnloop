@@ -4,7 +4,7 @@ use std::{
     ops::{Deref, DerefMut},
     time::Instant,
 };
-use windlass_wasi_p2_spike::{Completion, Driver, Timeout as PollTimeout};
+use turnloop_wasi_p2_spike::{Completion, Driver, Timeout as PollTimeout};
 #[derive(Default)]
 pub struct WasiP2 {
     driver: Driver,
@@ -31,7 +31,7 @@ impl DraftBackend for WasiP2 {
         timeout: Timeout,
         out: &mut Vec<Completion>,
     ) -> Result<TurnInfo, Self::Error> {
-        if out.capacity() < windlass_wasi_p2_spike::CAPACITY * 2 {
+        if out.capacity() < turnloop_wasi_p2_spike::CAPACITY * 2 {
             return Err(wasi::sockets::network::ErrorCode::OutOfMemory);
         }
         let timeout = match timeout {

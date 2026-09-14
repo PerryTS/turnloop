@@ -6,7 +6,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use windlass::{backend::Backend, *};
+use turnloop::{backend::Backend, *};
 fn localhost() -> SocketAddr {
     (Ipv4Addr::LOCALHOST, 0).into()
 }
@@ -97,7 +97,7 @@ pub fn tcp_echo<B: Backend>(connections: usize) {
         let (_, a, b) = pair(&mut l);
         pairs.push((a, b));
     }
-    let data = b"windlass echo: every byte matters";
+    let data = b"turnloop echo: every byte matters";
     for (i, &(a, b)) in pairs.iter().enumerate() {
         l.read(b, ReadBuf::Pooled, Token(100 + i as u64))
             .expect("read");
@@ -175,7 +175,7 @@ pub fn tcp_echo<B: Backend>(connections: usize) {
 ))]
 mod native {
     use super::*;
-    type B = windlass::backend::Platform;
+    type B = turnloop::backend::Platform;
     #[test]
     fn terminal_delivery_liveness() {
         ready_timer_liveness::<B>();

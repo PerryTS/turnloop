@@ -8,7 +8,7 @@
         target_os = "freebsd"
     )
 ))]
-use windlass::*;
+use turnloop::*;
 fn fd_count() -> usize {
     let path = if cfg!(any(target_os = "linux", target_os = "android")) {
         "/proc/self/fd"
@@ -26,7 +26,7 @@ fn loop_drop_and_stale_wakers_release_all_descriptors() {
     let mut connections = 0;
     for _ in 0..32 {
         let mut l = Loop::new(Config::default()).expect("loop");
-        let (_, _, _) = windlass_contract::pair(&mut l);
+        let (_, _, _) = turnloop_contract::pair(&mut l);
         connections += 1;
         let notifier = l.notifier();
         let poster = l.poster();

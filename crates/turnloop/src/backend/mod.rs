@@ -166,15 +166,15 @@ pub unsafe trait Backend: Sized + 'static {
     fn integration(&mut self) -> Result<Integration>;
 }
 
-#[cfg(windlass_backend = "epoll")]
+#[cfg(turnloop_backend = "epoll")]
 mod epoll;
-#[cfg(windlass_backend = "kqueue")]
+#[cfg(turnloop_backend = "kqueue")]
 mod kqueue;
-#[cfg(any(windlass_backend = "kqueue", windlass_backend = "epoll"))]
+#[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
 mod poller;
-#[cfg(any(windlass_backend = "kqueue", windlass_backend = "epoll"))]
+#[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
 mod socket;
-#[cfg(any(windlass_backend = "kqueue", windlass_backend = "epoll"))]
+#[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
 pub mod unix;
-#[cfg(any(windlass_backend = "kqueue", windlass_backend = "epoll"))]
+#[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
 pub use unix::Unix as Platform;

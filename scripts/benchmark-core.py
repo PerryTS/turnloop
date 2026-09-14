@@ -25,11 +25,11 @@ source_fingerprint = fingerprint()
 binaries = {}
 for mode in ['heap', 'btree']:
     target = root / 'target' / f'bench-{mode}'
-    command = ['cargo', '+nightly-2026-08-20', 'build', '--release', '-p', 'windlass-bench', '--target-dir', str(target)]
+    command = ['cargo', '+nightly-2026-08-20', 'build', '--release', '-p', 'turnloop-bench', '--target-dir', str(target)]
     if mode == 'btree':
         command += ['--features', 'timer-btree']
     subprocess.run(command, cwd=root, check=True)
-    binaries[mode] = target / 'release' / 'windlass-bench'
+    binaries[mode] = target / 'release' / 'turnloop-bench'
 rows = []
 for round_index in range(args.rounds):
     jobs = [('core', binaries['heap'], []), ('heap', binaries['heap'], ['--timers']), ('btree', binaries['btree'], ['--timers'])]

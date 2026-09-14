@@ -1,16 +1,20 @@
 [package]
-name = "windlass-contract"
+name = "turnloop-contract"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 publish = false
 
 [dependencies]
-windlass.workspace = true
+turnloop.workspace = true
 
 [lints]
 workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+
+[package.metadata.turnloop-ci]
+role = "contract"

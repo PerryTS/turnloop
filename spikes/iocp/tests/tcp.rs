@@ -2,7 +2,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #[test]
 fn acceptex_connectex_echo_zero_read_cancel_and_close() -> std::io::Result<()> {
-    let stats = windlass_iocp_spike::tcp::probe()?;
+    let stats = turnloop_iocp_spike::tcp::probe()?;
     assert_eq!(stats.accepted, 1);
     assert_eq!(stats.connected, 1);
     assert_eq!(stats.bytes_echoed, 128 * 8);

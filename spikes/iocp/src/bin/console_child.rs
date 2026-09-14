@@ -9,7 +9,7 @@ fn main() -> std::io::Result<()> {
     // SAFETY: test harness contract requires a private console for this invocation.
     assert_eq!(
         // SAFETY: harness launched this process with CREATE_NEW_CONSOLE.
-        unsafe { windlass_iocp_spike::console::isolated_probe() }?,
+        unsafe { turnloop_iocp_spike::console::isolated_probe() }?,
         2
     );
     std::process::exit(42);

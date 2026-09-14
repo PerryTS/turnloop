@@ -102,7 +102,7 @@ fn spawn(executable: &Path, handles: &[HANDLE; 3], mode: &str) -> io::Result<Chi
             "nul in executable",
         ));
     }
-    let mut command: Vec<u16> = format!("\"windlass-child\" {mode}\0")
+    let mut command: Vec<u16> = format!("\"turnloop-child\" {mode}\0")
         .encode_utf16()
         .collect();
     for handle in handles {
@@ -291,7 +291,7 @@ pub fn probe(executable: &Path, register_after_exit: bool) -> io::Result<u32> {
     let mut error = Operation::new(Rc::clone(&endpoints[2]))?;
     pipe::read(&mut output)?;
     pipe::read(&mut error)?;
-    pipe::write(&mut input, b"windlass")?;
+    pipe::write(&mut input, b"turnloop")?;
     let mut wait = if register_after_exit {
         None
     } else {
@@ -343,7 +343,7 @@ pub fn probe(executable: &Path, register_after_exit: bool) -> io::Result<u32> {
     assert_eq!(input.result, Some((0, 8)));
     assert_eq!(output.result, Some((0, 19)));
     assert_eq!(error.result, Some((0, 9)));
-    assert_eq!(&output.data()[..19], b"child-out:windlass\n");
+    assert_eq!(&output.data()[..19], b"child-out:turnloop\n");
     assert_eq!(&error.data()[..9], b"child-err");
     let mut exit_code = 0;
     // SAFETY: process exit notification received, valid output for exit code.

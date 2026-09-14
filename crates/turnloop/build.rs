@@ -15,6 +15,6 @@ fn main() {
         "unknown" if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("wasm32") => "web",
         _ => "unsupported",
     };
-    println!("cargo:rustc-cfg=windlass_backend=\"{backend}\"");
-    println!("cargo:rustc-env=WINDLASS_BACKEND={backend}");
+    println!("cargo:rustc-cfg=turnloop_backend=\"{backend}\"");
+    println!("cargo:rustc-env=TURNLOOP_BACKEND={backend}");
 }

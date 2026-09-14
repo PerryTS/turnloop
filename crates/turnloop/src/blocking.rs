@@ -109,7 +109,7 @@ mod native {
         for i in 0..config.threads {
             let s = state.clone();
             let worker = thread::Builder::new()
-                .name(format!("windlass-blocking-{i}"))
+                .name(format!("turnloop-blocking-{i}"))
                 .spawn(move || {
                     loop {
                         let job = {

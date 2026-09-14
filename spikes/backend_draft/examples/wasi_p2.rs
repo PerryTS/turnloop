@@ -1,8 +1,8 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #[cfg(all(target_os = "wasi", target_env = "p2"))]
 fn main() -> Result<(), wasi::sockets::network::ErrorCode> {
-    use windlass_wasi_p2_spike::{Completion, ResultKind};
-    use windlass_wasm_backend_draft::{DraftBackend, Integration, Timeout, wasi_p2::WasiP2};
+    use turnloop_wasi_p2_spike::{Completion, ResultKind};
+    use turnloop_wasm_backend_draft::{DraftBackend, Integration, Timeout, wasi_p2::WasiP2};
     let mut backend = WasiP2::default();
     assert_eq!(backend.integration(), Integration::RuntimeOwned);
     let mut out = Vec::with_capacity(512);

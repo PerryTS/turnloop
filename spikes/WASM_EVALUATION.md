@@ -114,7 +114,7 @@ boundary; browser fetch buffers are not automatically stable GC-provided IoBufs.
   imported JS callbacks outside the Rust turn. A fixed completion buffer can be
   allocation-free in Rust, while the host APIs/JS FFI are not. State exactly where
   the allocation gate is measured. Browser close cannot prove network teardown
-  finished, only that windlass released ownership and rejects late callbacks.
+  finished, only that turnloop released ownership and rejects late callbacks.
 
 No `trait-v0` tag was present at initial and post-spike checks. No other lane's
 implementation was read. Drafts under `backend_draft/` define an explicit temporary

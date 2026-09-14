@@ -34,16 +34,16 @@ allocation. [Key storage](https://docs.rs/crate/compio-driver/0.12.5/source/src/
 
 `Recv<T: IoBufMut>` and `Send<T: IoBuf>` retain the buffer in the operation; their
 control records keep the system slice descriptor stable. Vectored operations build
-a `Vec<SysSlice>`. A wrapper for windlass's externally rooted stable memory is
+a `Vec<SysSlice>`. A wrapper for turnloop's externally rooted stable memory is
 possible, but it must uphold both libraries' lifetime contracts. The normal receive
-path submits a real buffer; windlass's idle zero-byte probe followed by a pooled
+path submits a real buffer; turnloop's idle zero-byte probe followed by a pooled
 nonblocking read needs a custom operation/second stage.
 [Socket operations](https://docs.rs/crate/compio-driver/0.12.5/source/src/sys/op/socket/iocp.rs)
 
 The thin-cell dependency's `ThinCell::new` allocates its inner record; there is no
 public compio hook to submit a reusable caller-owned operation slab. Separately,
 `CompletionPort::poll` constructs `Vec::with_capacity(1024)` on each call. These are
-direct source-level conflicts with windlass's steady-state allocation gate, even
+direct source-level conflicts with turnloop's steady-state allocation gate, even
 if a token adapter itself uses preallocated tables.
 [Thin-cell source](https://docs.rs/crate/thin-cell/0.2.1/source/src/)
 [IOCP poll](https://docs.rs/crate/compio-driver/0.12.5/source/src/sys/driver/iocp/cp/mod.rs)
@@ -53,7 +53,7 @@ if a token adapter itself uses preallocated tables.
 Attach sets both skip-port-on-success and skip-event-on-handle. The socket helpers
 return `Poll::Ready` on immediate success, and `Pending` on `ERROR_IO_PENDING`, so
 the driver does not await a second packet for a synchronous result. The same source
-normalizes several pipe/error statuses into successful zero-byte results. Windlass
+normalizes several pipe/error statuses into successful zero-byte results. Turnloop
 must instead define EOF/truncation/reset handling per operation and preserve OS
 errors where the contract requires them.
 [Windows result helpers](https://docs.rs/crate/compio-driver/0.12.5/source/src/sys/pal/windows/mod.rs)
@@ -73,14 +73,14 @@ has actually finished, including cancel-vs-success races and close ordering.
 The default IOCP mode uses one port per driver. Its wait truncates `Duration` to
 milliseconds and is nonalertable. `poll` can call stored wakers through result
 delivery; custom operation methods also run in the driver. Internal-only wakers
-could enqueue windlass tokens, but host code must never be installed there.
+could enqueue turnloop tokens, but host code must never be installed there.
 That adaptation still cannot remove the upstream allocations.
 [Per-driver port](https://docs.rs/crate/compio-driver/0.12.5/source/src/sys/driver/iocp/cp/multi.rs)
 [Driver poll](https://docs.rs/crate/compio-driver/0.12.5/source/src/sys/driver/iocp/mod.rs)
 
 `iocp-global` adds a process-global collector thread and reposts to per-driver
 ports. It addresses routing of handles whose association cannot change, but adds
-a thread and a port hop; it does not expose windlass's auto-reset GUI event.
+a thread and a port hop; it does not expose turnloop's auto-reset GUI event.
 Default per-port routing also reposts entries whose stored driver differs, which
 requires the original port to keep being serviced.
 [Global collector](https://docs.rs/crate/compio-driver/0.12.5/source/src/sys/driver/iocp/cp/global.rs)
@@ -90,7 +90,7 @@ threadpool waits with a boxed callback context; `iocp-wait-packet` uses the NT w
 packet APIs. Thus “no event support” would be an incorrect assessment. Neither
 path by itself supplies a high-resolution per-loop deadline plus the host event
 integration and shutdown contract. The NT path creates a packet per wait, while
-windlass can reuse one per loop after dequeue.
+turnloop can reuse one per loop after dequeue.
 [Event wait selection](https://docs.rs/crate/compio-driver/0.12.5/source/src/sys/driver/iocp/wait/mod.rs)
 [Threadpool waits](https://docs.rs/crate/compio-driver/0.12.5/source/src/sys/driver/iocp/wait/thread_pool.rs)
 [NT packet waits](https://docs.rs/crate/compio-driver/0.12.5/source/src/sys/driver/iocp/wait/packet.rs)

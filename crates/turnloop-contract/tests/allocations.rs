@@ -13,7 +13,7 @@ use std::{
     cell::Cell,
     time::{Duration, Instant},
 };
-use windlass::*;
+use turnloop::*;
 struct Counting;
 thread_local! { static ACTIVE: Cell<bool> = const { Cell::new(false) }; static ALLOCS: Cell<usize> = const { Cell::new(0) }; }
 fn record() {
@@ -148,7 +148,7 @@ fn timer_batch(l: &mut Loop, out: &mut Completions) -> usize {
 #[test]
 fn steady_read_write_timer_and_accept_allocate_nothing() {
     let mut l = Loop::new(Config::default()).expect("loop");
-    let (_, a, b) = windlass_contract::pair(&mut l);
+    let (_, a, b) = turnloop_contract::pair(&mut l);
     let mut output = [0; 64];
     let mut out = Completions::default();
     for _ in 0..10 {

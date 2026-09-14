@@ -49,7 +49,7 @@ impl EventIntegration {
         let worker_shared = Arc::clone(&shared);
         let worker_port = Arc::clone(&port);
         let worker = std::thread::Builder::new()
-            .name("windlass-iocp-event".into())
+            .name("turnloop-iocp-event".into())
             .spawn(move || {
                 if let Err(error) = pump(&worker_shared, &worker_port) {
                     let mut queue = worker_shared
