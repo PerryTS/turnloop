@@ -1,6 +1,7 @@
 //! One lazy process-wide signal dispatcher, with weak per-loop subscriptions.
 use super::poller::last_error;
-use crate::{Error, ErrorKind, Notifier, Result, Signal};
+use super::services::ReadyQueue;
+use crate::{Error, ErrorKind, Handle, Notifier, Result, Signal};
 use std::{
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
     sync::{
@@ -26,6 +27,8 @@ pub(super) struct Ticket {
     signal: Signal,
     pending: AtomicBool,
     notifier: Notifier,
+    handle: Handle,
+    ready: Arc<ReadyQueue>,
 }
 impl Ticket {
     pub fn take(&self) -> bool {
@@ -136,6 +139,7 @@ impl Dispatcher {
             for ticket in &record.subscribers {
                 if let Some(t) = ticket.upgrade() {
                     t.pending.store(true, Ordering::Release);
+                    t.ready.push(t.handle);
                     let _ = t.notifier.notify();
                 }
             }
@@ -191,7 +195,12 @@ impl Dispatcher {
         }
     }
 }
-pub(super) fn subscribe(signal: Signal, notifier: Notifier) -> Result<Subscription> {
+pub(super) fn subscribe(
+    signal: Signal,
+    notifier: Notifier,
+    handle: Handle,
+    ready: Arc<ReadyQueue>,
+) -> Result<Subscription> {
     let number = number(signal)?;
     if signal == Signal::Kill {
         return Err(Error::new(ErrorKind::InvalidInput));
@@ -205,6 +214,8 @@ pub(super) fn subscribe(signal: Signal, notifier: Notifier) -> Result<Subscripti
         signal,
         pending: AtomicBool::new(false),
         notifier,
+        handle,
+        ready,
     });
     if let Some(record) = records.iter_mut().find(|r| r.number == number) {
         record.subscribers.push(Arc::downgrade(&ticket));
@@ -213,6 +224,21 @@ pub(super) fn subscribe(signal: Signal, notifier: Notifier) -> Result<Subscripti
         let (mut action, mut original): (libc::sigaction, libc::sigaction) =
             unsafe { std::mem::zeroed() };
         action.sa_sigaction = handler as *const () as usize;
+        #[cfg(turnloop_backend = "kqueue")]
+        {
+            // EVFILT_SIGNAL observes generation even for SIG_IGN. A no-op
+            // handler instead leaves ordinary delivery pending on another
+            // thread: all loops can consume the kevent and restore SIG_DFL
+            // before that thread runs, killing the process on the old signal.
+            // SIG_IGN discards that pending delivery. For SIGCHLD, SIG_DFL also
+            // discards ordinary delivery but preserves wait status; SIG_IGN
+            // would auto-reap children. Kqueue observes generation in both cases.
+            action.sa_sigaction = if signal == Signal::Chld {
+                libc::SIG_DFL
+            } else {
+                libc::SIG_IGN
+            };
+        }
         action.sa_flags = libc::SA_RESTART
             | if signal == Signal::Chld {
                 libc::SA_NOCLDSTOP

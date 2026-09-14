@@ -1,250 +1,192 @@
-# ci-fix4 lane report
+# core3 lane report
 
-Updated 2026-09-14. Scope implemented on main 59593ee. The requested path, wasm
-compiler/provider and Windows curl fixes pass their local checks. **The entire
-native CI runner is not green:** it exposed an unchanged core2 signal race after
-both workspace configurations passed. Windows/Linux runtime remains UNRUN.
+Implemented all three requested fixes. Final reliability campaigns: **50/50
+contract runs and 10/10 all-feature workspace runs PASS, zero failures**.
+Local instruction measurements prove the idle regression removed. Linux
+Callgrind and native Linux/Windows execution remain **UNRUN**.
 
-Read completely: DESIGN.md, CONTRIBUTING.md, docs/INTEGRATION_REPORT.md and
-CI/HTTP/Windows/WASM lane reports. No applicable AGENTS.md. No commits by this
-agent; integrator checkpoints 648efb7 and 23a95e2 appeared externally.
+Starting revision: 9e9d8aa. Read DESIGN.md, CONTRIBUTING.md, integration report,
+core/CI/Windows/WASM lane reports and core2 command history. No applicable
+AGENTS.md. Integrator checkpoints appeared during work; this agent made no commits
+because .git is read-only. The inherited ci-fix4 report remains in Git history and
+`.tools/core3/inherited-ci-fix4-report.md`.
 
 ## Implemented
 
-- `scripts/ci/check-paths.py`: independent Python/Git gate, no Cargo dependencies.
-  Uses index spellings and working-tree source, rejects case collisions (including
-  directories), checks include_str/include_bytes, #[path], default/inline modules,
-  conditional paths and their default fallback, and Cargo readme/license-file
-  entries including workspace definitions. Rust comments/strings/characters are
-  lexed; raw/escaped literals and concat with CARGO_MANIFEST_DIR are supported.
-  Unknown computed includes fail closed. Parent normalization cannot hide a
-  misspelled intermediate directory. Explicit Cargo target roots and modules
-  loaded through #[path] use their correct source directories.
-- Eight path regressions include a real temporary Git index with tracked
-  `Readme.md` and an include of `README.md`, asserting CLI failure and the exact
-  diagnostic, then success after fixing only the reference. Synthetic collisions
-  also work on case-insensitive hosts. Guard runs in workflow-lint and the local
-  `scripts/verify-core.sh`; CONTRIBUTING lists it in local preflight.
-- Chose **option (a), retain ring 0.17.14**. The supplied WASI log's exact stderr
-  was `failed to find tool "llvm-ar": No such file or directory`. The existing
-  provider already supports these targets; no replacement crypto dependency or
-  soak override is needed. `install-wasm-toolchain.py` installs wasi-sdk 34.0's
-  clang, llvm-ar and sysroot under `.tools/`, checking committed official hashes
-  before extraction. It compiles and archives a real wasm object for p2/p3/web.
-  CI exports absolute target-specific CC/AR paths via GITHUB_ENV; local shells
-  source `.tools/wasm-env.sh`. Three installer regressions cover checksum refusal,
-  actual extraction, path traversal rejection and target environment mapping.
-- SDK pins, released 2026-08-25: Linux x86_64 SHA-256
-  `b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4`;
-  macOS arm64 `9c59398106b417f8f14913380fdf0097a8cc0ff4af9eb3ce0065a859e88d49e9`.
-  Verified against the [official release and asset digests](https://github.com/WebAssembly/wasi-sdk/releases/tag/wasi-sdk-34).
-  Rust keeps its target linker/libc; ring uses clang's freestanding C path.
-  The wasi/web jobs receive only the shared compiler prerequisite; their backend
-  gates/runner semantics are untouched.
-- New `turnloop-tls/tests/portable.rs`, declared through existing `wasi-tests`
-  metadata: three real in-memory TLS tests with fragmented ciphertext, generated
-  signing keys, bidirectional payloads, ALPN, full/resumed handshakes, four distinct
-  certificate rejection cases, explicit insecure mode and exactly-once injected
-  timeout. Bounded pumps assert records/bytes and both handshake states. Runs on
-  native Windows as well as both WASI versions; browser all-target lint includes it.
-- HTTP interop probes the same `curl -V` executable it runs. HTTP/1 requires the
-  `http` protocol; HTTP/2 additionally requires the exact `HTTP2` Features token.
-  Mandatory Node runs first, before probing curl; neither a missing curl feature
-  nor a broken curl probe can suppress that execution. Missing Node fails.
-  Both tests count successful legs and print which ran; Node h2 verifies all 100
-  streams. Added Windows-style capability parsing fixtures and a real 100-stream
-  Node regression with curl HTTP2 disabled. Bounded Node-fetch timeout added.
-- Reviewed all HTTP/TLS/WebSocket tests and the shared Node fixture: no /bin/sh,
-  Unix-only fixture paths, or hostname-based socket connections to change. Every
-  actual network address is IPv4 loopback. `localhost` remains only in protocol
-  fields, certificate names and SNI. No Windows cfg or portable-tests gate removed.
-- Removed the two supplied CI logs from docs, as requested. Original evidence is
-  retained locally under `.tools/ci-fix4/ci-original-*.log`.
+- **Idle path:** core2 added full-capacity walks in Services::has_work/poll and
+  Files::has_work/start, repeatedly per turn. Services now use a reserved,
+  coalesced readiness queue and indexed operation lookup. Its atomic empty check
+  avoids locking/scanning on idle turns. Dispatcher unsubscribe joins publication
+  before queued generations are removed. Files schedule only runnable heads;
+  a separate queue resumes pooled reads when a lease is available. Cancelling a
+  blocked read progresses without a lease. No helper starts on the idle path.
+- **Child registration:** the shared kqueue/epoll registration path handles ESRCH
+  by waiting for/reaping only the owned exiting child during spawn, caching its
+  real status, and delivering one normal terminal exit. A nonblocking wait can
+  still report no status during XNU's exit/registration gap; this no longer
+  becomes a failed spawn. No blocking retry or extra wait was added to turn.
+  The existing actual exit-before-registration test remains. A new injection seam
+  forces ESRCH while WNOHANG returns zero, delays normal child exit, and verifies
+  the operation identity, status 23, terminal completion, no duplicate and ECHILD.
+- **Signals:** kqueue subscriptions use SIG_IGN for ordinary signals and SIG_DFL
+  for SIGCHLD, whose default ignores delivery while retaining child wait status.
+  The registry mutex preserves installation and exact original-action restoration
+  across all subscribing threads. Linux retains its async-signal-safe self-pipe
+  handler. A fresh subprocess blocks ordinary SIGUSR1 delivery on every thread,
+  exercises four-loop fan-out/stop/close, then unblocks after unsubscribe. Original
+  code deterministically terminates with SIGUSR1; the fix survives. A stress test
+  performs 256 subscribe/raise/unsubscribe rounds on four loops and threads,
+  asserting exactly one delivery, Stopped and Closed per recipient every round.
+- **Allocations and models:** the new file backpressure gate exercises a held
+  lease, exact 2-ms timer parking, cancellation without a lease and successful
+  resumed bytes with zero allocations. It found Darwin std mutex storage being
+  allocated lazily in an unused file operation slot; all reserved file-slot and
+  service-queue mutexes now initialize during loop setup. The new production
+  readiness-queue loom model covers publication, coalescing and generation reuse.
 
-No runtime implementation, Cargo.lock, workspace dependency declaration, soak
-configuration/security exception, protocol runner, Postgres harness or MongoDB
-cleanup was changed. No backend/no-spin or pre-existing allocation gate changed.
+## Instruction evidence and measurement boundary
 
-## Verification summary
+[Raw measurements](benchmarks/core3-macos-arm64.jsonl): **390 positive measurements**,
+five rotated/interleaved fresh-process rounds, release **codegen-units=1**, actual
+macOS arm64 `proc_pid_rusage(RUSAGE_INFO_V4).ri_instructions`. No subtraction or
+sample exclusions. Metadata records source and binary SHA-256s; source hashes
+matched before/after measurement. The same extended harness runs starting core
+9e9d8aa, the fix, and pre-core2 baseline revision f747623. These are macOS process
+instruction counts, not Linux Callgrind or user-only counts.
 
-All commands and intermediate results are preserved in the ledger below. Wasm
-commands inherit `source .tools/wasm-env.sh`; audit tools use `.tools/bin` on PATH.
-Cargo uses nightly-2026-08-20 unless shown; stable here is 1.97.1. Raw output is
-under `.tools/ci-fix4/`. Commands within the CI test wrappers appear in those logs;
-the outcomes below distinguish their successful subcommands from overall failure.
+Instructions per operation, [min, max] across all five final rounds:
 
-| Check | Result |
+| Workload | Pre-core2 | Before fix | After fix |
+|---|---:|---:|---:|
+| Integer control | [9.01, 9.04] | [9.01, 9.08] | [9.01, 9.02] |
+| Idle turn | [10,975, 11,145] | [56,388, 56,538] | [11,239, 11,339] |
+| Notify + turn | [11,002, 11,186] | [56,425, 56,508] | [11,251, 11,343] |
+| Timer start/cancel/deliver/close | [1,972, 1,988] | [14,354, 14,371] | [2,058, 2,075] |
+| Timer start/cancel only | [727.42, 728.80] | [726.40, 727.60] | [727.42, 728.38] |
+
+Idle/notify improve about **80%**, timer lifecycle about **86%**. The existing
+steady harness warms 100 turns before measuring 10,000; the original regression
+therefore was not startup masquerading as steady work. Initial unmodified-harness
+before measurements (58.4–58.9k idle) are also retained in `.tools/core3/before.jsonl`.
+The final table uses the identical extended harness on all revisions.
+
+The additional `--instruction-boundaries` mode mirrors each 100-operation
+Callgrind workload, measures destruction separately, and varies reserved capacity:
+
+| Reserved handles | Before idle instructions/turn | After |
+|---|---:|---:|
+| 16 | [12,161, 12,835] | [11,417, 12,036] |
+| 1,024 | [56,379, 56,606] | [11,185, 11,561] |
+| 8,192 | [371,920, 372,855] | [11,211, 11,389] |
+
+There was also a **real benchmark boundary mistake**: Callgrind's setup returns
+owned `(Loop, Completions)` into the measured function, which previously destroyed
+both inside the sample. Default-capacity idle-fixture destruction measured
+[175,273, 377,765] instructions before core2, [1,422,585, 1,713,330] in starting core2,
+and [2,824,295, 3,146,192] after eagerly reserving Darwin mutex storage. These are
+one-time loop disposal costs, including thousands of reserved file/service slots.
+They must not be attributed to 100 idle/notify/timer operations.
+
+All three Gungraun functions now return their fixtures to explicit **unmeasured
+teardown**, preserving every workload/assertion and measuring all 100 operations.
+The integer control, case names, cgu=1, three CI rounds, exact-control policy and
+**3% threshold are unchanged**. The committed Linux baseline is unchanged.
+The integrator should measure/review a boundary-corrected candidate on Linux CI;
+no Linux counts were synthesized. Local steady timer lifecycle cost remains about
+4–5% above pre-core2, despite eliminating the large regression; Linux's actual
+instruction gate remains authoritative and UNRUN here.
+
+## Verification
+
+[Complete command ledger](docs/core3-commands.md), including intermediate failures
+and expected negative controls. Raw command output: `.tools/core3/`. PASS means
+actual command success; cross-checks are compilation only.
+
+| Command / group | Result |
 |---|---|
-| Path guard and eight synthetic regressions | PASS; current index 1306 files / 170 references |
-| Full Python automation tests | PASS: 60 tests, warnings treated as errors |
-| Pinned SDK installation and all three compile/archive probes | PASS on macOS arm64; official Linux artifact digest verified, Linux executable UNRUN |
-| cargo fmt --check | PASS |
-| Native workspace/all-target Clippy, default and all features, warnings and undocumented unsafe denied | PASS |
-| Whole-workspace wasm32-wasip2 and wasm32-unknown-unknown all-target Clippy, default/all features | PASS |
-| Stable workspace/all-target/all-feature check | PASS |
-| Linux x86_64 all-target/all-feature Clippy | PASS (compile only) |
-| Windows whole-workspace all-target/all-feature Clippy | FAIL: no Windows C SDK headers; ring/zstd-sys cannot build (assert.h/string.h/stdlib.h). Changed HTTP test execution UNRUN on Windows |
-| Windows core/contract/bench all-target/all-feature Clippy | PASS (compile only) |
-| WASI 0.3 whole-workspace Clippy | FAIL: inherited BSON dependency getrandom 0.3.4 rejects p3; ring C build now works |
-| WASI 0.3 TLS all-target Clippy | PASS, warnings and undocumented unsafe denied |
-| cargo test --workspace -- --test-threads=1 | PASS rerun: 217 tests. Initial FAIL in unchanged core2 256-child spawn (OS error 3 / ESRCH) |
-| run-tests.py native | FAIL overall in final independent all-feature core contract run: SIGUSR1 (signal 30) during signals_reach_four_loops_on_four_threads. Workspace default 217 and all-feature 232 tests PASS; all independent core/protocol member runs PASS; default contract 42 PASS; all-feature contract terminated after preceding 35 passed tests |
-| Fixture-driven HTTP/TLS/WebSocket interop | PASS: 9 HTTP + 5 TLS + 3 WebSocket, zero ignored, real Node/curl peers |
-| protocol-wasi --target wasm32-wasip2 | PASS: 23 tests, zero ignored: HTTP codecs 16 + HTTP allocation 3 + TLS 3 + decoder allocation 1 |
-| protocol-wasi --target wasm32-wasip3 | PASS: same 23 tests under Wasmtime 46.0.0 |
-| no-tokio.sh | PASS: all eight configured targets plus union graph, default/all features |
-| soak.py | PASS: 241 locked registry versions; existing exact rustls exception remains the only exception |
-| cargo deny --locked check | PASS advisories/bans/licenses/sources; existing duplicate-major warnings |
-| Workflow lint (actionlint compatibility wrapper, zizmor, ShellCheck) | PASS |
-| git diff --check | PASS |
+| `cargo fmt --check` | PASS |
+| `cargo clippy --workspace --all-targets -- -D warnings -D clippy::undocumented_unsafe_blocks`, default and all features | PASS |
+| Same whole-workspace Clippy for `x86_64-unknown-linux-gnu`, default and all features | PASS; checks epoll/pidfd plus forced timerfd/SIGCHLD paths and Gungraun teardown |
+| Core/contract/bench all-target/all-feature Clippy for Linux arm64, FreeBSD, iOS, Windows MSVC, WASI 0.2, browser wasm | PASS |
+| Android core/contract library all-feature Clippy | PASS; full Android test linking/runtime UNRUN |
+| Core/contract/bench all-target/all-feature WASI 0.3 Clippy using nightly-2026-09-07 | PASS |
+| `cargo +stable check --locked --workspace --all-targets --all-features` | PASS, stable 1.97.1 |
+| `env RUST_TEST_THREADS=1 cargo test --workspace` | PASS, 222 test passes |
+| `cargo test -p turnloop-contract --all-features -- --test-threads=1` × 50 | **PASS 50/50**, 52 tests/run, zero failures |
+| `env RUST_TEST_THREADS=1 cargo test --workspace --all-features` × 10 | **PASS 10/10**, 237 tests/run, zero failures |
+| `python3 scripts/ci/run-tests.py loom` | PASS, all six models, including new queue model |
+| `env RUSTFLAGS='--cfg loom' cargo clippy -p turnloop --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks` | PASS |
+| `env MIRI_SYSROOT=.tools/core3/miri-sysroot cargo miri setup`, then same env with `python3 scripts/ci/run-tests.py miri` | PASS, both configured pure-Rust tests execute |
+| `env RUSTDOCFLAGS=-Dwarnings cargo doc --locked --workspace --all-features --no-deps` | PASS |
+| `bash scripts/ci/no-tokio.sh` | PASS, eight targets and union, default/all features |
+| `python3 scripts/ci/soak.py` | PASS, 241 locked versions; only the pre-existing exact rustls security exception |
+| `python3 scripts/ci/check-paths.py`; `git diff --check` | PASS |
+| Release benchmark builds and final interleaved ri_instructions measurements | PASS, 390 measurements; actual operation/wait/byte assertions |
+| Original-code SIGUSR1 and ESRCH negative controls | Expected FAIL, proving both regressions detect their defects |
+| `python3 scripts/ci/instructions.py` | **UNRUN**, no Linux/Valgrind host |
 
-## Failures, deviations and DESIGN proposals
+The final repetition campaigns alone total **4,970 test passes**, 61,440 asserted
+churn signal deliveries and 15,360 reaped children in the 256-child contract.
+RUST_TEST_THREADS=1 follows CONTRIBUTING's process-global signal/allocator isolation;
+there are no retries in the test loop. Ignored external-service tests do not count.
 
-No DESIGN.md edit proposed for these CI fixes. Retaining ring avoids introducing
-a new provider and is backed by real WASI crypto execution, not compilation alone.
-Database/SMTP native real-server TLS harnesses still require threads/native socket
-fixtures; they are **UNRUN on WASI**, not replaced by or counted as the portable
-TLS suite. The selected provider is shared by those crates and remains usable on
-WASI; porting their fixture transports was not added to this CI-fix lane.
+## Intermediate failures and scope limits
 
-The initial new TLS memory harness overwrote successive EncodeTlsData chunks;
-the tests failed with InappropriateMessage on native/WASI. Fixed by appending
-all handshake chunks and clearing only after transport acknowledgement.
+- The first 50-run campaign stopped on run 5 (four passes, then SIGCHLD termination
+  in the process-group test). The no-op SIGCHLD handler had the same restore window
+  as SIGUSR1; early fallback unsubscription made it easier to expose. SIGCHLD now
+  uses default-ignore throughout its kqueue subscription. The final 50-run campaign
+  restarted at zero after this correction; its failures count is zero.
+- The new file gate initially measured an unfinished warm-up notification, then
+  exposed one lazy mutex allocation. A completed warm-up timer separates startup
+  from the exact quiet-wait test. A captured allocator stack identified the mutex;
+  production setup now reserves it. No wait limit or zero-allocation assertion was
+  removed or relaxed. Initial Clippy failures only required moving SAFETY comments
+  immediately before unsafe expressions inside assert macros.
+- Two early signal snapshot probes inadvertently used an integrator checkpoint or
+  stale Cargo artifacts after restoring old timestamps. Neither counts as original
+  code evidence. Final negative controls use explicit starting SHA 9e9d8aa and fresh
+  target directories; both fail for their intended reason.
+- Native Linux (both epoll modes), Windows, FreeBSD and mobile runtime tests are
+  **UNRUN**: no hosts. Windows/WASI/web production providers remain the existing
+  other-lane responsibility; scoped cross-compilation does not claim their runtime
+  contracts. Browser runtime and external-server tests are **UNRUN** here. SQL
+  sandbox limits and the inherited whole-workspace p3 getrandom issue are unchanged.
 
-An additional whole-record TLS allocation experiment FAILED: **4000 allocations
-for 1000 bidirectional 1024-byte exchanges**, after three warm-ups and a positive
-allocator calibration. rustls 0.23.45 ReadTraffic owns Option<Vec<u8>> and queues
-owned plaintext; record encryption also allocates. This behavior predates this
-lane (the HTTP report explicitly left rustls allocation counts uninstrumented).
-The probe initially sat in the new portable test during development; it is now
-preserved unchanged at `.tools/ci-fix4/tls-record-allocation-probe.rs`, with its
-failed zero assertion and raw result retained. It was not adopted as a new required
-CI gate or represented as a pass. Scope clarification received no response; the
-announced default was to finish the requested CI fixes, not fork/redesign rustls.
-The shipped portable suite tests TLS behavior; **no allocation-free TLS claim** is
-made. All allocation gates that existed on starting main remain required and pass.
-This performance finding needs separate TLS ownership/specification review.
+## Deviations / proposed DESIGN clarification / next steps
 
-The two native core2 failures also need independent follow-up: intermittent ESRCH
-when registering 256 short-lived children, and SIGUSR1 during the all-feature
-signal fan-out test. Successful reruns do not resolve either race. No retry was
-added to CI and no core test or assertion was changed to hide them.
+Restart audit at checkpoint **a87ae10**: the working tree was clean and all
+implementation/measurement artifacts were already checkpointed. Re-read the
+required design, contribution, integration and relevant lane reports; reviewed
+the complete source diff against 9e9d8aa. No source correction remained.
+`python3 .tools/core3/resume-audit.py` **PASS**: all 46 recorded source/configuration
+hashes and all three measured binary hashes match; all 390 positive measurements
+have five rounds; all 50 contract and 10 workspace logs contain their expected
+52/237 passes and the specific regression subjects. Saved loom/Miri/default-suite
+counts also match. Dependency/soak policy, instruction gate and baseline remain
+unchanged. An additional post-restart contract all-feature run **PASS**, 52 tests,
+separate from the original 50/50 campaign. No large campaigns were rerun, and no
+builds ran concurrently during the restart audit. Post-restart formatting, path
+validation and diff whitespace checks **PASS**; commands are in the linked ledger.
 
-## Windows coverage and remaining exclusions
+No Cargo dependency/lockfile, soak setting/security exception, platform gate, test
+threshold or Linux baseline changed. No public Backend trait revision was needed.
+The source changes are confined to Unix services/files, their tests and benchmarks.
 
-- The unchanged native gate executes the entire workspace in default/all-feature
-  modes and independently requires nonzero core/protocol tests. HTTP/TLS/WebSocket
-  fixture interop runs on windows-2025 too; both ignored HTTP fixture tests execute
-  there via --include-ignored. All new portable TLS and Node fallback tests run.
-- Only the curl h2 leg is unavailable when Features lacks HTTP2; Node h2 remains
-  mandatory. HTTP/1 curl runs whenever the http protocol exists. A missing curl
-  executable is reported as an unavailable curl leg, never a zero-client pass.
-- `turnloop-contract`'s 22 native backend contracts, 5/6 allocation tests,
-  descriptor lifetime test, 14 native surface tests and 6 feature-gated executor
-  tests still require the production IOCP provider/Windows fixtures. The existing
-  windows-contracts-pending marker and WINDOWS_HANDOFF.md are unchanged. Unix
-  kqueue/epoll internals and the waitid-based core child-race test are Unix-specific;
-  driver examples/doctest I/O bodies also await a Windows provider.
-- Ten external-service tests remain ignored in Windows native CI: PostgreSQL 3,
-  MySQL 3, Redis 2, MongoDB 1 and installed Postfix smtp-sink 1. CI provisions these
-  fixtures only in its Linux protocol job (Docker service containers, native Redis,
-  Unix Postfix sink). Their portable codecs/auth/TLS transition/allocation tests
-  and SMTP in-process TLS socket tests do run on Windows. No additional exclusions.
-- Platform-specific instruction/syscall measurements, Miri and loom remain in
-  their existing dedicated jobs; they are not Windows runtime test passes.
+The [XNU signal implementation](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_sig.c)
+issues NOTE_SIGNAL before ordinary disposition processing; postsig_locked's default
+branch assumes fatal delivery. The [FreeBSD implementation](https://github.com/freebsd/freebsd-src/blob/main/sys/kern/kern_sig.c)
+also notifies kqueue before ignoring signals. Proposed §7.2 clarification:
+**SIG_IGN for subscribed ordinary signals, SIG_DFL for SIGCHLD**, whose default
+ignores delivery without auto-reaping. DESIGN.md itself is unchanged.
 
-## UNRUN / exactly what CI and integrator must confirm
+No implementation questions remain. Integrator next steps:
 
-1. Commit the working tree (including new scripts/test and the two log deletions).
-   Run `python3 scripts/ci/check-paths.py` after staging all reference targets;
-   confirm Linux case-sensitive checkout and synthetic guard failures.
-2. `lint-wasm` and both `protocol-wasi` jobs: download/hash-check the pinned Linux
-   SDK, export GITHUB_ENV tool paths, run requested Clippy and all 23 protocol tests
-   per WASI target. Local macOS Wasmtime execution passes; hosted Linux UNRUN.
-3. Windows hosted and optional provisioned Windows runner: run
-   `python3 scripts/ci/run-tests.py native`, then
-   `python3 scripts/test-servers.py --services http run python3 scripts/ci/run-tests.py interop`.
-   Confirm printed Node h2 (100 streams), correct optional curl leg, all portable
-   member counts, and native C-dependency lint. Runtime UNRUN (no Windows host).
-4. Linux/macOS integrator: investigate both unchanged core2 process/signal races;
-   rerun complete default/all-feature native gate without retry/threshold waivers.
-   Linux runtime/no-spin/allocation execution UNRUN here (no Linux or Docker).
-5. WASM lane: resolve inherited p3 getrandom compatibility and production WASI/web
-   contracts; their required jobs/fan-in remain intact. Browser runtime UNRUN here
-   (backend lane and known sandbox Chrome startup limits).
-6. ci-fix3/integrator: full SQL/Mongo/server-runner jobs remain theirs. SQL tests
-   UNRUN (sandbox shmget / mysqld initialization limits); full Docker protocol job
-   UNRUN (no Docker). No server-harness or cleanup edits in this lane.
-7. TLS owner: address upstream record allocations separately before claiming the
-   whole TLS path obeys a zero-allocation-per-record budget.
-
-No publication, commits, changes to other clones, additional dependencies or
-soak/security-policy exceptions. Reviewable fixes are complete; the outstanding
-items above prevent a claim that the full repository CI is green.
-
-## Complete verification command ledger
-
-- PASS (exit 0): `python3 scripts/ci/install-wasm-toolchain.py`; log `.tools/ci-fix4/1789407110615594000.log`.
-- PASS (exit 0): `python3 scripts/ci/check-paths.py`; log `.tools/ci-fix4/1789407229916278000.log`.
-- PASS (exit 0): `python3 -m unittest discover -s scripts/ci -p test_paths.py -v`; log `.tools/ci-fix4/1789407313868572000.log`.
-- PASS (exit 0): `cargo clippy --workspace --all-targets --target wasm32-wasip2 -- -D warnings`; log `.tools/ci-fix4/1789407314292192000.log`.
-- PASS (exit 0): `cargo fmt --all`; log `.tools/ci-fix4/1789407363794312000.log`.
-- PASS (exit 0): `cargo clippy --workspace --all-targets --target wasm32-unknown-unknown -- -D warnings`; log `.tools/ci-fix4/1789407384689947000.log`.
-- PASS (exit 0): `cargo test -p turnloop-http --test interop -- --nocapture --test-threads=1`; log `.tools/ci-fix4/1789407385915828000.log`.
-- PASS (exit 0): `bash scripts/ci/install-wasmtime.sh`; log `.tools/ci-fix4/1789407416647395000.log`.
-- PASS (exit 0): `cargo fmt --all`; log `.tools/ci-fix4/1789407540379382000.log`.
-- FAIL (exit 101): `cargo test -p turnloop-tls --test portable`; log `.tools/ci-fix4/1789407541071487000.log`.
-- PASS (exit 0): `cargo clippy --workspace --all-targets -- -D warnings -D clippy::undocumented_unsafe_blocks`; log `.tools/ci-fix4/1789407570924511000.log`.
-- FAIL (exit 1): `python3 scripts/ci/run-tests.py protocol-wasi --target wasm32-wasip2`; log `.tools/ci-fix4/1789407569740037000.log`.
-- PASS (exit 0): `python3 -m unittest discover -s scripts/ci -p test_paths.py -v`; log `.tools/ci-fix4/1789407618057085000.log`.
-- FAIL (exit 101): `cargo test -p turnloop-tls --test portable`; log `.tools/ci-fix4/1789407616899305000.log`.
-- PASS (exit 0): `python3 scripts/ci/check-paths.py`; log `.tools/ci-fix4/1789407618618738000.log`.
-- PASS (exit 0): `python3 scripts/ci/install-tools.py actionlint zizmor shellcheck cargo-deny`; log `.tools/ci-fix4/1789407690491868000.log`.
-- PASS (exit 0): `python3 -W error -m unittest discover -s scripts/ci -p 'test_*.py' -v`; log `.tools/ci-fix4/1789407690475209000.log`.
-- PASS (exit 0): `cargo +stable check --locked --workspace --all-targets --all-features`; log `.tools/ci-fix4/1789407690478495000.log`.
-- PASS (exit 0): `python3 scripts/ci/lint-workflows.py`; log `.tools/ci-fix4/1789407747119442000.log`.
-- PASS (exit 0): `bash scripts/ci/no-tokio.sh`; log `.tools/ci-fix4/1789407747108375000.log`.
-- PASS (exit 0): `cargo deny --locked check`; log `.tools/ci-fix4/1789407749402117000.log`.
-- FAIL (exit 101): `cargo clippy --workspace --all-targets --target x86_64-pc-windows-msvc --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks`; log `.tools/ci-fix4/1789407747126135000.log`.
-- PASS (exit 0): `python3 scripts/ci/soak.py`; log `.tools/ci-fix4/1789407747113782000.log`.
-- PASS (exit 0): `cargo clippy --workspace --all-targets --all-features --target x86_64-unknown-linux-gnu -- -D warnings -D clippy::undocumented_unsafe_blocks`; log `.tools/ci-fix4/1789407785434759000.log`.
-- PASS (exit 0): `cargo fmt --all`; log `.tools/ci-fix4/1789407816194670000.log`.
-- PASS (exit 0): `cargo clippy -p turnloop -p turnloop-contract -p turnloop-bench --all-targets --target x86_64-pc-windows-msvc --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks`; log `.tools/ci-fix4/1789407816681819000.log`.
-- PASS (exit 0): `python3 scripts/test-servers.py --services http run python3 scripts/ci/run-tests.py interop`; log `.tools/ci-fix4/1789407817342181000.log`.
-- PASS (exit 0): `python3 -m unittest discover -s scripts/ci -p test_paths.py -v`; log `.tools/ci-fix4/1789407856210493000.log`.
-- PASS (exit 0): `python3 scripts/ci/check-paths.py`; log `.tools/ci-fix4/1789407856627549000.log`.
-- FAIL (exit 101): `cargo +nightly-2026-09-07 clippy --locked --workspace --all-targets --all-features --target wasm32-wasip3 -- -D warnings -D clippy::undocumented_unsafe_blocks`; log `.tools/ci-fix4/1789407858916648000.log`.
-- PASS (exit 0): `cargo fmt --check`; log `.tools/ci-fix4/1789407876501949000.log`.
-- PASS (exit 0): `git diff --check`; log `.tools/ci-fix4/1789407877089503000.log`.
-- PASS (exit 0): `cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks`; log `.tools/ci-fix4/1789407891982014000.log`.
-- FAIL (exit 101): `cargo test --workspace -- --test-threads=1`; log `.tools/ci-fix4/1789407890795465000.log`.
-- PASS (exit 0): `cargo clippy --workspace --all-targets --all-features --target wasm32-wasip2 -- -D warnings -D clippy::undocumented_unsafe_blocks`; log `.tools/ci-fix4/1789407893177605000.log`.
-- PASS (exit 0): `cargo clippy --workspace --all-targets --all-features --target wasm32-unknown-unknown -- -D warnings -D clippy::undocumented_unsafe_blocks`; log `.tools/ci-fix4/1789407927205151000.log`.
-- PASS (exit 0): `cargo fmt --all`; log `.tools/ci-fix4/1789407947053317000.log`.
-- PASS (exit 0): `cargo test -p turnloop-tls --test portable`; log `.tools/ci-fix4/1789407947569113000.log`.
-- PASS (exit 0): `python3 -W error -m unittest discover -s scripts/ci -p 'test_*.py' -v`; log `.tools/ci-fix4/1789407970049827000.log`.
-- PASS (exit 0): `python3 scripts/ci/run-tests.py protocol-wasi --target wasm32-wasip2`; log `.tools/ci-fix4/1789407968791800000.log`.
-- PASS (exit 0): `python3 scripts/ci/run-tests.py protocol-wasi --target wasm32-wasip3`; log `.tools/ci-fix4/1789407978545291000.log`.
-- PASS (exit 0): `python3 -m unittest discover -s scripts/ci -p test_paths.py -v`; log `.tools/ci-fix4/1789408010252153000.log`.
-- PASS (exit 0): `cargo test --workspace -- --test-threads=1`; log `.tools/ci-fix4/1789408018254092000.log`.
-- PASS (exit 0): `cargo fmt --all`; log `.tools/ci-fix4/1789408067998438000.log`.
-- PASS (exit 0): `python3 -m unittest discover -s scripts/ci -p test_paths.py -v`; log `.tools/ci-fix4/1789408143310554000.log`.
-- PASS (exit 0): `python3 scripts/ci/check-paths.py`; log `.tools/ci-fix4/1789408143925710000.log`.
-- FAIL (exit 1): `python3 scripts/ci/run-tests.py native`; log `.tools/ci-fix4/1789408068446759000.log`.
-- PASS (exit 0): `cargo clippy --workspace --all-targets -- -D warnings -D clippy::undocumented_unsafe_blocks`; log `.tools/ci-fix4/1789408198789189000.log`.
-- PASS (exit 0): `cargo clippy --workspace --all-targets --target wasm32-wasip2 -- -D warnings`; log `.tools/ci-fix4/1789408199413988000.log`.
-- PASS (exit 0): `cargo clippy --workspace --all-targets --target wasm32-unknown-unknown -- -D warnings`; log `.tools/ci-fix4/1789408214449688000.log`.
-- PASS (exit 0): `cargo +nightly-2026-09-07 clippy -p turnloop-tls --all-targets --target wasm32-wasip3 -- -D warnings -D clippy::undocumented_unsafe_blocks`; log `.tools/ci-fix4/1789408234418019000.log`.
-- PASS (exit 0): `cargo +stable check --locked --workspace --all-targets --all-features`; log `.tools/ci-fix4/1789408240177860000.log`.
-
-- PASS (exit 0): `python3 -W error -m unittest discover -s scripts/ci -p 'test_*.py' -v`; log `.tools/ci-fix4/1789408347389951000.log`.
-
-- PASS (exit 0): `python3 scripts/ci/check-paths.py`; log `.tools/ci-fix4/1789408356537298000.log`.
-
-- PASS (exit 0): `cargo fmt --check`; log `.tools/ci-fix4/1789408358752237000.log`.
-
-- PASS (exit 0): `git diff --check`; log `.tools/ci-fix4/1789408359229651000.log`.
-
-- PASS: read-only Python/subprocess assertions using `git diff 59593ee --` confirm Cargo.lock, root dependencies/config, soak policy, protocol runner and server harness are unchanged; added HTTP/TLS lines contain no `.unwrap()`; both supplied documentation logs are absent.
-
-- PASS (exit 0): `git diff --check`; log `.tools/ci-fix4/1789408519199562000.log`.
+1. Integrate the checkpointed implementation and raw measurement artifact; commit
+   the appended restart verification/report entries in the working tree.
+2. Run Linux native contracts, default and all features, and ordinary Callgrind CI.
+   Review a corrected-boundary candidate using
+   `python3 scripts/ci/instructions.py --record .tools/core3-instruction-candidates.json`.
+   Preserve the 3% ceiling, exact control and all declared cases.
+3. Run the unchanged native/first-class platform matrix on its real hosts; keep
+   inherited SQL/browser/provider prerequisites separate from these local passes.
