@@ -1,6 +1,6 @@
 # turnloop: an embeddable, cross-platform event-loop driver
 
-**Status:** draft 0.2 for review · 2026-09-14 (0.2: tokio replaced everywhere with no sidecar; WASI and web in the first release; protocol layer added; multithreading model based on the `perry/thread` code map)\
+**Status:** draft 0.3 for review · 2026-09-14 (0.3: zero tokio, own HTTP/1.1 + HTTP/2; 0.2: tokio replaced everywhere with no sidecar; WASI and web in the first release; protocol layer added; multithreading model based on the `perry/thread` code map)\
 **Name:** `turnloop` (chosen 2026-09-14; free on crates.io that day).\
 **First consumer:** Perry, removing tokio from every target and every crate.\
 **License / home:** MIT, a standalone repository, published to crates.io from day one.
@@ -18,7 +18,7 @@ turnloop is an event loop that someone else turns: the host program owns the loo
 - **Completion-shaped I/O,** implemented natively on Linux (epoll), macOS/BSD (kqueue), **Windows (IOCP), WASI 0.2/0.3 and the web (browser host)**, all from the first release.
 - **Timers with sub-millisecond deadlines,** a blocking thread pool, child processes, signals, pipes and TTYs (where the platform has them).
 - **Multithreading as a first-class use:** a loop per JS agent on any thread, per-loop routing, process-wide services that deliver per loop, handle transfer between loops and processes (§5a).
-- **Optional layers:** a futures executor and `hyper::rt` implementations. **No tokio sidecar.** Crates that call tokio by name are replaced through the protocol layer (§5b).
+- **Optional layers:** a futures executor and futures-io traits. **No tokio sidecar, and zero tokio anywhere** (not even tokio's trait-only features). Crates that depend on tokio, which includes hyper and h2, are replaced through the protocol layer (§5b).
 
 It knows nothing about JavaScript, garbage collection or Node's rules. Those stay in the host.
 
@@ -45,7 +45,7 @@ Tokio is designed to own the thread. Deno fits that model because JS runs *insid
 | Our PoC (macOS, compiled TS, `poc/custom-reactor`) | A main-thread mio reactor behind the same hooks. Single-connection TCP echo 2.6× faster; setTimeout lateness 2.1 → 1.1 ms with a socket open. Binary −0.9 %, RSS −1.5 %. The echo gap traced to writes waiting for the next 1 ms tick. |
 | Codex, isolated HTTP transport (macOS) | Moving fetch dispatch off the blocking pool: **−36.8 % instructions, −33.6 % peak RSS**. Hyper on a custom reactor vs lean tokio: a tie in steady state. |
 | Codex, Perry-runtime harness (macOS, cgu=16) | Native deadlines −10…−21 % instructions, timer abort −18 %, serial HTTP −6.7 % (inside cgu=16 layout noise), executable −92 KiB. |
-| Linux runs (perrymaster, cgu=1) | In progress: instruction attribution of today's tokio bridge, replacement A/B, real `fetch()` dispatch patch. §10 budgets get filled from these. |
+| Linux runs (shared x86_64 host, cgu=1) | In progress: instruction attribution of today's tokio bridge, replacement A/B, real `fetch()` dispatch patch. §10 budgets get filled from these. |
 
 The conclusion both experiments share is that steady-state socket I/O costs about the same on tokio or a custom reactor. The waste is in the *embedding*: per-turn setup, 1 ms floors, blocking-pool handoffs, cross-thread wakes, and a timer wheel used where a deadline would do.
 
@@ -70,8 +70,8 @@ The conclusion both experiments share is that steady-state socket I/O costs abou
 4. **Deterministic resource lifetimes.** Every submitted operation completes exactly once, including on cancel and close, so hosts with a GC know when to release roots.
 5. **Portable semantics** for TCP, UDP, Unix sockets / named pipes, stdio pipes, TTY/console, child processes, signals, timers, file and DNS operations (pool-backed), and host blocking jobs.
 6. **Multithreading.** Many loops on many threads, cross-thread wake-up and posting, and a shared blocking pool (§5a).
-7. **tokio-free Perry.** Together with the protocol layer (§5b), `cargo tree -i tokio` is empty for every Perry target, and a CI gate keeps it that way.
-8. **Optional integration layers:** a futures executor, futures-io traits, `hyper::rt`.
+7. **tokio-free Perry.** Together with the protocol layer (§5b), `cargo tree -i tokio` is empty for every Perry target, with no exceptions, and a CI gate keeps it that way.
+8. **Optional integration layers:** a futures executor and futures-io traits.
 9. **No knowledge of the host.** No JS, GC or Node types. Errors are OS codes plus a portable kind.
 
 **Non-goals (v0.x)**
@@ -98,7 +98,6 @@ flowchart TB
     SYS["backends: epoll · kqueue · IOCP · WASI 0.2 · WASI 0.3 · web host (io_uring later)"]
     subgraph OPT["optional features"]
       EX["executor + futures-io"]
-      HR["hyper::rt impls"]
     end
   end
   subgraph P["protocol crates (siblings, §5b)"]
@@ -110,7 +109,6 @@ flowchart TB
   NT --> SYS
   BP -- "post completion" --> NT
   EX --> API
-  HR --> EX
   PR --> EX
   H2 --> PR
 ```
@@ -210,7 +208,6 @@ There are two ways a host drives a loop:
 ### D9. Optional layers
 
 - **`executor`:** a `!Send` `LocalExecutor` that turns tokens into wakers, plus `futures-io` `AsyncRead`/`AsyncWrite` on handles, plus `Sleep`.
-- **`hyper`:** `hyper::rt::{Executor, Timer, Sleep, Read, Write}` implementations, so hyper clients and servers run on the loop with no tokio.
 - **`rustls`:** an adapter on rustls's unbuffered API, which suits completion-shaped I/O.
 - **No tokio sidecar.** An earlier draft proposed running tokio on its own thread for crates that call it by name. That is rejected: every such crate is replaced through the protocol layer (§5b), and tokio leaves Perry's dependency graph entirely.
 
@@ -276,8 +273,8 @@ Without a sidecar, every tokio-bound crate Perry uses has to be replaced. The ru
 
 | Perry surface | Today (tokio-bound) | Replacement | Work |
 |---|---|---|---|
-| HTTP/1.1 + HTTP/2 server (`node:http`, fastify, framework) | hyper + hyper-util `server-auto` (tokio) | hyper 1.x `server::conn` via `hyper::rt` on turnloop; own accept loop and graceful shutdown | medium |
-| HTTP client (`fetch`, axios, undici) | reqwest (tokio) | hyper 1.x `client::conn` on turnloop + own pool, redirects, proxy, decompression, cookies as needed | **large** (reqwest's feature surface) |
+| HTTP/1.1 + HTTP/2 server (`node:http`, fastify, framework) | hyper + hyper-util `server-auto` (tokio) | **own** HTTP/1.1 (on `httparse`) and HTTP/2 (own framing, flow control and HPACK) in `turnloop-http`, server side | **large** |
+| HTTP client (`fetch`, axios, undici) | reqwest (tokio) | **own** HTTP/1.1 + HTTP/2 client in `turnloop-http`: pool, redirects, proxy, decompression | **large** |
 | TLS | tokio-rustls | rustls unbuffered API adapter | small–medium |
 | WebSocket (`ws`) | tokio-tungstenite | tungstenite protocol core over turnloop streams | small–medium |
 | PostgreSQL (`pg`) | sqlx `runtime-tokio` | `postgres-protocol` (sans-IO messages, SCRAM) + own connection, pipeline and pool | **large** |
@@ -290,11 +287,7 @@ Without a sidecar, every tokio-bound crate Perry uses has to be replaced. The ru
 | cron | `tokio-cron-scheduler` (never referenced) | delete the dependency | trivial |
 | Linux tray/MPRIS (gtk4: ksni, mpris via zbus) | zbus `tokio` feature | zbus's non-tokio mode runs its own small executor thread (async-io). Decide: accept for this Linux-desktop-only surface, or drive zbus on turnloop | decision |
 
-**The one dependency question left:** hyper's HTTP/2 support pulls in `h2`, which uses tokio's `AsyncRead`/`AsyncWrite` traits and `tokio-util`'s codec. That is tokio's *crate* but not its runtime (`io-util` only; no `rt`, `net`, `time`). Options:
-- **(a)** allow `tokio` with `io-util` only, and gate in CI that no runtime feature is enabled anywhere
-- **(b)** fork or replace h2 to reach a literally empty `cargo tree -i tokio`
-
-**Recommendation:** start with (a) so HTTP/2 isn't blocked, with the feature gate enforced from day one; decide (b) after the HTTP client lands.
+**Zero tokio (decided 2026-09-14).** `hyper` 1.x has a mandatory `tokio` (`sync`) dependency, and `h2` needs `tokio` `io-util` plus `tokio-util`. So neither is used: HTTP/1.1 and HTTP/2 are implemented in `turnloop-http` (sans-IO, with `httparse` for HTTP/1 parsing and our own HPACK and HTTP/2 framing). `rustls` and `tungstenite` have no tokio dependency and are kept. CI fails if `tokio`, `tokio-util`, `async-std`, `smol` or any other async runtime crate appears in any target's dependency tree.
 
 ## 6. API sketch (non-normative)
 
@@ -531,10 +524,10 @@ Each phase must pass all of these before it lands:
 | **P2** | child_process, pty, stdin, dgram and signals on turnloop | per-pipe reader threads and polling readers (`os_process_streams.rs:361`, `dgram_reactor.rs:73`) on Unix; Windows keeps reader threads only where the OS requires them |
 | **P3** | JS timers into the turnloop heap; Node phase order | Vec scans, ms truncation, spin-until-throttle |
 | **P4** | blocking pool for bcrypt, argon2, sharp, zlib and crypto; perry-ffi ABI v2 | tokio `spawn_blocking` |
-| **P5** | HTTP server (hyper `server::conn`) and TLS (rustls adapter) and WebSocket (tungstenite) on turnloop | hyper-util tokio, tokio-rustls, tokio-tungstenite |
+| **P5** | HTTP server (`turnloop-http` server side), TLS (rustls adapter) and WebSocket (tungstenite) on turnloop | hyper, hyper-util, tokio-rustls, tokio-tungstenite |
 | **P6** | HTTP client replacing reqwest (fetch, axios, undici); SMTP client replacing lettre's tokio transport | reqwest, lettre tokio |
 | **P7** | Database clients: Postgres, MySQL, Redis, MongoDB on the protocol crates (§5b) | sqlx, redis tokio-comp, mongodb driver |
-| **P8** | Remove `async-runtime` / tokio from perry-stdlib, perry-ffi and every ext crate; web and WASI targets use the same stdlib paths through their backends; CI gate: `cargo tree -i tokio` is empty, or `io-util` only if §5b option (a) is chosen, for every target | tokio |
+| **P8** | Remove `async-runtime` / tokio from perry-stdlib, perry-ffi and every ext crate; web and WASI targets use the same stdlib paths through their backends; CI gate: `cargo tree -i tokio` is empty for every target | tokio |
 
 P5–P7 are independent of each other once P1 and P4 have landed, and can run as parallel lanes.
 
@@ -548,8 +541,8 @@ P5–P7 are independent of each other once P1 and P4 have landed, and can run as
   3. record the publish timestamp, source commit and checksum in the commit message
 - **Dependencies:**
   - Core depends only on `libc`/`rustix` (Unix), `windows-sys` (Windows), the WASI bindings (`wasi` / `wit-bindgen`) and `wasm-bindgen`/`js-sys` for the web backend, each behind its target cfg.
-  - Integration features pull their own crates (`futures-io`, `hyper`, `rustls`) and are off by default.
-  - No crate in the turnloop repository depends on `tokio`, apart from the `io-util`-only exception in §5b option (a), if chosen, confined to the HTTP/2 path.
+  - Integration features pull their own crates (`futures-io`, `rustls`) and are off by default.
+  - No crate in the turnloop repository depends on `tokio`, `hyper`, `h2` or any async runtime.
 
 ## 14. Milestones
 
@@ -559,7 +552,7 @@ P5–P7 are independent of each other once P1 and P4 have landed, and can run as
 | **M1** | Core: `Loop`, `turn`, notifier, timers, integration primitives on **all six backends**. **Spikes:** compio-driver as the IOCP/io_uring backend vs our own; Windows high-res timer approach; WASI 0.3 multi-wait mechanism; heap vs BTreeMap | Contract tests green on all targets; instruction baseline for idle turn, notify and timers; spike decisions written up |
 | **M2** | TCP, UDP, pipes and named pipes, stdio; buffer modes; close and cancel semantics; multi-loop and cross-thread posting | Echo, IPC and multi-thread contract tests; zero-alloc and zero-wake-syscall gates |
 | **M3** | Processes, signals, TTY/console; blocking pool (fs, DNS, jobs) | Process, signal and pool suites where the platform supports them |
-| **M4** | Executor, futures-io, `hyper::rt`; TLS and WebSocket crates | hyper client and server tests on the loop, TLS and WebSocket interop tests |
+| **M4** | Executor, futures-io; TLS and WebSocket crates; HTTP/1.1 and HTTP/2 cores | HTTP client and server interop tests (curl, Node) on the loop; TLS and WebSocket interop tests |
 | **M5** | Perry P0 + P1 | Perry gates (§12) |
 | **M6** | HTTP client; SMTP | fetch/axios parity suites |
 | **M7** | Postgres, MySQL, Redis, MongoDB clients | driver conformance suites against real servers in CI |
@@ -575,7 +568,7 @@ P5–P7 are independent of each other once P1 and P4 have landed, and can run as
 6. **Mobile CI.** iOS (kqueue) and Android (epoll) come almost free from the Unix backends. Which simulators/emulators run in CI.
 7. **DNS.** `getaddrinfo` on the pool is correct but coarse. Whether `hickory-proto` is in scope for 0.x.
 8. **Where protocol crates live.** In the turnloop repository as siblings, or as Perry ext crates.
-9. **The h2 / tokio `io-util` question** (§5b).
+9. ~~The h2 / tokio `io-util` question~~: decided, zero tokio (§5b).
 10. **zbus for the Linux tray/MPRIS surface** (§5b).
 11. **Async inside `perry/thread` workers.** The compiler forbids it today. With a loop per agent it becomes possible; whether and when Perry allows it is a language decision.
 12. **Maintenance ownership** and issue policy once external users appear.
