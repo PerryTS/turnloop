@@ -12,6 +12,7 @@ documentation = "https://docs.rs/turnloop-mongodb"
 description = "Host-driven, sans-IO MongoDB protocol state machines"
 
 [dependencies]
+turnloop-tls = { workspace = true, optional = true, features = ["turnloop"] }
 turnloop-io = { workspace = true, optional = true }
 bson.workspace = true
 base64.workspace = true
@@ -44,4 +45,4 @@ turnloop-io = { workspace = true, optional = true, features = ["wasi-p3-experime
 turnloop-wasi-random.workspace = true
 
 [features]
-turnloop = ["dep:turnloop-io"]
+turnloop = ["dep:turnloop-io", "dep:turnloop-tls"]

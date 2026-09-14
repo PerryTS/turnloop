@@ -22,9 +22,10 @@ role = "protocol"
 integration-tests = ["real"]
 
 [features]
-turnloop = ["dep:turnloop-io"]
+turnloop = ["dep:turnloop-io", "dep:turnloop-tls"]
 
 [dependencies]
+turnloop-tls = { workspace = true, optional = true, features = ["turnloop"] }
 turnloop-io = { workspace = true, optional = true }
 
 [target.'cfg(all(target_os = "wasi", target_env = "p3"))'.dependencies]

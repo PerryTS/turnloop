@@ -12,6 +12,7 @@ documentation = "https://docs.rs/turnloop-postgres"
 description = "Pull-driven sans-I/O PostgreSQL client protocol"
 
 [dependencies]
+turnloop-tls = { workspace = true, optional = true, features = ["turnloop"] }
 turnloop-io = { workspace = true, optional = true }
 bytes.workspace = true
 postgres-protocol.workspace = true
@@ -38,4 +39,4 @@ turnloop-io = { workspace = true, optional = true, features = ["wasi-p3-experime
 turnloop-wasi-random.workspace = true
 
 [features]
-turnloop = ["dep:turnloop-io"]
+turnloop = ["dep:turnloop-io", "dep:turnloop-tls"]

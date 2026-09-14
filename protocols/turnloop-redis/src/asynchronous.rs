@@ -63,3 +63,11 @@ mod tests {
         );
     }
 }
+
+#[path="client.rs"]
+mod client;
+pub use client::*;
+
+#[path="cluster.rs"]
+mod cluster;
+pub use cluster::{ClusterClient,sentinel};
