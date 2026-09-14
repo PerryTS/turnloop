@@ -13,3 +13,11 @@ banned = [
   "async-executor", "async-global-executor", "futures-executor", "futures-runtime",
   "http-body", "http-body-util",
 ]
+
+# Remove as soon as the exact registry timestamp has completed its seven-day soak.
+[[security-exceptions]]
+crate = "rustls"
+version = "0.23.45"
+advisory = "RUSTSEC-2026-0285"
+reason = "Fix TLS 1.3 handshake messages accepted across encryption-level boundaries"
+expires = 2026-09-21

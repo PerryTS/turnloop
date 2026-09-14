@@ -23,6 +23,13 @@ workspace = true
 [package.metadata.turnloop-ci]
 role = "bench"
 instruction-baseline = "benchmarks/instructions.json"
+instruction-controls = ["instructions::operations::control"]
+instruction-cases = [
+    "instructions::operations::control",
+    "instructions::operations::idle",
+    "instructions::operations::notify",
+    "instructions::operations::timer_cancel",
+]
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 gungraun.workspace = true

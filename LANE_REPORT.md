@@ -1,8 +1,112 @@
-# http-integrate lane report
+# http-merge lane report
 
-Updated 2026-09-14. Integration implemented and verified within available platforms.
-**Release is blocked by the rustls security fix's mandatory soak**, detailed below.
+Updated 2026-09-14. Current main is merged in the working tree; Git's merge index
+still needs the integrator to stage and commit the resolved files.
 No commits or uploads by this agent; the integrator checkpoints the working tree.
+
+## Current merge resolution and verification
+
+- Resolved all markers in `scripts/test-servers.py`, `scripts/ci/run-tests.py`
+  and `scripts/ci/test_servers.py`, retaining both parents' capabilities and tests.
+- Retained HTTP/TLS/WebSocket interop, strict h2spec, WASI 0.2/0.3 protocol runs,
+  private HTTP shutdown, main's positive native per-member counts and explicit
+  pending Windows contracts, Redis 8.4.0/TLS installation, all service log tails,
+  crash-safe Redis cleanup, original-error chaining and deterministic MySQL auth.
+- HTTP startup now uses the shared log-tail helper and preserves the startup
+  error if child cleanup fails. New regressions execute a crashing child and
+  verify bounded stdout/stderr tails, reaping, default HTTP selection and the
+  failed test command's exit status.
+- `Cargo.lock` contains one rustls, 0.23.45, shared by all consumers. Main's
+  RUSTSEC-2026-0285 exception is retained unchanged, expiring at the registry's
+  exact seven-day timestamp on 2026-09-21. The resolver's seven-day configuration
+  and runtime bans remain unchanged. The prior security blocker below is historical.
+- Main's measured Linux instruction baseline is present and retained unchanged;
+  regression execution still requires Linux/Valgrind.
+
+Merge verification is complete within this macOS sandbox. The requested native,
+Linux/WASI 0.2/browser cross-checks, tests, interop, dependency gates and both
+package dry runs pass. SQL bodies, Linux/Windows runtime and Docker remain UNRUN.
+Additional full Windows Clippy is blocked by SDK headers; extra whole-workspace
+WASI 0.3 Clippy exposes the inherited BSON/getrandom target incompatibility.
+HTTP/decoder WASI 0.3 runtime tests pass. The required platform gates remain intact.
+
+All commands below ran from this clone. Logs are `.tools/http-merge/<label>.log`
+and exact exit codes/timings are in `.tools/http-merge/commands.jsonl`. For WASM,
+`CC_wasm32_{wasip2,wasip3,unknown_unknown}` and matching `AR_*` select
+`/opt/homebrew/opt/llvm/bin/clang` and `llvm-ar`. `.tools/bin` precedes PATH.
+No publish-age override was set. Rust source and allocation thresholds were not
+changed by the merge resolution; all unsafe-aware lint flags remain enabled.
+
+| Command | Result | Evidence / limitation (log label) |
+|---|---|---|
+| `cargo metadata --locked --all-features --format-version 1` | PASS | Twelve members; one shared rustls 0.23.45 with ring/std/tls12. (`metadata`) |
+| `python3 -W error -m unittest discover -s scripts/ci -p 'test_*.py' -v` | PASS | 48 tests before the third added HTTP regression. (`scripts`) |
+| `cargo build --locked --workspace` | PASS |  (`build`) |
+| `python3 scripts/ci/lint-workflows.py` | PASS | Strict queue validation, supported actionlint diagnostics, zizmor and ShellCheck. (`workflow-lint`) |
+| `cargo fmt --all --check` | PASS |  (`fmt`) |
+| `python3 scripts/ci/soak.py` | PASS | 240 registry versions; exactly one active rustls 0.23.45 exception, no other flags. (`soak`) |
+| `cargo clippy --locked --workspace --all-targets -- -D warnings -D clippy::undocumented_unsafe_blocks` | PASS |  (`clippy-native`) |
+| `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks` | PASS |  (`clippy-native-all`) |
+| `cargo deny --locked check` | PASS | Advisories, bans, licenses and sources pass; transitive-version duplicates remain warnings. (`deny`) |
+| `bash scripts/ci/no-tokio.sh` | PASS | Eight triples plus all-target union, default/all features, normal/build/dev edges. (`no-tokio`) |
+| `cargo clippy --locked --workspace --all-targets --all-features --target x86_64-unknown-linux-gnu -- -D warnings -D clippy::undocumented_unsafe_blocks` | PASS | Compile only; Linux runtime UNRUN. (`clippy-linux`) |
+| `cargo clippy --locked --workspace --all-targets --all-features --target wasm32-wasip2 -- -D warnings -D clippy::undocumented_unsafe_blocks` | PASS |  (`clippy-wasip2`) |
+| `cargo clippy --locked --workspace --all-targets --all-features --target wasm32-unknown-unknown -- -D warnings -D clippy::undocumented_unsafe_blocks` | PASS |  (`clippy-web`) |
+| `cargo clippy --locked --workspace --all-targets --all-features --target x86_64-pc-windows-msvc -- -D warnings -D clippy::undocumented_unsafe_blocks` | FAIL | Missing Windows SDK C headers (ring/zstd); full test-target check blocked, runtime UNRUN. (`clippy-windows`) |
+| `cargo +stable check --workspace --locked` | PASS | Installed stable rustc 1.97.1. (`stable`) |
+| `cargo +stable check --locked --workspace --all-targets --all-features` | PASS | Installed stable rustc 1.97.1, all targets/features. (`stable-all`) |
+| `env 'RUSTDOCFLAGS=-D warnings' cargo doc --locked --workspace --all-features --no-deps` | PASS |  (`rustdoc`) |
+| `cargo test --locked --workspace` | PASS | 192 passed; 12 external-service tests ignored and not counted. (`tests`) |
+| `.tools/bin/actionlint -color` | FAIL | Only the two inherited concurrency.queue parser errors in actionlint 1.7.12; strict existing wrapper passes. (`actionlint-raw`) |
+| `.tools/bin/zizmor --offline --min-severity low .github/workflows` | PASS | No findings beyond existing annotations/suppressions. (`zizmor`) |
+| `python3 scripts/ci/run-tests.py native` | PASS | 639 passes across workspace/default (192), all features (199) and independent member repetitions; unchanged no-spin/allocation gates pass. (`native-runner`) |
+| `scripts/test-servers.py run cargo test --workspace -- --include-ignored` | FAIL | Initializer failure at PostgreSQL shmget; full-command test bodies UNRUN (sandbox). Original error and bounded log tail retained. (`servers-full`) |
+| `scripts/test-servers.py --services mysql run true` | FAIL | Initializer exits 2 after fatal signal; MySQL bodies UNRUN (sandbox). (`servers-mysql`) |
+| `python3 scripts/ci/instructions.py` | FAIL | Expected macOS host-precondition failure; actual Linux/Valgrind regression UNRUN. Committed baseline retained unchanged. (`instructions`) |
+| `python3 scripts/ci/release.py order` | PASS | Ten publishable crates in documented dependency order; helpers excluded. (`release-order`) |
+| `scripts/test-servers.py --services redis,mongodb,smtp,http run cargo test --locked --workspace --exclude turnloop-postgres --exclude turnloop-mysql -- --include-ignored --test-threads=1` | PASS | 175 passed, zero ignored; Redis 8.4.0 single/TLS/cluster/Sentinel, MongoDB, SMTP and HTTP; cleanup succeeds. (`servers-non-sql`) |
+| `scripts/test-servers.py --services http run python3 scripts/ci/run-tests.py interop` | PASS | 15/15 actual HTTP/TLS/WebSocket Node/curl tests. (`interop`) |
+| `python3 scripts/ci/h2spec.py` | PASS | 147 distinct tests passed, zero skips/failures; source checksum and Go modules verified. (`h2spec`) |
+| `python3 scripts/ci/run-tests.py protocol-wasi --target wasm32-wasip2` | PASS | 20 tests executed: 16 codecs, three HTTP allocation checks, decoder allocation regression. (`protocol-wasip2`) |
+| `python3 -W error -m unittest discover -s scripts/ci -p 'test_*.py' -v` | PASS | 49 tests; all 16 fixture tests from both parents retained, three added. (`scripts-final`) |
+| `python3 scripts/ci/run-tests.py protocol-wasi --target wasm32-wasip3` | PASS | Same 20 tests executed with nightly-2026-09-07 and Wasmtime 46. (`protocol-wasip3`) |
+| `cargo clippy --locked --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings -D clippy::undocumented_unsafe_blocks` | PASS | Compile only; Linux runtime UNRUN. (`clippy-linux-default`) |
+| `cargo clippy --locked --workspace --all-targets --target wasm32-wasip2 -- -D warnings -D clippy::undocumented_unsafe_blocks` | PASS |  (`clippy-wasip2-default`) |
+| `cargo clippy --locked --workspace --all-targets --target wasm32-unknown-unknown -- -D warnings -D clippy::undocumented_unsafe_blocks` | PASS |  (`clippy-web-default`) |
+| `cargo +nightly-2026-09-07 clippy --locked --workspace --all-targets --all-features --target wasm32-wasip3 -- -D warnings -D clippy::undocumented_unsafe_blocks` | FAIL | Additional check: inherited BSON -> ahash/rand -> getrandom 0.3.4 rejects WASI 0.3. Unresolved; protocol subset passes. (`clippy-wasip3`) |
+| `cargo clippy --locked -p turnloop -p turnloop-contract -p turnloop-bench --all-targets --all-features --target x86_64-pc-windows-msvc -- -D warnings -D clippy::undocumented_unsafe_blocks` | PASS | Core, contract and bench portable test targets compile; runtime UNRUN. (`clippy-windows-portable`) |
+| `cargo publish --dry-run --locked --allow-dirty --workspace` | PASS | All ten archives packaged and verified; every upload aborted by dry run. (`publish-native`) |
+| `python3 scripts/ci/lint-workflows.py` | PASS | Final workflow; no checks or filters weakened. (`workflow-lint-final`) |
+| `python3 -m compileall -q scripts` | PASS |  (`python-compile`) |
+| `cargo publish --dry-run --locked --allow-dirty --workspace --all-features --target wasm32-wasip2` | PASS | All ten packaged libraries verified with all features on WASI 0.2; every upload aborted. (`publish-wasip2`) |
+| `cargo test --locked --manifest-path target/package/turnloop-zstd-decoder-0.1.0/Cargo.toml --test reuse` | PASS | One independently packaged decoder allocation/byte regression executed. (`packaged-reuse`) |
+| `cargo +nightly-2026-09-07 tree --locked --target wasm32-wasip3 -i getrandom@0.3.4` | PASS | Confirms the failing getrandom 0.3.4 edges come from BSON via ahash and rand. (`wasip3-entropy-tree`) |
+| `python3 .tools/http-merge-review.py` | FAIL | Diagnostic helper initially assumed archives lived directly under target/package; actual batch output is tmp-crate/. Corrected path; no product or test changes. (`semantic-review`) |
+| `python3 .tools/http-merge-review.py` | PASS | All ten normalized archives, registry paths, unchanged policy/lock/baseline/MySQL tests, fixture cleanup and marker/whitespace scans pass. Every TLS archive locks rustls 0.23.45. (`semantic-review-final`) |
+| `git diff --check` | PASS |  (`diff-check`) |
+
+Additional read-only verification **PASS**: complete relevant design/contribution/
+integration and HTTP/CI/SQL/KV lane-report review; `git status`/parent diffs;
+Python AST union of both parents' fixture tests; byte equality of inherited soak,
+policy, lock, MySQL auth test and instruction baseline; metadata/provider graph;
+`rustc +stable --version`, `node --version`, Redis server/CLI versions and
+`.tools/bin/wasmtime --version`. The final archive check confirms ten packages
+below 10 MiB, no normalized path/patch requirements and eight TLS-containing
+archives with rustls 0.23.45. Decoder archive size is 10,031,025 bytes.
+
+`rg -n --hidden '^(<<<<<<<|=======|>>>>>>>)' -g '!.git' -g '!target/**'
+-g '!.tools/**' .` — **PASS**, no output, expected exit 1. No private server state,
+Redis instance/env records, HTTP state, SMTP supervisor socket or Docker ownership
+record remains. `.git` remains unmodified and the integrator must stage the three
+resolved conflict files before committing the merge.
+
+**UNRUN:** the full SQL server bodies and deterministic MySQL auth sequence in this
+sandbox; native Linux/Windows execution; Docker SQL probes/Mongo containers and
+Linux Redis installer/cache execution; production WASI/browser/Node backend
+contracts; Linux instruction runtime comparison; live GitHub CI/OIDC/publication.
+Local installed Redis 8.4.0/TLS ran successfully, and installer corruption/version/
+TLS tests executed. Full workspace WASI 0.3 Clippy is **FAIL**, not an environment
+skip; its BSON/getrandom compatibility issue is recorded under next steps.
 
 ## Implemented
 
@@ -10,7 +114,7 @@ No commits or uploads by this agent; the integrator checkpoints the working tree
   the independently publishable `turnloop-zstd-decoder`, with descriptions, READMEs,
   repository/docs/license metadata, shared dependencies and explicit versions on
   local dependency edges. Updated the publish order in `docs/INTEGRATION_REPORT.md`.
-- Shared rustls 0.23.44/ring 0.17.14/std/tls12 across TLS and SQL/Redis/SMTP/Mongo
+- Shared rustls 0.23.45/ring 0.17.14/std/tls12 across TLS and SQL/Redis/SMTP/Mongo
   test transports. Defaults/aws-lc disabled. ring supports native platforms and
   wasm32 with LLVM; browser entropy and PKI web features are explicit, WASI uses
   host entropy. No FIPS/PQ promise. Removed rustls-pemfile for maintained PKI PEM.
@@ -48,7 +152,7 @@ No commits or uploads by this agent; the integrator checkpoints the working tree
   CLI-import/custom-allocator stack trap without removing assertions or raising
   thresholds. These allocation targets always run all tests, regardless of filters.
 
-## Verification commands
+## Historical HTTP integration verification (before this merge)
 
 Commands ran from this checkout unless a manifest path is specified. `--locked`
 was used after resolution. Native stable is 1.97.1. Logs are in `.tools/` (ignored).
@@ -132,33 +236,36 @@ manifest/harness changes. The decoder archive includes all fixtures (~9.6 MiB).
   were removed or expectations changed in the Rust suites.
 - First cargo-deny run also rejected CDLA-Permissive-2.0; the reviewed Mozilla data
   license and redistribution text are now explicitly included. The security failure
-  was not suppressed and remains a release blocker.
+  was not suppressed; main's reviewed rustls update now resolves that former blocker.
 
 ## Blockers / deviations / DESIGN proposals
 
-No DESIGN.md changes, runtime exceptions, test exclusions hiding failures, or soak
-relaxations. Fork option (b) was necessary. The Rust standard library's internal
-rustc-dep-of-std feature is omitted from this independently published fork.
+No DESIGN.md changes, forbidden-runtime exceptions or test/gate relaxations.
+Main's reviewed security exception is retained. Fork option (b) was necessary.
+The Rust standard library's internal rustc-dep-of-std feature is omitted from
+this independently published fork.
 
-RUSTSEC-2026-0285 affects rustls 0.23.44. The fixed 0.23.45 was published
-**2026-09-14 15:11:17.808465 UTC** and becomes eligible only on
-**2026-09-21 15:11:17.808465 UTC**. The shared dependency remains on the soaked
-version; cargo-deny intentionally rejects it. No safe, already-soaked fixed release
-is available. The lane cannot honestly claim a green release gate today.
+Main replaced vulnerable rustls 0.23.44 with 0.23.45 and supplied the reviewed,
+dated RUSTSEC-2026-0285 security exception. This supersedes the earlier audit
+failure: all other dependency ages and every checksum remain mandatory. No new
+exception, advisory ignore or resolver override was added by this merge lane.
 
 UNRUN: Linux/Windows runtime, full Windows Clippy without SDK, Docker fixture path,
 browser runtime tests, and SQL bodies blocked by sandbox initialization. Existing
-production Windows/WASM backend contracts and Linux instruction baseline remain
-other-lane release prerequisites; protocol successes do not replace them. No live
+production Windows/WASM backend contracts and Linux instruction regression remain
+other-platform release prerequisites; the baseline is now committed. No live
 GitHub workflow, registry publication, OIDC or release bootstrap was performed.
 
 ## Open questions / next steps
 
-1. After 2026-09-21 15:11:17.808465 UTC, resolve rustls 0.23.45 with pinned nightly;
-   rerun TLS/interop, workspace/targets, soak, cargo-deny and package gates. Do not
-   publish while the required security audit fails.
+1. Have the integrator stage the resolved files and commit the merge. Remove the
+   rustls security exception at 2026-09-21T15:11:17Z, when the index timestamp
+   completes its soak.
 2. Integrator reruns the full server command outside the sandbox and hosted matrix;
-   supplies Windows SDK/runtime, Docker and backend/baseline prerequisites.
+   supplies Windows SDK/runtime, Docker and production backend prerequisites;
+   runs the instruction comparison against the committed Linux baseline.
+   Resolve BSON's getrandom 0.3.4 WASI 0.3 compilation failure without weakening
+   the required workspace gate; the HTTP/decoder p3 protocol suite already passes.
 3. Submit the prepared ruzstd patch; replace the fork only after an upstream release
    passes the unchanged soak and identical allocation/behavior/package tests.
 4. Track the pinned WASI 0.3 custom-allocator/libtest startup issue upstream; preserve

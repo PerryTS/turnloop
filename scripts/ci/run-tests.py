@@ -28,6 +28,33 @@ def checked_tests(command, *, cwd, env=None, minimum_groups=1):
     print(f'PASS executed {passed} tests')
 
 
+def native_tests(data, base, root, *, windows):
+    contracts = select(data, 'contract')
+    pending = []
+    for package in contracts:
+        handoff = settings(package).get('windows-contracts-pending')
+        if windows and handoff:
+            if handoff != 'WINDOWS_HANDOFF.md' or not (root / handoff).is_file():
+                fail(f'{package["name"]}: pending Windows contracts need WINDOWS_HANDOFF.md')
+            pending.append(package['name'])
+            message = (f'PENDING Windows backend contracts: {package["name"]}. '
+                       'IOCP bounded waits/no-spin, socket I/O, cancel/close ordering, '
+                       'wake/integration, allocation and lifetime tests await the production provider. '
+                       'See [WINDOWS_HANDOFF.md](https://github.com/PerryTS/turnloop/blob/main/WINDOWS_HANDOFF.md), phase 2. '
+                       'Remove windows-contracts-pending metadata when IOCP lands.\n')
+            print(message, flush=True)
+            if summary := os.environ.get('GITHUB_STEP_SUMMARY'):
+                with open(summary, 'a', encoding='utf-8') as output:
+                    output.write(message + '\n')
+    for features in ([], ['--all-features']):
+        checked_tests(base + ['--workspace'] + features + ['--', '--test-threads=1'], cwd=root)
+        # Every portable member must execute independently; another crate's tests
+        # cannot hide a cfg-excluded core, protocol codec or fixture suite.
+        for package in select(data, 'core') + select(data, 'protocol') + contracts:
+            if package['name'] not in pending:
+                checked_tests(base + ['-p', package['name']] + features + ['--', '--test-threads=1'], cwd=root)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('suite', choices=['native', 'wasi', 'web', 'node', 'loom', 'miri', 'protocol', 'protocol-wasi', 'interop'])
@@ -42,12 +69,8 @@ def main():
     if args.target:
         base += ['--target', args.target]
     if args.suite == 'native':
-        # Run all normal suites, then every contract member independently: zero
-        # platform contracts cannot be hidden by another member's passing tests.
-        for features in ([], ['--all-features']):
-            checked_tests(base + ['--workspace'] + features + ['--', '--test-threads=1'], cwd=root)
-            for package in select(data, 'contract'):
-                checked_tests(base + ['-p', package['name']] + features + ['--', '--test-threads=1'], cwd=root)
+        windows = 'windows' in args.target if args.target else sys.platform == 'win32'
+        native_tests(data, base, root, windows=windows)
     elif args.suite in ('wasi', 'protocol-wasi'):
         if args.target not in ('wasm32-wasip2', 'wasm32-wasip3'):
             fail('wasi requires --target wasm32-wasip2 or wasm32-wasip3')

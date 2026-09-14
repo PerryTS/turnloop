@@ -1,16 +1,58 @@
 # Integration report
 
 Updated 2026-09-14. HTTP integration produces a twelve-member workspace with ten
-publishable crates. Native and portable protocol checks, strict h2spec, and native
-and WASI packaged dry runs pass. **Release remains blocked:** the newly published
-rustls security fix is still in the mandatory seven-day soak. SQL sandbox and
-production Windows/WASM backend/baseline prerequisites below also remain pending.
+publishable crates. The current main merge retains HTTP/TLS/WebSocket and h2spec,
+main's service diagnostics/cleanup, deterministic MySQL authentication and portable
+Windows test gates. rustls 0.23.45 passes the security audit and the seven-day soak
+gate with main's exact dated exception. Linux instruction baselines are committed.
+SQL sandbox and production Windows/WASM backend prerequisites remain pending;
+neither cross-compilation nor package dry runs establish release readiness.
+
+## Current main merge
+
+Resolved all conflict markers in `scripts/test-servers.py`,
+`scripts/ci/run-tests.py` and `scripts/ci/test_servers.py` by combining both parents.
+HTTP remains a default fixture and retains authenticated shutdown, Node/curl
+interop, strict h2spec and both WASI protocol targets. Native default/all-feature
+runs independently require positive core/protocol counts, with only main's
+documented pending Windows production contracts marked pending. Redis uses main's
+pinned native 8.4.0 TLS build in CI, config-verified detached cleanup and owned-child
+reaping. Per-server logs, bounded failure tails, original-error chaining and the
+MySQL auth-admin cache reset are preserved. HTTP startup now shares the failure-tail
+helper; its new tests prove real child output, reaping and default fixture selection.
+
+Semantic review includes `Cargo.toml`, `Cargo.lock`, CI workflow, policy/soak code,
+this report and CONTRIBUTING. All 16 fixture tests from both parents survive;
+three regressions were added. Locked metadata/build, all 49 Python tests, soak
+(240 versions, exactly one exception), no-tokio, cargo-deny and workflow lint pass.
+Default/all-feature Clippy passes natively and for Linux, WASI 0.2 and browser WASM;
+stable 1.97.1 and rustdoc pass. Native and WASI package dry runs verify all ten
+archives; all eight archives that contain rustls lock 0.23.45. The unpacked decoder
+passes its allocation regression. No package needs a consumer path/patch override.
+
+The full server command fails during PostgreSQL initialization (`shmget` denied),
+and MySQL initialization reproduces the sandbox crash: SQL bodies are **UNRUN**.
+The non-SQL subset passes 175 tests, with no ignored tests, and all private state
+is removed. Full Windows cross-Clippy fails on missing SDK C headers; core and
+contract/bench all-target checking passes. Windows/Linux runtime and Docker are
+**UNRUN**. Raw actionlint still rejects only the inherited `concurrency.queue`
+syntax; the existing strict compatibility wrapper, zizmor and ShellCheck pass.
+
+An additional whole-workspace WASI 0.3 Clippy attempt fails in inherited
+`bson 3.1.0 -> ahash/rand -> getrandom 0.3.4`: that getrandom version rejects p3.
+HTTP/decoder protocol execution on p3 passes all 20 tests. The required workspace
+WASI job remains intact; this dependency compatibility issue and the pending
+production provider need resolution before that whole-workspace gate can pass.
+The Linux instruction gate correctly refuses this macOS host; the committed
+baseline is unchanged and merged-tree regression execution is **UNRUN** locally.
+Exact commands, failures and limits are in [LANE_REPORT.md](../LANE_REPORT.md).
+The integrator must stage and commit the merge; `.git` is read-only here.
 
 ## HTTP integration (current)
 
 - Added publication metadata and unified dependencies for `turnloop-tls`,
   `turnloop-http`, `turnloop-websocket` and `turnloop-zstd-decoder`. All local
-  dependency edges have explicit registry versions. rustls 0.23.44 and ring
+  dependency edges have explicit registry versions. rustls 0.23.45 and ring
   0.17.14/std/tls12 are shared with every database/SMTP TLS harness. Browser ring
   entropy/PKI features are explicit; WASI uses host randomness. LLVM supplies the
   wasm C compiler. rustls defaults/aws-lc are disabled on every target.
@@ -52,29 +94,26 @@ production Windows/WASM backend/baseline prerequisites below also remain pending
   proves a known allocation is counted. This avoids pinned p3 libtest's CLI-argument
   lowering calling a generated custom allocator shim without a valid stack. The
   initial debug trap is recorded; no test or allocation threshold was removed.
-- Local validation: default workspace suite **190 passed**, CI default/all-feature
-  wrapper **437 passes including repeated contract checks**, HTTP interop **15/15**,
-  non-SQL private-server workspace subset **173 passed, zero ignored**; strict
+- Local validation: default workspace suite **192 passed**, CI default/all-feature
+  wrapper **639 passes including independent member/contract repetitions**, HTTP interop **15/15**,
+  non-SQL private-server workspace subset **175 passed, zero ignored**; strict
   native/Linux/WASI/browser Clippy, stable 1.97.1, rustdoc, workflow lint and
-  18 automation tests pass. All ten native/WASI package builds verify tarballs.
+  49 automation tests pass. All ten native/WASI package builds verify tarballs.
   The packaged decoder also executes its allocation regression independently.
   Exact commands, intermediate failures and limits are in [LANE_REPORT.md](../LANE_REPORT.md).
 
-### Current security/soak release blocker
+### Current security exception
 
-The current RustSec audit rejects shared rustls 0.23.44 for
-[RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285): TLS 1.3
-handshake messages can be accepted across encryption-level boundaries. The fixed
-0.23.45 release was published **2026-09-14 15:11:17.808465 UTC**, making it eligible
-under the unchanged soak on **2026-09-21 15:11:17.808465 UTC**. `cargo deny` remains
-FAIL on this advisory; bans/licenses/sources and the independent 240-version soak
-check pass. No security ignore, fork of rustls, or publish-age override was added.
-After eligibility, update the shared lock with pinned nightly, rerun TLS/interop,
-workspace/target/allocation checks, soak, cargo-deny and package dry runs. Do not
-publish this checkout while its required security gate fails.
+Main replaces vulnerable rustls 0.23.44 with 0.23.45 for RUSTSEC-2026-0285 and
+provides the reviewed exact-version exception in `scripts/ci/policy.toml`.
+`cargo deny` now passes all four gates. The unchanged resolver configuration and
+independent soak check still enforce every other age and all checksums. The gate
+prints exactly one active exception and rejects expired/unused/malformed entries.
+Remove it at **2026-09-21T15:11:17Z**, seven days after the registry index timestamp.
+No additional exception, advisory ignore or resolver override was introduced here.
 
 The following sections preserve the earlier wave-1 implementation and verification
-evidence; current HTTP additions and audit status above supersede their old counts.
+evidence; current HTTP additions and merge results above supersede their old counts.
 
 No commits, pushes, remotes, repositories or registry uploads were performed by
 this agent. The integrator checkpoints the working tree. No other lane was
@@ -250,7 +289,7 @@ lock has one rustls, sha1, sha2, hmac, md-5, pbkdf2, flate2 and base64 version.
 | postgres-protocol | 0.6.12 | Lane's pinned sans-IO codec/auth implementation |
 | mysql_common | 0.38.2 | Lane's pinned codec/auth, default features off |
 | bson | 3.1.0 | Lane's pinned raw/serde codec, default features off |
-| rustls | 0.23.44 | Shared native test TLS with ring/std/tls12; 0.23.45 was inside soak |
+| rustls | 0.23.45 | Shared TLS with ring/std/tls12; main's dated RUSTSEC-2026-0285 exception |
 | base64 | 0.22.1 | Shared by DB codecs and SMTP/Mongo authentication |
 | email-encoding | 0.4.1 | Explicit compatible lettre helper pin keeps base64 unified; 0.4.2 introduces base64 0.23 |
 | lettre | 0.11.23 | Builder-only MIME implementation; no async transport |
@@ -310,8 +349,8 @@ within the [registry’s default 10-MiB archive limit](https://github.com/rust-l
 
 First publications, Trusted Publisher bootstrap, semver comparison against an
 existing release, tags/releases and OIDC exchange remain owner actions from
-RELEASING.md. The current rustls advisory and existing platform/baseline gates
-must be resolved before publication; dry-run success does not establish release
+RELEASING.md. The existing platform/runtime gates
+must pass before publication; dry-run success does not establish release
 readiness or claim that any package was uploaded.
 
 ## Pending CI gates and exact follow-ups
@@ -320,12 +359,13 @@ readiness or claim that any package was uploaded.
 |---|---|
 | Windows native contracts | Wave 2: implement production IOCP Backend and instantiate the unchanged shared tests, including no-spin. Run `python3 scripts/ci/run-tests.py native` on Windows. Required job is retained; runtime **UNRUN** |
 | WASI 0.2/0.3 contracts | Integrate providers and nonzero shared suites; solve persistent p3 bounded waitable-set stepping. Run `python3 scripts/ci/run-tests.py wasi --target wasm32-wasip2` and the p3 equivalent. Required jobs are explicitly pending; shared execution **UNRUN** |
+| WASI 0.3 workspace dependencies | Whole-workspace p3 Clippy **FAIL**: BSON's ahash/rand dependencies bring getrandom 0.3.4, which rejects the target. Resolve with a reviewed compatible dependency/provider and unchanged soak/allocation gates; no cfg exclusion or unsupported entropy fallback was added |
 | Browser/Node contracts | Add actual wasm-bindgen-test targets plus `web-tests`/`node-tests` metadata. Run `python3 scripts/ci/run-tests.py web` (Chrome AND Firefox) and `node`. Required job retained; shared execution **UNRUN** |
-| Instruction baseline | On Ubuntu 24.04 x86_64 install pinned Gungraun runner and Valgrind; run `python3 scripts/ci/instructions.py --record .tools/instruction-candidates.json`, review three rounds and controls, commit `crates/turnloop-bench/benchmarks/instructions.json`. Then run the gate without `--record`. No measured baseline or comparison exists: **UNRUN** |
+| Instruction regression | Main committed `crates/turnloop-bench/benchmarks/instructions.json` with four measured cases and an exact control. Run `python3 scripts/ci/instructions.py` on Ubuntu 24.04 x86_64 with pinned Gungraun/Valgrind. Merged-tree runtime comparison is **UNRUN** locally; no baseline was synthesized or changed here |
 | SQL/full protocol services | Run the full local command outside the sandbox, and run the Docker CI job. SQL bodies, independent CI TLS probes and Docker cleanup are **UNRUN** here |
 | Windows full cross-test lint | Supply real Windows SDK headers for ring or use the native Windows runner; no test-target cfg was removed to hide this limitation |
 | Raw actionlint queue support | Upgrade to a checksum-pinned official release that understands `concurrency.queue`, then remove only the existing compatibility filter. Strict queue validation remains active |
-| ci-gate/release workflow | Run on GitHub after missing provider/baseline inputs land. The fan-in rejects failures, cancellations and every skip except the already documented optional self-hosted Windows job. No new skip exemptions |
+| ci-gate/release workflow | Run on GitHub after production providers and p3 dependency compatibility are resolved; compare the merged code with the committed instruction baseline. The fan-in rejects failures, cancellations and every skip except the already documented optional self-hosted Windows job. No new skip exemptions |
 
 A real GitHub run, Linux x86_64/arm64, Windows, FreeBSD/mobile/Android runtime
 validation, Wasmtime/browser/Node shared contracts, instruction measurements,
@@ -368,8 +408,8 @@ No standalone spike or cross-compilation result substitutes for those tests.
 - **CI/release:** FreeBSD nightly, mobile runners, long-duration native churn,
   exact-SHA hosted release/OIDC behavior and owner setup still need execution or
   definitions. No release baseline or first upload exists.
-- **HTTP/TLS/WebSocket:** integration is implemented above. Resolve the rustls
-  security/soak blocker, run native Windows/Linux CI and browser runtime coverage,
+- **HTTP/TLS/WebSocket:** integration is implemented above. Maintain the rustls
+  exception lifecycle, run native Windows/Linux CI and browser runtime coverage,
   then supply the executor/Perry adapters. permessage-deflate and detailed Node
   error/option parity remain documented protocol-lane gaps.
 

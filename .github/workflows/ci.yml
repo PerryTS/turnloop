@@ -3,6 +3,12 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      record_baselines:
+        description: Record Linux instruction baselines for review
+        type: boolean
+        default: false
 permissions: {}
 concurrency:
   group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
@@ -231,7 +237,7 @@ jobs:
           --health-cmd "pg_isready -h 127.0.0.1 -U turnloop -d turnloop"
           --health-interval 5s --health-timeout 5s --health-retries 30
       mysql:
-        image: mysql:9
+        image: mysql:9.6.0
         env:
           MYSQL_DATABASE: turnloop
           MYSQL_USER: turnloop
@@ -254,12 +260,21 @@ jobs:
           package-manager-cache: false
       - name: Install pinned Rust
         run: rustup toolchain install nightly-2026-08-20 --profile minimal --component rustfmt,clippy
-      - name: Install SMTP sink for private fixture
+      - name: Install private fixture build dependencies and SMTP sink
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
           sudo apt-get update
-          sudo --preserve-env=DEBIAN_FRONTEND apt-get install --yes postfix
+          sudo --preserve-env=DEBIAN_FRONTEND apt-get install --yes postfix build-essential libssl-dev pkg-config
+      - name: Cache pinned Redis TLS build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .tools/redis-build
+          key: redis-tls-ubuntu-24.04-${{ runner.arch }}-${{ hashFiles('scripts/ci/install-redis.py') }}
+      - name: Install and verify Redis 8.4.0 with TLS
+        run: python3 scripts/ci/install-redis.py
+      - name: Pull MongoDB before the bounded fixture startup wait
+        run: docker pull mongo:8
       - name: Required real-server protocol suites with the shared fixture contract
         env:
           POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
@@ -268,6 +283,15 @@ jobs:
       - name: Fixture logs and cleanup
         if: always()
         run: scripts/test-servers.py --ci-services stop
+      - name: Preserve private server diagnostics
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: protocol-server-logs
+          path: .tools/**/*.log
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
 
   h2spec:
     runs-on: ubuntu-24.04
@@ -375,7 +399,7 @@ jobs:
           cargo +nightly-2026-08-20 miri setup
       - name: Check core's explicitly marked pure-Rust tests
         run: python3 scripts/ci/run-tests.py miri
-  # PENDING: record/review Ubuntu 24.04 x86_64 iai candidates and commit a real baseline.
+  # Compare against the committed Ubuntu 24.04 x86_64 instruction baseline.
   instructions:
     runs-on: ubuntu-24.04
     permissions:
@@ -396,7 +420,23 @@ jobs:
           sudo apt-get install --yes valgrind
           python3 scripts/ci/install-tools.py gungraun-runner
       - name: Three fresh-process instruction counts against reviewed baselines
-        run: python3 scripts/ci/instructions.py
+        env:
+          RECORD_BASELINES: ${{ github.event_name == 'workflow_dispatch' && inputs.record_baselines }}
+        run: |
+          if [[ "$RECORD_BASELINES" == "true" ]]; then
+            python3 scripts/ci/instructions.py --record-baselines
+          else
+            python3 scripts/ci/instructions.py
+          fi
+      - name: Upload measured baseline candidates, including missing-baseline failures
+        if: ${{ !cancelled() && hashFiles('.tools/instruction-baselines/measurements.json') != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: instruction-baselines
+          path: .tools/instruction-baselines/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
   ci-gate:
     name: ci-gate
     if: always()
