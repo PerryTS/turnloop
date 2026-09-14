@@ -545,9 +545,14 @@ fn concurrent_udp_returns_survive_cancellation_and_loop_drop_without_allocating(
                                 c.op, c.handle
                             );
                             assert_eq!(lease.is_some(), j == 1, "UDP buffer mode");
-                            let bytes = lease
-                                .as_ref()
-                                .map_or(&outputs[index][..n], BufLease::as_slice);
+                            // The other loop may still own outputs[index]. Only
+                            // borrow it for its completed provided-buffer read;
+                            // map_or would evaluate that borrow for pooled reads too.
+                            let bytes = if let Some(lease) = &lease {
+                                lease.as_slice()
+                            } else {
+                                &outputs[index][..n]
+                            };
                             assert_eq!(bytes, &payload[..n]);
                             received += usize::from(round != 0);
                         }
