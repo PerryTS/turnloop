@@ -24,19 +24,19 @@ use std::{
 };
 use turnloop::*;
 struct Counting;
-#[cfg(not(target_os = "wasi"))]
+#[cfg(not(all(target_os = "wasi", target_env = "p3")))]
 use std::cell::Cell;
-#[cfg(not(target_os = "wasi"))]
+#[cfg(not(all(target_os = "wasi", target_env = "p3")))]
 thread_local! { static ACTIVE: Cell<bool> = const { Cell::new(false) }; static ALLOCS: Cell<usize> = const { Cell::new(0) }; }
-#[cfg(not(target_os = "wasi"))]
+#[cfg(not(all(target_os = "wasi", target_env = "p3")))]
 fn record() {
     if ACTIVE.try_with(Cell::get).unwrap_or(false) {
         let _ = ALLOCS.try_with(|n| n.set(n.get() + 1));
     }
 }
-// WASI components have one agent. These counters also work before p3 std has
+// WASI p3 components have one agent. These counters also work before p3 std has
 // initialized its thread-local area, when the harness allocates argument strings.
-#[cfg(target_os = "wasi")]
+#[cfg(all(target_os = "wasi", target_env = "p3"))]
 mod single_agent_counter {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     pub struct Active(AtomicBool);
@@ -68,7 +68,7 @@ mod single_agent_counter {
         }
     }
 }
-#[cfg(target_os = "wasi")]
+#[cfg(all(target_os = "wasi", target_env = "p3"))]
 use single_agent_counter::{ACTIVE, ALLOCS, record};
 // SAFETY: all allocation calls are forwarded unchanged to System. Counters only
 // access already initialized thread-local Cells and never allocate themselves.
