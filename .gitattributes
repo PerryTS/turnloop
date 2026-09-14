@@ -1,0 +1,4 @@
+# turnloop is byte-sensitive: protocol fixtures, compressed corpora, HPACK/SMTP transcripts and
+# CRLF-bearing test data must be checked out exactly as committed on every platform.
+# Disable line-ending conversion everywhere (Windows core.autocrlf would otherwise rewrite them).
+* -text
