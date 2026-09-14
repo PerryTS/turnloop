@@ -199,7 +199,7 @@ jobs:
           POSTGRES_HOST_AUTH_METHOD: scram-sha-256
         ports: ['5432:5432']
         options: >-
-          --health-cmd "pg_isready -U turnloop -d turnloop"
+          --health-cmd "pg_isready -h 127.0.0.1 -U turnloop -d turnloop"
           --health-interval 5s --health-timeout 5s --health-retries 30
       mysql:
         image: mysql:9
@@ -210,7 +210,7 @@ jobs:
           MYSQL_ROOT_PASSWORD: turnloop-root # zizmor: ignore[hardcoded-container-credentials] -- Disposable CI database credential.
         ports: ['3306:3306']
         options: >-
-          --health-cmd "mysqladmin ping --silent"
+          --health-cmd "mysql --host=127.0.0.1 --user=turnloop --password=turnloop --execute 'SELECT 1'"
           --health-interval 5s --health-timeout 5s --health-retries 60
       redis:
         image: redis:8
