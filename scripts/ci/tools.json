@@ -157,5 +157,15 @@
     "commit": "70ac2294010887f48b18e2d64f5cccd48421fad1",
     "url": "https://codeload.github.com/summerwind/h2spec/tar.gz/70ac2294010887f48b18e2d64f5cccd48421fad1",
     "sha256": "791b995048c7e2a2895ed2c019eb9abe46015c3a7a6107cb9ea3f5e5f311da39"
+  },
+  "curl": {
+    "Windows-AMD64": {
+      "version": "8.22.0_1",
+      "url": "https://curl.se/windows/dl-8.22.0_1/curl-8.22.0_1-win64-mingw.zip",
+      "sha256": "7f23b039f6ea4197362d4468e1a0e71428201222e1bef3b680d5ef7b2aefb714",
+      "executables": [
+        "curl.exe"
+      ]
+    }
   }
 }

@@ -1,0 +1,4 @@
+# Decoder corpora are byte-for-byte reference data, including text originals.
+# CRLF conversion would make the originals differ from their compressed copies.
+/protocols/turnloop-zstd-decoder/decodecorpus_files/** -text
+/protocols/turnloop-zstd-decoder/dict_tests/** -text

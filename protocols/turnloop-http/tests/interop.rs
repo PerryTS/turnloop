@@ -165,6 +165,8 @@ fn curl_and_node_fetch_against_native_http1() {
             Command::new("node").args(["--input-type=module","-e","const r=await fetch(process.argv[1]);if(r.status!==200)process.exit(2);console.log(await r.text());",&url]).output().unwrap()
         } else {
             Command::new("curl")
+                // Explicit child PATH takes precedence over System32 on Windows.
+                .env("PATH", std::env::var_os("PATH").expect("PATH"))
                 .args([
                     "--silent",
                     "--show-error",
@@ -301,6 +303,8 @@ fn curl_and_node_h2_hundred_streams_against_native_server() {
             Command::new("node").args(["--input-type=module","-e",r#"import h2 from 'node:http2'; setTimeout(()=>{console.error('client timeout');process.exit(70);},10000).unref(); const c=h2.connect(process.argv[1]); await Promise.all(Array.from({length:100},()=>new Promise((resolve,reject)=>{const s=c.request({':path':'/interop'});let b='';s.on('response',h=>{if(h[':status']!==200)reject(Error('status'));});s.on('data',x=>b+=x);s.on('end',()=>b==='native-h2'?resolve():reject(Error(b)));s.on('error',reject);s.on('aborted',()=>reject(Error('stream aborted')));s.end();})));c.close();console.log('100 verified');"#,&url]).output().unwrap()
         } else {
             Command::new("curl")
+                // Explicit child PATH takes precedence over System32 on Windows.
+                .env("PATH", std::env::var_os("PATH").expect("PATH"))
                 .args([
                     "--http2-prior-knowledge",
                     "--silent",
