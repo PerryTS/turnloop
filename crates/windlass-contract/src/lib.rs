@@ -181,8 +181,8 @@ mod native {
         ready_timer_liveness::<B>();
     }
     #[test]
-    fn timer_backlog_post_progress() {
-        posts_progress_with_repeating_timers::<B>();
+    fn timer_backlog_io_and_post_progress() {
+        io_and_posts_progress_with_repeating_timers::<B>();
     }
     #[test]
     fn retained_pool_lease() {
@@ -828,14 +828,15 @@ pub fn ready_timer_liveness<B: Backend>() {
     assert!(matches!(out[0].result, OpResult::Timer));
     assert!(!l.alive());
 }
-pub fn posts_progress_with_repeating_timers<B: Backend>() {
+pub fn io_and_posts_progress_with_repeating_timers<B: Backend>() {
     let mut l = Driver::<B>::new(Config {
-        max_handles: 4,
-        max_operations: 4,
+        max_handles: 8,
+        max_operations: 8,
         events_per_turn: 2,
         ..Config::default()
     })
     .expect("loop");
+    let (_, a, b) = pair(&mut l);
     for i in 0..4 {
         l.timer(l.now(), Some(Duration::from_nanos(1)), Token(i))
             .expect("repeat");
@@ -848,9 +849,16 @@ pub fn posts_progress_with_repeating_timers<B: Backend>() {
     poster
         .post(Token(99), Payload::U64(42))
         .expect("post amid timers");
+    l.read(b, ReadBuf::Pooled, Token(100)).expect("read");
+    l.write(a, WriteBuf::Owned(vec![0xb7; 64]), Token(101))
+        .expect("write");
     let mut received = false;
     let mut timers = 0;
-    for _ in 0..32 {
+    let mut read = 0;
+    let mut wrote = 0;
+    let until = l.now() + Duration::from_secs(2);
+    while !received || read < 64 || wrote == 0 {
+        assert!(l.now() < until, "timer backlog starved I/O or posts");
         l.turn(Timeout::Now, &mut out).expect("bounded progress");
         for c in out.drain() {
             match c.result {
@@ -860,13 +868,25 @@ pub fn posts_progress_with_repeating_timers<B: Backend>() {
                     received = true;
                 }
                 OpResult::Timer => timers += 1,
+                OpResult::Read { n, lease } => {
+                    let lease = lease.expect("pooled read");
+                    assert!(n > 0);
+                    assert_eq!(lease.as_slice().len(), n);
+                    assert!(lease.as_slice().iter().all(|&v| v == 0xb7));
+                    read += n;
+                    if read < 64 {
+                        l.read(b, ReadBuf::Pooled, Token(100)).expect("read rest");
+                    }
+                }
+                OpResult::Wrote(n) => {
+                    assert_eq!(n, 64);
+                    wrote += 1;
+                }
                 other => panic!("unexpected {other:?}"),
             }
-        }
-        if received {
-            break;
         }
     }
     assert!(received, "posts must progress through a timer backlog");
     assert!(timers > 0);
+    assert_eq!((read, wrote), (64, 1));
 }

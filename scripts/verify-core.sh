@@ -5,7 +5,7 @@ export RUSTUP_TOOLCHAIN=nightly-2026-08-20
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
-cargo test -p windlass --features timer-btree
+cargo test --workspace --all-features
 RUSTFLAGS='--cfg loom' cargo test -p windlass models -- --test-threads=1
 cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu --all-features -- -D warnings
 cargo +stable check --workspace --locked

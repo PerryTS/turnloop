@@ -75,6 +75,7 @@ pub struct Driver<B: Backend> {
     events: Vec<Event<B::Detached>>,
     refs: usize,
     outstanding: usize,
+    native_pending: usize,
     config: Config,
     _local: PhantomData<Rc<()>>,
 }
@@ -135,6 +136,7 @@ impl<B: Backend> Driver<B> {
             events: Vec::with_capacity(config.events_per_turn),
             refs: 0,
             outstanding: 0,
+            native_pending: 0,
             config,
             _local: PhantomData,
         })
@@ -206,6 +208,9 @@ impl<B: Backend> Driver<B> {
             }
             r.tail = Some(id);
             r.pending += 1;
+            if matches!(r.kind, Kind::Socket) {
+                self.native_pending += 1;
+            }
             if r.referenced {
                 self.refs += 1;
             }
@@ -235,6 +240,9 @@ impl<B: Backend> Driver<B> {
                     r.tail = op.previous;
                 }
                 r.pending -= 1;
+                if matches!(r.kind, Kind::Socket) {
+                    self.native_pending -= 1;
+                }
                 if r.referenced {
                     self.refs -= 1;
                 }
@@ -703,7 +711,9 @@ impl<B: Backend> Driver<B> {
         let queued =
             !self.queued.is_empty() || !self.poster.is_empty() || !self.work_port.is_empty();
         let mut waits = 0;
-        if self.buffered[NATIVE_EVENTS] == 0 {
+        if self.buffered[NATIVE_EVENTS] == 0
+            && (!queued || self.native_pending != 0 || self.backend.has_work())
+        {
             let mut timeout = deadline.map(|d| d.saturating_duration_since(start));
             if timeout == Some(Duration::ZERO)
                 || queued
