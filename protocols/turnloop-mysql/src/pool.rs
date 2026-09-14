@@ -4,7 +4,7 @@ use std::{
     collections::VecDeque,
     time::{Duration, Instant},
 };
-const MYSQL: bool = false;
+const MYSQL: bool = true;
 #[derive(Debug, Clone)]
 pub struct Config {
     pub max: usize,

@@ -59,14 +59,16 @@ def start():
                  '-addext', 'basicConstraints=critical,CA:FALSE', '-keyout', key, '-out', cert], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         key.chmod(0o600)
         command([BIN / 'openssl', 'x509', '-in', cert, '-outform', 'DER', '-out', TOOLS / 'server.der'])
+    only_mysql = os.environ.get('TURNLOOP_SQL_SERVER') == 'mysql'
     pg = TOOLS / 'pgdata'
-    if not (pg / 'PG_VERSION').exists():
+    if not only_mysql and not (pg / 'PG_VERSION').exists():
         command([BIN / 'initdb', '-D', pg, '--username=postgres', '--auth=trust', '--encoding=UTF8', '--locale=C'], stdout=subprocess.DEVNULL)
     pgport, myport = port(), port()
     while myport == pgport:
         myport = port()
-    (pg / 'pg_hba.conf').write_text('local all all trust\nhostssl all tls_user 127.0.0.1/32 scram-sha-256\nhostnossl all tls_user 127.0.0.1/32 reject\nhost all scram_user 127.0.0.1/32 scram-sha-256\nhost all md5_user 127.0.0.1/32 md5\nhost all clear_user 127.0.0.1/32 password\nhost all postgres 127.0.0.1/32 trust\n')
-    (pg / 'postgresql.conf').write_text(f"listen_addresses='127.0.0.1'\nport={pgport}\nunix_socket_directories='{TOOLS}'\nssl=on\nssl_cert_file='{cert}'\nssl_key_file='{key}'\nmax_connections=30\n")
+    if not only_mysql:
+        (pg / 'pg_hba.conf').write_text('local all all trust\nhostssl all tls_user 127.0.0.1/32 scram-sha-256\nhostnossl all tls_user 127.0.0.1/32 reject\nhost all scram_user 127.0.0.1/32 scram-sha-256\nhost all md5_user 127.0.0.1/32 md5\nhost all clear_user 127.0.0.1/32 password\nhost all postgres 127.0.0.1/32 trust\n')
+        (pg / 'postgresql.conf').write_text(f"listen_addresses='127.0.0.1'\nport={pgport}\nunix_socket_directories='{TOOLS}'\nssl=on\nssl_cert_file='{cert}'\nssl_key_file='{key}'\nmax_connections=30\n")
     state = {'servers': [], 'env': {'TURNLOOP_PG_PORT': str(pgport), 'TURNLOOP_MYSQL_PORT': str(myport), 'TURNLOOP_SQL_TOOLS': str(TOOLS)}}
     STATE.write_text(json.dumps(state))
     def spawn(binary, args, log):
@@ -84,23 +86,24 @@ def start():
             time.sleep(.1)
         raise RuntimeError('server readiness timeout')
     try:
-        p = spawn('postgres', ['-D', pg], 'postgres.log')
-        psql = [BIN / 'psql', '-h', '127.0.0.1', '-p', pgport, '-U', 'postgres', '-d', 'postgres', '-v', 'ON_ERROR_STOP=1']
-        ready(p, [*psql, '-c', 'SELECT 1'])
-        command([*psql], input="""
-DO $$ BEGIN
- IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='scram_user') THEN CREATE ROLE scram_user LOGIN; END IF;
- IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='tls_user') THEN CREATE ROLE tls_user LOGIN; END IF;
- IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='md5_user') THEN CREATE ROLE md5_user LOGIN; END IF;
- IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='clear_user') THEN CREATE ROLE clear_user LOGIN; END IF;
-END $$;
-SET password_encryption='scram-sha-256';
-ALTER ROLE scram_user PASSWORD 'fixture-password';
-ALTER ROLE tls_user PASSWORD 'fixture-password';
-ALTER ROLE clear_user PASSWORD 'fixture-password';
-SET password_encryption='md5';
-ALTER ROLE md5_user PASSWORD 'fixture-password';
-""", text=True, stdout=subprocess.DEVNULL)
+        if not only_mysql:
+            p = spawn('postgres', ['-D', pg], 'postgres.log')
+            psql = [BIN / 'psql', '-h', '127.0.0.1', '-p', pgport, '-U', 'postgres', '-d', 'postgres', '-v', 'ON_ERROR_STOP=1']
+            ready(p, [*psql, '-c', 'SELECT 1'])
+            command([*psql], input="""
+    DO $$ BEGIN
+     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='scram_user') THEN CREATE ROLE scram_user LOGIN; END IF;
+     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='tls_user') THEN CREATE ROLE tls_user LOGIN; END IF;
+     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='md5_user') THEN CREATE ROLE md5_user LOGIN; END IF;
+     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='clear_user') THEN CREATE ROLE clear_user LOGIN; END IF;
+    END $$;
+    SET password_encryption='scram-sha-256';
+    ALTER ROLE scram_user PASSWORD 'fixture-password';
+    ALTER ROLE tls_user PASSWORD 'fixture-password';
+    ALTER ROLE clear_user PASSWORD 'fixture-password';
+    SET password_encryption='md5';
+    ALTER ROLE md5_user PASSWORD 'fixture-password';
+    """, text=True, stdout=subprocess.DEVNULL)
         my = TOOLS / 'mysqldata'
         if not (my / 'mysql').exists():
             command([BIN / 'mysqld', '--no-defaults', '--initialize-insecure', f'--datadir={my}', f'--log-error={TOOLS / "mysql-init.log"}'], stdout=subprocess.DEVNULL)
