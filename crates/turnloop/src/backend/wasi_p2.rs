@@ -574,7 +574,17 @@ fn execute(
         Operation::RecvFrom(buf) => receive(t, buf, false, pool, scratch),
         Operation::Write(buf) => write(t, buf.as_slice(), &mut p.offset, &mut p.flushing),
         Operation::Writev(bufs) => {
-            // A bounded pass over inline segments; progress is retained across turns.
+            let s = t
+                .streams
+                .as_ref()
+                .ok_or(Error::new(ErrorKind::InvalidInput))?;
+            let permitted = s.output.check_write().map_err(stream_error)? as usize;
+            if permitted == 0 {
+                return Err(Error::new(ErrorKind::WouldBlock));
+            }
+            if p.flushing {
+                return Ok(Some((Outcome::Wrote(p.offset), true)));
+            }
             let mut skip = p.offset;
             for b in bufs.bufs.iter().flatten() {
                 let bytes = b.as_slice();
@@ -582,16 +592,19 @@ fn execute(
                     skip -= bytes.len();
                     continue;
                 }
-                let previous = skip;
-                let done = write(t, bytes, &mut skip, &mut p.flushing)?;
-                p.offset += skip - previous;
-                if done.is_none() {
-                    return Ok(None);
-                }
-                p.flushing = false;
-                skip = 0;
+                let n = (bytes.len() - skip).min(permitted);
+                s.output
+                    .write(&bytes[skip..skip + n])
+                    .map_err(stream_error)?;
+                p.offset += n;
+                break;
             }
-            Ok(Some((Outcome::Wrote(p.offset), true)))
+            let total: usize = bufs.bufs.iter().flatten().map(|b| b.as_slice().len()).sum();
+            if p.offset == total {
+                s.output.flush().map_err(stream_error)?;
+                p.flushing = true;
+            }
+            Ok(None)
         }
         Operation::SendTo { buf, to } => {
             let s = t

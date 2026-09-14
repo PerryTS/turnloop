@@ -18,3 +18,23 @@ libc.workspace = true
 
 [package.metadata.turnloop-ci]
 role = "contract"
+web-tests = ["browser"]
+node-tests = ["node"]
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dev-dependencies]
+wasm-bindgen = "=0.2.108"
+js-sys = "=0.3.85"
+wasm-bindgen-test = "=0.3.58"
+wasm-bindgen-futures = "=0.4.58"
+
+[[test]]
+name = "browser"
+path = "tests/web/browser.rs"
+
+[[test]]
+name = "node"
+path = "tests/web/node.rs"
+
+[features]
+wasi-p3-experimental = ["turnloop/wasi-p3-experimental"]
+web-worker = ["turnloop/web-worker"]

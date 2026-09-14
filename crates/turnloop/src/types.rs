@@ -164,7 +164,24 @@ pub enum Integration {
 
 #[derive(Debug)]
 pub enum Open {
-    Tcp { addr: SocketAddr, opts: TcpOpts },
-    Listener { addr: SocketAddr, opts: ListenOpts },
-    Udp { addr: SocketAddr, opts: UdpOpts },
+    #[cfg(turnloop_backend = "web")]
+    Fetch {
+        url: String,
+    },
+    #[cfg(turnloop_backend = "web")]
+    WebSocket {
+        url: String,
+    },
+    Tcp {
+        addr: SocketAddr,
+        opts: TcpOpts,
+    },
+    Listener {
+        addr: SocketAddr,
+        opts: ListenOpts,
+    },
+    Udp {
+        addr: SocketAddr,
+        opts: UdpOpts,
+    },
 }

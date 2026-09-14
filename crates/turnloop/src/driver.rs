@@ -958,3 +958,43 @@ mod clock_contract {
         assert_eq!(l.backend.deadline, None);
     }
 }
+
+#[cfg(turnloop_backend = "web")]
+impl Driver<crate::backend::web::Web> {
+    /// Configure the host dispatcher. It is scheduled asynchronously and should
+    /// call turn(Now); no user callback runs inside a turnloop method.
+    pub fn set_schedule_turn(&mut self, schedule: &js_sys::Function) -> Result<()> {
+        self.backend.configure(schedule)?;
+        self.integration()?;
+        Ok(())
+    }
+    pub fn schedule_count(&self) -> u32 {
+        self.backend.schedule_count()
+    }
+    /// Fetch one complete response into a provided or pooled buffer. Responses
+    /// larger than that buffer complete with ResourceLimit, never truncated data.
+    pub fn fetch(&mut self, url: &str, buf: ReadBuf, token: Token) -> Result<(Handle, OpId)> {
+        let h = self.open(Open::Fetch { url: url.into() })?;
+        match self.read(h, buf, token) {
+            Ok(op) => Ok((h, op)),
+            Err(e) => {
+                self.backend.release(h);
+                self.handles.remove(h.key);
+                self.refs -= 1;
+                Err(e)
+            }
+        }
+    }
+    /// Connect a browser WebSocket; subsequent read/write operations exchange
+    /// whole binary messages. Oversize messages fail with ResourceLimit.
+    pub fn websocket(&mut self, url: &str, token: Token) -> Result<Handle> {
+        let h = self.open(Open::WebSocket { url: url.into() })?;
+        if let Err(e) = self.submit(h, Operation::Connect, token) {
+            self.backend.release(h);
+            self.handles.remove(h.key);
+            self.refs -= 1;
+            return Err(e);
+        }
+        Ok(h)
+    }
+}
