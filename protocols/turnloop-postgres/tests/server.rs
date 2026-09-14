@@ -31,6 +31,13 @@ struct Driver {
 }
 impl Driver {
     fn connect(user: &str, ssl: SslMode) -> Self {
+        let port: u16 = std::env::var("TURNLOOP_TEST_POSTGRES_PORT")
+            .expect("private server port required")
+            .parse()
+            .expect("fixture operation must succeed");
+        Self::connect_to(port, user, ssl)
+    }
+    fn connect_to(port: u16, user: &str, ssl: SslMode) -> Self {
         eprintln!("PostgreSQL connecting as {user}, SSL mode {ssl:?}");
         let password = b"fixture-password".to_vec();
         let config = Config {
@@ -41,10 +48,6 @@ impl Driver {
             ..Config::default()
         };
         let core = Connection::new(config).expect("fixture operation must succeed");
-        let port: u16 = std::env::var("TURNLOOP_TEST_POSTGRES_PORT")
-            .expect("private server port required")
-            .parse()
-            .expect("fixture operation must succeed");
         let mut d = Self {
             core,
             io: Transport::connect(port),
@@ -153,7 +156,10 @@ impl Driver {
                 Event::CopyOut { .. } | Event::CopyDone { .. } => {}
                 Event::CopyData { data, .. } => results.copies.extend_from_slice(data),
                 Event::Closed { reason } => {
-                    panic!("unexpected close: {reason}; server errors: {:?}", results.errors)
+                    panic!(
+                        "unexpected close: {reason}; server errors: {:?}",
+                        results.errors
+                    )
                 }
             }
         }
@@ -183,6 +189,42 @@ impl Driver {
             .expect("fixture operation must succeed");
         self.drain(None)
     }
+}
+
+#[test]
+fn rejected_startup_reports_server_sqlstate_and_message() {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("private listener");
+    let port = listener.local_addr().expect("private address").port();
+    let server = std::thread::spawn(move || {
+        let (mut io, _) = listener.accept().expect("client connects");
+        io.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        let mut size = [0; 4];
+        io.read_exact(&mut size).expect("startup length");
+        let size = u32::from_be_bytes(size) as usize;
+        assert!((8..4096).contains(&size));
+        let mut startup = vec![0; size - 4];
+        io.read_exact(&mut startup).expect("startup body");
+        assert!(
+            startup
+                .windows(14)
+                .any(|value| value == b"user\0postgres\0")
+        );
+        let body = b"SFATAL\0VFATAL\0C28000\0Mrole \"postgres\" does not exist\0\0";
+        io.write_all(b"E").expect("ErrorResponse tag");
+        io.write_all(&((body.len() + 4) as u32).to_be_bytes())
+            .expect("ErrorResponse length");
+        io.write_all(body).expect("ErrorResponse body");
+    });
+    let error = std::panic::catch_unwind(|| Driver::connect_to(port, "postgres", SslMode::Disable))
+        .err()
+        .expect("missing role must fail startup");
+    server
+        .join()
+        .expect("server must receive and reject startup");
+    let message = error.downcast_ref::<String>().expect("diagnostic panic");
+    assert!(message.contains("28000"), "{message}");
+    assert!(message.contains("does not exist"), "{message}");
 }
 
 #[test]
@@ -322,7 +364,10 @@ fn authentication_queries_pipeline_copy_cancel() {
     let r = d.drain(None);
     assert_eq!(r.errors.len(), 1);
     assert_eq!(r.errors[0].0, "57014");
-    assert_eq!(r.completed, [(7, Outcome::ServerError, TransactionStatus::Idle)]);
+    assert_eq!(
+        r.completed,
+        [(7, Outcome::ServerError, TransactionStatus::Idle)]
+    );
     assert_eq!(
         d.query("SELECT count(*) FROM items").rows[0][0],
         Some(b"4".to_vec())

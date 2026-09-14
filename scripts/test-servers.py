@@ -234,18 +234,21 @@ def sql_start():
     if SQL_STATE.exists():
         raise RuntimeError('state exists; run stop first')
     cert, key = sql_certificates()
+    # Record before initdb/mysqld initialization so failed partial data is removed.
+    SQL_STATE.write_text(json.dumps({'servers': [], 'env': {}}))
+    try:
+        return sql_start_private(cert, key)
+    except BaseException as error:
+        cleanup_after_failure(error, sql_stop)
+        raise
+
+
+def sql_start_private(cert, key):
     only_mysql = "postgres" not in SELECTED
     pg = SQL_TOOLS / 'pgdata'
-    # Record before initdb/mysqld initialization so failed partial data is removed.
-    state = {'servers': [], 'env': {}}
-    SQL_STATE.write_text(json.dumps(state))
     if not only_mysql and not (pg / 'PG_VERSION').exists():
-        try:
-            with startup_logs('PostgreSQL initdb', SQL_TOOLS / 'postgres-init.log'), (SQL_TOOLS / 'postgres-init.log').open('wb') as log:
-                sql_command([SQL_BIN / 'initdb', '-D', pg, '--username=turnloop', '--auth=trust', '--encoding=UTF8', '--locale=C'], stdout=log, stderr=log)
-        except BaseException as error:
-            cleanup_after_failure(error, sql_stop)
-            raise
+        with startup_logs('PostgreSQL initdb', SQL_TOOLS / 'postgres-init.log'), (SQL_TOOLS / 'postgres-init.log').open('wb') as log:
+            sql_command([SQL_BIN / 'initdb', '-D', pg, '--username=turnloop', '--auth=trust', '--encoding=UTF8', '--locale=C'], stdout=log, stderr=log)
     pgport, myport = sql_port(), sql_port()
     while myport == pgport:
         myport = sql_port()
