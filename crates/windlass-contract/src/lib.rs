@@ -177,6 +177,14 @@ mod native {
     use super::*;
     type B = windlass::backend::Platform;
     #[test]
+    fn terminal_delivery_liveness() {
+        ready_timer_liveness::<B>();
+    }
+    #[test]
+    fn timer_backlog_post_progress() {
+        posts_progress_with_repeating_timers::<B>();
+    }
+    #[test]
     fn retained_pool_lease() {
         pooled_lease_backpressure::<B>();
     }
@@ -782,4 +790,83 @@ pub fn pooled_lease_backpressure<B: Backend>() {
     l.turn(Timeout::Now, &mut out).expect("stop");
     assert!(matches!(out[0].result, OpResult::Stopped));
     assert_eq!(writes, 1);
+}
+
+pub fn ready_timer_liveness<B: Backend>() {
+    let mut l = Driver::<B>::new(Config::default()).expect("loop");
+    let at = l.now();
+    for i in 0..3 {
+        l.timer(at, None, Token(i)).expect("timer");
+    }
+    let mut out = Completions::with_capacity(1);
+    let mut delivered = 0;
+    while l.alive() {
+        assert!(delivered < 3, "liveness never clears");
+        l.turn(Timeout::Now, &mut out).expect("turn");
+        assert_eq!(out.len(), 1);
+        assert!(matches!(out[0].result, OpResult::Timer));
+        delivered += 1;
+    }
+    assert_eq!(
+        delivered, 3,
+        "all referenced results delivered before loop can exit"
+    );
+    let at = l.now();
+    let a = l.timer(at, None, Token(10)).expect("timer");
+    let b = l.timer(at, None, Token(11)).expect("timer");
+    l.turn(Timeout::Now, &mut out).expect("first result");
+    assert_eq!(out.len(), 1);
+    assert!(l.alive());
+    let pending = if out[0].handle == Some(a) { b } else { a };
+    l.set_ref(pending, false).expect("unref queued result");
+    assert!(!l.alive());
+    l.set_ref(pending, true).expect("ref queued result");
+    assert!(l.alive());
+    l.turn(Timeout::Now, &mut out).expect("last result");
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].handle, Some(pending));
+    assert!(matches!(out[0].result, OpResult::Timer));
+    assert!(!l.alive());
+}
+pub fn posts_progress_with_repeating_timers<B: Backend>() {
+    let mut l = Driver::<B>::new(Config {
+        max_handles: 4,
+        max_operations: 4,
+        events_per_turn: 2,
+        ..Config::default()
+    })
+    .expect("loop");
+    for i in 0..4 {
+        l.timer(l.now(), Some(Duration::from_nanos(1)), Token(i))
+            .expect("repeat");
+    }
+    let poster = l.poster();
+    let mut out = Completions::with_capacity(1);
+    for _ in 0..10 {
+        l.turn(Timeout::Now, &mut out).expect("build timer backlog");
+    }
+    poster
+        .post(Token(99), Payload::U64(42))
+        .expect("post amid timers");
+    let mut received = false;
+    let mut timers = 0;
+    for _ in 0..32 {
+        l.turn(Timeout::Now, &mut out).expect("bounded progress");
+        for c in out.drain() {
+            match c.result {
+                OpResult::Posted(Payload::U64(42)) => {
+                    assert_eq!(c.token, Token(99));
+                    assert!(!received);
+                    received = true;
+                }
+                OpResult::Timer => timers += 1,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        if received {
+            break;
+        }
+    }
+    assert!(received, "posts must progress through a timer backlog");
+    assert!(timers > 0);
 }

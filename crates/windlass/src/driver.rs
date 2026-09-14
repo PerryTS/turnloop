@@ -42,6 +42,17 @@ struct Op {
     next: Option<OpId>,
 }
 
+struct Queued {
+    completion: Completion,
+    referenced: bool,
+}
+impl std::ops::Deref for Queued {
+    type Target = Completion;
+    fn deref(&self) -> &Completion {
+        &self.completion
+    }
+}
+
 /// A driver belongs to its constructing thread. Backend is an internal extension
 /// point used by platform lanes and the common contract suite.
 pub struct Driver<B: Backend> {
@@ -55,7 +66,7 @@ pub struct Driver<B: Backend> {
     handles: Table<Resource>,
     ops: Table<Op>,
     timers: TimerQueue,
-    queued: VecDeque<Completion>,
+    queued: VecDeque<Queued>,
     events: Vec<Event<B::Detached>>,
     refs: usize,
     outstanding: usize,
@@ -229,26 +240,43 @@ impl<B: Backend> Driver<B> {
             && let Some(token) = r.closing
         {
             r.closed_queued = true;
-            self.queued.push_back(Completion {
-                token,
-                op: None,
-                handle: Some(h),
-                terminal: true,
-                result: OpResult::Closed,
-            });
+            self.enqueue(
+                Completion {
+                    token,
+                    op: None,
+                    handle: Some(h),
+                    terminal: true,
+                    result: OpResult::Closed,
+                },
+                false,
+            );
         }
+    }
+    fn enqueue(&mut self, completion: Completion, referenced: bool) {
+        self.refs += usize::from(referenced);
+        self.queued.push_back(Queued {
+            completion,
+            referenced,
+        });
     }
     fn finish(&mut self, id: OpId, result: OpResult, terminal: bool) {
         let Some(op) = self.ops.get(id.key).cloned() else {
             return;
         };
-        self.queued.push_back(Completion {
-            token: op.token,
-            op: Some(id),
-            handle: op.handle,
-            terminal,
-            result,
-        });
+        let referenced = terminal
+            && op
+                .handle
+                .is_none_or(|h| self.handles.get(h.key).is_some_and(|r| r.referenced));
+        self.enqueue(
+            Completion {
+                token: op.token,
+                op: Some(id),
+                handle: op.handle,
+                terminal,
+                result,
+            },
+            referenced,
+        );
         if terminal {
             self.retire(id);
             if let Some(h) = op.handle {
@@ -279,6 +307,19 @@ impl<B: Backend> Driver<B> {
                 .get_mut(h.key)
                 .expect("validated handle")
                 .referenced = referenced;
+            // Terminal results retain the operation reference through delivery,
+            // including after the native operation has left the active table.
+            for q in &mut self.queued {
+                if q.handle == Some(h) && q.terminal && q.op.is_some() && q.referenced != referenced
+                {
+                    if referenced {
+                        self.refs += 1;
+                    } else {
+                        self.refs -= 1;
+                    }
+                    q.referenced = referenced;
+                }
+            }
         }
         Ok(())
     }
@@ -558,12 +599,17 @@ impl<B: Backend> Driver<B> {
     }
     fn drain(&mut self, out: &mut Completions) {
         while out.len() < out.capacity() {
-            let Some(c) = self.queued.pop_front() else {
+            let Some(Queued {
+                completion: c,
+                referenced,
+            }) = self.queued.pop_front()
+            else {
                 break;
             };
             let closed = matches!(c.result, OpResult::Closed)
                 .then_some(c.handle)
                 .flatten();
+            self.refs -= usize::from(referenced);
             if c.terminal && c.op.is_some() {
                 self.outstanding -= 1;
             }
@@ -705,19 +751,28 @@ impl<B: Backend> Driver<B> {
             };
             self.finish(work.op, result, true);
         }
-        self.drain(out);
-        while out.len() < out.capacity() {
+        // Queue posts before output delivery so a persistent timer/I/O backlog
+        // cannot indefinitely overtake an accepted post. Capacity reserves this
+        // stage's event budget; no queue growth is permitted here.
+        for _ in 0..self.config.events_per_turn {
+            if self.queued.len() == self.queued.capacity() {
+                break;
+            }
             let Some(p) = self.poster.pop() else {
                 break;
             };
-            out.entries.push(Completion {
-                token: p.token,
-                op: None,
-                handle: None,
-                terminal: true,
-                result: OpResult::Posted(p.payload),
-            });
+            self.enqueue(
+                Completion {
+                    token: p.token,
+                    op: None,
+                    handle: None,
+                    terminal: true,
+                    result: OpResult::Posted(p.payload),
+                },
+                false,
+            );
         }
+        self.drain(out);
         if self.external {
             self.notifier.external_park(
                 !self.queued.is_empty()
