@@ -216,6 +216,7 @@ pub fn udp_stdio_and_join_cancel<B: backend::Backend>(program: &std::ffi::OsStr)
         .expect("UDP b");
     let a_addr = ex.driver().local_addr(a).expect("a address");
     let b_addr = ex.driver().local_addr(b).expect("b address");
+    assert_ne!(a_addr, b_addr, "default UDP endpoints must be distinct");
     let mut a = ex.handle().udp(a, b_addr);
     let mut b = ex.handle().udp(b, a_addr);
     let h = ex.handle();

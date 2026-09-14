@@ -187,6 +187,7 @@ impl Default for ListenOpts {
 /// UDP binding options.
 pub struct UdpOpts {
     /// Enable SO_REUSEPORT when supported; macOS does not promise balanced accepts.
+    /// Defaults to false: a live UDP endpoint cannot be shared by another bind.
     pub reuse_port: bool,
 }
 

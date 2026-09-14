@@ -434,7 +434,12 @@ unsafe impl Backend for Unix {
         }
         let fd = socket::create(addr, kind == Kind::Udp)?;
         if kind != Kind::Tcp {
-            socket::option(fd.as_raw_fd(), libc::SOL_SOCKET, libc::SO_REUSEADDR, 1)?;
+            // TCP listeners need address reuse for TIME_WAIT. Default UDP binds
+            // must stay exclusive: on Linux SO_REUSEADDR also permits two live
+            // bind(:0) sockets to receive the same ephemeral endpoint.
+            if kind == Kind::Listener || reuse {
+                socket::option(fd.as_raw_fd(), libc::SOL_SOCKET, libc::SO_REUSEADDR, 1)?;
+            }
             if reuse {
                 socket::option(fd.as_raw_fd(), libc::SOL_SOCKET, libc::SO_REUSEPORT, 1)?;
             }
@@ -881,6 +886,262 @@ fn receive(
         Ok(Some((Outcome::Eof, true)))
     } else {
         Ok(Some((Outcome::Read { n, lease }, !multishot)))
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod udp_tests {
+    use super::*;
+
+    #[test]
+    fn default_udp_bind_does_not_enable_address_sharing() {
+        let mut checked = 0;
+        for addr in ["127.0.0.1:0", "[::1]:0"] {
+            let mut backend =
+                Unix::new(&Config::default(), BufferPool::new(2, 64)).expect("backend");
+            let first = Handle {
+                owner: 1,
+                key: 1 << 32,
+            };
+            let second = Handle {
+                owner: 1,
+                key: (1 << 32) | 1,
+            };
+            backend
+                .open(
+                    first,
+                    Open::Udp {
+                        addr: addr.parse().expect("address"),
+                        opts: UdpOpts::default(),
+                    },
+                )
+                .expect("first bind");
+            let fd = backend
+                .get(first)
+                .expect("resource")
+                .transport
+                .fd
+                .as_raw_fd();
+            let mut reuse = -1i32;
+            let mut len = std::mem::size_of_val(&reuse) as libc::socklen_t;
+            assert_eq!(
+                // SAFETY: live owned socket and correctly sized integer output.
+                unsafe {
+                    libc::getsockopt(
+                        fd,
+                        libc::SOL_SOCKET,
+                        libc::SO_REUSEADDR,
+                        (&mut reuse as *mut i32).cast(),
+                        &mut len,
+                    )
+                },
+                0
+            );
+            assert_eq!(reuse, 0, "default UDP must reserve its endpoint: {addr}");
+            let addr = backend.local_addr(first).expect("bound address");
+            let error = backend
+                .open(
+                    second,
+                    Open::Udp {
+                        addr,
+                        opts: UdpOpts::default(),
+                    },
+                )
+                .expect_err("a live default endpoint cannot be shared");
+            assert_eq!(error.os, Some(libc::EADDRINUSE));
+            backend.release(first);
+            backend
+                .open(
+                    second,
+                    Open::Udp {
+                        addr,
+                        opts: UdpOpts::default(),
+                    },
+                )
+                .expect("released endpoint can be rebound");
+            assert_eq!(backend.local_addr(second).expect("rebound address"), addr);
+            checked += 1;
+        }
+        assert_eq!(checked, 2, "IPv4 and IPv6 binding policies ran");
+    }
+
+    #[test]
+    fn udp_port_sharing_requires_explicit_opt_in() {
+        let mut checked = 0;
+        for addr in ["127.0.0.1:0", "[::1]:0"] {
+            let mut l = Loop::new(Config::default()).expect("loop");
+            let opts = UdpOpts { reuse_port: true };
+            let first = l
+                .udp_bind(addr.parse().expect("address"), &opts)
+                .expect("first bind");
+            let addr = l.local_addr(first).expect("first address");
+            let second = l.udp_bind(addr, &opts).expect("explicit shared bind");
+            assert_eq!(l.local_addr(second).expect("second address"), addr);
+            let error = l
+                .udp_bind(addr, &UdpOpts::default())
+                .expect_err("default cannot join");
+            assert_eq!(error.os, Some(libc::EADDRINUSE));
+            checked += 1;
+        }
+        assert_eq!(
+            checked, 2,
+            "both address families exercised explicit sharing"
+        );
+    }
+
+    #[test]
+    fn cancelled_udp_with_cached_events_survives_exact_fd_and_port_reuse() {
+        let mut received = 0;
+        for addr in ["127.0.0.1:0", "[::1]:0"] {
+            let mut backend =
+                Unix::new(&Config::default(), BufferPool::new(2, 64)).expect("backend");
+            let old = Handle {
+                owner: 1,
+                key: 1 << 32,
+            };
+            let next = Handle {
+                owner: 1,
+                key: 2 << 32,
+            };
+            let old_op = OpId {
+                owner: 1,
+                key: 1 << 32,
+            };
+            let next_op = OpId {
+                owner: 1,
+                key: 2 << 32,
+            };
+            backend
+                .open(
+                    old,
+                    Open::Udp {
+                        addr: addr.parse().expect("address"),
+                        opts: UdpOpts::default(),
+                    },
+                )
+                .expect("old socket");
+            let endpoint = backend.local_addr(old).expect("old endpoint");
+            let peer = std::net::UdpSocket::bind(addr).expect("peer");
+            let from = peer.local_addr().expect("peer address");
+            let mut events = Vec::with_capacity(1);
+            backend
+                .submit(Request {
+                    op: old_op,
+                    handle: old,
+                    operation: Operation::RecvFrom(ReadBuf::Pooled),
+                })
+                .expect("old receive");
+            backend
+                .poll(Some(Duration::ZERO), &mut events)
+                .expect("arm old receive");
+            assert!(events.is_empty());
+            assert_eq!(
+                peer.send_to(&[], endpoint).expect("old zero-byte packet"),
+                0
+            );
+            // Collect a real old-generation readiness event without consuming
+            // its datagram; the next poll must discard this cached event batch.
+            backend.polled.clear();
+            backend
+                .poller
+                .wait(Some(Duration::from_secs(1)), &mut backend.polled)
+                .expect("old readiness");
+            assert!(backend.polled.iter().any(|e| e.key == old.key() && e.read));
+            backend.cancel(old_op).expect("cancel old receive");
+            backend
+                .poll(Some(Duration::ZERO), &mut events)
+                .expect("acknowledgement");
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].op, old_op);
+            assert!(events[0].terminal);
+            assert!(matches!(events[0].result, Ok(Outcome::Cancelled)));
+            events.clear();
+            let transport = backend.detach(old).expect("detach quiescent socket");
+            let fd = transport.fd.as_raw_fd();
+            let replacement = socket::create(endpoint, true).expect("replacement socket");
+            assert_ne!(replacement.as_raw_fd(), fd);
+            // Keep the destination descriptor owned throughout: dup2 atomically
+            // closes the old socket (discarding its queued datagram) and reuses
+            // exactly its fd, without racing other tests for an unowned fd slot.
+            // SAFETY: distinct live owned fds; transport retains ownership of the
+            // destination and replacement owns the source reference.
+            assert_eq!(unsafe { libc::dup2(replacement.as_raw_fd(), fd) }, fd);
+            drop(replacement);
+            socket::configure(fd).expect("restore descriptor flags after dup2");
+            let address = Addr::new(endpoint);
+            // SAFETY: fd now owns a fresh UDP socket; address has initialized storage.
+            assert_eq!(unsafe { libc::bind(fd, address.ptr(), address.len) }, 0);
+            backend
+                .attach(next, transport)
+                .expect("attach next generation");
+            assert_eq!(
+                backend
+                    .get(next)
+                    .expect("new resource")
+                    .transport
+                    .fd
+                    .as_raw_fd(),
+                fd
+            );
+            assert_eq!(backend.local_addr(next).expect("reused port"), endpoint);
+            assert_eq!(old.index(), next.index());
+            assert_ne!(old.key(), next.key());
+            backend
+                .submit(Request {
+                    op: next_op,
+                    handle: next,
+                    operation: Operation::RecvFrom(ReadBuf::Pooled),
+                })
+                .expect("next receive");
+            assert_eq!(old_op.index(), next_op.index());
+            assert_eq!(
+                backend.cancel(old_op).expect_err("stale cancellation").kind,
+                ErrorKind::NotFound
+            );
+            backend.release(old); // A stale handle must not release the new fd.
+            backend
+                .poll(Some(Duration::ZERO), &mut events)
+                .expect("arm replacement receive");
+            assert!(events.is_empty(), "old event batch crossed generations");
+            // A stale event is not a completion, and must not cause a no-spin
+            // violation after the new socket reports EAGAIN.
+            let at = Instant::now() + Duration::from_millis(2);
+            let info = backend
+                .poll(Some(Duration::from_millis(2)), &mut events)
+                .expect("new empty socket waits");
+            assert!(events.is_empty(), "old datagram crossed socket lifetime");
+            assert_eq!(info.waits, 1);
+            assert!(Instant::now() >= at);
+            assert_eq!(peer.send_to(b"new", endpoint).expect("new packet"), 3);
+            backend
+                .poll(Some(Duration::from_secs(1)), &mut events)
+                .expect("new delivery");
+            assert_eq!(events.len(), 1);
+            let event = events.pop().expect("one completion");
+            assert_eq!(event.op, next_op);
+            assert!(event.terminal);
+            match event.result {
+                Ok(Outcome::RecvFrom {
+                    n,
+                    from: actual,
+                    lease: Some(lease),
+                }) => {
+                    assert_eq!(actual, from);
+                    assert_eq!(n, 3);
+                    assert_eq!(lease.as_slice(), b"new");
+                }
+                other => panic!("unexpected reused-socket result: {other:?}"),
+            }
+            backend
+                .poll(Some(Duration::ZERO), &mut events)
+                .expect("no duplicates");
+            assert!(events.is_empty());
+            received += 1;
+        }
+        assert_eq!(
+            received, 2,
+            "IPv4 and IPv6 fd/port reuse delivered new packets"
+        );
     }
 }
 
