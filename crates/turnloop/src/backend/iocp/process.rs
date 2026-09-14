@@ -53,6 +53,18 @@ fn quote(value: &OsStr, out: &mut Vec<u16>) -> Result<()> {
     Ok(())
 }
 fn program(spec: &ProcessSpec) -> Result<PathBuf> {
+    let path = resolve_program(spec)?;
+    // CreateProcess may dispatch batch files through cmd.exe, whose argument
+    // parsing does not obey the MSVCRT quoting used below. Require an explicit shell.
+    if path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("bat") || ext.eq_ignore_ascii_case("cmd"))
+    {
+        return Err(invalid());
+    }
+    Ok(path)
+}
+fn resolve_program(spec: &ProcessSpec) -> Result<PathBuf> {
     let path = PathBuf::from(&spec.program);
     if path.is_absolute() || path.components().count() > 1 {
         return Ok(path);
@@ -289,14 +301,24 @@ impl Child {
         if signal != Signal::Kill {
             return Err(unsupported());
         }
-        if group {
+        let result = if group {
             let job = self.job.as_ref().ok_or_else(invalid)?;
             // SAFETY: exclusively owned process tree; no PID/handle reuse is possible.
             bool_result(unsafe { TerminateJobObject(job.as_raw_handle(), 1) })
         } else {
             // SAFETY: process handle pins the identity even if its PID is later reused.
             bool_result(unsafe { TerminateProcess(self.process.as_raw_handle(), 1) })
+        };
+        if let Err(error) = result
+            && error.os == Some(ERROR_ACCESS_DENIED as i32)
+            // SAFETY: the owned process handle pins its identity; zero timeout
+            // only queries termination and never waits for the callback.
+            && unsafe { WaitForSingleObject(self.process.as_raw_handle(), 0) } == WAIT_OBJECT_0
+        {
+            self.context.ready.store(true, Ordering::Release);
+            return Err(crate::Error::new(crate::ErrorKind::NotFound));
         }
+        result
     }
     pub(super) fn close(&mut self) -> Result<()> {
         if self.status.is_some() {
@@ -306,7 +328,10 @@ impl Child {
             self.status()?;
             return Ok(());
         }
-        self.kill(Signal::Kill, self.job.is_some())
+        match self.kill(Signal::Kill, self.job.is_some()) {
+            Err(error) if error.kind == crate::ErrorKind::NotFound => Ok(()),
+            result => result,
+        }
     }
 }
 impl Drop for Child {
@@ -335,6 +360,7 @@ pub(super) fn spawn(
     if spec.uid.is_some() || spec.gid.is_some() || spec.program.is_empty() {
         return Err(unsupported());
     }
+    let application = wide(program(spec)?.as_os_str())?;
     let mut parents = [None, None, None];
     let mut child_ends = Vec::with_capacity(3);
     for (i, option) in spec.stdio.iter().enumerate() {
@@ -355,7 +381,6 @@ pub(super) fn spawn(
     }
     let handles = std::array::from_fn::<_, 3, _>(|i| child_ends[i].as_raw_handle());
     let mut attributes = Attributes::new(&handles)?;
-    let application = wide(program(spec)?.as_os_str())?;
     let mut command = Vec::new();
     quote(&spec.program, &mut command)?;
     for arg in &spec.args {
@@ -480,4 +505,55 @@ pub(super) fn spawn(
         )
     })?;
     Ok((child, parents))
+}
+
+#[cfg(all(test, not(loom)))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exited_process_without_callback_maps_kill_and_close() {
+        let driver = crate::Loop::new(crate::Config::default()).expect("notifier owner");
+        for close in [false, true] {
+            // Listing the unit-test binary exits normally without running any
+            // nested tests and needs no external fixture or shell argument rules.
+            let mut spec = ProcessSpec::new(std::env::current_exe().expect("test executable"));
+            spec.args.push("--list".into());
+            spec.stdio = [ProcessStdio::Null; 3];
+            let (mut child, _) =
+                spawn(&spec, [None; 3], driver.notifier()).expect("suspended child");
+            // The child cannot exit while suspended. Removing its wait now forces
+            // the exact callback-lag window, independent of thread-pool scheduling.
+            child.join().expect("unregister before resume");
+            let wait = child.process.try_clone().expect("duplicate process");
+            child.resume().expect("resume child");
+            assert_eq!(
+                // SAFETY: owned duplicate and bounded wait, with no callback installed.
+                unsafe { WaitForSingleObject(wait.as_raw_handle(), 10_000) },
+                WAIT_OBJECT_0
+            );
+            assert!(!child.ready(), "the exit callback must not have run");
+            if close {
+                child
+                    .close()
+                    .expect("close signaled process without callback");
+            } else {
+                assert_eq!(
+                    child
+                        .kill(Signal::Kill, false)
+                        .expect_err("already exited")
+                        .kind,
+                    crate::ErrorKind::NotFound
+                );
+            }
+            assert!(
+                child.ready(),
+                "termination failure observed the signaled handle"
+            );
+            assert_eq!(
+                child.status().expect("exit status").expect("exited").code,
+                Some(0)
+            );
+        }
+    }
 }

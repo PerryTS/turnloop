@@ -142,32 +142,34 @@ including when cancelled before the first poll. `LocalExecutor` and adapters are
 
 ## Windows and WASM integration
 
-Windows has the same resource/operation shapes needed by `spikes/iocp`: named pipe
-accept/connect, duplicate stdio, duplicated sockets/handles, process waits and Job
+The production Windows IOCP backend implements these resource/operation shapes:
+named pipe accept/connect, duplicate stdio, duplicated sockets/handles, process waits and Job
 Objects, console modes/resize and console signal dispatch. Keep OVERLAPPED storage
 pinned through cancellation. Parent stdio pipe ends need overlapped operation;
-child ends must work with ordinary synchronous child I/O. The wire format may use
-peer PID negotiation for WSADuplicateSocketW/ DuplicateHandle; no Unix fd leaks
+child ends must work with ordinary synchronous child I/O. The socket-transfer wire
+format uses OS-reported peer PIDs with WSADuplicateSocketW; no Unix fd leaks
 through this trait. uid/gid and unavailable console signals must reject explicitly.
 
 The new shared scenarios are public generic functions in
-`turnloop-contract::{native_surface,executor_contract}`. Instantiate them with
-IOCP and supply a named-pipe name, the child fixture executable, and a supported
-signal plus its real OS delivery closure for fan-out. The no-spin scenario also
-accepts the platform's idle signal. Adapt the fixture's platform alias/cfg once
-production IOCP exists; do not substitute ordinary stdio for its driver exercise.
-Unix-only openpty/sigaction/waitpid assertions stay in native tests. IOCP needs its
-console and process registration race equivalents in addition to the shared tests.
+`turnloop-contract::{native_surface,executor_contract}`. Windows instantiates
+them with IOCP, named pipes and the native child fixture, including the fixture's
+actual stdio driver exercise. Windows console and process registration/lifetime
+tests complement the shared scenarios; Unix-only openpty/sigaction/waitpid
+assertions remain in native tests. Further Windows revision-2 coverage gaps are
+listed in the IOCP lane report. Cancelling a Windows child exit watch alone
+acknowledges immediately and leaves the child owned and running. Close with a
+pending watch retains it until termination, then emits Cancelled before Closed.
 
 WASI 0.2/0.3 and web production adapters implement this revision; WASI 0.3 remains
 experimental. WASI stdio, single-agent external waits, Worker condition delivery
-and executor contracts run through the required platform runners. Windows still
-awaits its production IOCP adapter. Cross-checking is not runtime proof; browser
-and Windows runtime status remains explicit in the root lane report.
+and executor contracts run through the required platform runners. Windows IOCP
+runs in all three required native CI modes. Cross-checking is not runtime proof;
+browser and Windows runtime status remains explicit in the root lane report.
 
 ## Specification clarifications proposed for review
 
-No changes were made to authoritative `DESIGN.md`.
+DESIGN §7.3 now reflects the NT timer decision already recorded in §15 question 3.
+The following broader clarifications remain proposals.
 
 1. Specify local control-stream framing and independent send ownership explicitly.
 2. Specify nonblocking kill/reap-on-close via `prepare_close`, delayed cancellation

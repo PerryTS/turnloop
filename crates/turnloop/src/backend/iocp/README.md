@@ -28,6 +28,8 @@ I/O before releasing caller memory.
 - Child creation uses an explicit inherited handle list, correctly quoted argv,
   Unicode environment, suspended creation and optional Job Object assignment
   before resume. Parent stdio ends are overlapped; child ends are synchronous.
+  Direct `.bat`/`.cmd` programs are rejected with InvalidInput, including PATH
+  resolution; callers must explicitly select a shell for batch scripts.
   One-shot process waits publish to the owning notifier. Close terminates live
   owned children, then acknowledges exit before Closed. uid/gid and non-Kill
   process signals return Unsupported; console signal subscriptions are separate.

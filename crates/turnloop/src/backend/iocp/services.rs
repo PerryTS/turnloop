@@ -12,6 +12,7 @@ struct Entry {
     service: Service,
     op: Option<OpId>,
     cancelled: bool,
+    closing: bool,
 }
 pub(super) struct Services {
     entries: Vec<Option<Entry>>,
@@ -36,6 +37,7 @@ impl Services {
             service: Service::Child(child),
             op: None,
             cancelled: false,
+            closing: false,
         });
     }
     pub(super) fn signal(
@@ -50,6 +52,7 @@ impl Services {
             service: Service::Signal(signal, subscription),
             op: None,
             cancelled: false,
+            closing: false,
         });
         Ok(())
     }
@@ -74,7 +77,9 @@ impl Services {
     }
     pub(super) fn cancel(&mut self, op: OpId) -> bool {
         if let Some(entry) = self.entries.iter_mut().flatten().find(|e| e.op == Some(op)) {
-            entry.cancelled = true;
+            // Close retains the exit watch until the child has terminated. A
+            // standalone watch cancellation needs no process teardown or reap.
+            entry.cancelled = !entry.closing;
             true
         } else {
             false
@@ -89,6 +94,8 @@ impl Services {
             && let Service::Child(child) = &mut entry.service
         {
             child.close()?;
+            entry.closing = true;
+            entry.cancelled = false;
         }
         Ok(())
     }
@@ -115,10 +122,11 @@ impl Services {
         }
         self.entries.iter().flatten().any(|e| {
             e.op.is_some()
-                && match &e.service {
-                    Service::Child(child) => child.ready(),
-                    Service::Signal(_, signal) => e.cancelled || signal.ready(),
-                }
+                && (e.cancelled
+                    || match &e.service {
+                        Service::Child(child) => child.ready(),
+                        Service::Signal(_, signal) => signal.ready(),
+                    })
         })
     }
     pub(super) fn collect(&mut self, out: &mut Vec<Event<Detached>>) -> Result<()> {
@@ -132,17 +140,26 @@ impl Services {
             let Some(op) = entry.op else {
                 continue;
             };
-            let result = match &mut entry.service {
-                Service::Child(child) => child
-                    .status()?
-                    .map(|status| (Outcome::Exited(status), true)),
-                Service::Signal(signal, ticket) => {
-                    if entry.cancelled {
-                        Some((Outcome::Cancelled, true))
-                    } else if ticket.take() {
-                        Some((Outcome::Signal(*signal), false))
-                    } else {
-                        None
+            let result = if entry.cancelled {
+                Some((Outcome::Cancelled, true))
+            } else {
+                match &mut entry.service {
+                    Service::Child(child) => child.status()?.map(|status| {
+                        (
+                            if entry.closing {
+                                Outcome::Cancelled
+                            } else {
+                                Outcome::Exited(status)
+                            },
+                            true,
+                        )
+                    }),
+                    Service::Signal(signal, ticket) => {
+                        if ticket.take() {
+                            Some((Outcome::Signal(*signal), false))
+                        } else {
+                            None
+                        }
                     }
                 }
             };
@@ -154,11 +171,7 @@ impl Services {
                 out.push(Event {
                     op,
                     terminal,
-                    result: Ok(if entry.cancelled {
-                        Outcome::Cancelled
-                    } else {
-                        outcome
-                    }),
+                    result: Ok(outcome),
                 });
             }
         }

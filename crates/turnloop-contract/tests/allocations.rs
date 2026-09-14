@@ -1185,3 +1185,121 @@ fn stdio_reads_reuse_caller_buffers_through_eof() {
     assert_eq!((reads, eofs), (36, 2));
     assert_eq!(allocations, 0, "stdio reads and repeated CLI EOF results");
 }
+
+#[cfg(windows)]
+#[test]
+fn windows_child_watch_cancel_exit_and_close_allocate_nothing_after_setup() {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::{
+        Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT},
+        System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject},
+    };
+    let mut driver = Loop::new(Config::default()).expect("loop");
+    let mut spec = ProcessSpec::new(env!("CARGO_BIN_EXE_native_child"));
+    spec.args.push("sleep".into());
+    spec.stdio = [ProcessStdio::Null; 3];
+    let children: [_; 16] =
+        std::array::from_fn(|i| driver.spawn(&spec, Token(i as u64)).expect("child"));
+    let waits: [OwnedHandle; 16] = std::array::from_fn(|i| {
+        // SAFETY: driver's owned process handle prevents PID reuse; wait-only access.
+        let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, children[i].pid) };
+        assert!(!raw.is_null());
+        // SAFETY: successful OpenProcess transfers unique ownership.
+        unsafe { OwnedHandle::from_raw_handle(raw) }
+    });
+    let mut out = Completions::default();
+    driver.turn(Timeout::Now, &mut out).expect("warm services");
+    assert!(out.is_empty());
+    let mut terminal = [false; 16];
+    let mut closed = [false; 16];
+    let (mut cancellations, mut exits, mut closes) = (0, 0, 0);
+    ALLOCS.with(|count| count.set(0));
+    ACTIVE.with(|active| active.set(true));
+    for child in &children[..8] {
+        assert_eq!(
+            driver
+                .detach(child.handle)
+                .expect_err("cancel exit watch")
+                .kind,
+            ErrorKind::WouldBlock
+        );
+    }
+    let info = driver
+        .turn(Timeout::After(Duration::from_secs(2)), &mut out)
+        .expect("cancel watch turn");
+    assert_eq!(info.os_waits, 0);
+    assert_eq!(out.len(), 8);
+    for completion in out.drain() {
+        let i = completion.token.0 as usize;
+        assert!(i < 8);
+        assert_eq!(completion.handle, Some(children[i].handle));
+        assert!(completion.terminal && completion.op.is_some());
+        assert!(matches!(completion.result, OpResult::Cancelled));
+        assert!(!std::mem::replace(&mut terminal[i], true));
+        cancellations += 1;
+    }
+    for (child, wait) in children.iter().zip(&waits) {
+        assert_eq!(
+            // SAFETY: live process query proves cancellation did not kill it.
+            unsafe { WaitForSingleObject(wait.as_raw_handle(), 0) },
+            WAIT_TIMEOUT
+        );
+        driver.kill(child.handle, Signal::Kill).expect("kill");
+    }
+    // Cancelled watches no longer report exit; the fixture explicitly waits on
+    // all owned identities before asking close to release those process resources.
+    for wait in &waits {
+        assert_eq!(
+            // SAFETY: owned wait handle, bounded native wait after termination request.
+            unsafe { WaitForSingleObject(wait.as_raw_handle(), 10_000) },
+            WAIT_OBJECT_0
+        );
+    }
+    let deadline = driver.now() + Duration::from_secs(10);
+    while exits < 8 {
+        assert!(driver.now() < deadline);
+        driver
+            .turn(Timeout::Until(deadline), &mut out)
+            .expect("exit delivery");
+        for completion in out.drain() {
+            let i = completion.token.0 as usize;
+            assert!((8..16).contains(&i));
+            assert_eq!(completion.handle, Some(children[i].handle));
+            assert!(completion.terminal && completion.op.is_some());
+            assert!(matches!(
+                completion.result,
+                OpResult::Exited(ExitStatus {
+                    code: Some(1),
+                    signal: None
+                })
+            ));
+            assert!(!std::mem::replace(&mut terminal[i], true));
+            exits += 1;
+        }
+    }
+    for (i, child) in children.iter().enumerate() {
+        driver.close(child.handle, Token(i as u64)).expect("close");
+    }
+    while driver.alive() {
+        assert!(driver.now() < deadline);
+        driver
+            .turn(Timeout::Until(deadline), &mut out)
+            .expect("close delivery");
+        for completion in out.drain() {
+            let i = completion.token.0 as usize;
+            assert!(i < 16 && terminal[i]);
+            assert_eq!(completion.handle, Some(children[i].handle));
+            assert!(completion.terminal && completion.op.is_none());
+            assert!(matches!(completion.result, OpResult::Closed));
+            assert!(!std::mem::replace(&mut closed[i], true));
+            closes += 1;
+        }
+    }
+    ACTIVE.with(|active| active.set(false));
+    assert_eq!(
+        ALLOCS.with(Cell::get),
+        0,
+        "Windows service completion allocations"
+    );
+    assert_eq!((cancellations, exits, closes), (8, 8, 16));
+}

@@ -161,7 +161,7 @@ pub(super) fn nonblocking(socket: usize) -> Result<()> {
     // SAFETY: live socket and valid FIONBIO input.
     check(unsafe { ioctlsocket(socket, FIONBIO, &mut value) })
 }
-pub(super) fn loopback_connect(socket: usize) -> Result<()> {
+pub(super) fn loopback_connect(socket: usize) {
     // Loopback delivery does not lose SYN packets. Avoid Windows retrying a
     // refused local connection for ~2 seconds before reporting ECONNREFUSED.
     // https://learn.microsoft.com/en-us/windows/win32/api/mstcpip/ns-mstcpip-tcp_initial_rto_parameters
@@ -170,8 +170,10 @@ pub(super) fn loopback_connect(socket: usize) -> Result<()> {
         MaxSynRetransmissions: TCP_INITIAL_RTO_NO_SYN_RETRANSMISSIONS as u8,
     };
     let mut bytes = 0;
-    // SAFETY: live TCP socket and documented synchronous IOCTL input layout.
-    check(unsafe {
+    // This is a best-effort latency optimization, not a prerequisite for connect.
+    // SAFETY: documented synchronous IOCTL input layout; Winsock validates the
+    // socket value and retains none of these stack pointers after returning.
+    let _ = unsafe {
         WSAIoctl(
             socket,
             SIO_TCP_INITIAL_RTO,
@@ -183,7 +185,7 @@ pub(super) fn loopback_connect(socket: usize) -> Result<()> {
             ptr::null_mut(),
             None,
         )
-    })
+    };
 }
 pub(super) fn ifs(socket: usize) -> Result<bool> {
     let mut info = WSAPROTOCOL_INFOW::default();
@@ -297,5 +299,24 @@ impl Detached {
             return Err(unsupported());
         };
         Ok(Self::new(Native::Socket(socket), kind, true))
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod tests {
+    use super::*;
+    #[test]
+    fn loopback_rto_failure_is_best_effort() {
+        startup().expect("Winsock");
+        loopback_connect(INVALID_SOCKET);
+        assert_eq!(last_error().os, Some(WSAENOTSOCK), "the failing ioctl ran");
+        let socket = create(false, false).expect("valid socket after failure");
+        bind_to(socket.as_raw_socket() as usize, ([127, 0, 0, 1], 0).into()).expect("bind");
+        assert_ne!(
+            address(socket.as_raw_socket() as usize, false)
+                .expect("address")
+                .port(),
+            0
+        );
     }
 }

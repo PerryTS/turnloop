@@ -165,11 +165,16 @@ impl PacketTimer {
         Ok(())
     }
 
+    /// Report whether this packet acknowledges the current generation.
+    ///
     /// # Safety
     /// Call only after dequeuing this timer's TIMER packet on its port.
-    pub unsafe fn dequeued(&mut self, generation: usize) {
+    pub unsafe fn dequeued(&mut self, generation: usize) -> bool {
         if generation == self.generation {
             self.active = false;
+            true
+        } else {
+            false
         }
     }
 
@@ -193,5 +198,138 @@ impl PacketTimer {
 impl Drop for PacketTimer {
     fn drop(&mut self) {
         let _ = self.cancel();
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod tests {
+    use super::*;
+    use crate::{
+        backend::{
+            Backend,
+            iocp::{
+                Iocp,
+                port::{Entry, WAKE},
+                tests::Synthetic,
+            },
+        },
+        *,
+    };
+    use std::cell::Cell;
+    use windows_sys::Win32::System::IO::{OVERLAPPED, PostQueuedCompletionStatus};
+
+    thread_local! { static CANCELS: Cell<usize> = const { Cell::new(0) }; }
+    unsafe extern "system" fn pending(_: HANDLE, _: u8) -> i32 {
+        CANCELS.with(|count| count.set(count.get() + 1));
+        0x103
+    }
+    unsafe extern "system" fn failed(_: HANDLE, _: u8) -> i32 {
+        CANCELS.with(|count| count.set(count.get() + 1));
+        0xc0000001u32 as i32
+    }
+    unsafe extern "system" fn associate(
+        _: HANDLE,
+        _: HANDLE,
+        _: HANDLE,
+        _: *const c_void,
+        _: *const c_void,
+        _: i32,
+        _: usize,
+        _: *mut u8,
+    ) -> i32 {
+        // Simulate an associated packet; tests explicitly supply its completion.
+        0
+    }
+    fn post(backend: &Iocp, entry: Entry) {
+        assert_ne!(
+            // SAFETY: live port; contexts are opaque synthetic identities, never
+            // dereferenced by Windows. The backend owns the corresponding slots.
+            unsafe {
+                PostQueuedCompletionStatus(
+                    backend.port.raw(),
+                    entry.bytes,
+                    entry.key,
+                    entry.overlapped as *const OVERLAPPED,
+                )
+            },
+            0
+        );
+    }
+    #[test]
+    fn wait_cancellation_error_still_applies_dequeued_io() {
+        let mut fixture = Synthetic::new();
+        fixture.backend.timer.associate = associate;
+        fixture.backend.timer.cancel = failed;
+        CANCELS.with(|count| count.set(0));
+        for entry in fixture.entries {
+            post(&fixture.backend, entry);
+        }
+        let mut out = Vec::with_capacity(2);
+        assert!(
+            fixture
+                .backend
+                .poll(Some(Duration::from_secs(30)), &mut out)
+                .is_err()
+        );
+        assert_eq!(
+            CANCELS.with(Cell::get),
+            1,
+            "injected cancellation error ran"
+        );
+        fixture.assert_delivered();
+    }
+    #[test]
+    fn pending_wait_timer_is_not_rearmed_until_its_packet_is_dequeued() {
+        let config = Config::default();
+        let mut backend = Iocp::new(&config, BufferPool::new(2, 64)).expect("backend");
+        backend.timer.associate = associate;
+        backend.timer.cancel = pending;
+        CANCELS.with(|count| count.set(0));
+        backend.port.post(WAKE, 0).expect("wake first wait");
+        let mut out = Vec::with_capacity(1);
+        let info = backend
+            .poll(Some(Duration::from_secs(30)), &mut out)
+            .expect("first wait");
+        assert_eq!((info.waits, info.zero_event_waits), (1, 0));
+        assert!(out.is_empty());
+        assert!(backend.timer_pending && backend.timer.active);
+        let generation = backend.timer.generation;
+        assert_eq!(CANCELS.with(Cell::get), 1);
+        // A forwarded stale generation must not make the current packet reusable.
+        backend
+            .entries(&[Entry {
+                key: TIMER,
+                overlapped: generation - 1,
+                ..Entry::default()
+            }])
+            .expect("stale generation");
+        assert!(backend.timer_pending && backend.timer.active);
+        post(
+            &backend,
+            Entry {
+                key: TIMER,
+                overlapped: generation,
+                ..Entry::default()
+            },
+        );
+        let info = backend
+            .poll(Some(Duration::from_secs(30)), &mut out)
+            .expect("drain pending timer");
+        assert_eq!((info.waits, info.zero_event_waits), (1, 1));
+        assert_eq!(backend.timer.generation, generation, "no premature rearm");
+        assert_eq!(
+            CANCELS.with(Cell::get),
+            1,
+            "no second cancel of in-flight packet"
+        );
+        assert!(!backend.timer_pending && !backend.timer.active);
+        // Reuse is allowed after acknowledgement, and the next generation runs.
+        backend.port.post(WAKE, 0).expect("wake rearmed wait");
+        backend
+            .poll(Some(Duration::from_secs(30)), &mut out)
+            .expect("reuse timer");
+        assert_eq!(backend.timer.generation, generation + 1);
+        assert_eq!(CANCELS.with(Cell::get), 2);
+        assert!(backend.timer_pending && backend.timer.active);
     }
 }

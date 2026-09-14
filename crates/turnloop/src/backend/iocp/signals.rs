@@ -18,7 +18,7 @@ struct Ticket {
     notifier: Notifier,
 }
 pub(super) struct Subscription {
-    ticket: Box<Ticket>,
+    ticket: *mut Ticket,
     index: usize,
 }
 
@@ -68,20 +68,25 @@ impl Subscription {
             // SAFETY: process-lifetime function pointer; handler has no locks or allocations.
             bool_result(unsafe { SetConsoleCtrlHandler(Some(handler), 1) })?;
         }
-        let mut ticket = Box::new(Ticket {
+        let ticket = Box::into_raw(Box::new(Ticket {
             signal,
             pending: AtomicBool::new(false),
             notifier,
-        });
-        SLOTS[index].store(ptr::from_mut(&mut *ticket), Ordering::SeqCst);
+        }));
+        SLOTS[index].store(ticket, Ordering::SeqCst);
         *count += 1;
         Ok(Self { ticket, index })
     }
     pub(super) fn ready(&self) -> bool {
-        self.ticket.pending.load(Ordering::Acquire)
+        self.ticket().pending.load(Ordering::Acquire)
     }
     pub(super) fn take(&self) -> bool {
-        self.ticket.pending.swap(false, Ordering::AcqRel)
+        self.ticket().pending.swap(false, Ordering::AcqRel)
+    }
+    fn ticket(&self) -> &Ticket {
+        // SAFETY: this subscription owns the into_raw allocation until Drop joins
+        // dispatchers. Every concurrent access is shared and fields are atomic.
+        unsafe { &*self.ticket }
     }
 }
 impl Drop for Subscription {
@@ -98,5 +103,39 @@ impl Drop for Subscription {
         while ACTIVE.load(Ordering::SeqCst) != 0 {
             std::thread::yield_now();
         }
+        // SAFETY: uniquely owned into_raw allocation, unpublished before all
+        // dispatchers joined. No reference to this ticket can remain live.
+        drop(unsafe { Box::from_raw(self.ticket) });
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod tests {
+    use super::*;
+    #[test]
+    fn moved_subscription_keeps_its_published_ticket_alive() {
+        let driver = crate::Loop::new(crate::Config::default()).expect("notifier owner");
+        let first = Subscription::new(Signal::WinCh, driver.notifier()).expect("first");
+        let second = Subscription::new(Signal::WinCh, driver.notifier()).expect("second");
+        let mut subscriptions = vec![first];
+        assert_eq!(subscriptions.capacity(), 1);
+        subscriptions.push(second); // move both subscriptions by growing the vector
+        assert!(subscriptions.capacity() > 1);
+        let mut deliveries = 0;
+        for _ in 0..100 {
+            assert!(dispatch(Signal::WinCh));
+            for subscription in &subscriptions {
+                assert!(subscription.ready());
+                assert!(subscription.take());
+                assert!(!subscription.take());
+                deliveries += 1;
+            }
+        }
+        assert_eq!(deliveries, 200);
+        drop(subscriptions);
+        assert!(
+            !dispatch(Signal::WinCh),
+            "removed tickets cannot receive signals"
+        );
     }
 }

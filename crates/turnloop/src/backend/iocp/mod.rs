@@ -181,6 +181,7 @@ pub struct Iocp {
     port: Arc<Port>,
     wake: Arc<IocpWake>,
     timer: timer::PacketTimer,
+    timer_pending: bool,
     event: Option<EventIntegration>,
     notifier: Option<Notifier>,
     services: services::Services,
@@ -811,61 +812,69 @@ impl Iocp {
         )))
     }
     fn entries(&mut self, entries: &[Entry]) -> Result<()> {
+        let mut result = Ok(());
         for entry in entries {
-            if entry.key == WAKE {
-                continue;
-            }
-            if entry.key == TIMER {
-                // SAFETY: this port has exactly one associated deadline timer.
-                unsafe {
-                    self.timer.dequeued(entry.overlapped);
-                }
-                if self.event.is_some()
-                    && self
-                        .deadline
-                        .is_some_and(|deadline| deadline > Instant::now())
-                {
-                    self.arm_event_deadline()?;
-                }
-                continue;
-            }
-            let base = self.kernel.as_ptr() as usize;
-            let stride = size_of::<UnsafeCell<Kernel>>();
-            let offset = entry.overlapped.checked_sub(base).ok_or_else(invalid)?;
-            if offset % stride != 0 || offset / stride >= self.ops.len() {
-                return Err(invalid());
-            }
-            let i = offset / stride;
-            let bridge_result = if entry.key == sync_io::KEY {
-                let p = self.ops[i].as_ref().ok_or_else(invalid)?;
-                Some(
-                    self.workers[p.request.handle.index()]
-                        .as_ref()
-                        .ok_or_else(invalid)?
-                        .finish(),
-                )
-            } else if entry.key == bridge::KEY {
-                Some(self.bridges[i].as_mut().ok_or_else(invalid)?.finish()?)
-            } else {
-                None
-            };
-            let p = self.ops[i].as_mut().ok_or_else(invalid)?;
-            if !p.waiting {
-                return Err(invalid());
-            }
-            p.waiting = false;
-            p.completion = Some(bridge_result.unwrap_or_else(|| {
-                if entry.status < 0 {
-                    // SAFETY: pure NTSTATUS conversion, no pointers.
-                    Err(socket::error(
-                        unsafe { RtlNtStatusToDosError(entry.status) } as i32,
-                    ))
-                } else {
-                    Ok(entry.bytes)
-                }
-            }));
-            self.schedule(i);
+            // Every dequeued packet must be applied even after an earlier error.
+            // Keeping the first error must not strand later native operations.
+            let applied = self.entry(entry);
+            result = result.and(applied);
         }
+        result
+    }
+    fn entry(&mut self, entry: &Entry) -> Result<()> {
+        if entry.key == WAKE {
+            return Ok(());
+        }
+        if entry.key == TIMER {
+            // SAFETY: this port has exactly one associated deadline timer.
+            if unsafe { self.timer.dequeued(entry.overlapped) } {
+                self.timer_pending = false;
+            }
+            if self.event.is_some()
+                && self
+                    .deadline
+                    .is_some_and(|deadline| deadline > Instant::now())
+            {
+                self.arm_event_deadline()?;
+            }
+            return Ok(());
+        }
+        let base = self.kernel.as_ptr() as usize;
+        let stride = size_of::<UnsafeCell<Kernel>>();
+        let offset = entry.overlapped.checked_sub(base).ok_or_else(invalid)?;
+        if offset % stride != 0 || offset / stride >= self.ops.len() {
+            return Err(invalid());
+        }
+        let i = offset / stride;
+        let p = self.ops[i].as_ref().ok_or_else(invalid)?;
+        if !p.waiting {
+            return Err(invalid());
+        }
+        let bridge_result = if entry.key == sync_io::KEY {
+            Some(
+                self.workers[p.request.handle.index()]
+                    .as_ref()
+                    .ok_or_else(invalid)?
+                    .finish(),
+            )
+        } else if entry.key == bridge::KEY {
+            Some(self.bridges[i].as_mut().ok_or_else(invalid)?.finish()?)
+        } else {
+            None
+        };
+        let p = self.ops[i].as_mut().ok_or_else(invalid)?;
+        p.waiting = false;
+        p.completion = Some(bridge_result.unwrap_or_else(|| {
+            if entry.status < 0 {
+                // SAFETY: pure NTSTATUS conversion, no pointers.
+                Err(socket::error(
+                    unsafe { RtlNtStatusToDosError(entry.status) } as i32,
+                ))
+            } else {
+                Ok(entry.bytes)
+            }
+        }));
+        self.schedule(i);
         Ok(())
     }
 }
@@ -901,6 +910,7 @@ unsafe impl Backend for Iocp {
                 calls: AtomicU64::new(0),
             }),
             timer: timer::PacketTimer::new(Arc::clone(&port))?,
+            timer_pending: false,
             port,
             event: None,
             notifier: None,
@@ -1051,7 +1061,7 @@ unsafe impl Backend for Iocp {
                     },
                 )?;
                 if addr.ip().is_loopback() {
-                    socket::loopback_connect(raw)?;
+                    socket::loopback_connect(raw);
                 }
                 if opts.nodelay {
                     let value = 1i32;
@@ -1252,11 +1262,14 @@ unsafe impl Backend for Iocp {
             return Ok(PollInfo::default());
         }
         let mut entries = [Entry::default(); 64];
+        let mut cancel_result = Ok(());
         let (n, info) = if let Some(event) = &mut self.event {
             (event.drain(&mut entries)?, PollInfo::default())
         } else {
             let armed = timeout.is_some_and(|d| !d.is_zero());
-            if let Some(delay) = timeout.filter(|d| !d.is_zero()) {
+            if let Some(delay) = timeout.filter(|d| !d.is_zero())
+                && !self.timer_pending
+            {
                 self.timer.arm(delay)?;
             }
             // GQCSEx's millisecond timeout may expire at an earlier system tick.
@@ -1265,7 +1278,7 @@ unsafe impl Backend for Iocp {
                 .port
                 .wait(if armed { None } else { timeout }, false, &mut entries);
             if armed {
-                self.timer.cancel()?;
+                cancel_result = self.cancel_timer().map(|_| ());
             }
             match result? {
                 // The private deadline timer packet has the meaning of a timed wait
@@ -1290,7 +1303,9 @@ unsafe impl Backend for Iocp {
                 ),
             }
         };
-        self.entries(&entries[..n])?;
+        let entries_result = self.entries(&entries[..n]);
+        cancel_result?;
+        entries_result?;
         self.services.collect(events)?;
         self.run_ready(events);
         Ok(info)
@@ -1332,8 +1347,15 @@ unsafe impl Backend for Iocp {
     }
 }
 impl Iocp {
+    fn cancel_timer(&mut self) -> Result<bool> {
+        if !self.timer_pending {
+            self.timer_pending = self.timer.cancel()? == 0x103;
+        }
+        // STATUS_PENDING retains ownership until entry() sees this generation.
+        Ok(!self.timer_pending)
+    }
     fn arm_event_deadline(&mut self) -> Result<()> {
-        if self.timer.cancel()? == 0x103 {
+        if !self.cancel_timer()? {
             return Ok(());
         } // drain the in-flight packet before rearming
         if let Some(deadline) = self.deadline {
@@ -1426,4 +1448,100 @@ fn write_buffers(op: &Operation, mut offset: usize, out: &mut [WSABUF; MAX_IOV])
         _ => {}
     }
     n
+}
+
+#[cfg(all(test, not(loom)))]
+mod tests {
+    use super::*;
+
+    // These operations model already-dequeued kernel completions. No native I/O
+    // is submitted, so unwind must discard their metadata rather than wait on it.
+    pub(super) struct Synthetic {
+        pub backend: Iocp,
+        pub entries: [Entry; 2],
+        pub ops: [OpId; 2],
+    }
+    impl Synthetic {
+        pub fn new() -> Self {
+            let config = Config {
+                max_handles: 2,
+                max_operations: 2,
+                ..Config::default()
+            };
+            let mut backend = Iocp::new(&config, BufferPool::new(2, 64)).expect("backend");
+            let handle = Handle { owner: 1, key: 0 };
+            backend
+                .open(
+                    handle,
+                    Open::Tcp {
+                        addr: ([127, 0, 0, 1], 9).into(),
+                        opts: TcpOpts::default(),
+                    },
+                )
+                .expect("socket resource");
+            let ops = [OpId { owner: 1, key: 0 }, OpId { owner: 1, key: 1 }];
+            let entries = std::array::from_fn(|i| {
+                backend
+                    .submit(Request {
+                        op: ops[i],
+                        handle,
+                        operation: Operation::Write(WriteBuf::Owned(vec![0; i + 1])),
+                    })
+                    .expect("synthetic request");
+                let pending = backend.ops[i].as_mut().expect("op");
+                pending.waiting = true;
+                pending.queued = false;
+                pending.stage = Stage::Io;
+                Entry {
+                    key: 1,
+                    overlapped: backend.kernel_ptr(i) as usize,
+                    bytes: (i + 1) as u32,
+                    status: 0,
+                }
+            });
+            backend.ready.clear();
+            Self {
+                backend,
+                entries,
+                ops,
+            }
+        }
+        pub fn assert_delivered(&mut self) {
+            let mut out = Vec::with_capacity(1);
+            for (i, op) in self.ops.into_iter().enumerate() {
+                let info = self
+                    .backend
+                    .poll(Some(Duration::ZERO), &mut out)
+                    .expect("drain valid packet");
+                assert_eq!(info.waits, 0);
+                assert_eq!(out.len(), 1);
+                assert_eq!(out[0].op, op);
+                assert!(out[0].terminal);
+                assert!(matches!(out[0].result, Ok(Outcome::Wrote(n)) if n == i + 1));
+                out.clear();
+            }
+            assert!(self.backend.ops.iter().all(Option::is_none));
+            assert!(!self.backend.has_work());
+        }
+    }
+    impl Drop for Synthetic {
+        fn drop(&mut self) {
+            self.backend.ops.iter_mut().for_each(|op| *op = None);
+            self.backend.ready.clear();
+        }
+    }
+    #[test]
+    fn invalid_entry_does_not_discard_later_completions() {
+        let mut fixture = Synthetic::new();
+        let batch = [fixture.entries[0], Entry::default(), fixture.entries[1]];
+        assert_eq!(
+            fixture
+                .backend
+                .entries(&batch)
+                .expect_err("invalid packet")
+                .kind,
+            ErrorKind::InvalidInput
+        );
+        fixture.assert_delivered();
+    }
 }
