@@ -34,6 +34,7 @@ def main():
     parser.add_argument('suite', choices=['native', 'wasi', 'web', 'node', 'loom', 'miri', 'protocol'])
     parser.add_argument('--manifest-path', default='Cargo.toml')
     parser.add_argument('--target')
+    parser.add_argument('--browser', choices=['chrome', 'firefox'])
     args = parser.parse_args()
     pin = P3_PIN if args.target == 'wasm32-wasip3' else PIN
     data = metadata(args.manifest_path, toolchain=pin)
@@ -82,19 +83,27 @@ def main():
             for target in targets:
                 if target not in available:
                     fail(f'{package["name"]}: {key} target {target} absent from cargo metadata')
-                command = ['wasm-pack', 'test']
-                command += ['--headless', '--chrome', '--firefox'] if args.suite == 'web' else ['--node']
-                command += [str(Path(package['manifest_path']).parent), '--locked', '--test', target]
-                features = settings(package).get(key + '-features', [])
-                if features:
-                    command += ['--features', ','.join(features)]
-                fixture_path = settings(package).get('web-fixture')
-                if not fixture_path:
-                    fail(f'{package["name"]}: declare web-fixture for actual HTTP/WebSocket traffic')
-                with WebFixture(Path(package['manifest_path']).parent / fixture_path) as fixture:
-                    env['TURNLOOP_WEB_FIXTURE'] = fixture.url
-                    checked_tests(command, cwd=root, env=env, minimum_groups=2 if args.suite == 'web' else 1)
-                    fixture.verify(minimum=2 if args.suite == 'web' else 1)
+                browsers = ([args.browser] if args.browser else ['chrome', 'firefox']) if args.suite == 'web' else ['node']
+                failures = []
+                for browser in browsers:
+                    command = ['wasm-pack', 'test']
+                    command += ['--node'] if browser == 'node' else ['--headless', '--' + browser]
+                    command += [str(Path(package['manifest_path']).parent), '--locked', '--test', target]
+                    features = settings(package).get(key + '-features', [])
+                    if features:
+                        command += ['--features', ','.join(features)]
+                    fixture_path = settings(package).get('web-fixture')
+                    if not fixture_path:
+                        fail(f'{package["name"]}: declare web-fixture for actual HTTP/WebSocket traffic')
+                    try:
+                        with WebFixture(Path(package['manifest_path']).parent / fixture_path) as fixture:
+                            env['TURNLOOP_WEB_FIXTURE'] = fixture.url
+                            checked_tests(command, cwd=root, env=env)
+                            fixture.verify(minimum=1)
+                    except (subprocess.CalledProcessError, RuntimeError) as error:
+                        failures.append(browser + ': ' + str(error))
+                if failures:
+                    fail('Web gates failed: ' + '; '.join(failures))
     elif args.suite == 'loom':
         env['RUSTFLAGS'] = '--cfg loom'
         for package in select(data, 'core'):

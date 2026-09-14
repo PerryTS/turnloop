@@ -162,6 +162,28 @@ class Gates(unittest.TestCase):
                     installer.install('test', directory)
             self.assertFalse((directory/'tool').exists())
 
+    def test_web_fixture_rejects_missing_traffic_and_cleans_up(self):
+        import io
+        from web_fixture import WebFixture
+        traffic = {'fetches': 2, 'slow': 1, 'aborted': 1, 'websockets': 3, 'echoed': 6657}
+        fixture = WebFixture(None)
+        fixture.url = 'http://127.0.0.1:1'
+        with patch('web_fixture.urllib.request.urlopen', return_value=io.BytesIO(json.dumps(traffic).encode())):
+            fixture.verify(1)
+        for field in traffic:
+            bad = {**traffic, field: 0}
+            with self.subTest(field=field), patch('web_fixture.urllib.request.urlopen', return_value=io.BytesIO(json.dumps(bad).encode())):
+                with self.assertRaisesRegex(RuntimeError, 'subject did not run'):
+                    fixture.verify(1)
+        # A real fixture with no clients must fail and still be reaped.
+        import shutil
+        if shutil.which('node'):
+            with self.assertRaisesRegex(RuntimeError, 'subject did not run'):
+                with WebFixture(ROOT / 'crates/turnloop-contract/tests/web/fixture.mjs') as live:
+                    process = live.process
+                    live.verify(1)
+            self.assertIsNotNone(process.poll())
+
     def test_queue_is_never_silently_weakened(self):
         lint = module('lint-workflows')
         source = (ROOT/'.github/workflows/ci.yml').read_text()

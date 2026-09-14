@@ -181,11 +181,14 @@ inputs land. Their commands and the strict `ci-gate` fan-in are retained. No
 
 - **Wave 2 Windows:** adapt `spikes/iocp` to the production Backend, instantiate
   `turnloop-contract` on IOCP, run all contracts (including no-spin) on Windows.
-- **Wave 2 WASI:** integrate both providers, provide nonzero shared contracts on
-  `wasm32-wasip2` and `wasm32-wasip3`, run the existing `run-tests.py wasi` commands.
-  Resolve the p3 bounded waitable-set API before claiming D7 compliance.
-- **Wave 2 web:** provide real browser and Node test targets, add `web-tests` and
-  `node-tests` metadata, run Chrome, Firefox and Node via `run-tests.py`.
+- **WASM providers and contracts:** production p2 and web adapters and the
+  experimental p3 adapter now live in `crates/turnloop`. Run the mandatory
+  `run-tests.py wasi --target wasm32-wasip2`, `... wasm32-wasip3`, `run-tests.py web`
+  and `run-tests.py node` jobs. Each contract/allocation binary and each browser
+  must execute positive test counts. The runner owns and checks actual HTTP,
+  aborted fetch and WebSocket fixture traffic. See [docs/wasm.md](docs/wasm.md)
+  for setup, explicit platform exclusions and outstanding p3 runtime limitations.
+  These remain failing gates until the strict requirements pass.
 - **Linux instruction baseline:** run the candidate command below on Ubuntu
   24.04 x86_64, review three rounds and exact controls, commit the measured baseline.
   macOS timings must never substitute for Linux instruction counts.

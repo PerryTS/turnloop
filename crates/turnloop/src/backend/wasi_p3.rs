@@ -430,7 +430,11 @@ unsafe impl Backend for WasiP3 {
             &self.wait_set,
             self.resources[h.index()].as_mut().expect("owner"),
         );
+        let head = self.resources[h.index()].as_ref().expect("owner").heads[d] == Some(op.index());
         self.unlink(h, op.index(), d);
+        if head {
+            self.resources[h.index()].as_mut().expect("owner").ready[d] = true;
+        }
         self.cancelled.push_back(op);
         self.schedule(h);
         Ok(())

@@ -134,3 +134,50 @@ fn repeated_eof_shutdown_and_empty_datagram() {
     }
     assert_eq!((received, written), (1, 1));
 }
+
+#[test]
+fn cancelled_head_restarts_queued_read() {
+    use std::time::Duration;
+    use turnloop::*;
+    let mut l = Loop::new(Config::default()).expect("loop");
+    let (_, a, b) = contract::pair(&mut l);
+    let mut out = Completions::with_capacity(1);
+    let mut reads = 0;
+    for _ in 0..32 {
+        let first = l.read(b, ReadBuf::Pooled, Token(1)).expect("head");
+        let second = l.read(b, ReadBuf::Pooled, Token(2)).expect("successor");
+        l.turn(Timeout::Now, &mut out).expect("arm head");
+        assert!(out.is_empty());
+        assert!(l.cancel(first));
+        l.turn(Timeout::Now, &mut out).expect("cancel ack");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].op, Some(first));
+        assert!(matches!(out[0].result, OpResult::Cancelled));
+        l.write(a, WriteBuf::Owned(vec![0x61]), Token(3))
+            .expect("write");
+        let until = l.now() + Duration::from_secs(1);
+        let mut got = false;
+        let mut wrote = false;
+        while !got || !wrote {
+            assert!(l.now() < until, "cancelled head stranded successor");
+            l.turn(Timeout::Until(until), &mut out)
+                .expect("successor turn");
+            for c in out.drain() {
+                match c.result {
+                    OpResult::Read {
+                        n: 1,
+                        lease: Some(bytes),
+                    } => {
+                        assert_eq!(c.op, Some(second));
+                        assert_eq!(bytes.as_slice(), [0x61]);
+                        got = true;
+                        reads += 1;
+                    }
+                    OpResult::Wrote(1) => wrote = true,
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+        }
+    }
+    assert_eq!(reads, 32);
+}
