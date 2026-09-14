@@ -45,7 +45,7 @@ Rules:
 
 ## Phase 2: port the backend onto the core trait (ready now)
 
-The core Backend trait is merged on `main` as **revision 1**, tag `trait-v1`, in `crates/turnloop/src/backend/mod.rs`. It is revision 0 plus host-clock and callback-scheduling hooks; `docs/lanes/core.md` describes the changes. A lane on the Mac is adding processes, signals, TTY, pipes and an executor right now, and may bump it to revision 2; watch `main` for a `trait-v2` tag.
+The core Backend trait is merged on `main` as **revision 2**, tag `trait-v2`, in `crates/turnloop/src/backend/mod.rs`. Revision 2 adds pipes/local IPC, stdio, handle passing, processes, signals, TTY and external waits on top of revision 1's host-clock and scheduling hooks; see `docs/BACKEND_REVISION_2.md` and `docs/lanes/core.md`. The Windows mechanisms for all of these are prototyped in `spikes/iocp` (named pipes, overlapped stdio or reader threads, Job Objects + RegisterWaitForSingleObject, SetConsoleCtrlHandler, console input).
 
 1. Create `lane/windows-host` from `main`.
 2. Port `spikes/iocp/backend_draft/` to `crates/turnloop/src/backend/iocp/` against the trait. The adaptation notes are in `docs/lanes/windows.md`. Keep `spikes/iocp` as the mechanism reference.
