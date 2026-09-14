@@ -103,10 +103,12 @@ fn real_async_tls_queries_copy_cancel_pool_and_connection_kill() {
                 }],
                 result_formats: &[0],
             };
+            let mut prepared_rows = 0;
             for _ in 0..2 {
                 assert_eq!(
                     c.execute(q, at, |e| {
                         if let Event::Row { mut row, .. } = e {
+                            prepared_rows += 1;
                             assert_eq!(
                                 row.next().expect("row").expect("value"),
                                 Some(b"42".as_slice())
@@ -119,6 +121,7 @@ fn real_async_tls_queries_copy_cancel_pool_and_connection_kill() {
                     Outcome::Success
                 );
             }
+            assert_eq!(prepared_rows, 2);
             assert_eq!(
                 c.query("CREATE TEMP TABLE async_copy(v int)", at, |_| Ok(()))
                     .await

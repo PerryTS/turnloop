@@ -83,6 +83,62 @@ else: print('test result: ok. 3 passed; 0 failed;')
             runner.protocol_tests([p], [], ROOT, None)
         self.assertEqual(len(called), 2)
 
+    def test_wasi_real_servers_runs_native_setup_and_requires_actual_execution(self):
+        runner = module('run-tests')
+        p = package('mongo')
+        p['manifest_path'] = str(ROOT / 'protocols/mongo/Cargo.toml')
+        p['metadata'] = {'turnloop-ci': {'role': 'protocol', 'wasi-tests': ['socket'],
+            'wasi-setup-tests': ['bootstrap'], 'wasi-integration-tests': ['real']}}
+        p['targets'] = [{'name': name, 'kind': ['test'], 'required-features': ['turnloop']}
+                        for name in ('socket', 'bootstrap', 'real')]
+        data = {'workspace_root': str(ROOT), 'workspace_members': ['mongo'], 'packages': [p]}
+        argv = ['run-tests.py', 'protocol-wasi', '--target', 'wasm32-wasip2', '--real-servers']
+        for count in (2, 0):
+            with self.subTest(passed=count), tempfile.TemporaryDirectory() as folder:
+                log = Path(folder) / 'calls.txt'
+                script = Path(folder) / 'cargo.py'
+                script.write_text("import pathlib,sys,os\n"
+                    "assert os.environ['TURNLOOP_TEST_REQUIRED'] == '1'\n"
+                    "with pathlib.Path(sys.argv[1]).open('a') as f: f.write(' '.join(sys.argv[2:]) + '\\n')\n"
+                    f"print('test result: ok. {count} passed; 0 failed;')\n")
+                with patch.object(sys, 'argv', argv), patch.object(runner, 'metadata', return_value=data), \
+                     patch.object(runner, 'cargo', return_value=[sys.executable, str(script), str(log)]), \
+                     redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                    if count:
+                        runner.main()
+                    else:
+                        with self.assertRaises(RuntimeError):
+                            runner.main()
+                calls = log.read_text().splitlines()
+                self.assertEqual(len(calls), 3 if count else 1)
+                self.assertIn('--test bootstrap', calls[0])
+                self.assertNotIn('--target', calls[0])
+                if count:
+                    self.assertIn('--test socket', calls[1])
+                    self.assertNotIn('--include-ignored', calls[1])
+                    self.assertIn('--target wasm32-wasip2', calls[2])
+                    self.assertIn('--test real', calls[2])
+                    self.assertIn('--include-ignored', calls[2])
+                    self.assertIn('--features turnloop', calls[2])
+
+    def test_p3_allocator_profile_keeps_the_same_suite_and_required_features(self):
+        runner = module('run-tests')
+        p = package('db')
+        p['metadata'] = {'turnloop-ci': {'role': 'protocol', 'wasi-tests': ['asynchronous'],
+                                      'wasi-p3-release-tests': ['asynchronous']}}
+        p['targets'] = [{'name': 'asynchronous', 'kind': ['test'], 'required-features': ['turnloop']}]
+        data = {'workspace_root': '/workspace', 'workspace_members': ['db'], 'packages': [p]}
+        for target in ('wasm32-wasip2', 'wasm32-wasip3'):
+            with self.subTest(target=target), patch.object(sys, 'argv', ['run-tests.py', 'protocol-wasi', '--target', target]), \
+                 patch.object(runner, 'metadata', return_value=data), patch.object(runner, 'checked_tests') as checked:
+                runner.main()
+                checked.assert_called_once()
+                command = checked.call_args.args[0]
+                self.assertEqual(command[command.index('--test') + 1], 'asynchronous')
+                self.assertEqual('--release' in command, target == 'wasm32-wasip3')
+                self.assertIn('--all-features' if target.endswith('p3') else '--features', command)
+                self.assertEqual(command[-2:], ['--', '--test-threads=1'])
+
 
 if __name__ == '__main__':
     unittest.main()

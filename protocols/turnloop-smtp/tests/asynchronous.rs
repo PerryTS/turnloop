@@ -211,3 +211,88 @@ fn warmed_async_send_allocates_only_owned_result() {
     drive(&mut ex, &mut client);
     assert_eq!(drive(&mut ex, &mut server), 101);
 }
+
+#[test]
+fn idle_transport_parks_and_cancelled_send_closes_socket() {
+    let mut ex = LocalExecutor::<Platform>::new(LoopConfig::default()).expect("executor");
+    let h = ex.handle();
+    let listener = Listener::bind(&h, "127.0.0.1:0".parse().expect("address")).expect("listen");
+    let address = listener.local_addr().expect("address");
+    let mut server = ex
+        .spawn_local(async move {
+            let mut s = listener.accept().await.expect("accept");
+            write_all(&mut s, b"220 test\r\n").await.expect("hello");
+            assert!(line(&mut s).await.starts_with(b"EHLO"));
+            write_all(&mut s, b"250-test\r\n250 PIPELINING\r\n")
+                .await
+                .expect("hello");
+            assert_eq!(line(&mut s).await, b"MAIL FROM:<a@example.test>\r\n");
+            assert_eq!(line(&mut s).await, b"RCPT TO:<ok@example.test>\r\n");
+            let mut byte = [0];
+            assert_eq!(read(&mut s, &mut byte).await.expect("cancel EOF"), 0);
+            2
+        })
+        .expect("server");
+    let idle = std::rc::Rc::new(std::cell::Cell::new(false));
+    let client_idle = idle.clone();
+    let mut client = ex
+        .spawn_local(async move {
+            let at = h.now() + Duration::from_secs(5);
+            let mut c = Transport::connect(
+                &h,
+                &ConnectOptions {
+                    address,
+                    protocol: turnloop_smtp::Config {
+                        tls: Tls::None,
+                        ..Default::default()
+                    },
+                    tls: None,
+                },
+                at,
+            )
+            .await
+            .expect("connect");
+            client_idle.set(true);
+            h.sleep(Duration::from_millis(60))
+                .await
+                .expect("idle timer");
+            let result = deadline(
+                &h,
+                h.now() + Duration::from_millis(20),
+                c.send(
+                    Envelope {
+                        from: "a@example.test".into(),
+                        to: vec!["ok@example.test".into()],
+                    },
+                    "message-id".into(),
+                    b"payload",
+                    at,
+                ),
+            )
+            .await;
+            assert_eq!(
+                result.expect_err("drop pending send").kind(),
+                std::io::ErrorKind::TimedOut
+            );
+            assert!(!c.is_reusable());
+        })
+        .expect("client");
+    let end = ex.handle().now() + Duration::from_secs(5);
+    while !idle.get() {
+        assert!(ex.handle().now() < end);
+        ex.turn(Timeout::Until(end)).expect("turn");
+    }
+    let mut waited = false;
+    for _ in 0..8 {
+        let before = ex.handle().now();
+        let info = ex.turn(Timeout::Until(end)).expect("idle turn");
+        if ex.handle().now().duration_since(before) >= Duration::from_millis(10) {
+            assert_eq!(info.os_waits, 1);
+            waited = true;
+            break;
+        }
+    }
+    assert!(waited, "idle SMTP transport spun instead of parking");
+    drive(&mut ex, &mut client);
+    assert_eq!(drive(&mut ex, &mut server), 2);
+}

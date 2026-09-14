@@ -163,3 +163,94 @@ fn unsupported_wasi_dns_releases_reserved_slots() {
     }
     assert_eq!(finish(&mut task), 16);
 }
+
+#[cfg(all(unix, not(target_arch = "wasm32")))]
+#[test]
+fn blocking_worker_and_dns_validation_deliver_results() {
+    let mut executor = LocalExecutor::<Platform>::new(Config::default()).expect("executor");
+    let h = executor.handle();
+    let main_thread = std::thread::current().id();
+    let mut task = executor
+        .spawn_local(async move {
+            let result = h
+                .blocking(move || {
+                    assert_ne!(
+                        std::thread::current().id(),
+                        main_thread,
+                        "must execute off loop"
+                    );
+                    Ok(turnloop::Payload::Boxed(Box::new(42u32)))
+                })
+                .await
+                .expect("worker completion");
+            match result {
+                turnloop::Payload::Boxed(v) => {
+                    assert_eq!(*v.downcast::<u32>().expect("payload"), 42)
+                }
+                _ => panic!("wrong completion"),
+            }
+            // The native resolver validates this on its worker without network I/O.
+            let error = dns::query(
+                &h,
+                "invalid..name".into(),
+                dns::Query::Srv,
+                h.now() + Duration::from_secs(3),
+            )
+            .await
+            .expect_err("invalid DNS label");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            2
+        })
+        .expect("spawn");
+    let at = executor.handle().now() + Duration::from_secs(5);
+    while !task.is_finished() {
+        assert!(executor.handle().now() < at);
+        executor.turn(Timeout::Until(at)).expect("turn");
+    }
+    assert_eq!(finish(&mut task), 2);
+}
+
+#[cfg(all(unix, not(target_arch = "wasm32")))]
+#[test]
+#[ignore = "requires external DNS; deterministic wire/worker tests run by default"]
+fn native_srv_txt_records_through_blocking_pool() {
+    let mut executor = LocalExecutor::<Platform>::new(Config::default()).expect("executor");
+    let h = executor.handle();
+    let mut task = executor
+        .spawn_local(async move {
+            let at = h.now() + Duration::from_secs(15);
+            let records = dns::query(
+                &h,
+                "_xmpp-server._tcp.jabber.org".into(),
+                dns::Query::Srv,
+                at,
+            )
+            .await
+            .expect("native SRV query");
+            assert!(
+                records
+                    .iter()
+                    .any(|r| matches!(r, dns::Record::Srv { target, port: 5269, .. }
+            if target.ends_with(".jabber.org"))),
+                "actual XMPP service record: {records:?}"
+            );
+            let records = dns::query(&h, "example.com".into(), dns::Query::Txt, at)
+                .await
+                .expect("native TXT query");
+            assert!(
+                records
+                    .iter()
+                    .any(|r| matches!(r, dns::Record::Txt { text, .. }
+            if text.starts_with("v=spf1"))),
+                "actual SPF record: {records:?}"
+            );
+            2
+        })
+        .expect("spawn");
+    let at = executor.handle().now() + Duration::from_secs(20);
+    while !task.is_finished() {
+        assert!(executor.handle().now() < at);
+        executor.turn(Timeout::Until(at)).expect("turn");
+    }
+    assert_eq!(finish(&mut task), 2);
+}

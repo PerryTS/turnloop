@@ -184,7 +184,12 @@ def main():
                     target_features = ['--features', ','.join(required)] if required else []
                     if args.target == 'wasm32-wasip3' and (required or role(package) == 'adapter'):
                         target_features = ['--all-features']
-                    checked_tests(base + ['-p', package['name'], '--test', target] + target_features +
+                    # The pinned p3 compiler can trap before main when lowering
+                    # arguments through a debug custom allocator. Keep the actual
+                    # allocation/semantic assertions in release, as the core gate
+                    # does (docs/lanes/wasm2-wasm3.md); never accept zero tests.
+                    profile = ['--release'] if args.target == 'wasm32-wasip3' and target in settings(package).get('wasi-p3-release-tests', []) else []
+                    checked_tests(base + ['-p', package['name'], '--test', target] + target_features + profile +
                         ['--', '--test-threads=1'] + (['--include-ignored', '--nocapture'] if target in settings(package).get('wasi-integration-tests', []) else []), cwd=root, env=env)
         else:
             for package in select(data, 'core'):

@@ -48,6 +48,20 @@ struct Owner<B: Backend + 'static> {
     random: &'static dyn turnloop_tls::rustls::crypto::SecureRandom,
     _monitor: JoinHandle<()>,
 }
+// Balance selection load accounting even when a checkout or command is cancelled.
+struct ActiveOperation<'a, B: Backend + 'static> {
+    owner: &'a Owner<B>,
+    address: &'a str,
+}
+impl<B: Backend + 'static> Drop for ActiveOperation<'_, B> {
+    fn drop(&mut self) {
+        self.owner
+            .state
+            .borrow_mut()
+            .topology
+            .operation_finished(self.address);
+    }
+}
 pub struct Client<B: Backend + 'static> {
     owner: Rc<Owner<B>>,
     operation: Operation,
@@ -519,6 +533,16 @@ async fn run<B: Backend + 'static>(
                     .get(address)
                     .cloned()
                     .ok_or_else(|| io::Error::other("selected pool disappeared"))?;
+                owner
+                    .state
+                    .borrow_mut()
+                    .topology
+                    .operation_started(selected)
+                    .map_err(io::Error::other)?;
+                let _active = ActiveOperation {
+                    owner,
+                    address: selected,
+                };
                 match pool.acquire(at).await {
                     Ok(mut connection) => {
                         operation.checked_out().map_err(io::Error::other)?;

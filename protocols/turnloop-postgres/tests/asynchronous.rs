@@ -233,6 +233,13 @@ fn warmed_async_pool_queries_allocate_zero_and_idle_waits() {
                 Duration::from_secs(5),
             )
             .expect("pool");
+            let held = pool.acquire(at).await.expect("hold only slot");
+            let blocked = pool.acquire(h.now() + Duration::from_millis(10)).await;
+            assert!(
+                matches!(blocked, Err(e) if e.kind() == std::io::ErrorKind::TimedOut),
+                "queued acquire deadline must run"
+            );
+            drop(held);
             for i in 0..1001 {
                 let (rows, n) = count::measure(async {
                     let mut c = pool.acquire(at).await.expect("acquire");

@@ -122,6 +122,17 @@ fn command_reply_and_cancel_close() {
 }
 #[test]
 fn warmed_async_client_selection_pool_and_reply_allocate_zero() {
+    for preference in [
+        "primary",
+        "primaryPreferred",
+        "secondary",
+        "secondaryPreferred",
+        "nearest",
+    ] {
+        warmed_selection(preference);
+    }
+}
+fn warmed_selection(preference: &str) {
     use turnloop_mongodb::{
         asynchronous::{Client, ConnectOptions},
         operation::OperationKind,
@@ -139,6 +150,7 @@ fn warmed_async_client_selection_pool_and_reply_allocate_zero() {
         for _ in 0..1001 {let m=mongo_packet(&mut s).await;let m=wire::Message::parse(&m,16384).expect("command");assert_eq!(m.body.get_i32("ping").expect("ping"),1);wire::encode(&mut reply,1,m.request_id,0,&body,&[],16384).expect("encode");write_all(&mut s,&reply).await.expect("reply");}
         1001
     }).expect("server");
+    let preference = preference.to_owned();
     let mut client = ex
         .spawn_local(async move {
             count::prove_counter().await;
@@ -147,7 +159,7 @@ fn warmed_async_client_selection_pool_and_reply_allocate_zero() {
                 &h,
                 ConnectOptions {
                     protocol: Options::parse(&format!(
-                        "mongodb://{address}/?directConnection=true&heartbeatFrequencyMS=60000"
+                        "mongodb://{address}/?directConnection=true&heartbeatFrequencyMS=60000&readPreference={preference}"
                     ))
                     .expect("options"),
                     tls: None,

@@ -236,6 +236,8 @@ fn warmed_async_pool_ping_allocates_zero() {
             1001
         })
         .expect("server");
+    let idle = std::rc::Rc::new(std::cell::Cell::new(false));
+    let client_idle = idle.clone();
     let mut client = ex
         .spawn_local(async move {
             count::prove_counter().await;
@@ -250,11 +252,19 @@ fn warmed_async_pool_ping_allocates_zero() {
                 turnloop_mysql::pool::Config {
                     max: 1,
                     max_idle: 1,
+                    idle_timeout: Some(Duration::from_millis(100)),
                     ..Default::default()
                 },
                 Duration::from_secs(5),
             )
             .expect("pool");
+            let held = pool.acquire(at).await.expect("hold only slot");
+            let blocked = pool.acquire(h.now() + Duration::from_millis(10)).await;
+            assert!(
+                matches!(blocked, Err(e) if e.kind() == std::io::ErrorKind::TimedOut),
+                "queued acquire deadline must run"
+            );
+            drop(held);
             for i in 0..1001 {
                 let (result, n) = count::measure(async {
                     let mut c = pool.acquire(at).await.expect("acquire");
@@ -266,9 +276,31 @@ fn warmed_async_pool_ping_allocates_zero() {
                     assert_eq!(n, 0, "async ping + checkout/release");
                 }
             }
+            assert_eq!(pool.total(), 1);
+            client_idle.set(true);
+            h.sleep(Duration::from_millis(150))
+                .await
+                .expect("idle expiry timer");
+            assert_eq!(pool.total(), 0, "real idle deadline must retire the socket");
             pool.end().await.expect("end");
         })
         .expect("client");
+    let end = ex.handle().now() + Duration::from_secs(30);
+    while !idle.get() {
+        assert!(ex.handle().now() < end);
+        ex.turn(Timeout::Until(end)).expect("turn");
+    }
+    let mut waited = false;
+    for _ in 0..8 {
+        let before = ex.handle().now();
+        let info = ex.turn(Timeout::Until(end)).expect("idle turn");
+        if ex.handle().now().duration_since(before) >= Duration::from_millis(10) {
+            assert_eq!(info.os_waits, 1);
+            waited = true;
+            break;
+        }
+    }
+    assert!(waited, "idle MySQL pool spun instead of parking");
     drive(&mut ex, &mut client);
     assert_eq!(drive(&mut ex, &mut server), 1001);
 }

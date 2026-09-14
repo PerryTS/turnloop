@@ -28,6 +28,8 @@ workspace = true
 [package.metadata.turnloop-ci]
 role = "protocol"
 wasi-tests = ["asynchronous"]
+# Pinned p3 compiler: custom allocator traps before main in debug (wasm2 report).
+wasi-p3-release-tests = ["asynchronous"]
 wasi-integration-tests = ["async_server"]
 integration-tests = ["smtp", "async_server"]
 
