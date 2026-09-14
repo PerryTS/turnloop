@@ -1,17 +1,17 @@
-# windlass: an embeddable, cross-platform event-loop driver
+# turnloop: an embeddable, cross-platform event-loop driver
 
 **Status:** draft 0.2 for review · 2026-09-14 (0.2: tokio replaced everywhere with no sidecar; WASI and web in the first release; protocol layer added; multithreading model based on the `perry/thread` code map)\
-**Working name:** `windlass`. Also free on crates.io as of today: `hostloop`, `turnloop`, `perloop`, `perev`.\
+**Name:** `turnloop` (chosen 2026-09-14; free on crates.io that day).\
 **First consumer:** Perry, removing tokio from every target and every crate.\
 **License / home:** MIT, a standalone repository, published to crates.io from day one.
 
-A windlass is a winch that someone else turns. This crate is an event-loop driver that someone else turns: the host program owns the loop and the thread, and calls `turn()` when it wants I/O, timers and wake-ups to make progress.
+turnloop is an event loop that someone else turns: the host program owns the loop and the thread, and calls `turn()` when it wants I/O, timers and wake-ups to make progress.
 
 ---
 
 ## 1. Summary
 
-`windlass` is a small, cross-platform I/O and timer driver built to be **embedded in a host's event loop**. It is not built to own the thread. It delivers the part of libuv that the Rust ecosystem lacks:
+`turnloop` is a small, cross-platform I/O and timer driver built to be **embedded in a host's event loop**. It is not built to own the thread. It delivers the part of libuv that the Rust ecosystem lacks:
 
 - **A bounded turn.** `turn(timeout)` does at most one OS wait and returns completions. It never runs user code.
 - **A way to be woken from outside, on every platform:** a pollable fd on Unix, an event handle on Windows, and a cross-thread notifier that makes no syscall while the loop isn't parked.
@@ -89,7 +89,7 @@ flowchart TB
     H1["event loop: JS, microtasks, Node phases"]
     H2["GC rooting / pinning, promises, error mapping"]
   end
-  subgraph W["windlass"]
+  subgraph W["turnloop"]
     API["Loop API: submit ops with tokens · turn(timeout) → completions"]
     TM["Timer heap: ns deadlines"]
     NT["Notifier: Send + Sync, atomic park state"]
@@ -197,7 +197,7 @@ There are two ways a host drives a loop:
 - **The host has its own blocking wait** (GUI toolkits, libuv, other runtimes): call `loop.integration()`:
   - `Integration::Fd(RawFd)` on Unix: the epoll/kqueue fd becomes readable when `turn` has work. Add it to the host's poller along with `next_deadline()`.
   - `Integration::Event(HANDLE)` on Windows: an IOCP handle is **not** a waitable object (`MsgWaitForMultipleObjectsEx` can't wait on it, and libuv's `uv_backend_fd` is Unix-only). An opt-in helper thread blocks in `GetQueuedCompletionStatusEx`, moves entries to the loop's queue and signals an auto-reset event. The host waits on that event and calls `turn(Now)`.
-  - `Integration::HostCallback` on the web (and any host that owns scheduling): windlass calls a host-provided `schedule_turn()` when work arrives; the host calls `turn(Now)` (§7.5).
+  - `Integration::HostCallback` on the web (and any host that owns scheduling): turnloop calls a host-provided `schedule_turn()` when work arrives; the host calls `turn(Now)` (§7.5).
   - `Integration::RuntimeOwned` on WASI: the runtime schedules the component, and `turn` waits inside the WASI poll/async primitive (§7.4).
 
 ### D8. Blocking pool
@@ -216,7 +216,7 @@ There are two ways a host drives a loop:
 
 ## 5a. Multithreading
 
-`perry/thread` is system-wide multithreading, so windlass treats many JS-running threads as the normal case.
+`perry/thread` is system-wide multithreading, so turnloop treats many JS-running threads as the normal case.
 
 ### What Perry does today (base `4945fc1f74`)
 
@@ -272,23 +272,23 @@ There are two ways a host drives a loop:
 
 ## 5b. Protocol layer: which protocols have to be implemented
 
-Without a sidecar, every tokio-bound crate Perry uses has to be replaced. The rule: **use a sans-IO or runtime-agnostic protocol crate where a good one exists; implement the client or server logic ourselves on top of windlass where none does.** Protocol code lives in sibling crates (in the windlass repository, or as Perry ext crates), never in the core.
+Without a sidecar, every tokio-bound crate Perry uses has to be replaced. The rule: **use a sans-IO or runtime-agnostic protocol crate where a good one exists; implement the client or server logic ourselves on top of turnloop where none does.** Protocol code lives in sibling crates (in the turnloop repository, or as Perry ext crates), never in the core.
 
 | Perry surface | Today (tokio-bound) | Replacement | Work |
 |---|---|---|---|
-| HTTP/1.1 + HTTP/2 server (`node:http`, fastify, framework) | hyper + hyper-util `server-auto` (tokio) | hyper 1.x `server::conn` via `hyper::rt` on windlass; own accept loop and graceful shutdown | medium |
-| HTTP client (`fetch`, axios, undici) | reqwest (tokio) | hyper 1.x `client::conn` on windlass + own pool, redirects, proxy, decompression, cookies as needed | **large** (reqwest's feature surface) |
+| HTTP/1.1 + HTTP/2 server (`node:http`, fastify, framework) | hyper + hyper-util `server-auto` (tokio) | hyper 1.x `server::conn` via `hyper::rt` on turnloop; own accept loop and graceful shutdown | medium |
+| HTTP client (`fetch`, axios, undici) | reqwest (tokio) | hyper 1.x `client::conn` on turnloop + own pool, redirects, proxy, decompression, cookies as needed | **large** (reqwest's feature surface) |
 | TLS | tokio-rustls | rustls unbuffered API adapter | small–medium |
-| WebSocket (`ws`) | tokio-tungstenite | tungstenite protocol core over windlass streams | small–medium |
+| WebSocket (`ws`) | tokio-tungstenite | tungstenite protocol core over turnloop streams | small–medium |
 | PostgreSQL (`pg`) | sqlx `runtime-tokio` | `postgres-protocol` (sans-IO messages, SCRAM) + own connection, pipeline and pool | **large** |
 | MySQL (`mysql2`) | sqlx `runtime-tokio` | `mysql_common` (sans-IO packets, auth plugins, value codec) + own connection and pool | **large** |
 | Redis (`ioredis`) | redis `tokio-comp` | RESP codec (`redis-protocol`) + own client: pipelining, pub/sub, reconnect; cluster/sentinel scoped separately | medium–large |
 | MongoDB (`mongodb`) | official driver (tokio-only) | `bson` + own OP_MSG wire protocol, SCRAM auth, server discovery and monitoring, pool, TLS | **largest**; no sans-IO driver exists |
-| SMTP (nodemailer) | lettre `tokio1` | lettre's runtime-agnostic message builder + own SMTP client on windlass + rustls | small–medium |
+| SMTP (nodemailer) | lettre `tokio1` | lettre's runtime-agnostic message builder + own SMTP client on turnloop + rustls | small–medium |
 | DNS | tokio blocking lookups | blocking pool `getaddrinfo`/`GetAddrInfoW`; `hickory-proto` for async/DoH later | small |
-| child_process, container | `tokio::process` | windlass processes | covered by core |
+| child_process, container | `tokio::process` | turnloop processes | covered by core |
 | cron | `tokio-cron-scheduler` (never referenced) | delete the dependency | trivial |
-| Linux tray/MPRIS (gtk4: ksni, mpris via zbus) | zbus `tokio` feature | zbus's non-tokio mode runs its own small executor thread (async-io). Decide: accept for this Linux-desktop-only surface, or drive zbus on windlass | decision |
+| Linux tray/MPRIS (gtk4: ksni, mpris via zbus) | zbus `tokio` feature | zbus's non-tokio mode runs its own small executor thread (async-io). Decide: accept for this Linux-desktop-only surface, or drive zbus on turnloop | decision |
 
 **The one dependency question left:** hyper's HTTP/2 support pulls in `h2`, which uses tokio's `AsyncRead`/`AsyncWrite` traits and `tokio-util`'s codec. That is tokio's *crate* but not its runtime (`io-util` only; no `rt`, `net`, `time`). Options:
 - **(a)** allow `tokio` with `io-util` only, and gate in CI that no runtime feature is enabled anywhere
@@ -302,7 +302,7 @@ Without a sidecar, every tokio-bound crate Perry uses has to be replaced. The ru
 pub struct Loop { /* !Send */ }
 pub struct Handle(u32);                 // generational index
 pub struct OpId(u64);
-pub struct Token(pub u64);              // opaque to windlass
+pub struct Token(pub u64);              // opaque to turnloop
 
 impl Loop {
     pub fn new(cfg: Config) -> io::Result<Loop>;
@@ -416,7 +416,7 @@ Two backends, because both versions matter now:
 ### 7.5 Web (browser host, Perry's `--target web` / `--target wasm`)
 
 - **The event loop belongs to the browser.** `turn` never blocks on the main thread: only `Timeout::Now` is allowed there. A blocking `turn` is allowed only inside a Web Worker, where `Atomics.wait` is permitted.
-- **Integration:** `Integration::HostCallback`. When a completion is posted (a JS callback firing), windlass calls an imported `schedule_turn()`, which queues a macrotask or microtask in the host; the host then calls `turn(Now)`. Perry's `perry-wasm-host` provides the imports.
+- **Integration:** `Integration::HostCallback`. When a completion is posted (a JS callback firing), turnloop calls an imported `schedule_turn()`, which queues a macrotask or microtask in the host; the host then calls `turn(Now)`. Perry's `perry-wasm-host` provides the imports.
 - **Backend = host imports:**
   - timers via `setTimeout`/`clearTimeout`, or the host's scheduler
   - HTTP via `fetch` with `AbortController`
@@ -460,10 +460,10 @@ Two backends, because both versions matter now:
 |---|---|---|
 | JS values, promises, callbacks | Perry | Tokens map to Perry-side records. Results convert to JS values on the main thread, as `spawn_for_promise_deferred` does today |
 | GC rooting and pinning | Perry | Root Buffers and pin promises from submit to completion; exactly-once completion (D4) gives the release point. `gc_register_mutable_root_scanner` stays Perry's |
-| Event-loop phase order | Perry | Today one iteration runs microtasks → timers and immediates in the same batch → nextTick → intervals → cron → all I/O pumps → park (`promise/microtasks.rs:1192–1221`), which is **not** Node's order. Moving to windlass is the opportunity to implement timers → pending → poll (`turn`) → check → close; gated by gap tests |
+| Event-loop phase order | Perry | Today one iteration runs microtasks → timers and immediates in the same batch → nextTick → intervals → cron → all I/O pumps → park (`promise/microtasks.rs:1192–1221`), which is **not** Node's order. Moving to turnloop is the opportunity to implement timers → pending → poll (`turn`) → check → close; gated by gap tests |
 | Microtasks, nextTick | Perry | unchanged |
 | Error text and codes | Perry | Map `Error { kind, os }` to Node's `code`/`errno`/`syscall` |
-| Keep-alive for JS-level resources | Perry | Uses windlass `alive()` plus its own JS timers until those move (P3) |
+| Keep-alive for JS-level resources | Perry | Uses turnloop `alive()` plus its own JS timers until those move (P3) |
 | Thread-pool jobs touching JS | never | Pool jobs are `Send` Rust closures; results convert on the main thread |
 
 **Wiring for P0:**
@@ -476,7 +476,7 @@ No other Perry change is needed for P0.
 
 **perry-ffi async ABI:**
 - Today's `spawn_async` / `spawn_blocking` / `run_pending` assume an ambient tokio `Handle` (`perry-ffi/src/async_runtime.rs:383, 431, 469, 82`), and ext crates call `Handle::current().block_on`.
-- **v2** is token-based on windlass:
+- **v2** is token-based on turnloop:
   - `spawn_async` runs on the calling thread's loop executor
   - `spawn_blocking` goes to the shared pool
   - `run_pending` becomes a bounded `turn`
@@ -526,12 +526,12 @@ Each phase must pass all of these before it lands:
 
 | Phase | Change | Removes |
 |---|---|---|
-| **P0** | windlass behind the existing `js_register_wait_driver` hooks; timers stay in Perry | `block_on` + `Notify` + timeout per turn, 1 ms floors |
-| **P1** | net (bundled stdlib and perry-ext-net, including Windows named-pipe IPC) on windlass handles | tokio net tasks, mpsc-per-write |
-| **P2** | child_process, pty, stdin, dgram and signals on windlass | per-pipe reader threads and polling readers (`os_process_streams.rs:361`, `dgram_reactor.rs:73`) on Unix; Windows keeps reader threads only where the OS requires them |
-| **P3** | JS timers into the windlass heap; Node phase order | Vec scans, ms truncation, spin-until-throttle |
+| **P0** | turnloop behind the existing `js_register_wait_driver` hooks; timers stay in Perry | `block_on` + `Notify` + timeout per turn, 1 ms floors |
+| **P1** | net (bundled stdlib and perry-ext-net, including Windows named-pipe IPC) on turnloop handles | tokio net tasks, mpsc-per-write |
+| **P2** | child_process, pty, stdin, dgram and signals on turnloop | per-pipe reader threads and polling readers (`os_process_streams.rs:361`, `dgram_reactor.rs:73`) on Unix; Windows keeps reader threads only where the OS requires them |
+| **P3** | JS timers into the turnloop heap; Node phase order | Vec scans, ms truncation, spin-until-throttle |
 | **P4** | blocking pool for bcrypt, argon2, sharp, zlib and crypto; perry-ffi ABI v2 | tokio `spawn_blocking` |
-| **P5** | HTTP server (hyper `server::conn`) and TLS (rustls adapter) and WebSocket (tungstenite) on windlass | hyper-util tokio, tokio-rustls, tokio-tungstenite |
+| **P5** | HTTP server (hyper `server::conn`) and TLS (rustls adapter) and WebSocket (tungstenite) on turnloop | hyper-util tokio, tokio-rustls, tokio-tungstenite |
 | **P6** | HTTP client replacing reqwest (fetch, axios, undici); SMTP client replacing lettre's tokio transport | reqwest, lettre tokio |
 | **P7** | Database clients: Postgres, MySQL, Redis, MongoDB on the protocol crates (§5b) | sqlx, redis tokio-comp, mongodb driver |
 | **P8** | Remove `async-runtime` / tokio from perry-stdlib, perry-ffi and every ext crate; web and WASI targets use the same stdlib paths through their backends; CI gate: `cargo tree -i tokio` is empty, or `io-util` only if §5b option (a) is chosen, for every target | tokio |
@@ -540,16 +540,16 @@ P5–P7 are independent of each other once P1 and P4 have landed, and can run as
 
 ## 13. Release, versioning and supply chain
 
-- **Repository:** standalone under the PerryTS GitHub org, MIT, with `SECURITY.md`. Releases go to crates.io through **Trusted Publishing** (GitHub OIDC), so there are no long-lived tokens.
-- **Versioning:** `0.x` while Perry is the only consumer; breaking changes bump the minor version. Perry pins `windlass = "=0.x.y"`.
-- **Soak policy:** Perry's `.cargo/config.toml` sets `global-min-publish-age = "7 days"`, which would hide every new release for a week. **Standing policy: follow the perex precedent** (`1febaef5e0`, perex 0.1.4) on every windlass bump:
+- **Repository:** `github.com/PerryTS/turnloop`, standalone under the PerryTS GitHub org, MIT, with `SECURITY.md`. Releases go to crates.io through **Trusted Publishing** (GitHub OIDC), so there are no long-lived tokens.
+- **Versioning:** `0.x` while Perry is the only consumer; breaking changes bump the minor version. Perry pins `turnloop = "=0.x.y"`.
+- **Soak policy:** Perry's `.cargo/config.toml` sets `global-min-publish-age = "7 days"`, which would hide every new release for a week. **Standing policy: follow the perex precedent** (`1febaef5e0`, perex 0.1.4) on every turnloop bump:
   1. lock the new version with a one-time publish-age override
   2. verify the `.crate` checksum against the downloaded crate
   3. record the publish timestamp, source commit and checksum in the commit message
 - **Dependencies:**
   - Core depends only on `libc`/`rustix` (Unix), `windows-sys` (Windows), the WASI bindings (`wasi` / `wit-bindgen`) and `wasm-bindgen`/`js-sys` for the web backend, each behind its target cfg.
   - Integration features pull their own crates (`futures-io`, `hyper`, `rustls`) and are off by default.
-  - No crate in the windlass repository depends on `tokio`, apart from the `io-util`-only exception in §5b option (a), if chosen, confined to the HTTP/2 path.
+  - No crate in the turnloop repository depends on `tokio`, apart from the `io-util`-only exception in §5b option (a), if chosen, confined to the HTTP/2 path.
 
 ## 14. Milestones
 
@@ -567,14 +567,14 @@ P5–P7 are independent of each other once P1 and P4 have landed, and can run as
 
 ## 15. Open questions
 
-1. **Name.** `windlass` is a working name.
+1. **Name.** Settled: `turnloop`.
 2. **`sys` layer.** Own thin backends vs building on compio-driver (IOCP and io_uring already done) vs `polling`/mio for Unix. Decided in M1 with instruction numbers.
 3. **Windows timer mechanism.** Alertable GQCSEx + waitable timer APC, or timer-to-port association.
 4. **Pooled buffer sizing and lease lifetime.** Until the next `turn`, or explicit release only?
 5. **io_uring timing.** When, and whether as the default where available.
 6. **Mobile CI.** iOS (kqueue) and Android (epoll) come almost free from the Unix backends. Which simulators/emulators run in CI.
 7. **DNS.** `getaddrinfo` on the pool is correct but coarse. Whether `hickory-proto` is in scope for 0.x.
-8. **Where protocol crates live.** In the windlass repository as siblings, or as Perry ext crates.
+8. **Where protocol crates live.** In the turnloop repository as siblings, or as Perry ext crates.
 9. **The h2 / tokio `io-util` question** (§5b).
 10. **zbus for the Linux tray/MPRIS surface** (§5b).
 11. **Async inside `perry/thread` workers.** The compiler forbids it today. With a loop per agent it becomes possible; whether and when Perry allows it is a language decision.

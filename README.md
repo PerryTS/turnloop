@@ -1,4 +1,4 @@
-# windlass (working name)
+# turnloop
 
 An embeddable, cross-platform event-loop driver that the host turns: bounded `turn()`, completion-shaped I/O,
 native backends for Linux (epoll), macOS/BSD (kqueue), Windows (IOCP), WASI 0.2/0.3 and the web.
