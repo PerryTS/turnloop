@@ -37,7 +37,7 @@ impl Driver {
             let mut roots = rustls::RootCertStore::empty();
             roots
                 .add(rustls::pki_types::CertificateDer::from(
-                    include_bytes!("../../turnloop-smtp/tests/fixtures/ca.der").to_vec(),
+                    include_bytes!("fixtures/ca.der").to_vec(),
                 ))
                 .unwrap();
             let config = rustls::ClientConfig::builder()

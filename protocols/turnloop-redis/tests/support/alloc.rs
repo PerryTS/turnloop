@@ -13,19 +13,22 @@ fn count() {
 // thread-local counters have constant initialization and do not allocate.
 unsafe impl GlobalAlloc for Counter {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        count(); /* SAFETY: caller supplies a valid allocation layout. */
+        count();
+        // SAFETY: caller supplies a valid allocation layout.
         unsafe { System.alloc(layout) }
     }
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        count(); /* SAFETY: forwarded allocation layout. */
+        count();
+        // SAFETY: forwarded allocation layout.
         unsafe { System.alloc_zeroed(layout) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        /* SAFETY: pointer and layout are those supplied by this allocator. */
+        // SAFETY: pointer and layout are those supplied by this allocator.
         unsafe { System.dealloc(ptr, layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        count(); /* SAFETY: caller supplies the live allocation and valid new size. */
+        count();
+        // SAFETY: caller supplies the live allocation and valid new size.
         unsafe { System.realloc(ptr, layout, size) }
     }
 }

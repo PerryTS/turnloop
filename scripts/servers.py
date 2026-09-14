@@ -7,7 +7,6 @@ import json
 import os
 from pathlib import Path
 import random
-import signal
 import socket
 import subprocess
 import sys
@@ -81,7 +80,7 @@ def start():
                 node_file = directory / 'nodes.conf'
                 node_file.unlink(missing_ok=True)
                 lines += ['cluster-enabled yes', 'cluster-config-file nodes.conf',
-                          'cluster-node-timeout 1000', f'cluster-announce-ip 127.0.0.1',
+                          'cluster-node-timeout 1000', 'cluster-announce-ip 127.0.0.1',
                           f'cluster-announce-port {value}']
             else:
                 lines += [f'sentinel monitor turnloop 127.0.0.1 {ports[0]} 1',
