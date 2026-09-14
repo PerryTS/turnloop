@@ -1,0 +1,126 @@
+# Core lane report
+
+Branch: `lane/core`. Specification: DESIGN.md draft 0.2, read in full with LANES.md.
+Only this clone is modified. No publishing or remote operations.
+
+## Implemented
+
+- Step 1: three-crate workspace, stable Rust edition 2024, target-selected backend cfg,
+  release/bench codegen-units=1, shared unsafe lint. Dependency soak remains unchanged.
+- Steps 2–9: in progress.
+
+## Verification log
+
+Commands below are run in this clone. PASS means the command exited successfully;
+cross-checking is not execution of target tests.
+
+- FAIL: `rustc --version` through rust-toolchain.toml auto-sync: rustup reported
+  `failed to install component: 'rust-std-wasm32-unknown-unknown', detected conflict`
+  for `libaddr2line-f2b6e6cbcc23e6ae.rlib`. Existing explicit pinned toolchain works.
+- PASS: `cargo +nightly-2026-08-20 --version`: 1.100.0-nightly.
+- PASS: `cargo +stable --version`: 1.97.1 (environment differs from advertised stable
+  1.98; a separate `1.98.0` toolchain is installed).
+- PASS: `rustup target list --installed --toolchain nightly-2026-08-20`: includes
+  macOS arm64 and Linux/Windows/Wasm targets required by the task.
+
+## Deviations and proposed spec changes
+
+None yet. Public API sketch in §6 is non-normative; contract details will be documented.
+
+## Integrator questions
+
+None yet.
+
+## Next steps
+
+Publish trait-v0; implement and verify steps 3–9 in order. Linux runtime tests will
+be explicitly marked UNRUN because there is no Linux host.
+- PASS (step 1): `cargo +nightly-2026-08-20 fmt --all`.
+- PASS (step 1): `cargo +nightly-2026-08-20 clippy --workspace --all-targets -- -D warnings`.
+- PASS (step 1): `cargo +stable check --workspace`.
+
+### Step 2: backend contract
+
+- Implemented `backend/mod.rs` revision 0 with backend-neutral Request/Event,
+  generational identities scoped to a loop, buffer contracts, capacity limits,
+  native cancellation acknowledgement, close-release order, and detach/attach.
+- Fixed capacities make overload explicit instead of allocating on operation paths.
+- Proposed D3 clarification: leases own their pool slot until explicitly released
+  (drop); safe references cannot be invalidated by a subsequent turn. Pool exhaustion
+  applies backpressure. This selects the explicit-release option in §15.4.
+- Proposed §5a clarification: detach cancels immediately but returns WouldBlock
+  until native cancellation acknowledgements have been delivered. Caller turns and
+  retries. A synchronous always-successful detach cannot honor IOCP buffer lifetimes.
+- Proposed D5/D7 clarification: obtaining Integration opts into external parking;
+  the notifier stays PARKED between turns in this mode, so external waiters wake.
+  Otherwise RUNNING notification has no syscall and cannot make an OS fd readable.
+- FAIL: `git add Cargo.toml Cargo.lock crates LANE_REPORT.md && git commit -m
+  'Create the windlass workspace and target selection'`: `.git/index.lock` creation
+  rejected with Operation not permitted. The session marks `.git` read-only and
+  forbids escalation. Commits and trait-v0 tag are BLOCKED, not created. Files are
+  available in the working tree for the other lanes; no alternate git database or
+  permission workaround is used.
+
+### Core and notifier progress (steps 3–4)
+
+- Implemented preallocated generational handle/op tables with generation retirement,
+  cross-loop identity checks, exactly-once terminal retirement, output backpressure,
+  Cancelled…Closed ordering, O(1) liveness, timer reset/repeat, and bounded turn.
+- Implemented indexed four-ary heap and feature-selected BTreeMap comparison;
+  deterministic 1,000-timer cancellation/expiry test verifies all 666 survivors.
+- Implemented atomic notifier and a bounded per-loop preallocated posting queue;
+  post capacity is rounded up to a power of two. Full/closed posting returns ownership.
+- Added cfg(loom) tests of parking races, zero-syscall running notifications and
+  two-producer queue delivery. Native tests are still to come with kqueue.
+- API clarifications: fallible timer submission (capacity exhaustion); completion
+  op is optional for Closed/posts; writev accepts an inline owning WriteVectored
+  with at most 8 segments to avoid per-operation descriptor allocations.
+- FAIL then PASS (step 2): pinned Clippy initially rejected the 16-segment inline
+  writev enum as oversized; reduced the documented inline limit to 8. No lint
+  suppression or heap indirection. Formatting, workspace Clippy and stable check passed.
+- FAIL then PASS (step 3): pinned Clippy found deprecated AtomicU64::fetch_update
+  and a collapsible if; replaced with stable compare-exchange and simplified control
+  flow. `cargo +nightly-2026-08-20 fmt --all`,
+  `cargo +nightly-2026-08-20 clippy --workspace --all-targets -- -D warnings`,
+  `cargo +nightly-2026-08-20 test --workspace` (2 tests),
+  `cargo +nightly-2026-08-20 test -p windlass --features timer-btree` (2 tests), and
+  `cargo +stable check --workspace` all PASS.
+- FAIL then PASS (step 4 initial Clippy): collapsible if in notifier corrected.
+- UNRUN: step 2/3/4 commits; `.git` remains read-only. `git tag trait-v0` was also
+  attempted and failed to create the ref lock (Operation not permitted).
+
+### Unix and pool progress (steps 5–7)
+
+- kqueue: EVFILT_USER wake, EV_CLEAR read/write, nanosecond timespec waits;
+  TCP connect/listen/accept and accept_start, provided/pooled reads and read_start,
+  full-buffer writes/writev, shutdown, cancellation, close, SO_REUSEPORT, owning
+  detach/attach, and UDP bind/send_to/recv. Pending operations use intrusive queues.
+- epoll: the same Unix engine, eventfd wake, epoll_pwait2 probe at construction,
+  timerfd fallback, and `epoll-timerfd` feature to force the fallback in Linux CI.
+- Pool: lazy process-wide bounded queue with 4 workers by default; first submission
+  fixes configuration, later mismatches return InvalidInput. Host jobs and native
+  getaddrinfo resolution deliver through a dedicated per-loop completion queue.
+  Cancelling a started job waits for its real return before the terminal Cancelled.
+  Panics are caught so a host job cannot kill a pool worker.
+- Posting queue refined to a bounded lock-free slot queue: a paused producer cannot
+  block consumption of other slots. No cross-producer FIFO ordering is promised.
+  Wake failure after an accepted post returns an error with payload=None (do not retry).
+- PASS: step 4 initial loom command
+  `RUSTFLAGS='--cfg loom' cargo +nightly-2026-08-20 test -p windlass models -- --test-threads=1`
+  (3 models); subsequent queue revision is being rechecked.
+- FAIL then PASS (step 5): public associated Wake initially leaked private Poller
+  types (E0446); now names the public native wake type directly.
+- PASS (step 5): formatting, native workspace Clippy, stable workspace check.
+- PASS: `cargo +nightly-2026-08-20 test --workspace`: 2 core tests and 5 native
+  contracts (bounded wait, parked/running notify, byte-verified echo at 1 and 64 TCP
+  connections). The waits, wake syscall count, accepts, writes and returned bytes
+  are explicitly asserted.
+- PASS (step 6): `cargo +nightly-2026-08-20 fmt --all` and native workspace Clippy;
+  `cargo +nightly-2026-08-20 clippy --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings`;
+  `cargo +nightly-2026-08-20 check --workspace --target x86_64-unknown-linux-gnu --features windlass/epoll-timerfd`;
+  `cargo +stable check --workspace`.
+- UNRUN: `cargo test --workspace --target x86_64-unknown-linux-gnu` and forced timerfd
+  runtime variant: no Linux machine or container. Cross-check success is not runtime proof.
+- UNRUN: step 5/6 commits, blocked by the same explicit read-only `.git` permission.
+- Reference checks: Apple kevent manual and Linux man-pages epoll/timerfd documentation;
+  local libc 0.2.175 bindings used for ABI details. No new runtime dependency besides libc.
