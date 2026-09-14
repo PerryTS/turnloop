@@ -31,8 +31,8 @@ For explicit protocol control, `asynchronous::{Http1,Http2}` expose streaming
 events, writes and HTTP upgrade handoff. HTTP/2 callbacks release receive capacity
 after consuming DATA and retain unsent application data while send windows stall.
 The pooled facade serializes each client's requests; multiplexing is available
-through the lower-level HTTP/2 driver. `Expect: 100-continue` currently requires
-explicit HTTP/1 event handling in that facade.
+through the lower-level HTTP/2 driver. `Expect: 100-continue` waits for an informational reply or the configured
+continue deadline; an early final response suppresses the upload and closes the lease.
 
 `asynchronous::server::Server` owns the TCP accept loop and local service tasks.
 Use `server::http1` or `server::http2` inside a service (optionally after TLS/ALPN).
@@ -50,6 +50,9 @@ cargo run -p turnloop-http --features turnloop --example https_get -- https://lo
 The TLS echo example negotiates HTTP/1.1 or HTTP/2 through ALPN. Certificates and
 private keys are supplied by the host; certificate verification stays enabled.
 WASI 0.2/0.3 use wasi:sockets and this same TLS/HTTP path (p3 remains experimental).
+The current core resolver uses a native blocking pool: WASI clients need literal
+IP URLs, or a host-resolved stream with the low-level HTTP/TLS drivers. The latter
+lets the host retain the original hostname for SNI and certificate validation.
 On browsers, `asynchronous::web::get` maps to the existing host fetch operation:
 bounded GET response bodies, abort and deadlines. The current host interface does
 not expose status/headers, custom methods, body streaming, proxy CONNECT or ALPN;

@@ -33,6 +33,7 @@ workspace = true
 role = "protocol"
 service-group = "http"
 integration-tests = ["websocket", "asynchronous", "async_allocations"]
+wasi-tests = ["asynchronous", "async_allocations"]
 
 [[example]]
 name = "echo_server"
@@ -55,4 +56,5 @@ required-features = ["turnloop"]
 harness = false
 
 [target.'cfg(all(target_os = "wasi", target_env = "p3"))'.dependencies]
+turnloop-wasi-random.workspace = true
 turnloop-io = { workspace = true, optional = true, features = ["wasi-p3-experimental"] }

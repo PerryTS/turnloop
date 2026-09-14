@@ -366,7 +366,7 @@ impl<B: Backend> ExecutorHandle<B> {
     pub fn now(&self) -> Instant {
         self.shared.driver.borrow().now()
     }
-    /// Resolve through the driver's native pool or host DNS capability.
+    /// Resolve through the driver's native blocking pool. WASI/web return Unsupported.
     pub fn resolve(&self, request: DnsRequest) -> Resolve<B> {
         Resolve {
             executor: self.clone(),
@@ -902,6 +902,9 @@ impl<B: Backend> Future for Resolve<B> {
         let key = match this.key {
             Some(key) => key,
             None => {
+                if this.request.is_none() {
+                    return Poll::Ready(Err(Error::new(ErrorKind::InvalidInput)));
+                }
                 let key = shared.reserve(cx)?;
                 let request = this
                     .request

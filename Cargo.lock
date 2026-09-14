@@ -1922,6 +1922,7 @@ dependencies = [
  "tungstenite",
  "turnloop-http",
  "turnloop-io",
+ "turnloop-wasi-random",
 ]
 
 [[package]]

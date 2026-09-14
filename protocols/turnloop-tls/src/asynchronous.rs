@@ -111,6 +111,16 @@ fn step<E: Endpoint>(
             if let Some(record) = read.next_record() {
                 let record = record.map_err(io::Error::other)?;
                 discard += record.discard;
+                if b.plain_at > 0 {
+                    b.plain.drain(..b.plain_at);
+                    b.plain_at = 0;
+                }
+                if record.payload.len() > b.plain.capacity() - b.plain.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "TLS unread plaintext limit",
+                    ));
+                }
                 b.plain.extend_from_slice(record.payload);
             }
             Action::Progress

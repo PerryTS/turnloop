@@ -47,9 +47,7 @@ impl<S: Stream> Http1<S> {
         head: &http1::Head,
         length: http1::BodyLength,
     ) -> io::Result<()> {
-        let length = response_length(head, length);
-        self.encoder =
-            Some(http1::Encoder::start(head, length, &mut self.output).map_err(io::Error::other)?);
+        self.encoder = Some(encode_head(head, length, &mut self.output)?);
         self.flush().await
     }
     pub async fn send_body(&mut self, bytes: &[u8]) -> io::Result<()> {
@@ -85,6 +83,9 @@ impl<S: Stream> Http1<S> {
         &mut self,
         mut receive: impl FnMut(http1::Event<'_>) -> io::Result<()>,
     ) -> io::Result<bool> {
+        if self.ended || self.upgraded {
+            return Ok(false);
+        }
         let mut guard = Abort::new(&mut self.stream);
         loop {
             let step = self
@@ -111,17 +112,62 @@ impl<S: Stream> Http1<S> {
     pub async fn head(&mut self) -> io::Result<http1::Head> {
         loop {
             let mut head = None;
-            self.event(|event| {
-                if let http1::Event::Head(h) = event {
-                    head = Some(h);
-                }
-                Ok(())
-            })
-            .await?;
+            let received = self
+                .event(|event| {
+                    if let http1::Event::Head(h) = event {
+                        head = Some(h);
+                    }
+                    Ok(())
+                })
+                .await?;
             if let Some(head) = head {
                 return Ok(head);
             }
+            if !received {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
         }
+    }
+    /// Wait for 100 Continue, a final response, or the continue deadline. A
+    /// continue timeout preserves partial input and permits uploading the body;
+    /// dropping this future still closes the connection.
+    pub async fn continue_or_head<B: turnloop_io::Backend>(
+        &mut self,
+        executor: &turnloop_io::ExecutorHandle<B>,
+        at: turnloop_io::Instant,
+    ) -> io::Result<Option<http1::Head>> {
+        let mut guard = Abort::new(&mut self.stream);
+        let result = executor
+            .timeout_at(at, async {
+                loop {
+                    let step = self
+                        .decoder
+                        .receive(&self.input)
+                        .map_err(io::Error::other)?;
+                    let consumed = step.consumed;
+                    let result = match step.event {
+                        Some(http1::Event::Informational(h)) if h.status == 100 => Some(None),
+                        Some(http1::Event::Head(h)) => Some(Some(h)),
+                        Some(http1::Event::Informational(_)) | None => None,
+                        _ => return Err(io::Error::other("expected response head")),
+                    };
+                    self.input.drain(..consumed);
+                    if let Some(result) = result {
+                        return Ok(result);
+                    }
+                    if consumed == 0 && append(guard.stream()?, &mut self.input).await? == 0 {
+                        self.decoder.eof().map_err(io::Error::other)?;
+                    }
+                }
+            })
+            .await;
+        let result = match result {
+            Ok(result) => result?,
+            Err(e) if e.kind == turnloop_io::turnloop::ErrorKind::TimedOut => None,
+            Err(e) => return Err(turnloop_io::error(e)),
+        };
+        guard.commit();
+        Ok(result)
     }
     /// Transfer an upgraded transport and every byte following the HTTP head.
     pub fn into_upgrade(mut self) -> io::Result<(S, Vec<u8>)> {
@@ -260,6 +306,24 @@ fn response_length(head: &http1::Head, length: http1::BodyLength) -> http1::Body
     } else {
         length
     }
+}
+
+fn encode_head(
+    head: &http1::Head,
+    length: http1::BodyLength,
+    output: &mut Vec<u8>,
+) -> io::Result<http1::Encoder> {
+    let encoder = http1::Encoder::start(head, response_length(head, length), output)
+        .map_err(io::Error::other)?;
+    if !head.keep_alive
+        && head.status != 101
+        && !head.token("connection", "upgrade")
+        && !head.token("connection", "close")
+    {
+        output.truncate(output.len() - 2);
+        output.extend_from_slice(b"connection: close\r\n\r\n");
+    }
+    Ok(encoder)
 }
 
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]

@@ -561,3 +561,303 @@ fn drop_server_cancels_inflight_request_once() {
         Poll::Ready(Err(turnloop::JoinError::Cancelled))
     ));
 }
+
+#[test]
+fn expect_continue_timeout_and_early_response() {
+    use turnloop_http::{asynchronous::Http1, http1::Mode};
+    let mut executor = LocalExecutor::<Platform>::new(Config::default()).expect("executor");
+    let h = executor.handle();
+    let listener = Listener::bind(&h, "127.0.0.1:0".parse().expect("address")).expect("listen");
+    let address = listener.local_addr().expect("address");
+    let mut server = executor
+        .spawn_local(async move {
+            let mut uploaded = 0;
+            for case in 0..3 {
+                let stream = listener.accept().await.expect("accept");
+                let mut conn = Http1::new(stream, Mode::Request);
+                let head = conn.head().await.expect("request head");
+                assert!(head.token("expect", "100-continue"));
+                if case == 0 {
+                    for status in [103, 100] {
+                        conn.send_head(
+                            &Head {
+                                status,
+                                ..response()
+                            },
+                            BodyLength::Empty,
+                        )
+                        .await
+                        .expect("informational");
+                    }
+                }
+                if case < 2 {
+                    loop {
+                        let mut end = false;
+                        assert!(
+                            conn.event(|event| {
+                                match event {
+                                    Event::Body(bytes) => {
+                                        assert!(bytes.iter().all(|&b| b == b'x'));
+                                        uploaded += bytes.len();
+                                    }
+                                    Event::End => end = true,
+                                    _ => {}
+                                }
+                                Ok(())
+                            })
+                            .await
+                            .expect("upload")
+                        );
+                        if end {
+                            break;
+                        }
+                    }
+                    // A finished decoder must return immediately without another read.
+                    for _ in 0..3 {
+                        assert!(
+                            !conn
+                                .event(|_| panic!("duplicate completion"))
+                                .await
+                                .expect("terminal")
+                        );
+                    }
+                }
+                conn.send_head(
+                    &Head {
+                        status: if case == 2 { 417 } else { 200 },
+                        keep_alive: false,
+                        ..response()
+                    },
+                    BodyLength::Empty,
+                )
+                .await
+                .expect("response");
+                conn.finish_body(&[]).await.expect("finish");
+                if case == 2 {
+                    let mut stream = conn.into_inner().expect("no early upload");
+                    assert_eq!(read(&mut stream, &mut [0; 1]).await.expect("peer EOF"), 0);
+                }
+            }
+            uploaded
+        })
+        .expect("spawn");
+    let mut client = executor
+        .spawn_local(async move {
+            let tls = turnloop_tls::ClientConfig::new(Default::default(), 1_789_344_000)
+                .expect("TLS config");
+            let mut client = Client::new(
+                h,
+                tls,
+                1_789_344_000,
+                Options {
+                    continue_timeout: Duration::from_millis(2),
+                    ..Default::default()
+                },
+            );
+            let mut request = Request::new(&format!("http://{address}/"), "POST").expect("request");
+            request.headers.push(Header::new("expect", "100-continue"));
+            request.body = vec![b'x'; 16384];
+            for case in 0..3 {
+                let head = client
+                    .request(&mut request, |_| panic!("empty response"))
+                    .await
+                    .expect("response");
+                assert_eq!(head.status, if case == 2 { 417 } else { 200 });
+            }
+            3
+        })
+        .expect("spawn");
+    let end = executor.driver().now() + Duration::from_secs(5);
+    while !server.is_finished() || !client.is_finished() {
+        assert!(executor.driver().now() < end);
+        executor.turn(Timeout::Until(end)).expect("turn");
+    }
+    assert_eq!(finish(&mut client), 3);
+    assert_eq!(finish(&mut server), 32768);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn curl_against_async_http1_server() {
+    use std::process::{Command, Stdio};
+    let mut executor = LocalExecutor::<Platform>::new(Config::default()).expect("executor");
+    let h = executor.handle();
+    let listener = Listener::bind(&h, "127.0.0.1:0".parse().expect("address")).expect("listen");
+    let address = listener.local_addr().expect("address");
+    let mut task = executor
+        .spawn_local(async move {
+            let stream = listener.accept().await.expect("accept");
+            let signal = server::Shutdown::default();
+            let stop = signal.clone();
+            let mut received = 0;
+            server::http1(stream, signal, |event, out| {
+                match event {
+                    Event::Head(head) => {
+                        assert_eq!(head.method, "POST");
+                        out.start(&response(), BodyLength::Chunked)?;
+                    }
+                    Event::Body(bytes) => {
+                        assert_eq!(bytes, b"curl async echo");
+                        received += bytes.len();
+                        out.body(bytes)?;
+                    }
+                    Event::End => {
+                        out.finish(&[])?;
+                        stop.stop();
+                    }
+                    _ => {}
+                }
+                Ok(())
+            })
+            .await
+            .expect("server drain");
+            received
+        })
+        .expect("spawn");
+    let child = Command::new("curl")
+        .args([
+            "--http1.1",
+            "--silent",
+            "--show-error",
+            "--fail",
+            "--noproxy",
+            "*",
+            "--max-time",
+            "5",
+            "--data-binary",
+            "curl async echo",
+            &format!("http://{address}/"),
+        ])
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("curl required for HTTP/1.1");
+    let end = executor.driver().now() + Duration::from_secs(10);
+    while !task.is_finished() {
+        assert!(executor.driver().now() < end);
+        executor.turn(Timeout::Until(end)).expect("turn");
+    }
+    assert_eq!(finish(&mut task), 15);
+    executor.turn(Timeout::Now).expect("close delivery");
+    let output = child.wait_with_output().expect("curl exit");
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"curl async echo");
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn node_https_via_authenticated_connect_proxy() {
+    use std::{
+        io::{BufRead, BufReader},
+        process::{Command, Stdio},
+    };
+    use turnloop_http::client::ProxyEnvironment;
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("certificate");
+    let script = r#"
+const assert = require('node:assert/strict');
+const https = require('node:https'), http = require('node:http'), net = require('node:net');
+let connects = 0, requests = 0;
+const watchdog = setTimeout(() => process.exit(7), 10000);
+const origin = https.createServer({key: process.env.KEY, cert: process.env.CERT}, (req, res) => {
+  assert.equal(req.method, 'POST'); assert.equal(req.url, '/through-proxy');
+  let body = ''; req.on('data', b => body += b); req.on('end', () => {
+    assert.equal(body, 'verified TLS upload'); requests++;
+    res.setHeader('connection', 'close'); res.end('verified TLS response');
+  });
+});
+const proxy = http.createServer();
+proxy.on('connect', (req, client, head) => {
+  assert.equal(req.url, 'localhost:' + origin.address().port);
+  assert.equal(req.headers['proxy-authorization'], 'Basic dXNlcjpwYXNz'); connects++;
+  const upstream = net.connect(origin.address().port, '127.0.0.1', () => {
+    client.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+    if (head.length) upstream.write(head);
+    client.pipe(upstream); upstream.pipe(client);
+  });
+  client.on('error', () => upstream.destroy()); upstream.on('error', () => client.destroy());
+  client.on('close', () => {
+    upstream.destroy(); assert.equal(connects, 1); assert.equal(requests, 1);
+    proxy.close(); origin.close(); clearTimeout(watchdog);
+  });
+});
+origin.listen(0, '127.0.0.1', () => proxy.listen(0, '127.0.0.1', () => {
+  console.log(origin.address().port + ' ' + proxy.address().port);
+}));
+"#;
+    struct OwnedChild(std::process::Child);
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut node = OwnedChild(
+        Command::new("node")
+            .args(["-e", script])
+            .env("KEY", cert.key_pair.serialize_pem())
+            .env("CERT", cert.cert.pem())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("Node required"),
+    );
+    let mut ports = String::new();
+    BufReader::new(node.0.stdout.take().expect("stdout"))
+        .read_line(&mut ports)
+        .expect("listener ports");
+    let ports: Vec<u16> = ports
+        .split_whitespace()
+        .map(|p| p.parse().expect("port"))
+        .collect();
+    assert_eq!(ports.len(), 2);
+    let mut executor = LocalExecutor::<Platform>::new(Config::default()).expect("executor");
+    let h = executor.handle();
+    let mut task = executor
+        .spawn_local(async move {
+            let tls = turnloop_tls::ClientConfig::new(
+                turnloop_tls::ClientOptions {
+                    ca: Some(vec![cert.cert.der().clone()]),
+                    alpn: vec![b"http/1.1".to_vec()],
+                    ..Default::default()
+                },
+                1_789_344_000,
+            )
+            .expect("trusted TLS config");
+            let mut client = Client::new(
+                h,
+                tls,
+                1_789_344_000,
+                Options {
+                    proxy: ProxyEnvironment {
+                        https_proxy: Some(format!("http://user:pass@127.0.0.1:{}", ports[1])),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            );
+            let mut req = Request::new(
+                &format!("https://localhost:{}/through-proxy", ports[0]),
+                "POST",
+            )
+            .expect("request");
+            req.body = b"verified TLS upload".to_vec();
+            let mut body = Vec::new();
+            let head = client
+                .request(&mut req, |bytes| {
+                    body.extend_from_slice(bytes);
+                    Ok(())
+                })
+                .await
+                .expect("CONNECT and TLS request");
+            assert_eq!(head.status, 200);
+            assert_eq!(body, b"verified TLS response");
+            body.len()
+        })
+        .expect("spawn");
+    let end = executor.driver().now() + Duration::from_secs(10);
+    while !task.is_finished() {
+        assert!(executor.driver().now() < end);
+        executor.turn(Timeout::Until(end)).expect("turn");
+    }
+    assert_eq!(finish(&mut task), 21);
+    executor.turn(Timeout::Now).expect("close delivery");
+    assert!(node.0.wait().expect("Node exit").success());
+}

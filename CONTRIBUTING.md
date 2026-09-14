@@ -487,3 +487,26 @@ zizmor annotation documents a guarded workflow_run release trigger: only verifie
 main pushes, with no PR artifacts or caches entering the privileged workflow.
 
 See [RELEASING.md](RELEASING.md) for owner setup, publication and Perry consumption.
+
+## Async adapters on turnloop
+
+Protocol crates expose their async layer through a `turnloop` feature. Shared
+transport ownership, partial input/output and deadline handling live in the
+publishable `turnloop-io` crate; see its README for the adapter contract. The
+`adapter` CI role requires independent positive native test counts and declared
+WASI suites. Protocol integration targets' `required-features` are activated by
+`run-tests.py`; an absent or zero-test async suite remains a failure.
+
+The required native interop job runs Node HTTP/HTTPS/HTTP2/WebSocket and curl
+against the async layer, and h2spec runs all 147 strict tests against the async
+server. WASI protocol jobs execute async HTTP, TLS and WebSocket over wasi:sockets,
+alongside the shared driver's socket/allocation tests. The web/Node contracts
+exercise executor fetch with deadlines and aborts using real fixture traffic.
+The feature-coverage gate validates the required WASI/web jobs, their targets,
+feature forwarding and runtime commands as well as the explicit native modes.
+
+Adapter allocation gates retain existing core-owned HTTP head and rustls record
+costs while requiring zero extra transport allocations. The TLS gate verifies
+100 bidirectional real-socket records at rustls 0.23.45's existing 400 allocations;
+WebSocket frames and 1,000 warmed shared TCP driver exchanges require absolute zero.
+None of the pre-existing allocation thresholds or dependency policies change.

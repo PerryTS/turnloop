@@ -8,6 +8,9 @@
 //! deadline futures. See the crate README and turnloop-io for ownership, streaming
 //! and cancellation examples. Default features retain the sans-I/O API.
 #![deny(unsafe_op_in_unsafe_fn)]
+#[cfg(all(target_os = "wasi", target_env = "p3"))]
+use turnloop_wasi_random as _;
+
 use base64::{Engine, engine::general_purpose::STANDARD};
 use std::{
     io::{self, Read, Write},

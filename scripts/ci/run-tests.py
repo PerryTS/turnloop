@@ -156,7 +156,7 @@ def main():
         env['CARGO_TARGET_' + args.target.upper().replace('-', '_') + '_RUNNER'] = str(ROOT / 'scripts/ci/wasmtime-runner.sh')
         if args.suite == 'protocol-wasi':
             selected = [(p, settings(p).get('wasi-tests', [])) for p in members(data)
-                        if role(p) in ('protocol', 'codec') and settings(p).get('wasi-tests')]
+                        if role(p) in ('protocol', 'codec', 'adapter') and settings(p).get('wasi-tests')]
             if not selected:
                 fail('No wasi-tests metadata: protocol runtime coverage is required')
             for package, targets in selected:
@@ -167,7 +167,7 @@ def main():
                     required = next(t.get('required-features', []) for t in package['targets']
                                     if t['name'] == target and 'test' in t['kind'])
                     target_features = ['--features', ','.join(required)] if required else []
-                    if args.target == 'wasm32-wasip3' and required:
+                    if args.target == 'wasm32-wasip3' and (required or role(package) == 'adapter'):
                         target_features = ['--all-features']
                     checked_tests(base + ['-p', package['name'], '--test', target] + target_features +
                         ['--', '--test-threads=1'], cwd=root, env=env)

@@ -42,7 +42,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         TlsStream::accept(stream, &tls, &h, h.now() + Duration::from_secs(10), now)
                             .await?;
                     if stream.alpn_protocol() == Some(b"h2") {
-                        let mut pending = Vec::<(u32, Vec<u8>, usize, bool)>::new();
+                        let mut pending = Vec::<(u32, Vec<u8>, usize, bool)>::with_capacity(16);
+                        let mut buffers = Vec::<Vec<u8>>::with_capacity(16);
                         server::http2(stream, signal, move |core, event| {
                             match event {
                                 http2::Event::Headers {
@@ -60,27 +61,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     bytes,
                                     end_stream,
                                 } => {
-                                    pending.push((stream, bytes.to_vec(), 0, end_stream));
+                                    let mut buffer =
+                                        buffers.pop().unwrap_or_else(|| Vec::with_capacity(16384));
+                                    buffer.extend_from_slice(bytes);
+                                    pending.push((stream, buffer, 0, end_stream));
                                 }
                                 _ => {}
                             }
-                            let mut error = None;
-                            pending.retain_mut(|(id, bytes, offset, end)| {
-                                match core.send_data(*id, &bytes[*offset..], *end) {
-                                    Ok(n) => {
-                                        *offset += n;
-                                        if let Err(e) = core.release_capacity(*id, n as u32) {
-                                            error = Some(e);
-                                        }
-                                        *offset < bytes.len()
-                                    }
-                                    Err(e) => {
-                                        error = Some(e);
-                                        false
-                                    }
+                            let mut index = 0;
+                            while index < pending.len() {
+                                let (id, bytes, offset, end) = &mut pending[index];
+                                let n = core
+                                    .send_data(*id, &bytes[*offset..], *end)
+                                    .map_err(std::io::Error::other)?;
+                                *offset += n;
+                                core.release_capacity(*id, n as u32)
+                                    .map_err(std::io::Error::other)?;
+                                if *offset == bytes.len() {
+                                    let (_, mut buffer, _, _) = pending.remove(index);
+                                    buffer.clear();
+                                    buffers.push(buffer);
+                                } else {
+                                    index += 1;
                                 }
-                            });
-                            error.map_or(Ok(()), |e| Err(std::io::Error::other(e)))
+                            }
+                            Ok(())
                         })
                         .await
                     } else {

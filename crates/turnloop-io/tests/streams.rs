@@ -16,7 +16,7 @@ fn finish<T>(task: &mut turnloop::executor::JoinHandle<T>) -> T {
     }
 }
 #[test]
-fn tcp_roundtrip_deadline_and_cancelled_accept() {
+fn tcp_roundtrip_and_deadline() {
     let mut executor = LocalExecutor::<Platform>::new(Config::default()).expect("executor");
     let h = executor.handle();
     let listener = Listener::bind(&h, "127.0.0.1:0".parse().expect("address")).expect("listen");
@@ -76,4 +76,87 @@ fn tcp_roundtrip_deadline_and_cancelled_accept() {
         executor.turn(Timeout::Until(end)).expect("turn");
     }
     finish(&mut timeout);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn resolve_and_cancel_reuse_executor_slots() {
+    use turnloop::executor::ExecutorConfig;
+    let mut executor = LocalExecutor::<Platform>::with_config(
+        Config::default(),
+        ExecutorConfig {
+            tasks: 4,
+            operations: 4,
+            buffer_size: 256,
+        },
+    )
+    .expect("executor");
+    let h = executor.handle();
+    let mut task = executor.spawn_local(async move {
+        let mut completed = 0;
+        for _ in 0..16 {
+            let mut lookup = h.resolve(turnloop::DnsRequest {host: "localhost".into(), port: 4242});
+            std::future::poll_fn(|cx| {
+                assert!(Pin::new(&mut lookup).poll(cx).is_pending());
+                Poll::Ready(())
+            }).await;
+            drop(lookup);
+            // Give the cancelled operation its terminal completion before reusing
+            // a bounded four-slot executor. No late result may complete this timer.
+            h.sleep(Duration::from_millis(2)).await.expect("cancel settlement");
+            let mut lookup = h.resolve(turnloop::DnsRequest {host: "localhost".into(), port: 4242});
+            let addresses = (&mut lookup).await.expect("resolve");
+            assert!(!addresses.is_empty());
+            assert!(addresses.iter().all(|a| a.ip().is_loopback() && a.port() == 4242));
+            assert!(matches!(Pin::new(&mut lookup).poll(&mut Context::from_waker(Waker::noop())), Poll::Ready(Err(e)) if e.kind == turnloop::ErrorKind::InvalidInput));
+            completed += 1;
+        }
+        completed
+    }).expect("spawn");
+    let end = executor.driver().now() + Duration::from_secs(5);
+    while !task.is_finished() {
+        assert!(executor.driver().now() < end);
+        executor.turn(Timeout::Until(end)).expect("turn");
+    }
+    assert_eq!(finish(&mut task), 16);
+}
+
+#[cfg(target_os = "wasi")]
+#[test]
+fn unsupported_wasi_dns_releases_reserved_slots() {
+    use turnloop::executor::ExecutorConfig;
+    let mut executor = LocalExecutor::<Platform>::with_config(
+        Config::default(),
+        ExecutorConfig {
+            tasks: 4,
+            operations: 4,
+            buffer_size: 256,
+        },
+    )
+    .expect("executor");
+    let h = executor.handle();
+    let mut task = executor
+        .spawn_local(async move {
+            for _ in 0..16 {
+                let error = h
+                    .resolve(turnloop::DnsRequest {
+                        host: "localhost".into(),
+                        port: 4242,
+                    })
+                    .await
+                    .expect_err("WASI has no native blocking DNS pool");
+                assert_eq!(error.kind, turnloop::ErrorKind::Unsupported);
+                h.sleep(Duration::from_millis(1))
+                    .await
+                    .expect("slot released on submission error");
+            }
+            16
+        })
+        .expect("spawn");
+    let end = executor.driver().now() + Duration::from_secs(5);
+    while !task.is_finished() {
+        assert!(executor.driver().now() < end);
+        executor.turn(Timeout::Until(end)).expect("turn");
+    }
+    assert_eq!(finish(&mut task), 16);
 }

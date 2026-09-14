@@ -321,25 +321,26 @@ lettre's quoted_printable dependency; no advisory was ignored.
 
 ## Publish order and bootstrap
 
-All packages currently use **0.1.0**. The metadata-derived order is:
+All packages currently use **0.1.0-alpha.1**. The metadata-derived order is:
 
 1. `turnloop`
 2. `turnloop-io` (shared executor/stream adapters)
 3. `turnloop-tls`
 4. `turnloop-zstd-decoder`
 5. `turnloop-http`
-6. `turnloop-mongodb`
-7. `turnloop-mysql`
-8. `turnloop-postgres`
-9. `turnloop-redis`
-10. `turnloop-smtp`
-11. `turnloop-websocket`
+6. `turnloop-wasi-random`
+7. `turnloop-mongodb`
+8. `turnloop-mysql`
+9. `turnloop-postgres`
+10. `turnloop-redis`
+11. `turnloop-smtp`
+12. `turnloop-websocket`
 
 This is the current metadata-derived order (`python3 scripts/ci/release.py order`).
 turnloop-io follows turnloop and precedes every async protocol adapter.
 TLS and the decoder precede HTTP; HTTP precedes WebSocket. The independent database
 and SMTP crates may otherwise be reordered. `turnloop-contract` and `turnloop-bench`
-remain private. Every package is version 0.1.0.
+remain private. Every package is version 0.1.0-alpha.1.
 
 `cargo publish --dry-run --locked --allow-dirty --workspace` stages unpublished
 siblings together, packages each crate and recompiles each packaged library.

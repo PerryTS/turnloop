@@ -21,3 +21,36 @@
 | 2026-09-14T19:54:12.441094+00:00 | FAIL | `bash scripts/ci/install-wasmtime.sh` | `.tools/adapters-net/wasmtime.log` |
 | 2026-09-14T19:56:16.401692+00:00 | PASS | `cargo test --workspace --all-features -- --test-threads=1` | `.tools/adapters-net/workspace-test.log` |
 | 2026-09-14T19:56:21.062107+00:00 | PASS | `python3 scripts/ci/install-tools.py wasmtime --destination .tools/adapters-net/bin` | `.tools/adapters-net/wasmtime-owned.log` |
+| 2026-09-14T19:59:58.248166+00:00 | PASS | `python3 scripts/ci/run-tests.py protocol-wasi --target wasm32-wasip2` | `.tools/adapters-net/protocol-wasip2.log` |
+| 2026-09-14T20:00:37.827933+00:00 | PASS | `python3 scripts/ci/run-tests.py protocol-wasi --target wasm32-wasip3` | `.tools/adapters-net/protocol-wasip3.log` |
+| 2026-09-14T20:03:09.893278+00:00 | FAIL | `cargo test -p turnloop-http --features turnloop --test asynchronous -- --test-threads=1` | `.tools/adapters-net/http-continue-curl.log` |
+| 2026-09-14T20:04:12.756224+00:00 | PASS | `cargo test -p turnloop-http --features turnloop --test asynchronous -- --test-threads=1` | `.tools/adapters-net/http-continue-fixed.log` |
+| 2026-09-14T20:04:37.399405+00:00 | PASS | `cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks` | `.tools/adapters-net/clippy-native-latest.log` |
+| 2026-09-14T20:06:12.938796+00:00 | PASS | `cargo clippy --locked --workspace --all-targets --all-features --target wasm32-wasip2 -- -D warnings -D clippy::undocumented_unsafe_blocks` | `.tools/adapters-net/clippy-p2.log` |
+| 2026-09-14T20:06:27.126670+00:00 | FAIL | `python3 -m unittest discover -s scripts/ci -p 'test_*.py' -v` | `.tools/adapters-net/python-gates.log` |
+| 2026-09-14T20:06:31.106933+00:00 | PASS | `cargo clippy --locked --workspace --all-targets --all-features --target wasm32-unknown-unknown -- -D warnings -D clippy::undocumented_unsafe_blocks` | `.tools/adapters-net/clippy-web.log` |
+| 2026-09-14T20:06:48.835531+00:00 | PASS | `cargo +nightly-2026-09-07 clippy --locked --workspace --all-targets --all-features --target wasm32-wasip3 -- -D warnings -D clippy::undocumented_unsafe_blocks` | `.tools/adapters-net/clippy-p3.log` |
+| 2026-09-14T20:07:09.169615+00:00 | PASS | `cargo +stable check --locked --workspace --all-targets --all-features` | `.tools/adapters-net/stable-native.log` |
+| 2026-09-14T20:09:07.433351+00:00 | PASS | `python3 -m unittest discover -s scripts/ci -p test_feature_modes.py -v` | `.tools/adapters-net/feature-gates-fixed.log` |
+| 2026-09-14T20:09:10.471890+00:00 | PASS | `python3 scripts/ci/install-web-tools.py` | `.tools/adapters-net/web-tools.log` |
+| 2026-09-14T20:10:36.246278+00:00 | PASS | `cargo test -p turnloop-tls --features turnloop --test async_allocations` | `.tools/adapters-net/tls-record-allocations.log` |
+| 2026-09-14T20:10:37.118436+00:00 | PASS | `bash scripts/ci/no-tokio.sh` | `.tools/adapters-net/no-tokio.log` |
+| 2026-09-14T20:10:56.312773+00:00 | PASS | `python3 scripts/ci/soak.py` | `.tools/adapters-net/soak.log` |
+| 2026-09-14T20:11:32.601557+00:00 | FAIL | `python3 scripts/ci/run-tests.py node` | `.tools/adapters-net/node-contracts.log` |
+| 2026-09-14T20:11:45.578945+00:00 | PASS | `python3 scripts/ci/install-tools.py cargo-deny --destination .tools/adapters-net/bin` | `.tools/adapters-net/deny-tools.log` |
+| 2026-09-14T20:11:45.666891+00:00 | PASS | `cargo test -p turnloop-http --features turnloop --test asynchronous node_https_via_authenticated -- --nocapture` | `.tools/adapters-net/http-proxy.log` |
+| 2026-09-14T20:11:59.725594+00:00 | PASS | `cargo deny --locked check advisories bans licenses sources` | `.tools/adapters-net/deny.log` |
+| 2026-09-14T20:12:09.797898+00:00 | PASS | `python3 scripts/ci/run-tests.py node` | `.tools/adapters-net/node-contracts-cache.log` |
+| 2026-09-14T20:13:01.783098+00:00 | PASS | `python3 scripts/ci/install-tools.py zizmor actionlint shellcheck --destination .tools/adapters-net/bin` | `.tools/adapters-net/workflow-tools.log` |
+| 2026-09-14T20:13:05.415634+00:00 | FAIL | `cargo clippy --workspace --all-targets --all-features --target x86_64-unknown-linux-gnu -- -D warnings -D clippy::undocumented_unsafe_blocks` | `.tools/adapters-net/clippy-linux.log` |
+| 2026-09-14T20:13:58.582334+00:00 | PASS | `python3 scripts/ci/lint-workflows.py` | `.tools/adapters-net/workflow-lint.log` |
+| 2026-09-14T20:14:16.472023+00:00 | PASS | `cargo clippy --workspace --all-targets --all-features --target x86_64-unknown-linux-gnu -- -D warnings -D clippy::undocumented_unsafe_blocks` | `.tools/adapters-net/clippy-linux-zig.log` |
+| 2026-09-14T20:14:24.822781+00:00 | PASS | `python3 scripts/ci/check-paths.py` | `.tools/adapters-net/paths.log` |
+| 2026-09-14T20:14:44.874586+00:00 | FAIL | `python3 scripts/ci/run-tests.py web --browser chrome` | `.tools/adapters-net/chrome-contracts.log` |
+| 2026-09-14T20:15:29.607607+00:00 | FAIL | `cargo clippy --workspace --all-targets --all-features --target x86_64-pc-windows-msvc -- -D warnings -D clippy::undocumented_unsafe_blocks` | `.tools/adapters-net/clippy-windows.log` |
+| 2026-09-14T20:16:07.546926+00:00 | FAIL | `cargo clippy --workspace --all-targets --all-features --target x86_64-pc-windows-msvc -- -D warnings -D clippy::undocumented_unsafe_blocks` | `.tools/adapters-net/clippy-windows-zig.log` |
+| 2026-09-14T20:17:40.092743+00:00 | FAIL | `python3 scripts/ci/run-tests.py protocol-wasi --target wasm32-wasip2` | `.tools/adapters-net/protocol-wasip2-final.log` |
+| 2026-09-14T20:17:41.395520+00:00 | PASS | `python3 scripts/ci/feature_modes.py` | `.tools/adapters-net/feature-coverage.log` |
+| 2026-09-14T20:17:52.009366+00:00 | FAIL | `cargo test -p turnloop-io --target wasm32-wasip2 --test streams resolve_and_cancel -- --nocapture --test-threads=1` | `.tools/adapters-net/io-wasi-dns.log` |
+| 2026-09-14T20:17:55.173968+00:00 | PASS | `python3 -m unittest discover -s scripts/ci -p 'test_*.py' -v` | `.tools/adapters-net/python-gates-final.log` |
+| 2026-09-14T20:19:16.550532+00:00 | PASS | `python3 scripts/ci/run-tests.py protocol-wasi --target wasm32-wasip2` | `.tools/adapters-net/protocol-wasip2-complete.log` |

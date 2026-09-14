@@ -27,5 +27,7 @@ The host continues calling `LocalExecutor::turn` throughout the connection.
 The adapter retains ciphertext/plaintext storage and uses rustls's unbuffered
 state machine. rustls 0.23's plaintext record representation still allocates;
 transport scratch allocation freedom is distinct from upstream crypto storage.
+The real-socket allocation gate checks 100 bidirectional records: 400 existing
+rustls allocations and zero adapter overhead. Unread plaintext is bounded to 64 KiB.
 WASI sockets use the same implementation. Browser TLS is managed by host fetch
 or WebSocket and cannot expose raw TLS options.

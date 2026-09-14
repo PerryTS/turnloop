@@ -138,6 +138,7 @@ pub struct Response {
     encoder: Option<crate::http1::Encoder>,
     output: Vec<u8>,
     finished: bool,
+    keep_alive: bool,
 }
 impl Default for Response {
     fn default() -> Self {
@@ -145,6 +146,7 @@ impl Default for Response {
             encoder: None,
             output: Vec::with_capacity(65536),
             finished: false,
+            keep_alive: true,
         }
     }
 }
@@ -157,11 +159,8 @@ impl Response {
         if self.encoder.is_some() {
             return Err(io::Error::other("response already started"));
         }
-        let length = super::response_length(head, length);
-        self.encoder = Some(
-            crate::http1::Encoder::start(head, length, &mut self.output)
-                .map_err(io::Error::other)?,
-        );
+        self.encoder = Some(super::encode_head(head, length, &mut self.output)?);
+        self.keep_alive = head.keep_alive && !head.token("connection", "close");
         Ok(())
     }
     pub fn body(&mut self, bytes: &[u8]) -> io::Result<()> {
@@ -204,17 +203,21 @@ pub async fn http1<S: turnloop_io::Stream>(
         response.output.clear();
         loop {
             let mut ended = false;
-            conn.event(|event| {
-                ended = matches!(event, crate::http1::Event::End);
-                service(event, &mut response)
-            })
-            .await?;
+            let received = conn
+                .event(|event| {
+                    ended = matches!(event, crate::http1::Event::End);
+                    service(event, &mut response)
+                })
+                .await?;
             turnloop_io::write_all(
                 conn.stream.as_mut().ok_or_else(super::closed)?,
                 &response.output,
             )
             .await?;
             response.output.clear();
+            if !received {
+                return Err(io::Error::other("service must handle upgrades explicitly"));
+            }
             if ended {
                 break;
             }
@@ -222,7 +225,7 @@ pub async fn http1<S: turnloop_io::Stream>(
         if !response.finished {
             return Err(io::Error::other("service did not finish response"));
         }
-        if shutdown.is_stopped() || !conn.reusable() {
+        if shutdown.is_stopped() || !conn.reusable() || !response.keep_alive {
             if let Some(stream) = conn.stream.as_mut() {
                 turnloop_io::close(stream).await?;
             }

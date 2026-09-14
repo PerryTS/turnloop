@@ -1,5 +1,6 @@
 """Negative controls for explicit feature coverage and required native mode arms."""
 import json
+import copy
 import tomllib
 import unittest
 from common import ROOT
@@ -89,6 +90,32 @@ class FeatureModes(unittest.TestCase):
         self.assertNotIn('timer-btree', self.manifest['features'])
         bench = tomllib.loads((ROOT / 'crates/turnloop-bench/Cargo.toml').read_text())
         self.assertEqual(bench['features']['timer-btree'], [])
+
+    def test_backend_features_require_real_platform_jobs(self):
+        contract = tomllib.loads((ROOT / 'crates/turnloop-contract/Cargo.toml').read_text())
+        for old, new in [
+            ('target: wasm32-wasip3', 'target: wasm32-wasip2'),
+            ('python3 scripts/ci/run-tests.py wasi --target "$TARGET"', 'true'),
+            ('python3 scripts/ci/run-tests.py web', 'true'),
+            ('python3 scripts/ci/run-tests.py node', 'true'),
+            (', wasi, web,', ', web,'),
+            (', wasi, web,', ', wasi,'),
+            ('  wasi:\n', '  wasi:\n    if: false\n'),
+            ('  web:\n', '  web:\n    continue-on-error: true\n'),
+        ]:
+            self.assertIn(old, self.source)
+            with self.subTest(old=old), self.assertRaises(RuntimeError):
+                check(self.source.replace(old, new), self.manifest, contract)
+        for key in ['web-tests-features', 'node-tests-features']:
+            broken = copy.deepcopy(contract)
+            broken['package']['metadata']['turnloop-ci'][key].remove('web-worker')
+            with self.subTest(key=key), self.assertRaises(RuntimeError):
+                check(self.source, self.manifest, broken)
+        for feature in ['web-worker', 'wasi-p3-experimental']:
+            broken = copy.deepcopy(contract)
+            broken['features'][feature] = []
+            with self.subTest(feature=feature), self.assertRaises(RuntimeError):
+                check(self.source, self.manifest, broken)
 
 
 if __name__ == '__main__':

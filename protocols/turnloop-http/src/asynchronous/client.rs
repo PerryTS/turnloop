@@ -22,6 +22,8 @@ use turnloop_tls::{ClientConfig, TlsStream};
 /// Client policy; the deadline covers DNS, connect, TLS, upload and response.
 pub struct Options {
     pub timeout: Duration,
+    /// Maximum wait for 100 Continue before sending a request body.
+    pub continue_timeout: Duration,
     pub idle_timeout: Duration,
     pub max_per_origin: usize,
     pub redirects: RedirectMode,
@@ -35,6 +37,7 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             timeout: Duration::from_secs(30),
+            continue_timeout: Duration::from_secs(1),
             idle_timeout: Duration::from_secs(30),
             max_per_origin: 4,
             redirects: RedirectMode::Follow,
@@ -310,39 +313,50 @@ impl<B: Backend> Client<B> {
                     }
                     conn.response_to(&head.method);
                     conn.send_head(&head, length).await?;
-                    if head.token("expect", "100-continue") {
-                        return Err(io::Error::new(
-                            io::ErrorKind::Unsupported,
-                            "use explicit HTTP/1 events for 100-continue",
-                        ));
-                    }
-                    let mut bytes = [0; 16384];
-                    loop {
-                        let n = turnloop_io::read(upload, &mut bytes).await?;
-                        if n == 0 {
-                            break;
+                    let early_response = if head.token("expect", "100-continue")
+                        && !matches!(length, BodyLength::Empty | BodyLength::Known(0))
+                    {
+                        conn.continue_or_head(&executor, executor.now() + options.continue_timeout)
+                            .await?
+                    } else {
+                        None
+                    };
+                    let uploaded = early_response.is_none();
+                    let response = if let Some(response) = early_response {
+                        response
+                    } else {
+                        let mut bytes = [0; 16384];
+                        loop {
+                            let n = turnloop_io::read(upload, &mut bytes).await?;
+                            if n == 0 {
+                                break;
+                            }
+                            conn.send_body(&bytes[..n]).await?;
                         }
-                        conn.send_body(&bytes[..n]).await?;
-                    }
-                    conn.finish_body(&[]).await?;
-                    let response = conn.head().await?;
+                        conn.finish_body(&[]).await?;
+                        conn.head().await?
+                    };
                     let deliver = !(follow
                         && redirect(&response)
                         && matches!(options.redirects, RedirectMode::Follow));
                     decoders.start(&response, options)?;
                     loop {
                         let mut end = false;
-                        conn.event(|event| {
-                            match event {
-                                Event::Body(bytes) if deliver => {
-                                    decoders.feed(bytes, false, body)?
+                        let received = conn
+                            .event(|event| {
+                                match event {
+                                    Event::Body(bytes) if deliver => {
+                                        decoders.feed(bytes, false, body)?
+                                    }
+                                    Event::End => end = true,
+                                    _ => {}
                                 }
-                                Event::End => end = true,
-                                _ => {}
-                            }
-                            Ok(())
-                        })
-                        .await?;
+                                Ok(())
+                            })
+                            .await?;
+                        if !received {
+                            return Err(io::ErrorKind::UnexpectedEof.into());
+                        }
                         if end {
                             break;
                         }
@@ -350,7 +364,7 @@ impl<B: Backend> Client<B> {
                     if deliver {
                         decoders.feed(&[], true, body)?;
                     }
-                    lease.reusable = conn.reusable();
+                    lease.reusable = uploaded && conn.reusable();
                     response
                 }
                 Connection::H2(conn) => {
