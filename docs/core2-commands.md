@@ -17,3 +17,9 @@ Cross-compilation is not runtime execution. Raw outputs: `.tools/core2/`.
 - **FAIL** `cargo test -p turnloop-contract --features executor --test executor -- --test-threads=1` (exit 101; log 1789404153-917636).
 - **PASS** `cargo clippy -p turnloop -p turnloop-contract --all-targets --all-features --target x86_64-unknown-linux-gnu -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 0; log 1789404161-645415).
 - **FAIL** `cargo test -p turnloop-contract --all-features --test native_surface --test executor -- --test-threads=1` (exit 101; log 1789404275-238389).
+- **FAIL** `cargo test -p turnloop-contract --all-features --test native_surface --test executor -- --test-threads=1` (exit 101; log 1789404297-032008).
+- **FAIL** `cargo test -p turnloop-contract --all-features --test native_surface --test executor -- --test-threads=1` (exit 101; log 1789404381-516986).
+- **FAIL** `cargo test -p turnloop-contract --all-features --test native_surface file_backed_stdio_runs_in_the_child -- --test-threads=1 --nocapture` (exit 101; log 1789404434-847488).
+- **PASS** `cargo test -p turnloop-contract --all-features --test native_surface --test executor -- --test-threads=1` (exit 0; log 1789404456-296511).
+- **FAIL** `cargo test -p turnloop -p turnloop-contract --all-features -- --test-threads=1` (exit 101; log 1789404534-233569).
+- **PASS** `cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 0; log 1789404543-528808).

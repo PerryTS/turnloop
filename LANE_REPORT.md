@@ -15,7 +15,18 @@ Preserve all no-spin, exactly-once, allocation and dependency gates.
 
 ## Verification
 
-Implementation checks are pending. Linux/Windows runtime tests are UNRUN (no hosts).
+Current implemented surfaces: AF_UNIX listen/connect/accept and framed SCM_RIGHTS
+transfer (including duplicate ownership), generic native types/API, child spawn
+with stdio/env/cwd/uid/gid/groups, kqueue NOTE_EXIT with SIGCHLD reaping cooperation,
+Linux pidfd/SIGCHLD fallback, process-wide signal dispatcher, TTY mode/resize/restore,
+shared external waits, pool-backed regular-file stdio, optional local executor.
+
+PASS so far: shared IPC echo/ownership, 256 concurrent child exits, child-loop
+stdio pipes, signal fan-out to four threads, 1,024 external waits, executor echo
+with 64 connections and timer/cancellation. Additional contracts and full checks
+are still in progress. Initial failures and fixes are retained in the command ledger.
+
+ Linux/Windows runtime tests are UNRUN (no hosts).
 WASI/web native-only operations must explicitly return Unsupported; their common
 core and executor will be cross-checked. The seven-day dependency soak remains on.
 Exact verification invocations and outcomes will be in docs/core2-commands.md.

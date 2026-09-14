@@ -296,3 +296,38 @@ pub fn services_no_spin<B: Backend>(program: &std::ffi::OsStr) {
     assert_eq!(count, 60); assert!(waits >= 60);
     assert!(!l.alive(), "unreferenced services cannot keep the loop alive");
 }
+
+/// Move a connected socket to a child and back, with real bytes across processes.
+pub fn ipc_process<B: Backend>(program: &std::ffi::OsStr, name: &PipeName) {
+    let mut l = Driver::<B>::new(Config::default()).expect("loop");
+    let listener = l.pipe_listen(name, &ListenOpts::default()).expect("IPC listener");
+    l.accept(listener, Token(1)).expect("IPC accept");
+    let (_, tx, rx) = crate::pair(&mut l);
+    let mut spec = ProcessSpec::new(program); spec.args = vec!["handle".into(), name.0.clone().into_os_string()];
+    let child = l.spawn(&spec, Token(2)).expect("IPC child");
+    l.read_start(rx, Token(3)).expect("socket read");
+    let mut bytes = Vec::new(); let mut returned = None; let mut sent = 0; let mut exited = 0;
+    let until = l.now() + Duration::from_secs(5); let mut out = Completions::default();
+    while returned.is_none() || sent == 0 || exited == 0 || bytes.len() < 20 {
+        assert!(l.now() < until, "process handle passing timed out");
+        l.turn(Timeout::Until(until), &mut out).expect("turn");
+        for c in out.drain() {
+            match c.result {
+                OpResult::PipeAccepted { conn } => { l.send_handle(conn, tx, Token(4)).expect("send socket"); l.recv_handle(conn, Token(5)).expect("receive returned socket"); }
+                OpResult::HandleSent => { sent += 1; l.close(tx, Token(6)).expect("close source socket"); }
+                OpResult::HandleReceived { handle } => returned = Some(handle),
+                OpResult::Read { n, lease: Some(data) } => { assert!(n > 0); bytes.extend_from_slice(data.as_slice()); }
+                OpResult::Exited(status) => { assert_eq!(c.handle, Some(child.handle)); assert_eq!(status.code, Some(0)); exited += 1; }
+                OpResult::Closed => {}, other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+    assert_eq!(bytes, b"cross-process socket"); assert_eq!((sent, exited), (1, 1));
+    // Stop the multishot read before the next one-shot transfer assertion.
+    l.close(rx, Token(7)).expect("close receiver");
+    let handle = returned.expect("returned descriptor");
+    let d = l.detach(handle).expect("detach returned descriptor");
+    let mut other = Driver::<B>::new(Config::default()).expect("other loop");
+    let handle = other.attach(d, Token(8)).expect("attach on other loop");
+    other.close(handle, Token(9)).expect("close returned socket");
+}

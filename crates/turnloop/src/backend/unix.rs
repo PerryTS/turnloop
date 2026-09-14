@@ -749,3 +749,33 @@ fn receive(
         Ok(Some((Outcome::Read { n, lease }, !multishot)))
     }
 }
+
+#[cfg(all(test, not(loom)))]
+mod process_races {
+    use super::*;
+    #[test]
+    fn child_exited_before_native_registration_is_reaped_once() {
+        let mut backend = Unix::new(&Config::default(), BufferPool::new(2, 64)).expect("backend");
+        backend.set_notifier(Notifier::new(backend.waker()));
+        let child = std::process::Command::new("/bin/sh").args(["-c", "exit 23"]).spawn().expect("child");
+        let pid = child.id();
+        // SAFETY: initialized siginfo output and an owned child PID. WNOWAIT
+        // proves exit occurred while deliberately preserving status for turnloop.
+        let mut status: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: valid child identity and writable output; wait only for its exit.
+        assert_eq!(unsafe { libc::waitid(libc::P_PID, pid, &mut status, libc::WEXITED | libc::WNOWAIT) }, 0);
+        let h = Handle { owner: 1, key: 1 << 32 };
+        let op = OpId { owner: 1, key: 1 << 32 };
+        backend.services.child(h, child, false, &mut backend.poller).expect("register already exited child");
+        backend.submit(Request { op, handle: h, operation: Operation::ProcessExit }).expect("exit operation");
+        let mut events = Vec::with_capacity(4);
+        backend.poll(Some(Duration::ZERO), &mut events).expect("exit poll");
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0].result, Ok(Outcome::Exited(ExitStatus { code: Some(23), signal: None }))));
+        events.clear(); backend.poll(Some(Duration::ZERO), &mut events).expect("duplicate check"); assert!(events.is_empty());
+        let mut code = 0;
+        // SAFETY: query only the fixture child's wait status, without blocking.
+        assert_eq!(unsafe { libc::waitpid(pid as i32, &mut code, libc::WNOHANG) }, -1);
+        assert_eq!(last_error().os, Some(libc::ECHILD));
+    }
+}

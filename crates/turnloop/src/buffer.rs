@@ -116,6 +116,7 @@ impl BufferPool {
             inner: Rc::new(RefCell::new((0..count).map(|_| vec![0; size]).collect())),
         }
     }
+    pub(crate) fn available(&self) -> bool { !self.inner.borrow().is_empty() }
     /// Exhaustion applies backpressure: the backend keeps the read pending.
     pub fn acquire(&self) -> Option<BufLease> {
         self.inner.borrow_mut().pop().map(|data| BufLease {

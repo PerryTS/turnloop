@@ -36,9 +36,10 @@ fn native_stdio() {
     let mut out = Completions::default();
     let mut eof = false;
     let mut pending = 0;
+    let deadline = l.now() + Duration::from_secs(5);
     while !eof || pending != 0 {
-        l.turn(Timeout::After(Duration::from_secs(5)), &mut out).expect("child turn");
-        assert!(!out.is_empty(), "child timed out");
+        assert!(l.now() < deadline, "child timed out");
+        l.turn(Timeout::Until(deadline), &mut out).expect("child turn");
         for c in out.drain() {
             match c.result {
                 OpResult::Read { n, lease: Some(bytes) } => {

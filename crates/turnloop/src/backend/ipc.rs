@@ -81,7 +81,12 @@ fn classify_hint(fd: OwnedFd, listener: bool) -> Result<Detached> {
             (libc::AF_INET | libc::AF_INET6, libc::SOCK_DGRAM, _) => Kind::Udp,
             _ => return Err(Error::new(ErrorKind::Unsupported)),
         }
-    } else if stat.st_mode & libc::S_IFMT == libc::S_IFREG { Kind::File } else { Kind::Stream };
+    } else if stat.st_mode & libc::S_IFMT == libc::S_IFREG {
+        Kind::File
+    } else if stat.st_mode & libc::S_IFMT == libc::S_IFCHR {
+        // SAFETY: isatty only inspects the live owned descriptor.
+        if unsafe { libc::isatty(fd.as_raw_fd()) } == 1 { Kind::Stream } else { Kind::File }
+    } else { Kind::Stream };
     // SAFETY: live descriptor and integer-only fcntl command.
     let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
     if flags < 0 { return Err(last_error()); }
