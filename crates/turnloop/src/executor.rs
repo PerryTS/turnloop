@@ -4,7 +4,8 @@
 //! `futures-io` is the only extra dependency. Tasks allocate once when spawned;
 //! polls and warmed I/O/timer operations use fixed tables and retained buffers.
 //! Borrowed futures-io buffers are copied into/from executor-owned staging memory,
-//! so Pending never extends a caller buffer's lifetime.
+//! so Pending never extends a caller buffer's lifetime. Writes are buffered;
+//! flush or close the adapter to confirm delivery to the underlying transport.
 //!
 //! ```
 //! # #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android", target_os = "freebsd"))]
@@ -522,6 +523,14 @@ impl<T> Drop for JoinHandle<T> {
 }
 
 /// TCP, UDP, local-pipe or stdio adapter with stable owned staging buffers.
+///
+/// Writes are buffered: `poll_write` reports bytes accepted into owned storage;
+/// `poll_flush`, `poll_close`, or the next write waits for their native completion
+/// and reports delayed errors. Flush before dropping to preserve buffered output.
+/// Dropping cancels pending reads and writes and closes the owned loop handle.
+/// A Pending poll never consumes the current write slice, so it may be replaced.
+/// UDP writes accept one complete datagram or reject it if staging is too small;
+/// UDP reads expose payload bytes without the sender address.
 pub struct AsyncIo<B: Backend> {
     shared: Rc<Shared<B>>,
     handle: Handle,
@@ -633,76 +642,70 @@ impl<B: Backend> AsyncRead for AsyncIo<B> {
 }
 impl<B: Backend> AsyncWrite for AsyncIo<B> {
     fn poll_write(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let this = self.get_mut();
-        if this.closed {
+        if self.closed {
             return Poll::Ready(Err(io_error(Error::new(ErrorKind::BrokenPipe))));
         }
-        let key = match this.write {
-            Some(key) => key,
-            None => {
-                if buf.is_empty() {
-                    return Poll::Ready(Ok(0));
-                }
-                let key = match this.shared.reserve(cx) {
-                    Ok(key) => key,
-                    Err(e) => return Poll::Ready(Err(io_error(e))),
-                };
-                let (ptr, n, too_big) = {
-                    let mut slots = this.shared.slots.borrow_mut();
-                    let bytes = &mut slots[key.index].bytes;
-                    let n = buf.len().min(bytes.len());
-                    bytes[..n].copy_from_slice(&buf[..n]);
-                    (bytes.as_ptr(), n, n < buf.len() && this.peer.is_some())
-                };
-                if too_big {
-                    this.shared.free(key);
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "datagram exceeds executor buffer",
-                    )));
-                }
-                // SAFETY: staging bytes are immutable from submit until terminal
-                // acknowledgement; dropping the adapter abandons but retains the slot.
-                let buf = WriteBuf::Provided(unsafe { IoBuf::from_raw_parts(ptr, n) });
-                let result = if let Some(peer) = this.peer {
-                    this.shared
-                        .driver
-                        .borrow_mut()
-                        .send_to(this.handle, buf, peer, key.token())
-                } else {
-                    this.shared
-                        .driver
-                        .borrow_mut()
-                        .write(this.handle, buf, key.token())
-                };
-                match result {
-                    Ok(op) => {
-                        this.shared.slots.borrow_mut()[key.index].op = Some(op);
-                        this.write = Some(key);
-                        key
-                    }
-                    Err(e) => {
-                        this.shared.free(key);
-                        return Poll::Ready(Err(io_error(e)));
-                    }
-                }
+        // A Pending call must not consume the current caller's bytes. Drain the
+        // previously accepted buffer before accepting this one, even if the
+        // caller changed its slice after a Pending poll_write.
+        match self.as_mut().poll_flush(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Ready(Ok(())) => {}
+        }
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        let this = self.get_mut();
+        let key = match this.shared.reserve(cx) {
+            Ok(key) => key,
+            Err(e) => return Poll::Ready(Err(io_error(e))),
+        };
+        let (ptr, n, too_big) = {
+            let mut slots = this.shared.slots.borrow_mut();
+            let bytes = &mut slots[key.index].bytes;
+            let n = buf.len().min(bytes.len());
+            bytes[..n].copy_from_slice(&buf[..n]);
+            (bytes.as_ptr(), n, n < buf.len() && this.peer.is_some())
+        };
+        if too_big {
+            this.shared.free(key);
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "datagram exceeds executor buffer",
+            )));
+        }
+        // SAFETY: staging bytes are immutable from submit until terminal
+        // acknowledgement; dropping the adapter abandons but retains the slot.
+        let buf = WriteBuf::Provided(unsafe { IoBuf::from_raw_parts(ptr, n) });
+        let result = if let Some(peer) = this.peer {
+            this.shared
+                .driver
+                .borrow_mut()
+                .send_to(this.handle, buf, peer, key.token())
+        } else {
+            this.shared
+                .driver
+                .borrow_mut()
+                .write(this.handle, buf, key.token())
+        };
+        match result {
+            Ok(op) => {
+                this.shared.slots.borrow_mut()[key.index].op = Some(op);
+                this.write = Some(key);
+                // The adapter now owns these bytes. Native errors are surfaced
+                // by flush, close, or the next write, as for a buffered writer.
+                Poll::Ready(Ok(n))
             }
-        };
-        let Some(result) = this.shared.result(key, cx) else {
-            return Poll::Pending;
-        };
-        this.shared.free(key);
-        this.write = None;
-        Poll::Ready(match result {
-            OpResult::Wrote(n) => Ok(n),
-            OpResult::Err(e) => Err(io_error(e)),
-            OpResult::Cancelled => Err(io_error(Error::new(ErrorKind::Cancelled))),
-            _ => Err(io::Error::other("unexpected write completion")),
-        })
+            Err(e) => {
+                this.shared.free(key);
+                Poll::Ready(Err(io_error(e)))
+            }
+        }
     }
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();

@@ -1,4 +1,4 @@
-//! Internal platform contract, revision 2 (empty-wait instrumentation).
+//! Internal platform contract, revision 2 (empty-wait instrumentation and native services).
 //!
 //! Public only so the contract runner and independently developed backends can use
 //! it; not a stable end-user extension API. All identifiers and buffers are core

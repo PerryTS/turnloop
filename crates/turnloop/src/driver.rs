@@ -1126,6 +1126,68 @@ mod clock_contract {
         }
     }
     #[test]
+    fn optional_native_capabilities_reject_without_leaking_core_reservations() {
+        let mut l = Driver::<Host>::new(Config::default()).expect("host loop");
+        let mut spec = ProcessSpec::new("unused-native-program");
+        spec.stdio = [ProcessStdio::Pipe; 3];
+        assert_eq!(
+            l.spawn(&spec, Token(1))
+                .expect_err("unsupported spawn")
+                .kind,
+            ErrorKind::Unsupported
+        );
+        assert_eq!(
+            l.signal_start(Signal::Int, Token(2))
+                .expect_err("unsupported signal")
+                .kind,
+            ErrorKind::Unsupported
+        );
+        assert_eq!(
+            l.open_stdio(Stdio::Stdin)
+                .expect_err("unsupported stdio")
+                .kind,
+            ErrorKind::Unsupported
+        );
+        assert_eq!(
+            l.pipe_listen(&PipeName("unused".into()), &ListenOpts::default())
+                .expect_err("unsupported pipe")
+                .kind,
+            ErrorKind::Unsupported
+        );
+        assert!(
+            !l.alive(),
+            "failed native setup must roll back every reservation"
+        );
+        let h = l
+            .timer(l.now(), None, Token(3))
+            .expect("core timer still works");
+        assert_eq!(
+            l.kill(h, Signal::Kill).expect_err("unsupported kill").kind,
+            ErrorKind::Unsupported
+        );
+        assert_eq!(
+            l.tty_set_mode(h, TtyMode::Raw)
+                .expect_err("unsupported TTY")
+                .kind,
+            ErrorKind::Unsupported
+        );
+        assert_eq!(
+            l.tty_window_size(h)
+                .expect_err("unsupported dimensions")
+                .kind,
+            ErrorKind::Unsupported
+        );
+        let mut out = Completions::default();
+        l.turn(Timeout::Now, &mut out).expect("core turn");
+        assert_eq!(out.len(), 1);
+        assert!(matches!(out[0].result, OpResult::Timer));
+        l.close(h, Token(4)).expect("timer close");
+        l.turn(Timeout::Now, &mut out).expect("closed turn");
+        assert_eq!(out.len(), 1);
+        assert!(matches!(out[0].result, OpResult::Closed));
+        assert!(!l.alive());
+    }
+    #[test]
     fn host_clock_arms_deadline_and_validates_queued_turns() {
         let mut l = Driver::<Host>::new(Config::default()).expect("host loop");
         let at = l.now() + Duration::from_micros(50);

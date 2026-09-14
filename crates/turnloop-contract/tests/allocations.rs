@@ -439,7 +439,11 @@ fn executor_steady_io_poll_and_sleep_allocate_nothing() {
         }
         let mut input = [0; 64];
         let output = [27; 64];
-        assert!(Pin::new(&mut a).poll_write(&mut cx, &output).is_pending());
+        let Poll::Ready(wrote) = Pin::new(&mut a).poll_write(&mut cx, &output) else {
+            panic!("fresh write buffer")
+        };
+        assert_eq!(wrote.expect("buffer write"), 64);
+        assert!(Pin::new(&mut a).poll_flush(&mut cx).is_pending());
         assert!(Pin::new(&mut b).poll_read(&mut cx, &mut input).is_pending());
         let mut sleep = ex.handle().sleep(Duration::ZERO);
         assert!(Pin::new(&mut sleep).poll(&mut cx).is_pending());
@@ -450,8 +454,8 @@ fn executor_steady_io_poll_and_sleep_allocate_nothing() {
         while !wrote || !read || !slept {
             assert!(ex.driver().now() < deadline);
             ex.turn(Timeout::Until(deadline)).expect("executor turn");
-            if !wrote && let Poll::Ready(r) = Pin::new(&mut a).poll_write(&mut cx, &output) {
-                assert_eq!(r.expect("write"), 64);
+            if !wrote && let Poll::Ready(r) = Pin::new(&mut a).poll_flush(&mut cx) {
+                r.expect("write completion");
                 wrote = true;
             }
             if !read && let Poll::Ready(r) = Pin::new(&mut b).poll_read(&mut cx, &mut input) {
@@ -473,4 +477,78 @@ fn executor_steady_io_poll_and_sleep_allocate_nothing() {
         "executor steady I/O and timer polls allocate nothing"
     );
     assert_eq!(count, 1001);
+}
+
+#[test]
+fn signal_exit_and_external_notification_delivery_allocate_nothing() {
+    let mut l = Loop::new(Config::default()).expect("loop");
+    let signal = l.signal_start(Signal::Usr1, Token(1)).expect("signal");
+    let condition = WaitCondition::new(0).expect("condition");
+    let mut children = [None; 16];
+    for child in &mut children {
+        let mut spec = ProcessSpec::new(env!("CARGO_BIN_EXE_native_child"));
+        spec.args.push("sleep".into());
+        *child = Some(l.spawn(&spec, Token(2)).expect("child"));
+    }
+    let mut out = Completions::default();
+    // Warm notifier/TLS paths before measuring completion delivery, leaving the
+    // already registered children alive. Process creation is resource setup.
+    l.turn(Timeout::Now, &mut out).expect("warm services");
+    assert!(out.is_empty());
+    ALLOCS.with(|v| v.set(0));
+    ACTIVE.with(|v| v.set(true));
+    for child in children.iter().flatten() {
+        l.kill(child.handle, Signal::Kill).expect("kill child");
+    }
+    let mut exits = 0;
+    let until = l.now() + Duration::from_secs(5);
+    while exits != 16 {
+        assert!(l.now() < until);
+        l.turn(Timeout::Until(until), &mut out).expect("exit turn");
+        for c in out.drain() {
+            assert_eq!(c.token, Token(2));
+            let OpResult::Exited(status) = c.result else {
+                panic!("missing exit")
+            };
+            assert_eq!(status.signal, Some(libc::SIGKILL));
+            exits += 1;
+        }
+    }
+    let (mut signals, mut waits) = (0, 0);
+    for _ in 0..200 {
+        let op = l
+            .external_wait(&condition, 0, None, Token(3))
+            .expect("wait");
+        condition.notify();
+        // SAFETY: SIGUSR1 has a live subscription and getpid names this process.
+        assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGUSR1) }, 0);
+        let (mut signaled, mut notified) = (false, false);
+        let until = l.now() + Duration::from_secs(2);
+        while !signaled || !notified {
+            assert!(l.now() < until);
+            l.turn(Timeout::Until(until), &mut out)
+                .expect("service turn");
+            for c in out.drain() {
+                match c.result {
+                    OpResult::Signal(Signal::Usr1) => {
+                        assert_eq!(c.token, Token(1));
+                        assert!(!signaled);
+                        signaled = true;
+                        signals += 1;
+                    }
+                    OpResult::ExternalWait(WaitResult::Notified) => {
+                        assert_eq!(c.op, Some(op));
+                        assert!(!notified);
+                        notified = true;
+                        waits += 1;
+                    }
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+        }
+    }
+    ACTIVE.with(|v| v.set(false));
+    assert_eq!(ALLOCS.with(Cell::get), 0, "service completion allocations");
+    assert_eq!((exits, signals, waits), (16, 200, 200));
+    l.signal_stop(signal, Token(4)).expect("stop");
 }

@@ -31,7 +31,7 @@ fn spawned_child_stdio_uses_the_driver() {
 }
 #[test]
 fn signals_reach_four_loops_on_four_threads() {
-    turnloop_contract::native_surface::signal_fanout::<backend::Platform>(|| {
+    turnloop_contract::native_surface::signal_fanout::<backend::Platform>(Signal::Usr1, || {
         // SAFETY: SIGUSR1 is subscribed by all four loops before the barrier opens.
         assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGUSR1) }, 0);
     });
@@ -48,9 +48,10 @@ fn kills_live_child_and_grandchild_as_a_group() {
 }
 #[test]
 fn registered_processes_and_signals_do_not_spin() {
-    turnloop_contract::native_surface::services_no_spin::<backend::Platform>(std::ffi::OsStr::new(
-        env!("CARGO_BIN_EXE_native_child"),
-    ));
+    turnloop_contract::native_surface::services_no_spin::<backend::Platform>(
+        std::ffi::OsStr::new(env!("CARGO_BIN_EXE_native_child")),
+        Signal::Usr2,
+    );
 }
 #[test]
 fn terminal_modes_resize_and_restore_on_close_and_drop() {
@@ -410,4 +411,69 @@ fn queued_file_writes_preserve_order_and_close_quiesces_buffers() {
     provided.fill(37);
     assert!(provided.iter().all(|&b| b == 37));
     std::fs::remove_file(path).expect("remove file");
+}
+
+#[test]
+fn sigchld_subscription_cooperates_with_owned_child_reaping() {
+    let mut l = Loop::new(Config::default()).expect("loop");
+    let signal = l.signal_start(Signal::Chld, Token(1)).expect("SIGCHLD");
+    let mut spec = ProcessSpec::new(env!("CARGO_BIN_EXE_native_child"));
+    spec.args.push("sleep".into());
+    let live = l.spawn(&spec, Token(2)).expect("live child");
+    spec.args[0] = "exit".into();
+    let exited = l.spawn(&spec, Token(3)).expect("exiting child");
+    let until = l.now() + std::time::Duration::from_secs(5);
+    let (mut notification, mut exit) = (0, 0);
+    let mut out = Completions::default();
+    while notification == 0 || exit == 0 {
+        assert!(l.now() < until);
+        l.turn(Timeout::Until(until), &mut out)
+            .expect("exit and signal");
+        for c in out.drain() {
+            match c.result {
+                OpResult::Signal(Signal::Chld) => {
+                    assert_eq!(c.token, Token(1));
+                    notification += 1;
+                }
+                OpResult::Exited(status) => {
+                    assert_eq!(c.handle, Some(exited.handle));
+                    assert_eq!(status.code, Some(23));
+                    exit += 1;
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+    assert_eq!(exit, 1);
+    l.signal_stop(signal, Token(4))
+        .expect("stop public subscription");
+    let mut closed = false;
+    while !closed {
+        assert!(l.now() < until);
+        l.turn(Timeout::Until(until), &mut out).expect("stop turn");
+        for c in out.drain() {
+            match c.result {
+                OpResult::Stopped => {}
+                OpResult::Closed => closed = true,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+    l.kill(live.handle, Signal::Kill)
+        .expect("terminate remaining child");
+    let mut reaped = 0;
+    while reaped == 0 {
+        assert!(l.now() < until);
+        l.turn(Timeout::Until(until), &mut out)
+            .expect("remaining child exit");
+        for c in out.drain() {
+            assert_eq!(c.handle, Some(live.handle));
+            let OpResult::Exited(status) = c.result else {
+                panic!("missing remaining child exit")
+            };
+            assert_eq!(status.signal, Some(libc::SIGKILL));
+            reaped += 1;
+        }
+    }
+    assert_eq!(reaped, 1);
 }

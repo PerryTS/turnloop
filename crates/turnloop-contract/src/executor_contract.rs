@@ -65,6 +65,9 @@ pub fn executor_echoes_64_real_connections<B: backend::Backend>() {
                                     .await
                                     .expect("server write");
                         }
+                        poll_fn(|cx| Pin::new(&mut stream).poll_flush(cx))
+                            .await
+                            .expect("server flush");
                         count.set(count.get() + 1);
                     })
                     .expect("spawn connection"),
@@ -222,6 +225,9 @@ pub fn udp_stdio_and_join_cancel<B: backend::Backend>(program: &std::ffi::OsStr)
                 .await
                 .expect("UDP write");
             assert_eq!(n, 16);
+            poll_fn(|cx| Pin::new(&mut a).poll_flush(cx))
+                .await
+                .expect("UDP flush");
             let mut bytes = [0; 64];
             let n = poll_fn(|cx| Pin::new(&mut b).poll_read(cx, &mut bytes))
                 .await
@@ -316,4 +322,73 @@ pub fn drop_ready_accept<B: backend::Backend>() {
     ex.driver()
         .close(listener, Token(0))
         .expect("close listener");
+}
+
+/// A Pending write consumes no caller bytes; replacing that slice cannot report
+/// an earlier operation's count or emit bytes from the abandoned call.
+pub fn pending_writes_may_replace_the_caller_slice<B: backend::Backend>() {
+    use std::task::{Context, Poll, Waker};
+    let mut ex = LocalExecutor::<B>::new(Config::default()).expect("executor");
+    let (_, a, b) = crate::pair(&mut ex.driver());
+    let mut a = ex.handle().io(a);
+    let mut b = ex.handle().io(b);
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut first = vec![7; 32];
+    let Poll::Ready(n) = Pin::new(&mut a).poll_write(&mut cx, &first) else {
+        panic!("empty staging buffer")
+    };
+    assert_eq!(n.expect("accepted bytes"), first.len());
+    first.fill(0);
+    drop(first);
+    assert!(
+        Pin::new(&mut a)
+            .poll_write(&mut cx, b"discarded pending slice")
+            .is_pending()
+    );
+    let until = ex.driver().now() + Duration::from_secs(3);
+    loop {
+        assert!(ex.driver().now() < until);
+        ex.turn(Timeout::Until(until))
+            .expect("first write completion");
+        if let Poll::Ready(n) = Pin::new(&mut a).poll_write(&mut cx, b"new") {
+            assert_eq!(n.expect("replacement bytes"), 3);
+            break;
+        }
+    }
+    loop {
+        match Pin::new(&mut a).poll_flush(&mut cx) {
+            Poll::Ready(result) => {
+                result.expect("both writes completed");
+                break;
+            }
+            Poll::Pending => {
+                assert!(ex.driver().now() < until);
+                ex.turn(Timeout::Until(until)).expect("flush turn");
+            }
+        }
+    }
+    let Poll::Ready(closed) = Pin::new(&mut a).poll_close(&mut cx) else {
+        panic!("flushed close")
+    };
+    closed.expect("close after flush");
+    let mut actual = Vec::new();
+    loop {
+        let mut bytes = [0; 64];
+        match Pin::new(&mut b).poll_read(&mut cx, &mut bytes) {
+            Poll::Ready(result) => {
+                let n = result.expect("peer read");
+                if n == 0 {
+                    break;
+                }
+                actual.extend_from_slice(&bytes[..n]);
+            }
+            Poll::Pending => {
+                assert!(ex.driver().now() < until);
+                ex.turn(Timeout::Until(until)).expect("read turn");
+            }
+        }
+    }
+    assert_eq!(actual.len(), 35);
+    assert_eq!(&actual[..32], [7; 32]);
+    assert_eq!(&actual[32..], b"new");
 }

@@ -212,7 +212,7 @@ pub fn child_stdio<B: Backend>(program: &std::ffi::OsStr) {
     assert_eq!(bytes[1], payload);
 }
 /// Every subscribed loop receives its own signal on its owning thread.
-pub fn signal_fanout<B: Backend>(send: impl FnOnce()) {
+pub fn signal_fanout<B: Backend>(signal: Signal, send: impl FnOnce()) {
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(5));
     let mut workers = Vec::new();
     for i in 0..4 {
@@ -220,7 +220,7 @@ pub fn signal_fanout<B: Backend>(send: impl FnOnce()) {
         workers.push(std::thread::spawn(move || {
             let mut l = Driver::<B>::new(Config::default()).expect("thread loop");
             let h = l
-                .signal_start(Signal::Usr1, Token(i))
+                .signal_start(signal, Token(i))
                 .expect("signal subscription");
             barrier.wait();
             let mut out = Completions::default();
@@ -232,7 +232,7 @@ pub fn signal_fanout<B: Backend>(send: impl FnOnce()) {
                 for c in out.drain() {
                     assert_eq!(c.token, Token(i));
                     assert_eq!(c.handle, Some(h));
-                    assert!(matches!(c.result, OpResult::Signal(Signal::Usr1)));
+                    assert!(matches!(c.result, OpResult::Signal(received) if received == signal));
                     delivered += 1;
                 }
             }
@@ -240,6 +240,7 @@ pub fn signal_fanout<B: Backend>(send: impl FnOnce()) {
             let mut stopped = 0;
             let mut closed = 0;
             while closed == 0 {
+                assert!(l.now() < until, "signal stop timed out");
                 l.turn(Timeout::Now, &mut out).expect("stop turn");
                 for c in out.drain() {
                     match c.result {
@@ -410,14 +411,12 @@ pub fn process_group<B: Backend>(program: &std::ffi::OsStr) {
     );
 }
 /// Subscribed signals and a live sleeping process must preserve the no-spin limits.
-pub fn services_no_spin<B: Backend>(program: &std::ffi::OsStr) {
+pub fn services_no_spin<B: Backend>(program: &std::ffi::OsStr, signal: Signal) {
     let mut l = Driver::<B>::new(Config::default()).expect("loop");
     let mut spec = ProcessSpec::new(program);
     spec.args.push("sleep".into());
     let child = l.spawn(&spec, Token(100)).expect("sleeping child");
-    let signal = l
-        .signal_start(Signal::Usr2, Token(101))
-        .expect("idle signal");
+    let signal = l.signal_start(signal, Token(101)).expect("idle signal");
     l.set_ref(child.handle, false).expect("unref child");
     l.set_ref(signal, false).expect("unref signal");
     let mut out = Completions::default();

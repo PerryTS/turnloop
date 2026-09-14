@@ -46,3 +46,14 @@ Cross-compilation is not runtime execution. Raw outputs: `.tools/core2/`.
 - **FAIL** `cargo clippy --workspace --all-targets --all-features --target x86_64-unknown-linux-gnu -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 101; log 1789405443-565386).
 - **PASS** `env RUSTDOCFLAGS=-Dwarnings cargo doc --workspace --all-features --no-deps` (exit 0; log 1789405443-588294).
 - **PASS** `cargo test -p turnloop -p turnloop-contract --all-features -- --test-threads=1` (exit 0; log 1789405482-900884).
+- **PASS** `cargo test -p turnloop-contract --all-features --test allocations -- --test-threads=1` (exit 0; log 1789405533-327561).
+- **PASS** `cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 0; log 1789405585-297931).
+- **PASS** `cargo +nightly-2026-09-07 clippy -p turnloop -p turnloop-contract -p turnloop-bench --all-targets --all-features --target wasm32-wasip3 -- -D warnings` (exit 0; log 1789405585-353678).
+- **PASS** `bash scripts/ci/no-tokio.sh` (exit 0; log 1789405585-433882).
+- **PASS** `cargo clippy -p turnloop -p turnloop-contract --all-targets --all-features --target aarch64-apple-ios -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 0; log 1789405585-400132).
+- **PASS** `cargo clippy -p turnloop -p turnloop-contract --lib --all-features --target aarch64-linux-android -- -D warnings` (exit 0; log 1789405585-357625).
+- **PASS** `cargo clippy --workspace --all-targets --all-features --target x86_64-unknown-linux-gnu -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 0; log 1789405585-351105).
+- **PASS** `python3 scripts/ci/soak.py` (exit 0; log 1789405585-466433).
+- **PASS** `python3 scripts/ci/run-tests.py native` (exit 0; log 1789405661-106325).
+- **PASS** `cargo test -p turnloop-contract --all-features --test executor --test allocations -- --test-threads=1` (exit 0; log 1789405799-407619).
+- **PASS** `python3 scripts/ci/run-tests.py loom` (exit 0; log 1789405800-585026).

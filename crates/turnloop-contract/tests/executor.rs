@@ -36,3 +36,10 @@ fn udp_stdio_and_explicit_cancellation() {
 fn abandoned_ready_accept_closes_its_socket() {
     turnloop_contract::executor_contract::drop_ready_accept::<turnloop::backend::Platform>();
 }
+
+#[test]
+fn pending_write_can_replace_its_buffer() {
+    turnloop_contract::executor_contract::pending_writes_may_replace_the_caller_slice::<
+        turnloop::backend::Platform,
+    >();
+}
