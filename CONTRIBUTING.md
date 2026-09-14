@@ -161,9 +161,11 @@ python3 scripts/ci/run-tests.py loom
 python3 scripts/ci/run-tests.py miri
 ```
 
-Install the appropriate Rust targets and Miri component first. Both browsers must
-be installed; GitHub's Ubuntu image supplies Chrome and Firefox. wasm-pack locates
-or downloads the matching WebDriver and wasm-bindgen test runner. WASI gets network
+Install the appropriate Rust targets and Miri component first. Linux browser CI installs the checksum-pinned Chrome for Testing/matching driver
+and Firefox/geckodriver with `python3 scripts/ci/install-browsers.py`. The runner
+uses explicit binary paths and prints persistent driver logs on failure; zero
+browser tests is a failure. wasm-pack runs in no-install mode after the matching
+wasm-bindgen CLI is built by `install-web-tools.py`. WASI gets network
 access only inside the disposable test runner; each component has a 120-second
 runtime timeout. A standalone spike is not a substitute for the shared contracts.
 
@@ -368,8 +370,11 @@ are chained beneath the original startup/test error so both remain visible.
 
 ## Pending platform and measurement gates
 
-The `wasi` and `web` jobs remain required and fail until their missing production
-backend inputs land. The instruction job compares against the committed Linux
+The `wasi` and `web` jobs run the production revision-2 providers and remain
+required. WASI 0.3 keeps its experimental feature; Linux must execute both pinned
+browsers. WASI runners enable the executor and independently require positive core,
+debug/release semantic and release allocation counts, supplying a real stdin
+fixture to the semantic tests. The instruction job compares against the committed Linux
 baseline. The strict `ci-gate` fan-in is retained. Windows `test-native`
 runs the workspace and independently requires positive counts for core and every
 protocol member, with default, executor and all features. The existing sans-IO unit, wire,
@@ -385,11 +390,14 @@ contract zero counts always fail.
 
 - **Wave 2 Windows:** adapt `spikes/iocp` to the production Backend, instantiate
   `turnloop-contract` on IOCP, run all contracts (including no-spin) on Windows.
-- **Wave 2 WASI:** integrate both providers, provide nonzero shared contracts on
-  `wasm32-wasip2` and `wasm32-wasip3`, run the existing `run-tests.py wasi` commands.
-  Resolve the p3 bounded waitable-set API before claiming D7 compliance.
-- **Wave 2 web:** provide real browser and Node test targets, add `web-tests` and
-  `node-tests` metadata, run Chrome, Firefox and Node via `run-tests.py`.
+- **WASM providers and contracts:** production p2 and web adapters and the
+  experimental p3 adapter now live in `crates/turnloop`. Run the mandatory
+  `run-tests.py wasi --target wasm32-wasip2`, `... wasm32-wasip3`, `run-tests.py web`
+  and `run-tests.py node` jobs. Each contract/allocation binary and each browser
+  must execute positive test counts. The runner owns and checks actual HTTP,
+  aborted fetch and WebSocket fixture traffic. See [docs/wasm.md](docs/wasm.md)
+  for setup, explicit platform exclusions and outstanding p3 runtime limitations.
+  These remain failing gates until the strict requirements pass.
 - **Linux instruction regression:** run against the committed baseline on Ubuntu
   24.04 x86_64. Use the candidate command below only for a reviewed rebaseline;
   macOS timings must never substitute for Linux instruction counts.

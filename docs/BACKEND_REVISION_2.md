@@ -107,8 +107,10 @@ if the value did not change. Hosts mutating the supplied atomic must call `notif
 Registration/notification/parking share one lock to prevent lost wakes. Completion
 publication uses the waiting loop's existing work queue and notifier. Cancellation
 and loop drop remove registrations; no thread or allocation is created per wait.
-WASM returns `Unsupported` for this native thread service. Host callback/worker
-providers can add an equivalent API implementation without JavaScript in the core.
+WASI/web use a single-agent registry with the same completion semantics; their
+wait deadlines participate in the loop's native/host scheduling. The optional web
+Worker bridge uses an Atomics-backed queue to deliver condition updates on the
+owner. See [WASI/web revision-2 behavior](wasm.md#revision-2-stdio-external-waits-and-executor).
 
 ## Executor
 
@@ -157,10 +159,11 @@ production IOCP exists; do not substitute ordinary stdio for its driver exercise
 Unix-only openpty/sigaction/waitpid assertions stay in native tests. IOCP needs its
 console and process registration race equivalents in addition to the shared tests.
 
-WASI 0.2/0.3, web and Windows common core/executor compile without a production
-backend. Their existing spikes remain separate, unchanged projects. Passing a
-cross-check does not claim runtime support: platform contract jobs must execute
-nonzero tests after those adapters land.
+WASI 0.2/0.3 and web production adapters implement this revision; WASI 0.3 remains
+experimental. WASI stdio, single-agent external waits, Worker condition delivery
+and executor contracts run through the required platform runners. Windows still
+awaits its production IOCP adapter. Cross-checking is not runtime proof; browser
+and Windows runtime status remains explicit in the root lane report.
 
 ## Specification clarifications proposed for review
 

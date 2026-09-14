@@ -404,6 +404,7 @@ Two backends, because both versions matter now:
   - `wasi:io` is gone; async moves into the component model (`async func`, `stream<T>`, `future<T>`).
   - The backend maps operations onto those futures and streams, and turns their resolution into completions. How a guest waits on several at once (the component-model async ABI's waitable sets) is an **M1 spike**.
   - `std::thread` isn't supported on 0.3 yet; cooperative threads are expected in 0.3.x.
+- **Timer precision:** nanosecond deadline representation; wake precision is **host-dependent (Wasmtime ≈1 ms)**. Bare monotonic-clock waits reproduce the host lateness. The Wasmtime release contract uses median lateness ≤ 2 ms; debug builds exercise semantics and no-spin, not precision. No backend wait floor or busy-spin compensation is allowed. See [measurements](docs/wasm.md#wasi-timer-measurements).
 - **Threads on WASI:** `wasm32-wasip1-threads` exists, but 0.2/0.3 are single-threaded today. The notifier degrades to a same-thread flag, and the blocking pool runs jobs inline or through host-provided async interfaces.
 - **Host integration:** the host (Wasmtime or jco) owns scheduling. The guest's `turn(timeout)` blocks inside `poll` (0.2) or the component-model wait (0.3).
 - **CI:** Wasmtime runs the contract tests for both, on every PR.
@@ -429,7 +430,7 @@ Two backends, because both versions matter now:
 |---|---|---|---|---|---|---|
 | Wait / completions | epoll (io_uring later) | kqueue | IOCP | `wasi:io/poll` | component-model async | host callbacks |
 | Wake | eventfd | EVFILT_USER | PostQueuedCompletionStatus | same-thread flag | same-thread flag | `schedule_turn` import / Atomics.notify |
-| Timer wait precision | ns (epoll_pwait2 / timerfd) | ns (kevent timespec) | sub-ms via high-res waitable timer | ns (monotonic-clock) | ns (monotonic-clock) | host `setTimeout` (clamped by browser) |
+| Timer wait precision | ns (epoll_pwait2 / timerfd) | ns (kevent timespec) | sub-ms via high-res waitable timer | host-dependent (Wasmtime ≈1 ms) | host-dependent (Wasmtime ≈1 ms) | host `setTimeout` (clamped by browser) |
 | TCP / UDP | non-blocking + readiness | non-blocking + readiness | overlapped Winsock | `wasi:sockets` | `wasi:sockets` | unsupported |
 | Outbound HTTP | protocol crate | protocol crate | protocol crate | protocol crate or `wasi:http` | protocol crate or `wasi:http` | host `fetch` |
 | WebSocket | protocol crate | protocol crate | protocol crate | protocol crate | protocol crate | host `WebSocket` |

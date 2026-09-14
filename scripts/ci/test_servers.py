@@ -9,6 +9,7 @@ import subprocess
 import socket
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch, Mock
 
@@ -73,7 +74,27 @@ class Fixtures(unittest.TestCase):
             fixtures.SELECTED = {'http'}
             executable = crashing_binary(fixtures.TOOLS / 'node')
             errors = io.StringIO()
+            spawn = fixtures.private_process
+
+            def logged_child(*args, **kwargs):
+                child = spawn(*args, **kwargs)
+                # The first diagnostic is deliberately invalid readiness JSON.
+                # Hand off only after both output streams have written their
+                # proof markers, otherwise http_start may correctly terminate
+                # the child midway through its diagnostics. Do not poll/wait:
+                # the runner must still reap the real child itself.
+                deadline = time.monotonic() + 5
+                while b'stderr: rejected fixture option\n' not in Path(args[1]).read_bytes():
+                    if time.monotonic() >= deadline:
+                        child.terminate()
+                        child.wait(timeout=5)
+                        self.fail('HTTP failure fixture did not finish writing its diagnostics')
+                    time.sleep(.005)
+                self.assertIsNone(child.returncode)
+                return child
+
             with patch.object(fixtures, 'find_binary', return_value=executable), \
+                 patch.object(fixtures, 'private_process', side_effect=logged_child), \
                  redirect_stderr(errors), self.assertRaises((RuntimeError, json.JSONDecodeError)):
                 fixtures.start_all()
             self.assertIn('HTTP startup failed', errors.getvalue())

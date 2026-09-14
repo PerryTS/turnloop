@@ -55,8 +55,14 @@ mod queue;
 mod sync;
 pub use notifier::{Notifier, PostError, Poster};
 
-#[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
-/// The native driver selected for the compilation target; owned by one thread.
+#[cfg(any(
+    turnloop_backend = "kqueue",
+    turnloop_backend = "epoll",
+    turnloop_backend = "wasi_p2",
+    turnloop_backend = "web",
+    all(turnloop_backend = "wasi_p3", feature = "wasi-p3-experimental")
+))]
+/// The platform driver selected for the compilation target; owned by one agent.
 pub type Loop = Driver<backend::Platform>;
 #[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
 pub use backend::unix::Detached;

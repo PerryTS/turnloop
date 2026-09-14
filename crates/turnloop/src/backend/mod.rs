@@ -308,6 +308,20 @@ pub mod unix;
 #[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
 pub use unix::Unix as Platform;
 
+#[cfg(turnloop_backend = "wasi_p2")]
+pub mod wasi_p2;
+#[cfg(turnloop_backend = "wasi_p2")]
+pub use wasi_p2::WasiP2 as Platform;
+
+#[cfg(turnloop_backend = "web")]
+pub mod web;
+#[cfg(turnloop_backend = "web")]
+pub use web::Web as Platform;
+
+#[cfg(all(turnloop_backend = "wasi_p3", feature = "wasi-p3-experimental"))]
+pub mod wasi_p3;
+#[cfg(all(turnloop_backend = "wasi_p3", feature = "wasi-p3-experimental"))]
+pub use wasi_p3::WasiP3 as Platform;
 #[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
 mod ipc;
 
