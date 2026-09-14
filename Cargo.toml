@@ -1,6 +1,7 @@
 [workspace]
 members = ["protocols/turnloop-tls", "protocols/turnloop-http", "protocols/turnloop-websocket"]
 resolver = "3"
+exclude = ["protocols/turnloop-http/vendor/ruzstd"]
 
 [workspace.package]
 version = "0.1.0"

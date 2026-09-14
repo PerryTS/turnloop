@@ -141,7 +141,7 @@ fn lengths(head: &Head) -> Result<(Option<u64>, bool)> {
     let mut cl = None;
     let mut te = false;
     for h in &head.headers {
-        if h.name == "content-length" {
+        if h.name.eq_ignore_ascii_case("content-length") {
             // Deliberately reject even identical duplicates: no downstream ambiguity.
             if cl.is_some() || h.value.is_empty() || !h.value.iter().all(u8::is_ascii_digit) {
                 return Err(Error::new(
@@ -158,7 +158,7 @@ fn lengths(head: &Head) -> Result<(Option<u64>, bool)> {
                     .ok_or(invalid("content-length overflow"))?,
             );
         }
-        if h.name == "transfer-encoding" {
+        if h.name.eq_ignore_ascii_case("transfer-encoding") {
             if te || !h.value.eq_ignore_ascii_case(b"chunked") {
                 return Err(Error::new(
                     "HPE_INVALID_TRANSFER_ENCODING",

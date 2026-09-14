@@ -131,3 +131,62 @@ fn http1_body_and_h2_flow_control_allocate_zero() {
     assert_eq!(accepted, 4000);
     assert_eq!(allocations, 0);
 }
+
+#[test]
+fn streaming_decompressors_reuse_scratch() {
+    use std::io::Write;
+    use turnloop_http::compression::StreamingDecoder;
+    let body = b"allocation profile allocation profile allocation profile";
+    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), Default::default());
+    gzip.write_all(body).unwrap();
+    let mut deflate = flate2::write::ZlibEncoder::new(Vec::new(), Default::default());
+    deflate.write_all(body).unwrap();
+    let mut brotli = Vec::new();
+    {
+        let mut writer = brotli::CompressorWriter::new(&mut brotli, 4096, 4, 22);
+        writer.write_all(body).unwrap();
+    }
+    let cases = [
+        ("gzip", gzip.finish().unwrap()),
+        ("deflate", deflate.finish().unwrap()),
+        ("br", brotli),
+        (
+            "zstd",
+            "28b52ffd2038cd000098616c6c6f636174696f6e2070726f66696c65200100d933c3"
+                .as_bytes()
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|s| u8::from_str_radix(std::str::from_utf8(s).unwrap(), 16).unwrap())
+                .collect(),
+        ),
+    ];
+    for (name, wire) in cases {
+        let mut decoder = StreamingDecoder::new(name, 4096).unwrap();
+        let mut count = 0;
+        let mut run = || {
+            decoder.reset(4096).unwrap();
+            let mut pos = 0;
+            loop {
+                let mut output = [0; 4096];
+                let step = decoder.process(&wire[pos..], &mut output, true).unwrap();
+                pos += step.consumed;
+                count += step.written;
+                if step.finished {
+                    break;
+                }
+                assert!(step.consumed > 0 || step.written > 0);
+            }
+        };
+        for _ in 0..5 {
+            run();
+        }
+        let allocations = measured(|| {
+            for _ in 0..100 {
+                run();
+            }
+        });
+        assert_eq!(allocations, 0, "{name}");
+        assert_eq!(count, 105 * body.len());
+    }
+}

@@ -94,7 +94,7 @@ impl Request {
             target
         };
         let mut headers = self.headers.clone();
-        headers.retain(|h| h.name != "host");
+        headers.retain(|h| !h.name.eq_ignore_ascii_case("host"));
         headers.push(Header::new("host", authority(&url)));
         Head {
             method: self.method.clone(),
@@ -148,10 +148,15 @@ impl Request {
         }
         if self.url.origin() != next.origin() {
             self.headers.retain(|h| {
-                !matches!(
-                    h.name.as_str(),
-                    "authorization" | "proxy-authorization" | "cookie" | "cookie2" | "host"
-                )
+                ![
+                    "authorization",
+                    "proxy-authorization",
+                    "cookie",
+                    "cookie2",
+                    "host",
+                ]
+                .iter()
+                .any(|name| h.name.eq_ignore_ascii_case(name))
             });
         }
         if rewrite {
@@ -159,15 +164,16 @@ impl Request {
             self.body.clear();
             self.replayable = true;
             self.headers.retain(|h| {
-                !matches!(
-                    h.name.as_str(),
-                    "content-encoding"
-                        | "content-language"
-                        | "content-location"
-                        | "content-type"
-                        | "content-length"
-                        | "transfer-encoding"
-                )
+                ![
+                    "content-encoding",
+                    "content-language",
+                    "content-location",
+                    "content-type",
+                    "content-length",
+                    "transfer-encoding",
+                ]
+                .iter()
+                .any(|name| h.name.eq_ignore_ascii_case(name))
             });
         }
         self.url = next;

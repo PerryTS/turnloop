@@ -1,54 +1,24 @@
 //! Bounded decompression into a caller-reused result buffer. This convenience API
 //! accepts a complete encoded body; wire body streaming is exposed by the codecs.
 use crate::{Error, Result};
-use std::io::{Cursor, Read};
+/// Convenience whole-body decode. Cache `StreamingDecoder` and use `reset` for
+/// allocation-free repeated responses instead of constructing one per call.
 pub fn decode(encoding: &str, input: &[u8], output: &mut Vec<u8>, limit: usize) -> Result<()> {
     output.clear();
-    let mut reader: Box<dyn Read + '_> = match encoding.trim() {
-        "" | "identity" => Box::new(Cursor::new(input)),
-        "gzip" | "x-gzip" => Box::new(flate2::read::MultiGzDecoder::new(input)),
-        "deflate" => {
-            if input.len() >= 2
-                && input[0] & 15 == 8
-                && u16::from_be_bytes([input[0], input[1]]).is_multiple_of(31)
-            {
-                Box::new(flate2::read::ZlibDecoder::new(input))
-            } else {
-                Box::new(flate2::read::DeflateDecoder::new(input))
-            }
-        }
-        "br" => Box::new(brotli::Decompressor::new(input, 4096)),
-        #[cfg(not(target_arch = "wasm32"))]
-        "zstd" => Box::new(
-            zstd::stream::read::Decoder::new(input)
-                .map_err(|_| Error::new("UND_ERR_SOCKET", "invalid zstd stream"))?,
-        ),
-        #[cfg(target_arch = "wasm32")]
-        "zstd" => Box::new(ruzstd::decoding::StreamingDecoder::new(input).map_err(|_| corrupt())?),
-        _ => {
-            return Err(Error::new(
-                "UND_ERR_NOT_SUPPORTED",
-                "unsupported content encoding",
-            ));
-        }
-    };
-    let mut bytes = [0; 8192];
+    let mut decoder = StreamingDecoder::new(encoding.trim(), limit)?;
+    let mut pos = 0;
     loop {
-        let n = reader
-            .read(&mut bytes)
-            .map_err(|_| Error::new("UND_ERR_SOCKET", "invalid compressed body"))?;
-        if n == 0 {
-            break;
+        let mut bytes = [0; 8192];
+        let step = decoder.process(&input[pos..], &mut bytes, true)?;
+        pos += step.consumed;
+        output.extend_from_slice(&bytes[..step.written]);
+        if step.finished {
+            return Ok(());
         }
-        if n > limit.saturating_sub(output.len()) {
-            return Err(Error::new(
-                "UND_ERR_RES_EXCEEDED_MAX_SIZE",
-                "decoded body exceeds limit",
-            ));
+        if step.consumed == 0 && step.written == 0 {
+            return Err(corrupt());
         }
-        output.extend_from_slice(&bytes[..n]);
     }
-    Ok(())
 }
 
 /// A single incremental decode step. Retain input after `consumed`, and consume
@@ -66,11 +36,12 @@ enum Stage {
     Trailer,
     Done,
 }
-type BrotliState = brotli::BrotliState<
-    brotli::HeapAlloc<u8>,
-    brotli::HeapAlloc<u32>,
-    brotli::HeapAlloc<brotli::HuffmanCode>,
->;
+type BytePool = crate::recycling::Pool<u8>;
+type IntPool = crate::recycling::Pool<u32>;
+type CodePool = crate::recycling::Pool<brotli::HuffmanCode>;
+type BrotliState = brotli::BrotliState<BytePool, IntPool, CodePool>;
+// Keep the WASM decoder inline: 480 bytes avoids another per-response allocation.
+#[allow(clippy::large_enum_variant)]
 enum Engine {
     Identity,
     Deflate {
@@ -81,14 +52,23 @@ enum Engine {
         crc: flate2::Crc,
         members: usize,
     },
-    Brotli(Box<BrotliState>),
+    Brotli {
+        state: Box<BrotliState>,
+        bytes: BytePool,
+        ints: IntPool,
+        codes: CodePool,
+    },
     #[cfg(not(target_arch = "wasm32"))]
     Zstd {
         decoder: zstd::stream::raw::Decoder<'static>,
         boundary: bool,
     },
     #[cfg(target_arch = "wasm32")]
-    Zstd(ruzstd::decoding::FrameDecoder),
+    Zstd {
+        decoder: ruzstd::decoding::FrameDecoder,
+        reset: bool,
+        boundary: bool,
+    },
 }
 pub struct StreamingDecoder {
     engine: Engine,
@@ -120,11 +100,18 @@ impl StreamingDecoder {
                 crc: flate2::Crc::new(),
                 members: 0,
             },
-            "br" => Engine::Brotli(Box::new(BrotliState::new(
-                Default::default(),
-                Default::default(),
-                Default::default(),
-            ))),
+            "br" => {
+                let bytes = BytePool::default();
+                let ints = IntPool::default();
+                let codes = CodePool::default();
+                let state = Box::new(BrotliState::new(bytes.clone(), ints.clone(), codes.clone()));
+                Engine::Brotli {
+                    state,
+                    bytes,
+                    ints,
+                    codes,
+                }
+            }
             #[cfg(not(target_arch = "wasm32"))]
             "zstd" => {
                 let mut decoder = zstd::stream::raw::Decoder::new().map_err(|_| corrupt())?;
@@ -137,7 +124,11 @@ impl StreamingDecoder {
                 }
             }
             #[cfg(target_arch = "wasm32")]
-            "zstd" => Engine::Zstd(ruzstd::decoding::FrameDecoder::new()),
+            "zstd" => Engine::Zstd {
+                decoder: ruzstd::decoding::FrameDecoder::new(),
+                reset: true,
+                boundary: false,
+            },
             _ => {
                 return Err(Error::new(
                     "UND_ERR_NOT_SUPPORTED",
@@ -152,6 +143,53 @@ impl StreamingDecoder {
             done: false,
             failed: false,
         })
+    }
+    /// Reuse algorithm and scratch storage for another body of the same encoding.
+    /// Warm up with the largest expected body shape before measuring allocations.
+    pub fn reset(&mut self, limit: usize) -> Result<()> {
+        match &mut self.engine {
+            Engine::Identity => {}
+            Engine::Deflate {
+                decoder,
+                gzip,
+                detect,
+                stage,
+                crc,
+                members,
+            } => {
+                decoder.reset(false);
+                *detect = !*gzip;
+                *stage = if *gzip { Stage::Header } else { Stage::Body };
+                crc.reset();
+                *members = 0;
+            }
+            Engine::Brotli {
+                state,
+                bytes,
+                ints,
+                codes,
+            } => {
+                **state = BrotliState::new(bytes.clone(), ints.clone(), codes.clone());
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Engine::Zstd { decoder, boundary } => {
+                use zstd::stream::raw::Operation;
+                decoder.reinit().map_err(|_| corrupt())?;
+                *boundary = false;
+            }
+            #[cfg(target_arch = "wasm32")]
+            Engine::Zstd {
+                reset, boundary, ..
+            } => {
+                *reset = true;
+                *boundary = false;
+            }
+        }
+        self.total = 0;
+        self.limit = limit;
+        self.done = false;
+        self.failed = false;
+        Ok(())
     }
     /// `end` means no more encoded bytes will arrive, not that output is unbounded.
     pub fn process(&mut self, input: &[u8], output: &mut [u8], end: bool) -> Result<DecodeStep> {
@@ -265,7 +303,7 @@ impl StreamingDecoder {
                     }
                 }
             }
-            Engine::Brotli(state) => {
+            Engine::Brotli { state, .. } => {
                 let mut available_in = input.len();
                 let mut available_out = output.len();
                 let mut total = self.total;
@@ -315,26 +353,47 @@ impl StreamingDecoder {
                 }
             }
             #[cfg(target_arch = "wasm32")]
-            Engine::Zstd(decoder) => {
-                if self.total == 0 && input.len() < 18 && !end {
+            Engine::Zstd {
+                decoder,
+                reset,
+                boundary,
+            } => {
+                if input.is_empty() && end && *boundary {
+                    self.done = true;
                     return Ok(DecodeStep {
                         consumed: 0,
                         written: 0,
-                        finished: false,
+                        finished: true,
                     });
                 }
-                let result = decoder
-                    .decode_from_to(input, output)
-                    .map_err(|_| corrupt())?;
-                consumed = result.0;
-                written = result.1;
-                finished = decoder.is_finished() && decoder.can_collect() == 0;
-                if finished {
-                    if let Some(expected) = decoder.get_checksum_from_data() {
-                        if decoder.get_calculated_checksum() != Some(expected) {
-                            return Err(corrupt());
-                        }
+                let mut source = input;
+                if *reset {
+                    if source.len() < 18 && !end {
+                        return Ok(DecodeStep {
+                            consumed: 0,
+                            written: 0,
+                            finished: false,
+                        });
                     }
+                    decoder.reset(&mut source).map_err(|_| corrupt())?;
+                    consumed = input.len() - source.len();
+                    *reset = false;
+                    *boundary = false;
+                }
+                let result = decoder
+                    .decode_from_to(source, output)
+                    .map_err(|_| corrupt())?;
+                consumed += result.0;
+                written = result.1;
+                if decoder.is_finished() && decoder.can_collect() == 0 {
+                    if let Some(expected) = decoder.get_checksum_from_data()
+                        && decoder.get_calculated_checksum() != Some(expected)
+                    {
+                        return Err(corrupt());
+                    }
+                    *boundary = true;
+                    *reset = true;
+                    finished = end && consumed == input.len();
                 } else if end && consumed == 0 && written == 0 {
                     return Err(corrupt());
                 }

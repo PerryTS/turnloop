@@ -1,6 +1,7 @@
 //! RFC 9113 connection/stream framing. Caller retains partial frames and acknowledges
 //! writes. DATA is borrowed, flow-control credit is returned explicitly by the host.
 use crate::{Error, Result, hpack, http1::Header};
+use std::time::Instant;
 pub const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -156,6 +157,7 @@ pub struct Connection {
     output_pos: usize,
     draining: bool,
     failed: bool,
+    settings_deadline: Option<Instant>,
 }
 impl Connection {
     pub fn new(role: Role, limits: Limits) -> Result<Self> {
@@ -188,6 +190,7 @@ impl Connection {
             output_pos: 0,
             draining: false,
             failed: false,
+            settings_deadline: None,
         };
         if role == Role::Client {
             result.output.extend_from_slice(PREFACE);
@@ -206,6 +209,47 @@ impl Connection {
         }
         result.frame(4, 0, 0, &settings)?;
         Ok(result)
+    }
+    /// Host-supplied SETTINGS acknowledgement deadline; no clock is sampled.
+    pub fn set_settings_deadline(&mut self, deadline: Option<Instant>) {
+        self.settings_deadline = deadline;
+    }
+    pub fn next_timeout(&self) -> Option<Instant> {
+        if self.settings_awaiting_ack && !self.failed {
+            self.settings_deadline
+        } else {
+            None
+        }
+    }
+    pub fn handle_timeout(&mut self, now: Instant) -> Option<Error> {
+        if self.next_timeout().is_some_and(|d| d <= now) {
+            self.failed = true;
+            let mut payload = [0; 8];
+            payload[..4].copy_from_slice(&self.last_remote.to_be_bytes());
+            payload[7] = 4;
+            self.frame(7, 0, 0, &payload).expect("fixed-size GOAWAY");
+            Some(error(
+                "SETTINGS_TIMEOUT",
+                "SETTINGS acknowledgement timeout",
+            ))
+        } else {
+            None
+        }
+    }
+    /// Notify transport loss, then call `poll_failed_stream` until exhausted.
+    pub fn eof(&mut self) {
+        self.failed = true;
+    }
+    /// Exactly one terminal result for each still-open stream after connection failure.
+    /// Fully ended/reset streams have already produced their terminal event.
+    pub fn poll_failed_stream(&mut self) -> Option<u32> {
+        if !self.failed {
+            return None;
+        }
+        let stream = self.streams.iter_mut().find(|s| !s.closed())?;
+        stream.local_end = true;
+        stream.remote_end = true;
+        Some(stream.id)
     }
     pub fn output(&self) -> &[u8] {
         &self.output[self.output_pos..]

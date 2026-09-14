@@ -327,7 +327,10 @@ impl Decoder {
             let header = if b & 128 != 0 {
                 let index = integer(input, &mut pos, 7)?;
                 let (n, v) = self.table.get(index)?;
-                Header::new(n, v)
+                Header {
+                    name: n.to_string(),
+                    value: v.to_vec(),
+                }
             } else {
                 let indexed = b & 64 != 0;
                 let index = integer(input, &mut pos, if indexed { 6 } else { 4 })?;
