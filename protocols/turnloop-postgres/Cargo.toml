@@ -13,3 +13,6 @@ postgres-protocol.workspace = true
 [dev-dependencies]
 rustls.workspace = true
 
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+postgres-protocol = { workspace = true, features = ["js"] }

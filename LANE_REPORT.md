@@ -69,3 +69,27 @@ cargo check --workspace --target wasm32-wasip2 --locked.
 Implement and test both stages. Verify whether MySQL 9.6 still provides
 mysql_native_password (removed in MySQL 9.0); report unsupported server
 capabilities rather than mislabeling fixture tests as real-server tests.
+
+## Progress checkpoint
+
+Both stages now have implementations in both crates. Current passing coverage:
+wire authentication (clear/MD5/native/caching fast/full TLS and auth switch),
+fragmented multi-result queries, extended/prepared execution, error fields,
+COPY command generation, transaction status, cancellation packet generation,
+LOCAL INFILE denial, bounded framing, 16 MiB MySQL packet continuation,
+compressed framing, conversion helpers, and pool FIFO/timeouts/stale releases.
+Allocation counters pass: PostgreSQL query/row and named execution and MySQL
+plain/compressed ping each allocate zero after warming (1,000 operations).
+WASI check passed; browser target feature wiring is being verified.
+
+Real-server status is **UNRUN**, not a pass. Both startup commands **FAIL**:
+`python3 scripts/sql-servers.py start`: PostgreSQL initdb's 56-byte shmget
+request is denied with Operation not permitted. `TURNLOOP_SQL_SERVER=mysql
+python3 scripts/sql-servers.py start`: MySQL 9.6.0 initialization SIGSEGV in
+memory::Aligned_atomic<long> (see .tools/mysql-init.log). No server survived.
+No sandbox override or system/default-port server was used.
+
+MySQL docs confirm mysql_native_password was removed in 9.0:
+https://dev.mysql.com/doc/mysql-security-excerpt/8.0/en/native-pluggable-authentication.html.
+Thus MySQL 9.6 alone cannot satisfy the real native-plugin auth requirement;
+proposed fixture addition is a private MySQL 8.4 with that plugin enabled.

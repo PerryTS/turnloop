@@ -66,6 +66,7 @@ pub struct Config {
     pub channel_binding_required: bool,
     pub max_buffer: usize,
     pub max_pending: usize,
+    pub max_scram_iterations: u32,
     pub connect_deadline: Option<Instant>,
 }
 impl Default for Config {
@@ -79,6 +80,7 @@ impl Default for Config {
             channel_binding_required: false,
             max_buffer: 64 * 1024 * 1024,
             max_pending: 1024,
+            max_scram_iterations: 1_000_000,
             connect_deadline: None,
         }
     }
@@ -215,8 +217,17 @@ pub struct Connection {
 }
 impl Connection {
     pub fn new(config: Config) -> Result<Self> {
-        if config.max_buffer < 1024 || config.max_pending == 0 {
+        if config.max_buffer < 1024
+            || config.max_buffer > i32::MAX as usize
+            || config.max_pending == 0
+        {
             return Err(Error::Limit);
+        }
+        if config.user.contains('\0')
+            || config.database.contains('\0')
+            || config.application_name.contains('\0')
+        {
+            return Err(Error::State("NUL in startup parameter"));
         }
         if config.channel_binding_required && config.ssl == SslMode::Disable {
             return Err(Error::State("channel binding requires TLS"));
@@ -356,6 +367,9 @@ impl Connection {
     }
     pub fn query(&mut self, token: Token, sql: &str, deadline: Option<Instant>) -> Result<()> {
         self.accept(token)?;
+        if sql.len().saturating_add(6) > self.config.max_buffer.saturating_sub(self.output.len()) {
+            return Err(Error::Limit);
+        }
         let before = self.output.len();
         let result = frontend::query(sql, &mut self.output).map_err(Error::from);
         self.finish_command(token, deadline, None, before, result)
@@ -375,6 +389,21 @@ impl Connection {
             result_formats,
         } = query;
         self.accept(token)?;
+        let size = params.iter().fold(
+            64usize
+                .saturating_add(name.len().saturating_mul(2))
+                .saturating_add(sql.len())
+                .saturating_add(oids.len().saturating_mul(4))
+                .saturating_add(result_formats.len().saturating_mul(2)),
+            |n, p| {
+                n.saturating_add(6)
+                    .saturating_add(p.value.map_or(0, <[u8]>::len))
+            },
+        );
+        if size > self.config.max_buffer.saturating_sub(self.output.len()) {
+            return Err(Error::Limit);
+        }
+
         if params.iter().any(|p| !matches!(p.format, 0 | 1))
             || result_formats.iter().any(|f| !matches!(f, 0 | 1))
         {
@@ -648,6 +677,14 @@ impl Connection {
                         return Ok(Some(Event::ScramNeeded { plus }));
                     }
                     11 => {
+                        let iterations = std::str::from_utf8(c.0)
+                            .ok()
+                            .and_then(|s| s.split(',').find_map(|p| p.strip_prefix("i=")))
+                            .and_then(|s| s.parse::<u32>().ok())
+                            .ok_or(Error::Protocol("invalid SCRAM iterations"))?;
+                        if iterations == 0 || iterations > self.config.max_scram_iterations {
+                            return Err(Error::Limit);
+                        }
                         let scram = self
                             .scram
                             .as_mut()

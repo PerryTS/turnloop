@@ -209,8 +209,17 @@ pub struct Connection {
 }
 impl Connection {
     pub fn new(config: Config) -> Result<Self> {
-        if config.max_buffer < 1024 || config.max_columns == 0 {
+        if config.max_buffer < 1024
+            || config.max_buffer > u32::MAX as usize
+            || config.max_columns == 0
+        {
             return Err(Error::Limit);
+        }
+        if config.user.contains('\0')
+            || config.database.as_ref().is_some_and(|s| s.contains('\0'))
+            || config.password.contains(&0)
+        {
+            return Err(Error::State("NUL in credentials"));
         }
         let mut codec = PacketCodec::default();
         codec.max_allowed_packet = config.max_buffer;
@@ -402,6 +411,10 @@ impl Connection {
     }
     pub fn query(&mut self, token: Token, sql: &str, deadline: Option<Instant>) -> Result<()> {
         self.accept()?;
+        if sql.len().saturating_add(33) > self.config.max_buffer {
+            return Err(Error::Limit);
+        }
+
         self.scratch.clear();
         self.scratch.push(3);
         self.scratch.extend_from_slice(sql.as_bytes());
@@ -410,6 +423,10 @@ impl Connection {
     }
     pub fn prepare(&mut self, token: Token, sql: &str, deadline: Option<Instant>) -> Result<()> {
         self.accept()?;
+        if sql.len().saturating_add(33) > self.config.max_buffer {
+            return Err(Error::Limit);
+        }
+
         self.scratch.clear();
         self.scratch.push(0x16);
         self.scratch.extend_from_slice(sql.as_bytes());
@@ -430,6 +447,14 @@ impl Connection {
             .ok_or(Error::State("unknown prepared statement"))?;
         if params.len() != stmt.parameters as usize {
             return Err(Error::State("Incorrect arguments to mysqld_stmt_execute"));
+        }
+        let size = params
+            .iter()
+            .fold(16u64.saturating_add(params.len() as u64 * 3), |n, p| {
+                n.saturating_add(p.bin_len())
+            });
+        if size > self.config.max_buffer.saturating_sub(32) as u64 {
+            return Err(Error::Limit);
         }
         self.scratch.clear();
         self.scratch.push(0x17);
@@ -703,6 +728,9 @@ impl Connection {
                 }
                 self.caps = caps & h.capabilities();
                 if self.config.tls {
+                    if !self.input.is_empty() {
+                        return Err(Error::Protocol("plaintext after TLS handshake offer"));
+                    }
                     self.scratch.clear();
                     SslRequest::new(self.caps, self.config.max_buffer as u32, 45)
                         .serialize(&mut self.scratch);
@@ -928,10 +956,6 @@ impl Connection {
             token: self.token()?,
             statement,
         }))
-    }
-    /// True when another packet may already be buffered. Poll before reading again.
-    pub fn has_buffered_input(&self) -> bool {
-        !self.input.is_empty()
     }
 }
 fn parse_ok(b: &[u8], caps: Caps) -> Result<OkPacket<'_>> {

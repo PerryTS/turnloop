@@ -319,3 +319,13 @@ fn infile_disabled_timeout_and_bad_sequence() {
         Some(Event::Completed { token: 3, .. })
     ));
 }
+
+#[test]
+fn rsa_full_auth_uses_host_seed_and_matches_independent_oaep_vector() {
+    let mut c=Connection::new(Config {password:b"secret".to_vec(),..Config::default()}).unwrap();c.receive(&handshake("caching_sha2_password",Caps::empty())).unwrap();c.next_event().unwrap();flush(&mut c);c.receive(&frame(2,&[1,4])).unwrap();assert!(matches!(c.next_event().unwrap(),Some(Event::AuthFull)));assert_eq!(flush(&mut c),frame(3,&[2]));
+    let mut key=vec![1];key.extend_from_slice(include_bytes!("fixtures/rsa-public.pem"));c.receive(&frame(4,&key)).unwrap();assert!(matches!(c.next_event().unwrap(),Some(Event::RsaSeedNeeded)));assert!(c.output().is_empty());let mut seed=[0;20];for (i,b) in seed.iter_mut().enumerate() {*b=i as u8;}c.rsa_seed(seed).unwrap();assert_eq!(flush(&mut c),frame(5,include_bytes!("fixtures/rsa-oaep-expected.bin")));c.receive(&ok(6,0,2)).unwrap();assert!(matches!(c.next_event().unwrap(),Some(Event::Connected {..})));assert!(c.rsa_seed(seed).is_err());
+}
+#[test]
+fn local_infile_enabled_is_an_explicit_borrowed_request() {
+    let mut c=Connection::new(Config {local_infile:true,..Config::default()}).unwrap();c.receive(&handshake("mysql_native_password",Caps::CLIENT_LOCAL_FILES)).unwrap();c.next_event().unwrap();flush(&mut c);c.receive(&ok(2,0,2)).unwrap();c.next_event().unwrap();c.query(1,"LOAD DATA LOCAL INFILE 'fixture.tsv'",None).unwrap();flush(&mut c);c.receive(&frame(1,b"\xfbfixture.tsv")).unwrap();let Some(Event::LocalInfile {token,file_name})=c.next_event().unwrap() else {panic!()};assert_eq!(token,1);assert_eq!(file_name,b"fixture.tsv");assert!(c.output().is_empty());c.local_infile_data(b"42\n").unwrap();assert_eq!(flush(&mut c),frame(2,b"42\n"));c.local_infile_finish().unwrap();assert_eq!(flush(&mut c),frame(3,b""));c.receive(&ok(4,1,2)).unwrap();let Some(Event::Ok {packet,..})=c.next_event().unwrap() else {panic!()};assert_eq!(packet.affected_rows(),1);assert!(matches!(c.next_event().unwrap(),Some(Event::Completed {token:1,outcome:Outcome::Success})));
+}

@@ -241,7 +241,7 @@ fn numeric(b: &[u8]) -> Result<String> {
     let scale = c.u16()? as usize;
     let digits = c.take(count.checked_mul(2).ok_or(Error::Limit)?)?;
     c.end()?;
-    if scale > 16383 {
+    if count > 32767 || scale > 16383 {
         return Err(Error::Protocol("invalid numeric scale"));
     }
     for d in digits.as_chunks::<2>().0 {
@@ -342,6 +342,7 @@ fn binary_array(element: u32, b: &[u8]) -> Result<Value<'_>> {
 }
 fn text_array(element: u32, s: &str) -> Result<Value<'_>> {
     let mut c = Cursor(s.as_bytes());
+    let has_bounds = c.0.first() == Some(&b'[');
     // pg drops custom lower bounds in the JS array. Validate the prefix grammar.
     while c.0.first() == Some(&b'[') {
         c.u8()?;
@@ -357,8 +358,8 @@ fn text_array(element: u32, s: &str) -> Result<Value<'_>> {
         let _: i32 = number(high)?;
         c.u8()?;
     }
-    if c.0.first() == Some(&b'=') {
-        c.u8()?;
+    if has_bounds && c.u8()? != b'=' {
+        return Err(Error::Protocol("array bounds require equals"));
     }
     fn array<'a>(c: &mut Cursor<'a>, element: u32, depth: usize) -> Result<Value<'a>> {
         if depth > 6 || c.u8()? != b'{' {
@@ -400,6 +401,9 @@ fn text_array(element: u32, s: &str) -> Result<Value<'_>> {
                     c.u8()?;
                 }
                 let raw = &start[..end];
+                if !quoted && raw.is_empty() {
+                    return Err(Error::Protocol("empty unquoted array element"));
+                }
                 if !quoted && raw == b"NULL" {
                     values.push(Value::Null);
                 } else if escaped {
