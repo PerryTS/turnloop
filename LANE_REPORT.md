@@ -193,3 +193,7 @@ private Redis TCP ports refuse connections. Postfix child is waited after kill.
   avoid multipart random generation.
 - [Postfix smtp-sink source](https://github.com/vdukhovni/postfix/blob/master/postfix/src/smtpstone/smtp-sink.c):
   private listener and message dump options used by the installed binary test.
+
+## Integrator verification
+
+- 2026-09-14, integrator, outside the Codex sandbox (macOS arm64): `python3 scripts/servers.py test` — **PASS, 25 tests** against private Redis 8.4 (single, 3-master cluster, sentinel, TLS) and Postfix smtp-sink. `cargo tree -i tokio` is empty for x86_64-unknown-linux-gnu, wasm32-wasip2 and aarch64-apple-darwin.
