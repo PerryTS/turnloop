@@ -141,6 +141,9 @@ fn simultaneous_measurements_count_only_their_own_thread() {
     );
 }
 
+// Abort-only targets cannot resume after a panic; the cleanup contract is for
+// unwinding. Allocation calibration and the full workload still run everywhere.
+#[cfg(panic = "unwind")]
 #[test]
 fn measurement_disables_counting_after_a_panic() {
     let panic = std::panic::catch_unwind(|| allocations(|| panic!("measured failure")));

@@ -1,29 +1,8 @@
 //! The published decoder must retain its tables across independent frames.
 use std::alloc::{GlobalAlloc, Layout, System};
 use turnloop_zstd_decoder::decoding::FrameDecoder;
-// P3 has one guest agent, but its allocator can run before task-local storage
-// exists. Keep only that target's counter in statics; every threaded target uses
-// const-initialized TLS, including wasm with atomics.
-#[cfg(all(target_os = "wasi", target_env = "p3"))]
-mod tracking {
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
-    static ENABLED: AtomicBool = AtomicBool::new(false);
-    static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
-    pub fn count() {
-        if ENABLED.load(Relaxed) {
-            ALLOCATIONS.fetch_add(1, Relaxed);
-        }
-    }
-    pub fn start() {
-        ALLOCATIONS.store(0, Relaxed);
-        ENABLED.store(true, Relaxed);
-    }
-    pub fn finish() -> usize {
-        ENABLED.store(false, Relaxed);
-        ALLOCATIONS.load(Relaxed)
-    }
-}
-#[cfg(not(all(target_os = "wasi", target_env = "p3")))]
+// Const TLS isolates every measuring thread/agent, including WASM. The p3
+// standalone harness still avoids libtest's debug allocator-shim startup trap.
 mod tracking {
     use std::cell::Cell;
     thread_local! {
