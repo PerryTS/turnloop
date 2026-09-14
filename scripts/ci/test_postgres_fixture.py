@@ -115,17 +115,16 @@ class PostgresFixture(unittest.TestCase):
             thread.start()
             try:
                 with proxy_module.TcpProxy(backend.server_address[1]) as proxy:
-                    with socket.create_connection(('127.0.0.1', proxy.port), timeout=5) as main:
+                    with socket.create_connection(('127.0.0.1', proxy.port), timeout=5) as main, main.makefile('rb') as response:
                         main.sendall(query)
                         main.shutdown(socket.SHUT_WR)
-                        self.assertEqual(main.recv(6), b'active')
+                        self.assertEqual(response.read(6), b'active')
                         with socket.create_connection(('127.0.0.1', proxy.port), timeout=5) as request:
                             for byte in cancel:
                                 request.sendall(bytes([byte]))
                             request.shutdown(socket.SHUT_WR)
                             self.assertEqual(request.recv(1), b'')
-                        with main.makefile('rb') as response:
-                            self.assertEqual(response.read(), b'cancelled')
+                        self.assertEqual(response.read(), b'cancelled')
                 self.assertEqual(proxy.connections, 2)
                 self.assertEqual(proxy.cancel_requests, 1)
                 self.assertEqual(proxy.bytes_forwarded, len(query) + len(cancel) + len(b'activecancelled'))

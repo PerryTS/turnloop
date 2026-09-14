@@ -13,6 +13,37 @@ from common import ROOT
 
 
 class Cleanup(unittest.TestCase):
+    def test_failed_sql_initializer_removes_its_partial_data(self):
+        for service, binary in [('postgres', 'initdb'), ('mysql', 'mysqld')]:
+            with self.subTest(service=service), private_runner() as fixtures:
+                fixtures.SELECTED = {service}
+                fixtures.SQL_TOOLS.mkdir()
+                executable = fixtures.TOOLS / binary
+                executable.write_text('''#!/usr/bin/env python3
+import pathlib, sys
+if '-D' in sys.argv: db = pathlib.Path(sys.argv[sys.argv.index('-D') + 1])
+else: db = pathlib.Path(next(arg.split('=', 1)[1] for arg in sys.argv if arg.startswith('--datadir=')))
+tmp = db / '_tmp'
+tmp.mkdir(parents=True)
+(tmp / 'data').write_bytes(b'partial initialization')
+tmp.chmod(0)
+(db.parent / 'initialized.marker').write_text(str(db))
+print('initializer created private data before failing', flush=True)
+raise SystemExit(23)
+''')
+                executable.chmod(0o755)
+                output = io.StringIO()
+                with patch.object(fixtures, 'SQL_BIN', fixtures.TOOLS), \
+                     patch.object(fixtures, 'sql_certificates', return_value=('cert', 'key')), \
+                     redirect_stderr(output), self.assertRaises(subprocess.CalledProcessError) as caught:
+                    fixtures.sql_start()
+                self.assertEqual(caught.exception.returncode, 23)
+                marker = fixtures.SQL_TOOLS / 'initialized.marker'
+                self.assertTrue(marker.exists())
+                self.assertFalse(Path(marker.read_text()).exists())
+                self.assertFalse(fixtures.SQL_STATE.exists())
+                self.assertIn('initializer created private data before failing', output.getvalue())
+
     def test_docker_cleanup_precedes_reaping_and_data_removal(self):
         from unittest.mock import Mock
         with private_runner() as fixtures:
