@@ -2,3 +2,8 @@
 **/target
 *.swp
 .DS_Store
+.tools/
+**/pkg/
+**/node_modules/
+**/node_modules
+**/pkg

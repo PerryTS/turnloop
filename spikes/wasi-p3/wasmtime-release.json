@@ -1,0 +1,11 @@
+{
+  "tag_name": "v46.0.0",
+  "published_at": "2026-06-22T17:57:10Z",
+  "html_url": "https://github.com/bytecodealliance/wasmtime/releases/tag/v46.0.0",
+  "asset": {
+    "name": "wasmtime-v46.0.0-aarch64-macos.tar.xz",
+    "browser_download_url": "https://github.com/bytecodealliance/wasmtime/releases/download/v46.0.0/wasmtime-v46.0.0-aarch64-macos.tar.xz",
+    "digest": "sha256:ab4bdab6ea42a3245cda91cdc6e0430491c4b78ecd643406fc1764ccddbdcd25",
+    "size": 10138548
+  }
+}

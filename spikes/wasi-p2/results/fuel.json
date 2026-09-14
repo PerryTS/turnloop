@@ -1,0 +1,86 @@
+[
+  {
+    "round": 0,
+    "mode": "control",
+    "fuel_100": 50590,
+    "fuel_200": 70421,
+    "slope": 198.31
+  },
+  {
+    "round": 0,
+    "mode": "idle",
+    "fuel_100": 1480313,
+    "fuel_200": 2930044,
+    "slope": 14497.31
+  },
+  {
+    "round": 0,
+    "mode": "poll",
+    "fuel_100": 2724129,
+    "fuel_200": 5417560,
+    "slope": 26934.31
+  },
+  {
+    "round": 0,
+    "mode": "timer-cancel",
+    "fuel_100": 1526362,
+    "fuel_200": 3022093,
+    "slope": 14957.31
+  },
+  {
+    "round": 1,
+    "mode": "control",
+    "fuel_100": 50590,
+    "fuel_200": 70421,
+    "slope": 198.31
+  },
+  {
+    "round": 1,
+    "mode": "idle",
+    "fuel_100": 1480313,
+    "fuel_200": 2930044,
+    "slope": 14497.31
+  },
+  {
+    "round": 1,
+    "mode": "poll",
+    "fuel_100": 2724129,
+    "fuel_200": 5417560,
+    "slope": 26934.31
+  },
+  {
+    "round": 1,
+    "mode": "timer-cancel",
+    "fuel_100": 1526362,
+    "fuel_200": 3022093,
+    "slope": 14957.31
+  },
+  {
+    "round": 2,
+    "mode": "control",
+    "fuel_100": 50590,
+    "fuel_200": 70421,
+    "slope": 198.31
+  },
+  {
+    "round": 2,
+    "mode": "idle",
+    "fuel_100": 1480313,
+    "fuel_200": 2930044,
+    "slope": 14497.31
+  },
+  {
+    "round": 2,
+    "mode": "poll",
+    "fuel_100": 2724129,
+    "fuel_200": 5417560,
+    "slope": 26934.31
+  },
+  {
+    "round": 2,
+    "mode": "timer-cancel",
+    "fuel_100": 1526362,
+    "fuel_200": 3022093,
+    "slope": 14957.31
+  }
+]
