@@ -817,11 +817,7 @@ fn file_readiness_survives_pool_backpressure_without_allocations_or_spin() {
         .turn(Timeout::Until(at), &mut out)
         .expect("pool exhaustion wait");
     assert_eq!(info.os_waits, 1);
-    #[cfg(unix)]
     assert_eq!(info.zero_event_waits, 1);
-    // IOCP deadlines arrive as real NT completion packets, rather than an empty wait.
-    #[cfg(windows)]
-    assert_eq!(info.zero_event_waits, 0);
     assert!(l.now() >= at);
     assert_eq!(out.len(), 1);
     assert!(matches!(out[0].result, OpResult::Timer));
