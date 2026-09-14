@@ -1,28 +1,8 @@
 //! Count protocol work after warm-up; result head construction is outside the body hot path.
 #![deny(unsafe_op_in_unsafe_fn)]
 use std::alloc::{GlobalAlloc, Layout, System};
-// These standalone WASM tests are single-threaded. Static counters avoid
-// depending on task-local storage during component allocation callbacks.
-#[cfg(target_arch = "wasm32")]
-mod tracking {
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
-    static ENABLED: AtomicBool = AtomicBool::new(false);
-    static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
-    pub fn count() {
-        if ENABLED.load(Relaxed) {
-            ALLOCATIONS.fetch_add(1, Relaxed);
-        }
-    }
-    pub fn start() {
-        ALLOCATIONS.store(0, Relaxed);
-        ENABLED.store(true, Relaxed);
-    }
-    pub fn finish() -> usize {
-        ENABLED.store(false, Relaxed);
-        ALLOCATIONS.load(Relaxed)
-    }
-}
-#[cfg(not(target_arch = "wasm32"))]
+// Const TLS isolates every measuring thread/agent, including WASM. The p3
+// standalone harness still avoids libtest's debug allocator-shim startup trap.
 mod tracking {
     use std::cell::Cell;
     thread_local! {
@@ -30,8 +10,8 @@ mod tracking {
         static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
     }
     pub fn count() {
-        if ENABLED.get() {
-            ALLOCATIONS.set(ALLOCATIONS.get() + 1);
+        if ENABLED.try_with(Cell::get).unwrap_or(false) {
+            let _ = ALLOCATIONS.try_with(|n| n.set(n.get() + 1));
         }
     }
     pub fn start() {

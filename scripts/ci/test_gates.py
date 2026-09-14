@@ -274,5 +274,22 @@ class Gates(unittest.TestCase):
                 self.assertTrue(all(k['input_text'] == 'turnloop revision two stdin fixture\n' for _, k in commands[1:]))
 
 
+    def test_protocol_runner_enables_required_adapter_features(self):
+        runner = module('run-tests')
+        p = package('network')
+        p['targets'] = [{'name': 'async_io', 'kind': ['test'], 'required-features': ['turnloop']}]
+        p['metadata'] = {'turnloop-ci': {'role': 'protocol', 'integration-tests': ['async_io']}}
+        commands = []
+        def execute(command, **kwargs):
+            commands.append(command)
+            self.assertIn('--features', command)
+            self.assertIn('turnloop', command)
+            return 1
+        with patch.object(runner, 'checked_tests', side_effect=execute):
+            result = runner.protocol_tests([p], ['cargo', 'test'], ROOT, {})
+        self.assertEqual(len(commands), 1)
+        self.assertEqual(result[0][1], 'PASS')
+
+
 if __name__ == '__main__':
     unittest.main()

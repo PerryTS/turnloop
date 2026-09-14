@@ -159,6 +159,7 @@ pub struct TurnInfo {
     pub alive: bool,
     /// Actual native wait invocations during this turn, at most one.
     pub os_waits: u32,
-    /// Number of OS waits that returned zero native events.
+    /// OS waits with no native I/O or notifier events, including interrupted waits.
+    /// Private timeout events (such as timerfd expiry) count as zero-event waits.
     pub zero_event_waits: u32,
 }

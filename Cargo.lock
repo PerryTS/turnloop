@@ -1763,7 +1763,7 @@ dependencies = [
 
 [[package]]
 name = "turnloop"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "futures-io",
  "js-sys",
@@ -1777,7 +1777,7 @@ dependencies = [
 
 [[package]]
 name = "turnloop-bench"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "gungraun",
  "libc",
@@ -1787,7 +1787,7 @@ dependencies = [
 
 [[package]]
 name = "turnloop-contract"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "bson",
  "futures-io",
@@ -1804,7 +1804,7 @@ dependencies = [
 
 [[package]]
 name = "turnloop-http"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "base64",
  "brotli",
@@ -1814,6 +1814,7 @@ dependencies = [
  "httparse",
  "percent-encoding",
  "rcgen",
+ "turnloop-io",
  "turnloop-tls",
  "turnloop-zstd-decoder",
  "url",
@@ -1821,8 +1822,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "turnloop-io"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "futures-io",
+ "turnloop",
+]
+
+[[package]]
 name = "turnloop-mongodb"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "base64",
  "bson",
@@ -1836,63 +1845,69 @@ dependencies = [
  "sha1",
  "sha2",
  "stringprep",
+ "turnloop-io",
  "turnloop-wasi-random",
 ]
 
 [[package]]
 name = "turnloop-mysql"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "bytes",
  "flate2",
  "getrandom 0.4.3",
  "mysql_common",
  "rustls",
+ "turnloop-io",
  "turnloop-wasi-random",
 ]
 
 [[package]]
 name = "turnloop-postgres"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "bytes",
  "postgres-protocol",
  "rustls",
  "sha2",
+ "turnloop-io",
  "turnloop-wasi-random",
 ]
 
 [[package]]
 name = "turnloop-redis"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "rustls",
+ "turnloop-io",
 ]
 
 [[package]]
 name = "turnloop-smtp"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "base64",
  "email-encoding",
  "lettre",
  "rustls",
+ "turnloop-io",
 ]
 
 [[package]]
 name = "turnloop-tls"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "rcgen",
  "ring",
  "rustls",
  "rustls-pki-types",
+ "turnloop-io",
  "webpki-roots",
 ]
 
 [[package]]
 name = "turnloop-wasi-random"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "getrandom 0.3.4",
  "getrandom 0.4.3",
@@ -1900,7 +1915,7 @@ dependencies = [
 
 [[package]]
 name = "turnloop-websocket"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "base64",
  "bytes",
@@ -1908,11 +1923,13 @@ dependencies = [
  "http",
  "tungstenite",
  "turnloop-http",
+ "turnloop-io",
+ "turnloop-wasi-random",
 ]
 
 [[package]]
 name = "turnloop-zstd-decoder"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "criterion",
  "fastrand",

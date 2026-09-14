@@ -1,6 +1,29 @@
 # Integration report
 
-Updated 2026-09-14. HTTP integration produces a twelve-member workspace with ten
+## Wave 3 adapters-net update (2026-09-14)
+
+The workspace now has fourteen members and twelve publishable crates. The new
+`turnloop-io` crate supplies shared stream ownership, sans-I/O driving and deadline
+helpers. Optional `turnloop` features add executor-backed TLS, HTTP, WebSocket and
+database/mail adapters. HTTP includes pooled streaming clients, a draining server,
+and the browser's existing bounded GET capability. The HTTPS/TLS echo/WebSocket
+examples are checked in required CI; h2spec runs against the async server.
+
+Native verification, strict cross-target Clippy for Linux/WASI/web, stable checks,
+real WASI 0.2/0.3 socket suites, Node web contracts, Node/curl interop and all 147
+h2spec cases pass. Windows generic libraries pass cross-Clippy; full Windows
+all-target checking fails because this clone still lacks the IOCP `Platform`
+provider. Chrome runtime is UNRUN after sandbox startup failure; Linux/Windows
+runtime and instruction comparisons require their hosts. The seven-day soak and
+all existing required gates remain enabled. See [the lane report](../LANE_REPORT.md)
+and [exact verification commands](adapters-net-commands.md) for allocation
+baselines, WASI DNS/browser capability limits and the remaining integration work.
+The publish order below includes `turnloop-io` before its protocol consumers.
+
+The following merge narrative records the earlier integration checkpoint; its
+WASI, Node and cross-compilation status is superseded by this update.
+
+HTTP integration produced a twelve-member workspace with ten
 publishable crates. The current main merge retains HTTP/TLS/WebSocket and h2spec,
 main's service diagnostics/cleanup, deterministic MySQL authentication and portable
 Windows test gates. rustls 0.23.45 passes the security audit and the seven-day soak
@@ -321,23 +344,26 @@ lettre's quoted_printable dependency; no advisory was ignored.
 
 ## Publish order and bootstrap
 
-All packages currently use **0.1.0**. The metadata-derived order is:
+All packages currently use **0.1.0-alpha.1**. The metadata-derived order is:
 
 1. `turnloop`
-2. `turnloop-tls`
-3. `turnloop-zstd-decoder`
-4. `turnloop-http`
-5. `turnloop-mongodb`
-6. `turnloop-mysql`
-7. `turnloop-postgres`
-8. `turnloop-redis`
-9. `turnloop-smtp`
-10. `turnloop-websocket`
+2. `turnloop-io` (shared executor/stream adapters)
+3. `turnloop-tls`
+4. `turnloop-zstd-decoder`
+5. `turnloop-http`
+6. `turnloop-wasi-random`
+7. `turnloop-mongodb`
+8. `turnloop-mysql`
+9. `turnloop-postgres`
+10. `turnloop-redis`
+11. `turnloop-smtp`
+12. `turnloop-websocket`
 
 This is the current metadata-derived order (`python3 scripts/ci/release.py order`).
+turnloop-io follows turnloop and precedes every async protocol adapter.
 TLS and the decoder precede HTTP; HTTP precedes WebSocket. The independent database
 and SMTP crates may otherwise be reordered. `turnloop-contract` and `turnloop-bench`
-remain private. Every package is version 0.1.0.
+remain private. Every package is version 0.1.0-alpha.1.
 
 `cargo publish --dry-run --locked --allow-dirty --workspace` stages unpublished
 siblings together, packages each crate and recompiles each packaged library.

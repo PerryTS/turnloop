@@ -43,7 +43,9 @@
 //!   callback results and rejects blocking waits on the main thread.
 //! * EINTR ends this poll early; it must not restart the timeout. `PollInfo.waits`
 //!   reports actual wait invocations for the contract tests; `zero_event_waits`
-//!   counts OS waits that returned zero native events, including EINTR.
+//!   counts OS waits with no native I/O or notifier events, including EINTR.
+//!   Private timeout events (e.g. timerfd expiry) count as zero-event waits, just
+//!   like a timed OS wait returning zero; never infer this from user completions.
 //! * Cached readiness ending in EAGAIN with no completion must retain the original
 //!   timeout for the one permitted OS wait. It must not force a zero-timeout turn.
 //! * `has_work` covers queued completions and cached runnable I/O. `wake` is called
@@ -197,7 +199,8 @@ pub enum Outcome<D> {
 pub struct PollInfo {
     /// Actual OS wait invocations, at most one for this poll.
     pub waits: u32,
-    /// OS waits returning zero native events (including interrupted waits).
+    /// OS waits with no native I/O or notifier events (including interrupted waits).
+    /// Private timeout events, such as timerfd expiry, are not native work.
     pub zero_event_waits: u32,
 }
 

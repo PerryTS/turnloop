@@ -1,10 +1,8 @@
 #![deny(unsafe_op_in_unsafe_fn)]
+#[path = "support/allocation.rs"]
+mod allocation;
 #[path = "support/clock.rs"]
 mod clock;
-use std::{
-    alloc::{GlobalAlloc, Layout, System},
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
-};
 use turnloop_mongodb::{
     Connection, ConnectionEvent,
     bson::{doc, raw::RawDocumentBuf},
@@ -12,31 +10,6 @@ use turnloop_mongodb::{
     uri::Options,
     wire::{self},
 };
-struct Counter;
-static COUNT: AtomicUsize = AtomicUsize::new(0);
-static TRACK: AtomicBool = AtomicBool::new(false);
-// SAFETY: Every allocation is forwarded with its original layout to System;
-// counting does not access the allocated memory or alter allocation semantics.
-unsafe impl GlobalAlloc for Counter {
-    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-        if TRACK.load(Ordering::Relaxed) {
-            COUNT.fetch_add(1, Ordering::Relaxed);
-        } // SAFETY: Forward identical layout to allocator.
-        unsafe { System.alloc(l) }
-    }
-    unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-        // SAFETY: Pointer and layout come from this allocator's allocation.
-        unsafe { System.dealloc(p, l) }
-    }
-    unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
-        if TRACK.load(Ordering::Relaxed) {
-            COUNT.fetch_add(1, Ordering::Relaxed);
-        } // SAFETY: Preserve allocator contract and forward unchanged pointer/layout.
-        unsafe { System.realloc(p, l, n) }
-    }
-}
-#[global_allocator]
-static ALLOCATOR: Counter = Counter;
 #[test]
 fn warmed_command_and_borrowed_reply_allocate_zero() {
     for compressed in [false, true] {
@@ -90,11 +63,7 @@ fn measure(compressed: bool, coordinator: bool) {
     use turnloop_mongodb::operation::*;
     let mut operation = Operation::new();
     let mut rows = 0;
-    for round in 0..1002 {
-        if round == 2 {
-            COUNT.store(0, Ordering::SeqCst);
-            TRACK.store(true, Ordering::SeqCst);
-        }
+    let mut run = |round| {
         cmd.find("db", "items", &filter, None).unwrap();
         if coordinator {
             operation
@@ -151,9 +120,21 @@ fn measure(compressed: bool, coordinator: bool) {
             rows += row.unwrap().get_i32("x").unwrap();
         }
         c.release_reply().unwrap();
+    };
+    // Both alternating compression buffers and the operation template have seen
+    // this fixed-size workload after the original two warm-up commands.
+    for round in 0..2 {
+        run(round);
     }
-    TRACK.store(false, Ordering::SeqCst);
-    let allocations = COUNT.load(Ordering::SeqCst);
+    let allocations = allocation::allocations(|| {
+        for round in 2..1002 {
+            assert!(
+                allocation::is_tracking(),
+                "command runs on the measuring thread"
+            );
+            run(round);
+        }
+    });
     assert_eq!(rows, 2004);
     assert_eq!(
         allocations, 0,

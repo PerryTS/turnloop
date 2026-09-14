@@ -14,6 +14,7 @@ required, with no nightly language features in the library. WASI 0.3 alone uses
 
 ```bash
 python3 scripts/ci/check-paths.py
+python3 scripts/ci/feature_modes.py
 cargo +nightly-2026-08-20 fmt --all --check
 cargo +nightly-2026-08-20 clippy --locked --workspace --all-targets --all-features -- \
   -D warnings -D clippy::undocumented_unsafe_blocks
@@ -42,10 +43,31 @@ with `python3 -m unittest discover -s scripts/ci -p test_paths.py -v`.
 Every unsafe block must explain its safety with `// SAFETY:` and crate roots deny
 `unsafe_op_in_unsafe_fn`. No `unwrap()` on I/O paths. Assert actual completions,
 bytes or work counters; success with zero tests is an error. Contracts run with
-`--test-threads=1` for global signal/process and allocator isolation. Default and
-all-feature native suites exercise the timer alternative and forced Linux
-`epoll-timerfd` backend; newly introduced incompatible feature combinations need
-explicit metadata-driven CI coverage, not silent exclusions.
+`--test-threads=1` for global signal/process and allocator isolation. Native CI
+selects each mode in `.github/workflows/ci.yml` independently: Linux x86_64 and
+arm64 run default, `epoll-timerfd`, `process-sigchld`, both fallbacks (`fallbacks`),
+`executor`, and `all-features`. macOS and Windows run default, executor, and all
+features. Each arm runs the workspace, independently requires positive counts
+for each core/protocol/contract member, and runs native Node/curl interop with the
+same mode. Independent member runs retain the selected features belonging to that
+member or its direct dependencies; a sans-IO crate with no core dependency has
+no backend feature to select. The workspace run keeps the full feature selection.
+The existing Windows pending-contract marker remains scoped to
+that provider. Every arm is required through the matrix job's `ci-gate` result.
+
+`python3 scripts/ci/run-tests.py native` runs all applicable modes on the current
+host; `--mode epoll-timerfd` selects just that Linux arm. `interop --mode MODE`
+uses the same selection. The native matrix's JSON flow rows are a YAML subset
+parsed directly by `feature_modes.py` and the runner. The required feature gate
+compares those rows to `crates/turnloop/Cargo.toml`: every public core feature
+must be explicitly named in a runtime arm. `all-features` does not grant implicit
+coverage to newly added features. Missing fallback combinations, disconnected
+matrix commands and optional/skipped mode configuration fail the gate.
+
+The allocating BTree timer comparison lives only in `turnloop-bench`, selected by
+that private crate's `timer-btree` feature. It cannot affect the core through Cargo
+feature unification. Both benchmark implementations retain workload assertions
+and run in native CI; production always uses the preallocated 4-ary heap.
 
 `tokio`, `tokio-util`, `hyper`, `h2`, `async-std`, `smol`, `async-io` and
 `async-executor` are forbidden in normal, build and dev dependency graphs. There
@@ -355,7 +377,7 @@ debug/release semantic and release allocation counts, supplying a real stdin
 fixture to the semantic tests. The instruction job compares against the committed Linux
 baseline. The strict `ci-gate` fan-in is retained. Windows `test-native`
 runs the workspace and independently requires positive counts for core and every
-protocol member, with default and all features. The existing sans-IO unit, wire,
+protocol member, with default, executor and all features. The existing sans-IO unit, wire,
 SCRAM, SDAM/selection fixture and allocation tests are portable. No unnecessary
 Unix test cfg exclusions were found.
 
@@ -465,3 +487,26 @@ zizmor annotation documents a guarded workflow_run release trigger: only verifie
 main pushes, with no PR artifacts or caches entering the privileged workflow.
 
 See [RELEASING.md](RELEASING.md) for owner setup, publication and Perry consumption.
+
+## Async adapters on turnloop
+
+Protocol crates expose their async layer through a `turnloop` feature. Shared
+transport ownership, partial input/output and deadline handling live in the
+publishable `turnloop-io` crate; see its README for the adapter contract. The
+`adapter` CI role requires independent positive native test counts and declared
+WASI suites. Protocol integration targets' `required-features` are activated by
+`run-tests.py`; an absent or zero-test async suite remains a failure.
+
+The required native interop job runs Node HTTP/HTTPS/HTTP2/WebSocket and curl
+against the async layer, and h2spec runs all 147 strict tests against the async
+server. WASI protocol jobs execute async HTTP, TLS and WebSocket over wasi:sockets,
+alongside the shared driver's socket/allocation tests. The web/Node contracts
+exercise executor fetch with deadlines and aborts using real fixture traffic.
+The feature-coverage gate validates the required WASI/web jobs, their targets,
+feature forwarding and runtime commands as well as the explicit native modes.
+
+Adapter allocation gates retain existing core-owned HTTP head and rustls record
+costs while requiring zero extra transport allocations. The TLS gate verifies
+100 bidirectional real-socket records at rustls 0.23.45's existing 400 allocations;
+WebSocket frames and 1,000 warmed shared TCP driver exchanges require absolute zero.
+None of the pre-existing allocation thresholds or dependency policies change.

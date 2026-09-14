@@ -12,6 +12,7 @@ documentation = "https://docs.rs/turnloop-postgres"
 description = "Pull-driven sans-I/O PostgreSQL client protocol"
 
 [dependencies]
+turnloop-io = { workspace = true, optional = true }
 bytes.workspace = true
 postgres-protocol.workspace = true
 
@@ -33,4 +34,8 @@ integration-tests = ["server"]
 sha2.workspace = true
 
 [target.'cfg(all(target_os = "wasi", target_env = "p3"))'.dependencies]
+turnloop-io = { workspace = true, optional = true, features = ["wasi-p3-experimental"] }
 turnloop-wasi-random.workspace = true
+
+[features]
+turnloop = ["dep:turnloop-io"]

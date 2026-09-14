@@ -1,0 +1,30 @@
+[package]
+name = "turnloop-io"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared async stream and sans-I/O driver glue for turnloop"
+readme = "README.md"
+keywords = ["networking", "asynchronous", "sans-io"]
+categories = ["network-programming", "asynchronous"]
+documentation = "https://docs.rs/turnloop-io"
+
+[dependencies]
+turnloop = { workspace = true, features = ["executor"] }
+futures-io.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.turnloop-ci]
+role = "adapter"
+wasi-tests = ["streams", "allocations"]
+
+[features]
+wasi-p3-experimental = ["turnloop/wasi-p3-experimental"]
+
+[[test]]
+name = "allocations"
+harness = false

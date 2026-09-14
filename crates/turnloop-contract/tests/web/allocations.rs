@@ -1,15 +1,18 @@
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::cell::Cell;
 struct Counting;
-static ACTIVE: AtomicBool = AtomicBool::new(false);
-static COUNT: AtomicUsize = AtomicUsize::new(0);
+// Each worker/agent measures only its own synchronous turn.
+thread_local! {
+    static ACTIVE: Cell<bool> = const { Cell::new(false) };
+    static COUNT: Cell<usize> = const { Cell::new(0) };
+}
 fn record() {
-    if ACTIVE.load(Ordering::Relaxed) {
-        COUNT.fetch_add(1, Ordering::Relaxed);
+    if ACTIVE.try_with(Cell::get).unwrap_or(false) {
+        let _ = COUNT.try_with(|n| n.set(n.get() + 1));
     }
 }
 // SAFETY: forwards the complete allocator contract unchanged to System. Counter
-// updates use initialized statics and never allocate or call JavaScript.
+// updates use const-initialized TLS and never allocate or call JavaScript.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         record();
@@ -33,15 +36,22 @@ unsafe impl GlobalAlloc for Counting {
 }
 #[global_allocator]
 static ALLOCATOR: Counting = Counting;
+
+#[wasm_bindgen_test::wasm_bindgen_test]
+fn allocator_detects_work_on_the_measured_agent() {
+    COUNT.set(0);
+    ACTIVE.set(true);
+    let bytes = std::hint::black_box(Box::new([7_u8; 64]));
+    ACTIVE.set(false);
+    assert_eq!(bytes[63], 7);
+    assert_eq!(COUNT.get(), 1, "the guest allocator must detect real work");
+}
+
 pub fn measure<T>(f: impl FnOnce() -> T) -> T {
-    COUNT.store(0, Ordering::Relaxed);
-    ACTIVE.store(true, Ordering::Relaxed);
+    COUNT.set(0);
+    ACTIVE.set(true);
     let result = f();
-    ACTIVE.store(false, Ordering::Relaxed);
-    assert_eq!(
-        COUNT.load(Ordering::Relaxed),
-        0,
-        "Rust steady-state allocations"
-    );
+    ACTIVE.set(false);
+    assert_eq!(COUNT.get(), 0, "Rust steady-state allocations");
     result
 }

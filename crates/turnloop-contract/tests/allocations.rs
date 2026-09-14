@@ -25,52 +25,13 @@ use std::{
 };
 use turnloop::*;
 struct Counting;
-#[cfg(not(target_os = "wasi"))]
 use std::cell::Cell;
-#[cfg(not(target_os = "wasi"))]
 thread_local! { static ACTIVE: Cell<bool> = const { Cell::new(false) }; static ALLOCS: Cell<usize> = const { Cell::new(0) }; }
-#[cfg(not(target_os = "wasi"))]
 fn record() {
     if ACTIVE.try_with(Cell::get).unwrap_or(false) {
         let _ = ALLOCS.try_with(|n| n.set(n.get() + 1));
     }
 }
-// WASI components have one agent. These counters also work before p3 std has
-// initialized its thread-local area, when the harness allocates argument strings.
-#[cfg(target_os = "wasi")]
-mod single_agent_counter {
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    pub struct Active(AtomicBool);
-    pub struct Allocations(AtomicUsize);
-    pub static ACTIVE: Active = Active(AtomicBool::new(false));
-    pub static ALLOCS: Allocations = Allocations(AtomicUsize::new(0));
-    impl Active {
-        pub fn with<T>(&self, f: impl FnOnce(&Self) -> T) -> T {
-            f(self)
-        }
-        pub fn set(&self, value: bool) {
-            self.0.store(value, Ordering::Relaxed);
-        }
-    }
-    impl Allocations {
-        pub fn with<T>(&self, f: impl FnOnce(&Self) -> T) -> T {
-            f(self)
-        }
-        pub fn set(&self, value: usize) {
-            self.0.store(value, Ordering::Relaxed);
-        }
-        pub fn get(&self) -> usize {
-            self.0.load(Ordering::Relaxed)
-        }
-    }
-    pub fn record() {
-        if ACTIVE.0.load(Ordering::Relaxed) {
-            ALLOCS.0.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-}
-#[cfg(target_os = "wasi")]
-use single_agent_counter::{ACTIVE, ALLOCS, record};
 // SAFETY: all allocation calls are forwarded unchanged to System. Counters only
 // access already initialized thread-local Cells and never allocate themselves.
 unsafe impl GlobalAlloc for Counting {
@@ -338,7 +299,9 @@ fn steady_udp_allocate_nothing() {
     let addr = "127.0.0.1:0".parse().expect("address");
     let a = l.udp_bind(addr, &UdpOpts::default()).expect("UDP a");
     let b = l.udp_bind(addr, &UdpOpts::default()).expect("UDP b");
+    let from = l.local_addr(a).expect("source");
     let to = l.local_addr(b).expect("destination");
+    assert_ne!(from, to, "default UDP endpoints must be distinct");
     static BYTES: [u8; 64] = [0x42; 64];
     let mut out = Completions::default();
     let mut bytes = 0;
@@ -360,8 +323,12 @@ fn steady_udp_allocate_nothing() {
             for c in out.drain() {
                 match c.result {
                     OpResult::RecvFrom {
-                        n, lease: Some(b), ..
+                        n,
+                        from: actual,
+                        lease: Some(b),
                     } => {
+                        assert_eq!(actual, from, "unexpected UDP sender");
+                        assert_eq!(n, BYTES.len());
                         assert_eq!(b.as_slice(), BYTES);
                         read += n;
                     }
@@ -429,22 +396,34 @@ fn concurrent_udp_returns_survive_cancellation_and_loop_drop_without_allocating(
     // This Mac accepts 8 KiB datagrams and rejects 16 KiB with EMSGSIZE.
     // The maximum canonical buffer size is exercised separately without the OS.
     let payload: Vec<u8> = (0..8192).map(|i| (i % 251) as u8).collect();
+    // Keep every socket bound through every round. Default UDP binds must also
+    // be exclusive: SO_REUSEADDR used to allow live ephemeral-port collisions
+    // on Linux even though none of these sockets had been closed.
     let mut sockets = Vec::new();
+    let mut addresses = Vec::with_capacity(N * 2);
     for l in &mut loops {
         let mut group = Vec::new();
         for _ in 0..N {
             let h = l
                 .udp_bind("[::1]:0".parse().expect("IPv6"), &UdpOpts::default())
                 .expect("UDP");
-            group.push((h, l.local_addr(h).expect("local address")));
+            let addr = l.local_addr(h).expect("local address");
+            assert!(
+                !addresses.contains(&addr),
+                "duplicate live UDP endpoint {addr}; previous endpoints: {addresses:?}"
+            );
+            addresses.push(addr);
+            group.push((h, addr));
         }
         sockets.push(group);
     }
+    eprintln!("concurrent UDP fixture handles/endpoints: {sockets:?}");
     let mut out = Completions::with_capacity(1);
     let mut received = 0;
     let mut cancelled = 0;
     let mut allocations = 0;
     for round in 0..=ROUNDS {
+        let mut operations = [[None; N * 2]; 2];
         ALLOCS.with(|n| n.set(0));
         ACTIVE.with(|v| v.set(round != 0));
         for (j, l) in loops.iter_mut().enumerate() {
@@ -459,6 +438,10 @@ fn concurrent_udp_returns_survive_cancellation_and_loop_drop_without_allocating(
                 l.turn(Timeout::Now, &mut out)
                     .expect("cancel acknowledgement");
                 assert_eq!(out.len(), 1);
+                assert_eq!(out[0].op, Some(op));
+                assert_eq!(out[0].handle, Some(h));
+                assert_eq!(out[0].token, Token(100));
+                assert!(out[0].terminal);
                 assert!(matches!(out[0].result, OpResult::Cancelled));
                 cancelled += usize::from(round != 0);
             }
@@ -472,11 +455,13 @@ fn concurrent_udp_returns_survive_cancellation_and_loop_drop_without_allocating(
                 } else {
                     ReadBuf::Pooled
                 };
-                l.recv(h, buf, Token(i as u64)).expect("receive");
+                operations[j][i] = Some(l.recv(h, buf, Token(i as u64)).expect("receive"));
                 // SAFETY: immutable retained payload lives until both loops drop.
                 let input = unsafe { IoBuf::from_raw_parts(payload.as_ptr(), LENGTHS[i]) };
-                l.send_to(h, WriteBuf::Provided(input), to, Token((N + i) as u64))
-                    .expect("send");
+                operations[j][N + i] = Some(
+                    l.send_to(h, WriteBuf::Provided(input), to, Token((N + i) as u64))
+                        .expect("send"),
+                );
             }
         }
         let mut seen = [[false; N * 2]; 2];
@@ -488,20 +473,55 @@ fn concurrent_udp_returns_survive_cancellation_and_loop_drop_without_allocating(
                 l.turn(Timeout::Now, &mut out).expect("interleave loops");
                 for c in out.drain() {
                     let index = c.token.0 as usize;
-                    assert!(!seen[j][index], "duplicate UDP result");
+                    assert!(
+                        index < N * 2,
+                        "unexpected UDP token: round={round} loop={j} completion={c:?}"
+                    );
+                    assert!(
+                        !seen[j][index],
+                        "duplicate UDP result: round={round} loop={j} completion={c:?}"
+                    );
+                    assert_eq!(
+                        c.op, operations[j][index],
+                        "UDP operation: round={round} loop={j} token={index}"
+                    );
+                    assert_eq!(
+                        c.handle,
+                        Some(sockets[j][index % N].0),
+                        "UDP handle: round={round} loop={j} token={index}"
+                    );
+                    assert!(c.terminal, "UDP operations are one-shot");
                     seen[j][index] = true;
                     completed += 1;
                     match c.result {
                         OpResult::RecvFrom { n, from, lease } => {
-                            assert_eq!(n, LENGTHS[index]);
-                            assert_eq!(from, sockets[j][index].1);
-                            let bytes = lease
-                                .as_ref()
-                                .map_or(&outputs[index][..n], BufLease::as_slice);
+                            assert!(index < N, "receive used a send token");
+                            assert_eq!(
+                                from, sockets[j][index].1,
+                                "unexpected UDP sender: round={round} loop={j} token={index} op={:?} handle={:?} n={n}",
+                                c.op, c.handle
+                            );
+                            assert_eq!(
+                                n, LENGTHS[index],
+                                "UDP length: round={round} loop={j} token={index} from={from} op={:?} handle={:?}",
+                                c.op, c.handle
+                            );
+                            assert_eq!(lease.is_some(), j == 1, "UDP buffer mode");
+                            // The other loop may still own outputs[index]. Only
+                            // borrow it for its completed provided-buffer read;
+                            // map_or would evaluate that borrow for pooled reads too.
+                            let bytes = if let Some(lease) = &lease {
+                                lease.as_slice()
+                            } else {
+                                &outputs[index][..n]
+                            };
                             assert_eq!(bytes, &payload[..n]);
                             received += usize::from(round != 0);
                         }
-                        OpResult::Wrote(n) => assert_eq!(n, LENGTHS[index - N]),
+                        OpResult::Wrote(n) => {
+                            assert!(index >= N, "send used a receive token");
+                            assert_eq!(n, LENGTHS[index - N]);
+                        }
                         other => panic!("unexpected {other:?}"),
                     }
                 }
@@ -718,6 +738,7 @@ fn regular_file_jobs_reuse_pool_storage() {
     std::fs::remove_file(path).expect("remove file");
 }
 
+#[cfg(not(target_os = "wasi"))]
 #[test]
 fn file_readiness_survives_pool_backpressure_without_allocations_or_spin() {
     use std::io::Write;
@@ -988,6 +1009,50 @@ fn signal_exit_and_external_notification_delivery_allocate_nothing() {
     );
     assert_eq!((exits, signals, waits), (16, 200, 200));
     l.signal_stop(signal, Token(4)).expect("stop");
+}
+
+#[cfg(not(target_os = "wasi"))]
+#[test]
+fn quiet_deadline_waits_have_identical_accounting_without_allocations() {
+    let mut l = Loop::new(Config::default()).expect("loop");
+    let mut out = Completions::with_capacity(1);
+    let mut expiries = 0;
+    ALLOCS.with(|v| v.set(0));
+    ACTIVE.with(|v| v.set(true));
+    for duration in [
+        Duration::from_micros(500),
+        Duration::from_millis(2),
+        Duration::from_millis(10),
+    ] {
+        for _ in 0..20 {
+            let at = l.now() + duration;
+            let token = Token(expiries);
+            let h = l.timer(at, None, token).expect("timer");
+            let op = l.timer_op(h).expect("timer operation");
+            let info = l.turn(Timeout::Until(at), &mut out).expect("quiet wait");
+            assert_eq!((info.os_waits, info.zero_event_waits), (1, 1));
+            assert!(l.now() >= at);
+            assert_eq!(out.len(), 1);
+            assert_eq!(
+                (out[0].handle, out[0].op, out[0].token),
+                (Some(h), Some(op), token)
+            );
+            assert!(matches!(out[0].result, OpResult::Timer));
+            l.close(h, token).expect("close timer");
+            let info = l.turn(Timeout::Now, &mut out).expect("queued close");
+            assert_eq!((info.os_waits, info.zero_event_waits), (0, 0));
+            assert_eq!(out.len(), 1);
+            assert!(matches!(out[0].result, OpResult::Closed));
+            expiries += 1;
+        }
+    }
+    ACTIVE.with(|v| v.set(false));
+    assert_eq!(expiries, 60);
+    assert_eq!(
+        ALLOCS.with(Cell::get),
+        0,
+        "deadline waits reuse reserved storage"
+    );
 }
 
 #[cfg(target_os = "wasi")]
