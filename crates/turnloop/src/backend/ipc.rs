@@ -32,7 +32,7 @@ pub(super) fn open(name: &PipeName, listen: Option<ListenOpts>) -> Result<(Detac
         // SAFETY: bound stream socket and checked integer backlog.
         if unsafe { libc::listen(raw, opts.backlog as i32) } < 0 { return Err(last_error()); }
     }
-    Ok((Detached { fd, kind: if listen.is_some() { Kind::PipeListener } else { Kind::Pipe } }, addr))
+    Ok((Detached::new(fd, if listen.is_some() { Kind::PipeListener } else { Kind::Pipe }), addr))
 }
 
 pub(super) fn accept(fd: RawFd) -> Result<Detached> {
@@ -42,7 +42,7 @@ pub(super) fn accept(fd: RawFd) -> Result<Detached> {
     // SAFETY: accept returned a fresh exclusively owned descriptor.
     let fd = unsafe { OwnedFd::from_raw_fd(raw) };
     socket::configure(raw)?;
-    Ok(Detached { fd, kind: Kind::Pipe })
+    Ok(Detached::new(fd, Kind::Pipe))
 }
 
 pub(super) fn stdio(raw: RawFd) -> Result<Detached> {
@@ -54,6 +54,9 @@ pub(super) fn stdio(raw: RawFd) -> Result<Detached> {
 }
 
 pub(super) fn classify(fd: OwnedFd) -> Result<Detached> {
+    classify_hint(fd, false)
+}
+fn classify_hint(fd: OwnedFd, listener: bool) -> Result<Detached> {
     // SAFETY: stat is plain output storage and all-zero is a valid initial value.
     let mut stat: libc::stat = unsafe { zeroed() };
     // SAFETY: writable stat storage and a live owned fd.
@@ -64,7 +67,12 @@ pub(super) fn classify(fd: OwnedFd) -> Result<Detached> {
         // SAFETY: initialized sockaddr output storage and length.
         if unsafe { libc::getsockname(fd.as_raw_fd(), addr.mut_ptr(), &mut addr.len) } < 0 { return Err(last_error()); }
         let socket_type = get_option(fd.as_raw_fd(), libc::SO_TYPE)?;
+        #[cfg(turnloop_backend = "epoll")]
         let listening = get_option(fd.as_raw_fd(), libc::SO_ACCEPTCONN)? != 0;
+        #[cfg(turnloop_backend = "kqueue")]
+        let listening = listener;
+        #[cfg(turnloop_backend = "epoll")]
+        let _ = listener;
         match (addr.storage.ss_family as i32, socket_type, listening) {
             (libc::AF_UNIX, libc::SOCK_STREAM, false) => Kind::Pipe,
             (libc::AF_UNIX, libc::SOCK_STREAM, true) => Kind::PipeListener,
@@ -80,7 +88,9 @@ pub(super) fn classify(fd: OwnedFd) -> Result<Detached> {
     // SAFETY: live descriptor and valid status flags.
     if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 { return Err(last_error()); }
     if matches!(kind, Kind::Tcp | Kind::Listener | Kind::Udp | Kind::Pipe | Kind::PipeListener) { socket::configure(fd.as_raw_fd())?; }
-    Ok(Detached { fd, kind })
+    let mut transport = Detached::new(fd, kind);
+    if matches!(kind, Kind::Stream | Kind::File) { transport.original_flags = Some(flags); }
+    Ok(transport)
 }
 fn get_option(fd: RawFd, name: i32) -> Result<i32> {
     let mut value: i32 = 0;
@@ -94,8 +104,8 @@ fn get_option(fd: RawFd, name: i32) -> Result<i32> {
 #[repr(C)]
 struct Control { _align: [libc::cmsghdr; 0], bytes: [u8; 256] }
 
-pub(super) fn send(fd: RawFd, passed: RawFd) -> Result<()> {
-    let mut byte = 0x54u8;
+pub(super) fn send(fd: RawFd, passed: &Detached) -> Result<()> {
+    let mut byte = if matches!(passed.kind, Kind::Listener | Kind::PipeListener) { 0x55u8 } else { 0x54u8 };
     let mut iov = libc::iovec { iov_base: (&mut byte as *mut u8).cast(), iov_len: 1 };
     let mut control = Control { _align: [], bytes: [0; 256] };
     // SAFETY: zero initializes msghdr; its referenced stack storage lives for sendmsg.
@@ -110,7 +120,7 @@ pub(super) fn send(fd: RawFd, passed: RawFd) -> Result<()> {
         (*c).cmsg_level = libc::SOL_SOCKET;
         (*c).cmsg_type = libc::SCM_RIGHTS;
         (*c).cmsg_len = libc::CMSG_LEN(size_of::<i32>() as _) as _;
-        std::ptr::write_unaligned(libc::CMSG_DATA(c).cast::<i32>(), passed);
+        std::ptr::write_unaligned(libc::CMSG_DATA(c).cast::<i32>(), passed.fd.as_raw_fd());
     }
     #[cfg(turnloop_backend = "epoll")]
     let flags = libc::MSG_NOSIGNAL;
@@ -156,11 +166,11 @@ pub(super) fn receive(fd: RawFd) -> Result<Detached> {
             c = libc::CMSG_NXTHDR(&msg, c);
         }
     }
-    if n != 1 || byte != 0x54 || count != 1 || msg.msg_flags & libc::MSG_CTRUNC != 0 { return Err(Error::new(ErrorKind::InvalidInput)); }
+    if n != 1 || !matches!(byte, 0x54 | 0x55) || count != 1 || msg.msg_flags & libc::MSG_CTRUNC != 0 { return Err(Error::new(ErrorKind::InvalidInput)); }
     let received = received.ok_or(Error::new(ErrorKind::InvalidInput))?;
     // SAFETY: received fd is owned; CLOEXEC prevents subsequent child inheritance.
     if unsafe { libc::fcntl(received.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 { return Err(last_error()); }
-    let transport = classify(received)?;
+    let transport = classify_hint(received, byte == 0x55)?;
     if matches!(transport.kind, Kind::Stream | Kind::File) { return Err(Error::new(ErrorKind::Unsupported)); }
     Ok(transport)
 }

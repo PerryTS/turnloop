@@ -228,3 +228,8 @@ pub use unix::Unix as Platform;
 
 #[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
 mod ipc;
+
+#[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
+mod signals;
+#[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
+mod services;

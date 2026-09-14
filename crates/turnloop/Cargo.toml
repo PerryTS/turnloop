@@ -15,6 +15,7 @@ description = "An embeddable event-loop driver, turned by its host"
 default = []
 timer-btree = []
 epoll-timerfd = []
+process-sigchld = []
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

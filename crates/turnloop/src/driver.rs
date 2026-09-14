@@ -40,6 +40,7 @@ struct Op {
     token: Token,
     cancel: bool,
     stop: bool,
+    external_wait: bool,
     job_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     previous: Option<OpId>,
     next: Option<OpId>,
@@ -191,6 +192,7 @@ impl<B: Backend> Driver<B> {
                 cancel: false,
                 stop: false,
                 job_cancel: None,
+                external_wait: false,
                 previous,
                 next: None,
             })
@@ -635,7 +637,9 @@ impl<B: Backend> Driver<B> {
                 true,
             );
         } else {
-            if let Some(cancel) = op.job_cancel {
+            if op.external_wait {
+                crate::external_wait::cancel(id);
+            } else if let Some(cancel) = op.job_cancel {
                 cancel.store(true, Ordering::Release);
             } else if self.backend.cancel(id).is_err() {
                 return false;
@@ -696,6 +700,16 @@ impl<B: Backend> Driver<B> {
             return Err(e);
         }
         Ok(h)
+    }
+    /// Park a host condition on the process-wide helper. Registrations use
+    /// preallocated storage; cancellation and completion follow normal OpId rules.
+    pub fn external_wait(&mut self, condition: &WaitCondition, expected: u64, deadline: Option<Instant>, token: Token) -> Result<OpId> {
+        let op = self.new_op(None, token)?;
+        self.ops.get_mut(op.key).expect("new wait").external_wait = true;
+        if let Err(e) = crate::external_wait::submit(op, self.work_port.clone(), condition, expected, deadline) {
+            self.retire(op); self.outstanding -= 1; return Err(e);
+        }
+        Ok(op)
     }
     pub fn blocking<F: FnOnce() -> BlockingResult + Send + 'static>(
         &mut self,
@@ -906,6 +920,7 @@ impl<B: Backend> Driver<B> {
                 }
             } else {
                 match work.result {
+                    Ok(crate::blocking::WorkOutput::ExternalWait(r)) => OpResult::ExternalWait(r),
                     Ok(crate::blocking::WorkOutput::Blocking(p)) => OpResult::Blocking(p),
                     Ok(crate::blocking::WorkOutput::Resolved(a)) => OpResult::Resolved(a),
                     Err(e) => OpResult::Err(e),
@@ -954,6 +969,7 @@ impl<B: Backend> Driver<B> {
 
 impl<B: Backend> Drop for Driver<B> {
     fn drop(&mut self) {
+        crate::external_wait::close(self.owner);
         self.work_port.close();
         self.poster.close();
         self.notifier.close();

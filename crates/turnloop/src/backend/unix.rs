@@ -31,10 +31,39 @@ pub(super) enum Kind {
     Udp,
 }
 /// Owns an unregistered socket and can be sent to another loop/thread.
-#[derive(Debug)]
 pub struct Detached {
     pub(super) fd: OwnedFd,
     pub(super) kind: Kind,
+    pub(super) original_flags: Option<i32>,
+    original_mode: Option<libc::termios>,
+}
+impl std::fmt::Debug for Detached {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.debug_struct("Detached").field("fd", &self.fd).field("kind", &self.kind).finish_non_exhaustive() }
+}
+impl Detached {
+    pub(super) fn new(fd: OwnedFd, kind: Kind) -> Self {
+        // SAFETY: termios is plain C storage, filled by tcgetattr on a terminal.
+        let mut mode: libc::termios = unsafe { std::mem::zeroed() };
+        // SAFETY: live fd and writable termios; ENOTTY means no restoration needed.
+        let original_mode = (unsafe { libc::tcgetattr(fd.as_raw_fd(), &mut mode) } == 0).then_some(mode);
+        Self { fd, kind, original_flags: None, original_mode }
+    }
+    /// Adopt an owned Unix descriptor, classifying stream/file/TTY or socket.
+    /// The descriptor must have no concurrent I/O users. Status flags and terminal
+    /// settings are restored when this transport is closed, detached or dropped.
+    pub fn from_fd(fd: OwnedFd) -> Result<Self> { super::ipc::classify(fd) }
+}
+impl Drop for Detached {
+    fn drop(&mut self) {
+        if let Some(mode) = &self.original_mode {
+            // SAFETY: descriptor is still owned; restore before OwnedFd drops.
+            unsafe { libc::tcsetattr(self.fd.as_raw_fd(), libc::TCSANOW, mode); }
+        }
+        if let Some(flags) = self.original_flags {
+            // SAFETY: descriptor is still owned and flags came from F_GETFL.
+            unsafe { libc::fcntl(self.fd.as_raw_fd(), libc::F_SETFL, flags); }
+        }
+    }
 }
 struct Resource {
     handle: Handle,
@@ -60,6 +89,7 @@ pub struct Unix {
     cancelled: VecDeque<OpId>,
     polled: Vec<Ready>,
     pool: BufferPool,
+    services: super::services::Services,
 }
 fn direction(op: &Operation) -> usize {
     usize::from(!matches!(
@@ -210,7 +240,78 @@ unsafe impl Backend for Unix {
             cancelled: VecDeque::with_capacity(config.max_operations),
             polled: Vec::with_capacity(config.events_per_turn),
             pool,
+            services: super::services::Services::new(config.max_handles),
         })
+    }
+    fn set_notifier(&mut self, notifier: Notifier) { self.services.set_notifier(notifier); }
+    fn signal(&mut self, h: Handle, signal: Signal) -> Result<()> { self.services.signal(h, signal) }
+    fn kill(&mut self, h: Handle, signal: Signal, group: bool) -> Result<()> { self.services.kill(h, signal, group) }
+    fn spawn(&mut self, h: Handle, pipes: [Option<Handle>; 3], spec: &ProcessSpec) -> Result<u32> {
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio as ChildStdio};
+        // Explicit SIG_IGN/NOCLDWAIT would auto-reap children behind our ownership.
+        // Reject before launch instead of losing exit-before-registration status.
+        // SAFETY: writable sigaction storage; null input only queries disposition.
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        // SAFETY: query a valid signal with initialized writable output storage.
+        if unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut action) } < 0 { return Err(last_error()); }
+        if action.sa_sigaction == libc::SIG_IGN || action.sa_flags & libc::SA_NOCLDWAIT != 0 { return Err(Error::new(ErrorKind::InvalidInput)); }
+        let mut command = Command::new(&spec.program);
+        command.args(&spec.args);
+        if spec.env_clear { command.env_clear(); }
+        command.envs(spec.env.iter().map(|(k, v)| (k, v)));
+        if let Some(cwd) = &spec.cwd { command.current_dir(cwd); }
+        if let Some(uid) = spec.uid { command.uid(uid); }
+        if let Some(gid) = spec.gid { command.gid(gid); }
+        if spec.new_process_group { command.process_group(0); }
+        for (i, stdio) in spec.stdio.iter().enumerate() {
+            let stream = match stdio {
+                ProcessStdio::Inherit => ChildStdio::inherit(),
+                ProcessStdio::Null => ChildStdio::null(),
+                ProcessStdio::Pipe => ChildStdio::piped(),
+                ProcessStdio::Handle(h) => ChildStdio::from(self.get(*h)?.transport.fd.try_clone().map_err(Error::from)?),
+            };
+            match i { 0 => { command.stdin(stream); }, 1 => { command.stdout(stream); }, _ => { command.stderr(stream); } }
+        }
+        let mut child = command.spawn().map_err(Error::from)?;
+        let pid = child.id();
+        let stdio: [Option<OwnedFd>; 3] = [child.stdin.take().map(Into::into), child.stdout.take().map(Into::into), child.stderr.take().map(Into::into)];
+        let result = (|| {
+            self.services.child(h, child, spec.new_process_group, &mut self.poller)?;
+            for (handle, fd) in pipes.into_iter().zip(stdio) {
+                if let (Some(handle), Some(fd)) = (handle, fd) {
+                    let transport = super::ipc::classify(fd)?;
+                    self.install(handle, transport, None)?;
+                }
+            }
+            Ok(pid)
+        })();
+        if result.is_err() {
+            for handle in std::iter::once(h).chain(pipes.into_iter().flatten()) { self.release(handle); }
+        }
+        result
+    }
+    fn tty_set_mode(&mut self, h: Handle, mode: TtyMode) -> Result<()> {
+        let r = self.get(h)?;
+        let original = r.transport.original_mode.ok_or(Error::new(ErrorKind::InvalidInput))?;
+        let mut termios = original;
+        if mode != TtyMode::Normal {
+            // SAFETY: initialized termios structure with exclusive local access.
+            unsafe { libc::cfmakeraw(&mut termios); }
+            if mode == TtyMode::Raw { termios.c_lflag |= libc::ISIG; }
+        }
+        // SAFETY: owned tty fd and valid termios; TCSANOW does not drain/block output.
+        if unsafe { libc::tcsetattr(r.transport.fd.as_raw_fd(), libc::TCSANOW, &termios) } < 0 { return Err(last_error()); }
+        Ok(())
+    }
+    fn tty_window_size(&self, h: Handle) -> Result<WindowSize> {
+        let r = self.get(h)?;
+        if r.transport.original_mode.is_none() { return Err(Error::new(ErrorKind::InvalidInput)); }
+        // SAFETY: winsize is plain C output storage.
+        let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+        // SAFETY: owned tty fd and writable winsize output.
+        if unsafe { libc::ioctl(r.transport.fd.as_raw_fd(), libc::TIOCGWINSZ, &mut size) } < 0 { return Err(last_error()); }
+        Ok(WindowSize { columns: size.ws_col, rows: size.ws_row })
     }
     fn now(&self) -> Instant {
         Instant::now()
@@ -269,7 +370,7 @@ unsafe impl Backend for Unix {
         }
         self.install(
             h,
-            Detached { fd, kind },
+            Detached::new(fd, kind),
             (kind == Kind::Tcp).then(|| Addr::new(addr)),
         )
     }
@@ -278,6 +379,7 @@ unsafe impl Backend for Unix {
     }
     fn submit(&mut self, request: Request) -> Result<()> {
         let h = request.handle;
+        if self.services.contains(h) { return self.services.submit(&request); }
         let r = self.get(h)?;
         let valid = match &request.operation {
             Operation::Accept { .. } => matches!(r.transport.kind, Kind::Listener | Kind::PipeListener),
@@ -298,7 +400,7 @@ unsafe impl Backend for Unix {
             if !matches!(source.transport.kind, Kind::Tcp | Kind::Listener | Kind::Udp | Kind::Pipe | Kind::PipeListener) {
                 return Err(Error::new(ErrorKind::Unsupported));
             }
-            Some(Detached { fd: source.transport.fd.try_clone().map_err(Error::from)?, kind: source.transport.kind })
+            Some(Detached::new(source.transport.fd.try_clone().map_err(Error::from)?, source.transport.kind))
         } else { None };
         let d = direction(&request.operation);
         let i = request.op.index();
@@ -319,6 +421,7 @@ unsafe impl Backend for Unix {
         Ok(())
     }
     fn cancel(&mut self, op: OpId) -> Result<()> {
+        if self.services.cancel(op) { return Ok(()); }
         let p = self
             .ops
             .get(op.index())
@@ -333,7 +436,7 @@ unsafe impl Backend for Unix {
         Ok(())
     }
     fn has_work(&self) -> bool {
-        !self.ready.is_empty() || !self.cancelled.is_empty()
+        !self.ready.is_empty() || !self.cancelled.is_empty() || self.services.has_work()
     }
     fn poll(
         &mut self,
@@ -351,6 +454,7 @@ unsafe impl Backend for Unix {
                 result: Ok(Outcome::Cancelled),
             });
         }
+        self.services.poll(events);
         self.run_ready(events);
         // Cached readiness can end in EAGAIN without producing a completion.
         // In that case use this turn's single OS wait with its exact timeout;
@@ -362,6 +466,7 @@ unsafe impl Backend for Unix {
         let info = self.poller.wait(timeout, &mut self.polled)?;
         for i in 0..self.polled.len() {
             let e = self.polled[i];
+            if self.services.ready(e.key) { continue; }
             let Some(r) = self
                 .resources
                 .get_mut(e.key as u32 as usize)
@@ -377,10 +482,12 @@ unsafe impl Backend for Unix {
             let h = r.handle;
             self.schedule(h);
         }
+        self.services.poll(events);
         self.run_ready(events);
         Ok(info)
     }
     fn release(&mut self, h: Handle) {
+        self.services.release(h, &mut self.poller);
         if let Ok(r) = self.get(h) {
             if r.transport.kind != Kind::File {
                 let fd = r.transport.fd.as_raw_fd();
@@ -421,6 +528,7 @@ fn execute(
 ) -> Result<Option<(Outcome<Detached>, bool)>> {
     let fd = r.transport.fd.as_raw_fd();
     match &mut p.request.operation {
+        Operation::ProcessExit | Operation::WatchSignal => Err(Error::new(ErrorKind::InvalidInput)),
         Operation::Connect => {
             if !r.connecting {
                 let a = r.connect.as_ref().ok_or(Error::new(ErrorKind::InvalidInput))?;
@@ -459,7 +567,7 @@ fn execute(
             Ok(Some((Outcome::Connected, true)))
         }
         Operation::SendHandle(_) => {
-            super::ipc::send(fd, p.passed.as_ref().ok_or(Error::new(ErrorKind::InvalidInput))?.fd.as_raw_fd())?;
+            super::ipc::send(fd, p.passed.as_ref().ok_or(Error::new(ErrorKind::InvalidInput))?)?;
             Ok(Some((Outcome::HandleSent, true)))
         }
         Operation::RecvHandle => Ok(Some((Outcome::HandleReceived(super::ipc::receive(fd)?), true))),
@@ -470,10 +578,7 @@ fn execute(
             let (fd, peer) = socket::accept(fd)?;
             Ok(Some((
                 Outcome::Accepted {
-                    transport: Detached {
-                        fd,
-                        kind: Kind::Tcp,
-                    },
+                    transport: Detached::new(fd, Kind::Tcp),
                     peer,
                 },
                 !*multishot,

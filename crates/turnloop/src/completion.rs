@@ -22,6 +22,8 @@ pub struct Completion {
 }
 #[derive(Debug)]
 pub enum OpResult {
+    /// Completion of a registered host wait condition.
+    ExternalWait(crate::WaitResult),
     /// Child exit, after reaping; produced exactly once per accepted spawn.
     Exited(crate::ExitStatus),
     /// Process-wide signal delivered to this subscribed loop.

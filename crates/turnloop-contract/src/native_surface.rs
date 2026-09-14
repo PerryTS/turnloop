@@ -83,3 +83,152 @@ pub fn ipc<B: Backend>(name: &PipeName) {
     let attached = l.attach(detached, Token(30)).expect("attach received socket");
     transfer(&mut l, attached, rx, b"passed socket remains usable");
 }
+
+/// Spawn 256 children concurrently and require one distinct reaped exit each.
+pub fn children<B: Backend>(program: &std::ffi::OsStr) {
+    let mut l = Driver::<B>::new(Config::default()).expect("loop");
+    let mut spec = ProcessSpec::new(program);
+    spec.args.push("exit".into());
+    let mut children = Vec::new();
+    for i in 0..256 { children.push(l.spawn(&spec, Token(i)).expect("spawn")); }
+    // Every child has a chance to exit before the first completion poll.
+    std::thread::sleep(Duration::from_millis(50));
+    let mut seen = [false; 256];
+    let mut count = 0;
+    let mut closed = 0;
+    let mut out = Completions::with_capacity(7);
+    let until = l.now() + Duration::from_secs(10);
+    while count != 256 || closed != 256 {
+        assert!(l.now() < until, "children timed out: {count} exits {closed} closes");
+        l.turn(Timeout::Until(until), &mut out).expect("turn");
+        for c in out.drain() {
+            match c.result {
+                OpResult::Exited(status) => {
+                    assert_eq!(status, ExitStatus { code: Some(23), signal: None });
+                    let i = c.token.0 as usize; assert!(!seen[i]); seen[i] = true; count += 1;
+                    assert_eq!(c.handle, Some(children[i].handle));
+                    l.close(children[i].handle, Token(999)).expect("close reaped child");
+                }
+                OpResult::Closed => closed += 1,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+    assert!(seen.into_iter().all(|v| v)); assert!(!l.alive());
+}
+/// Child stdio is driven by its own loop, proving pipe-backed open_stdio ran.
+pub fn child_stdio<B: Backend>(program: &std::ffi::OsStr) {
+    let mut l = Driver::<B>::new(Config::default()).expect("loop");
+    let mut spec = ProcessSpec::new(program); spec.args.push("stdio".into());
+    spec.stdio = [ProcessStdio::Pipe; 3];
+    let child = l.spawn(&spec, Token(1)).expect("spawn stdio child");
+    let payload = b"stdio via child loop\n";
+    l.write(child.stdin.expect("stdin"), WriteBuf::Owned(payload.to_vec()), Token(2)).expect("stdin write");
+    l.read_start(child.stdout.expect("stdout"), Token(3)).expect("stdout read");
+    l.read_start(child.stderr.expect("stderr"), Token(4)).expect("stderr read");
+    let mut bytes = [Vec::new(), Vec::new()];
+    let mut exit = false; let mut eof = 0; let mut writes = 0;
+    let mut out = Completions::with_capacity(2);
+    let until = l.now() + Duration::from_secs(10);
+    while !exit || eof != 2 {
+        assert!(l.now() < until, "child stdio timed out");
+        l.turn(Timeout::Until(until), &mut out).expect("turn");
+        for c in out.drain() {
+            match c.result {
+                OpResult::Wrote(n) => { assert_eq!(n, payload.len()); writes += 1; l.close(child.stdin.expect("stdin"), Token(5)).expect("close stdin"); }
+                OpResult::Read { n, lease: Some(b) } => { assert!(n > 0); bytes[c.token.0 as usize - 3].extend_from_slice(b.as_slice()); }
+                OpResult::Eof => eof += 1,
+                OpResult::Exited(status) => { assert_eq!(status.code, Some(23)); assert!(!exit); exit = true; }
+                OpResult::Closed => {},
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+    assert_eq!(writes, 1); assert_eq!(bytes[0], payload); assert_eq!(bytes[1], payload);
+}
+/// Every subscribed loop receives its own signal on its owning thread.
+pub fn signal_fanout<B: Backend>(send: impl FnOnce()) {
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(5));
+    let mut workers = Vec::new();
+    for i in 0..4 {
+        let barrier = barrier.clone();
+        workers.push(std::thread::spawn(move || {
+            let mut l = Driver::<B>::new(Config::default()).expect("thread loop");
+            let h = l.signal_start(Signal::Usr1, Token(i)).expect("signal subscription");
+            barrier.wait();
+            let mut out = Completions::default();
+            let until = l.now() + Duration::from_secs(5);
+            let mut delivered = 0;
+            while delivered == 0 {
+                assert!(l.now() < until, "signal was not delivered to loop {i}");
+                l.turn(Timeout::Until(until), &mut out).expect("turn");
+                for c in out.drain() {
+                    assert_eq!(c.token, Token(i)); assert_eq!(c.handle, Some(h));
+                    assert!(matches!(c.result, OpResult::Signal(Signal::Usr1))); delivered += 1;
+                }
+            }
+            l.signal_stop(h, Token(100)).expect("signal stop");
+            let mut stopped = 0; let mut closed = 0;
+            while closed == 0 {
+                l.turn(Timeout::Now, &mut out).expect("stop turn");
+                for c in out.drain() {
+                    match c.result { OpResult::Stopped => stopped += 1, OpResult::Closed => { assert_eq!(stopped, 1); closed += 1; }, other => panic!("unexpected {other:?}") }
+                }
+            }
+            assert_eq!((delivered, stopped, closed), (1, 1, 1));
+            assert!(!l.alive()); delivered
+        }));
+    }
+    barrier.wait(); send();
+    assert_eq!(workers.into_iter().map(|t| t.join().expect("loop thread")).sum::<usize>(), 4);
+}
+
+/// A thousand waits on four owning loops, plus timeout/cancellation races.
+pub fn external_waits<B: Backend>() {
+    let condition = WaitCondition::new(7).expect("condition");
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(5));
+    let mut workers = Vec::new();
+    for thread in 0..4 {
+        let condition = condition.clone(); let barrier = barrier.clone();
+        workers.push(std::thread::spawn(move || {
+            let mut l = Driver::<B>::new(Config::default()).expect("loop");
+            let until = l.now() + Duration::from_secs(5);
+            for i in 0..256 { l.external_wait(&condition, 7, Some(until), Token(thread * 256 + i)).expect("wait registration"); }
+            barrier.wait();
+            let mut seen = [false; 256]; let mut count = 0;
+            let mut out = Completions::with_capacity(3);
+            while count != 256 {
+                assert!(l.now() < until, "external wait starvation");
+                l.turn(Timeout::Until(until), &mut out).expect("turn");
+                for c in out.drain() {
+                    assert!(matches!(c.result, OpResult::ExternalWait(WaitResult::Notified)));
+                    let i = (c.token.0 - thread * 256) as usize; assert!(!seen[i]); seen[i] = true; count += 1;
+                }
+            }
+            assert!(!l.alive()); count
+        }));
+    }
+    barrier.wait(); condition.notify();
+    assert_eq!(workers.into_iter().map(|t| t.join().expect("wait thread")).sum::<usize>(), 1024);
+    let mut l = Driver::<B>::new(Config::default()).expect("loop");
+    let at = l.now() + Duration::from_millis(5);
+    l.external_wait(&condition, 7, Some(at), Token(1)).expect("deadline wait");
+    let cancel = l.external_wait(&condition, 7, None, Token(2)).expect("cancel wait");
+    assert!(l.cancel(cancel));
+    l.external_wait(&condition, 8, None, Token(3)).expect("unequal wait");
+    let mut out = Completions::default(); let mut seen = [false; 3];
+    let until = l.now() + Duration::from_secs(2);
+    while seen.iter().any(|v| !v) {
+        assert!(l.now() < until); l.turn(Timeout::Until(until), &mut out).expect("turn");
+        for c in out.drain() {
+            let i = c.token.0 as usize - 1; assert!(!seen[i]); seen[i] = true;
+            match c.result {
+                OpResult::ExternalWait(WaitResult::TimedOut) => { assert_eq!(i, 0); assert!(l.now() >= at); }
+                OpResult::Cancelled => assert_eq!(i, 1),
+                OpResult::ExternalWait(WaitResult::NotEqual) => assert_eq!(i, 2),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+    assert!(!l.alive());
+}

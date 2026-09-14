@@ -27,6 +27,7 @@ pub struct DnsRequest {
     pub port: u16,
 }
 pub(crate) enum WorkOutput {
+    ExternalWait(crate::WaitResult),
     Blocking(Payload),
     Resolved(Vec<SocketAddr>),
 }
@@ -61,7 +62,7 @@ impl WorkPort {
         self.closed.store(true, Ordering::Release);
     }
     #[cfg(not(target_arch = "wasm32"))]
-    fn complete(&self, result: WorkResult) {
+    pub(crate) fn complete(&self, result: WorkResult) {
         if self.closed.load(Ordering::Acquire) {
             return;
         }
