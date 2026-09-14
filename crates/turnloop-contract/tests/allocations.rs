@@ -719,7 +719,10 @@ fn quiet_deadline_waits_have_identical_accounting_without_allocations() {
             assert_eq!((info.os_waits, info.zero_event_waits), (1, 1));
             assert!(l.now() >= at);
             assert_eq!(out.len(), 1);
-            assert_eq!((out[0].handle, out[0].op, out[0].token), (Some(h), Some(op), token));
+            assert_eq!(
+                (out[0].handle, out[0].op, out[0].token),
+                (Some(h), Some(op), token)
+            );
             assert!(matches!(out[0].result, OpResult::Timer));
             l.close(h, token).expect("close timer");
             let info = l.turn(Timeout::Now, &mut out).expect("queued close");
@@ -731,5 +734,9 @@ fn quiet_deadline_waits_have_identical_accounting_without_allocations() {
     }
     ACTIVE.with(|v| v.set(false));
     assert_eq!(expiries, 60);
-    assert_eq!(ALLOCS.with(Cell::get), 0, "deadline waits reuse reserved storage");
+    assert_eq!(
+        ALLOCS.with(Cell::get),
+        0,
+        "deadline waits reuse reserved storage"
+    );
 }

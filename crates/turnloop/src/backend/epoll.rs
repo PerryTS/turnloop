@@ -327,7 +327,9 @@ mod tests {
         poller.register(reader.as_raw_fd(), key).expect("register");
         writer.write_all(b"ready").expect("socket bytes");
         let mut ready = Vec::with_capacity(4);
-        let info = poller.wait(Some(Duration::from_secs(1)), &mut ready).expect("I/O wait");
+        let info = poller
+            .wait(Some(Duration::from_secs(1)), &mut ready)
+            .expect("I/O wait");
         assert_eq!((info.waits, info.zero_event_waits), (1, 0));
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].key, key);
@@ -338,7 +340,9 @@ mod tests {
     #[test]
     fn forced_sigchld_mode_never_registers_a_pidfd() {
         let mut poller = Epoll::new(4).expect("epoll");
-        let error = poller.process(std::process::id(), 1 << 32).expect_err("force SIGCHLD");
+        let error = poller
+            .process(std::process::id(), 1 << 32)
+            .expect_err("force SIGCHLD");
         assert_eq!(error.os, Some(libc::ENOSYS));
     }
 }

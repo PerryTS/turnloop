@@ -14,6 +14,7 @@ required, with no nightly language features in the library. WASI 0.3 alone uses
 
 ```bash
 python3 scripts/ci/check-paths.py
+python3 scripts/ci/feature_modes.py
 cargo +nightly-2026-08-20 fmt --all --check
 cargo +nightly-2026-08-20 clippy --locked --workspace --all-targets --all-features -- \
   -D warnings -D clippy::undocumented_unsafe_blocks
@@ -42,10 +43,31 @@ with `python3 -m unittest discover -s scripts/ci -p test_paths.py -v`.
 Every unsafe block must explain its safety with `// SAFETY:` and crate roots deny
 `unsafe_op_in_unsafe_fn`. No `unwrap()` on I/O paths. Assert actual completions,
 bytes or work counters; success with zero tests is an error. Contracts run with
-`--test-threads=1` for global signal/process and allocator isolation. Default and
-all-feature native suites exercise the timer alternative and forced Linux
-`epoll-timerfd` backend; newly introduced incompatible feature combinations need
-explicit metadata-driven CI coverage, not silent exclusions.
+`--test-threads=1` for global signal/process and allocator isolation. Native CI
+selects each mode in `.github/workflows/ci.yml` independently: Linux x86_64 and
+arm64 run default, `epoll-timerfd`, `process-sigchld`, both fallbacks (`fallbacks`),
+`executor`, and `all-features`. macOS and Windows run default, executor, and all
+features. Each arm runs the workspace, independently requires positive counts
+for each core/protocol/contract member, and runs native Node/curl interop with the
+same mode. Independent member runs retain the selected features belonging to that
+member or its direct dependencies; a sans-IO crate with no core dependency has
+no backend feature to select. The workspace run keeps the full feature selection.
+The existing Windows pending-contract marker remains scoped to
+that provider. Every arm is required through the matrix job's `ci-gate` result.
+
+`python3 scripts/ci/run-tests.py native` runs all applicable modes on the current
+host; `--mode epoll-timerfd` selects just that Linux arm. `interop --mode MODE`
+uses the same selection. The native matrix's JSON flow rows are a YAML subset
+parsed directly by `feature_modes.py` and the runner. The required feature gate
+compares those rows to `crates/turnloop/Cargo.toml`: every public core feature
+must be explicitly named in a runtime arm. `all-features` does not grant implicit
+coverage to newly added features. Missing fallback combinations, disconnected
+matrix commands and optional/skipped mode configuration fail the gate.
+
+The allocating BTree timer comparison lives only in `turnloop-bench`, selected by
+that private crate's `timer-btree` feature. It cannot affect the core through Cargo
+feature unification. Both benchmark implementations retain workload assertions
+and run in native CI; production always uses the preallocated 4-ary heap.
 
 `tokio`, `tokio-util`, `hyper`, `h2`, `async-std`, `smol`, `async-io` and
 `async-executor` are forbidden in normal, build and dev dependency graphs. There
@@ -350,7 +372,7 @@ The `wasi` and `web` jobs remain required and fail until their missing productio
 backend inputs land. The instruction job compares against the committed Linux
 baseline. The strict `ci-gate` fan-in is retained. Windows `test-native`
 runs the workspace and independently requires positive counts for core and every
-protocol member, with default and all features. The existing sans-IO unit, wire,
+protocol member, with default, executor and all features. The existing sans-IO unit, wire,
 SCRAM, SDAM/selection fixture and allocation tests are portable. No unnecessary
 Unix test cfg exclusions were found.
 
