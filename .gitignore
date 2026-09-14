@@ -7,3 +7,4 @@
 .tools/
 **/node_modules
 **/pkg
+__pycache__/
