@@ -226,7 +226,7 @@ jobs:
     timeout-minutes: 45
     services:
       postgres:
-        image: postgres:16
+        image: postgres:16.13
         env:
           POSTGRES_DB: turnloop
           POSTGRES_USER: turnloop
@@ -283,12 +283,26 @@ jobs:
       - name: Fixture logs and cleanup
         if: always()
         run: scripts/test-servers.py --ci-services stop
+      - name: SQL service container logs on failure
+        if: failure()
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+          MYSQL_CONTAINER: ${{ job.services.mysql.id }}
+        run: |
+          mkdir -p .tools/protocol-logs
+          status=0
+          docker logs "$POSTGRES_CONTAINER" 2>&1 | tee .tools/protocol-logs/postgres-container.log || status=1
+          docker logs "$MYSQL_CONTAINER" 2>&1 | tee .tools/protocol-logs/mysql-container.log || status=1
+          exit "$status"
+      - name: Collect private server logs without traversing data directories
+        if: always()
+        run: scripts/test-servers.py logs
       - name: Preserve private server diagnostics
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: protocol-server-logs
-          path: .tools/**/*.log
+          path: .tools/protocol-logs/
           include-hidden-files: true
           if-no-files-found: ignore
           retention-days: 7

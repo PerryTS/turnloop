@@ -338,9 +338,12 @@ class Fixtures(unittest.TestCase):
                 errors = io.StringIO()
                 crashing_binary(fixtures.TOOLS / 'psql')
                 crashing_binary(fixtures.TOOLS / 'mysql')
+                cert, key = fixtures.SQL_TOOLS / 'server.crt', fixtures.SQL_TOOLS / 'server.key'
+                cert.write_text('fixture certificate')
+                key.write_text('fixture key')
                 # A failing readiness query gives the real child time to exit.
                 with patch.object(fixtures, 'SQL_BIN', fixtures.TOOLS), \
-                     patch.object(fixtures, 'sql_certificates', return_value=('cert', 'key')), \
+                     patch.object(fixtures, 'sql_certificates', return_value=(cert, key)), \
                      redirect_stderr(errors), self.assertRaisesRegex(RuntimeError, 'server exited with status 23'):
                     fixtures.sql_start()
                 self.assertIn('stdout: fixture actually executed', errors.getvalue())
@@ -389,6 +392,7 @@ class Fixtures(unittest.TestCase):
             self.assertEqual(args[:2], ['run', '--rm'])
             self.assertEqual(args[args.index('--label') + 1], 'turnloop.fixture=' + str(tools))
             self.assertEqual(args[args.index('--volume') + 1], str(root) + ':' + str(root))
+            self.assertEqual(args[args.index('--user') + 1], f'{os.getuid()}:{os.getgid()}')
             self.assertEqual(args[-4:], ['mongod', 'mongo:8', '--port', '32123'])
             recorded = json.loads((tools / 'docker-fixtures.json').read_text())
             self.assertEqual(recorded, [args[args.index('--name') + 1]])

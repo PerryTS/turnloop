@@ -1,191 +1,141 @@
-# core2 lane report
+# ci-fix3 lane report
 
-Updated 2026-09-14. Native scope implemented; macOS runtime verification passes.
-Release is blocked by the pre-existing protocol test dependency's newly published
-rustls advisory, described below. Linux/Windows runtime tests remain UNRUN.
+Completed implementation and available local verification, 2026-09-14.
+SQL/Docker confirmation is still required. The integrator owns commits and CI;
+no commits, pushes, dependency changes or sandbox overrides were performed here.
 
-Read completely: `DESIGN.md`, `CONTRIBUTING.md`, `docs/INTEGRATION_REPORT.md`, and
-`docs/lanes/{core,windows,wasm}.md`. No applicable `AGENTS.md`. Git remains read-only;
-the integrator has periodically checkpointed the tree. No commits/tags or pushes
-were attempted. Wave-1 history remains in the integration and lane reports.
+## Implemented and findings
 
-## Implemented
+### PostgreSQL CI failure
 
-- AF_UNIX stream listen/connect/accept with `PipeName`; `open_stdio` classifies
-  pipes, regular files and TTYs; framed SCM_RIGHTS sending/receiving retains
-  independent socket ownership and supports detach/attach across loops/processes.
-- Processes with argv, environment, cwd, inherit/null/pipe/existing-handle stdio,
-  uid/gid and isolated process groups. kqueue NOTE_EXIT plus SIGCHLD cooperation;
-  Linux pidfd with forced/testable SIGCHLD fallback. Only owned children are reaped.
-  `prepare_close` initiates termination without blocking; cancellation and Closed
-  follow reaping through ordinary turns. Loop destruction also kills/reaps live
-  owned children. Group termination includes the fixture's live grandchild.
-- One lazy process-wide signal dispatcher; per-loop fan-out, coalescing, stop and
-  original-disposition restoration. Child registrations share SIGCHLD ownership.
-- TTY Normal/Raw/Io, dimensions, SIGWINCH resize subscription and full saved-mode
-  restoration on close/drop, including transferred transport ownership.
-- One generic external-wait helper, fixed 16,384 registrations, host-owned atomic
-  condition support, notifications, inequality, exact deadlines and cancellation.
-- Regular-file stdio on the existing bounded blocking pool, fixed reusable jobs,
-  per-file FIFO and worker quiescence before provided buffers can be reused.
-- Optional `executor`: `!Send LocalExecutor`, tokens to wakers, fixed operation
-  staging, TCP/UDP/local-pipe/stdio futures-io adapters, sleep/timeout, local spawn,
-  JoinHandle cancellation, and drop-cancels-I/O. Buffered writes report acceptance;
-  flush/close confirms native completion. Pending calls may replace caller buffers.
-- Public rustdoc throughout `crates/turnloop`, enforced with `deny(missing_docs)`,
-  two executable loop/executor examples, updated crate README, and the full
-  [Backend revision 2 handoff](docs/BACKEND_REVISION_2.md).
+The supplied backtrace reaches `Driver::connect` at the old server.rs:289: the
+observer login as `postgres`. COPY has finished and CancelRequest has **not yet
+been sent**. CI sets `POSTGRES_USER=turnloop`; the official Docker entrypoint
+passes that name to initdb, so the local-only `postgres` role is not created.
+This strongly supports a missing observer role as the cause. The original log
+contains no PostgreSQL service error detail, so this remains an evidence-based
+fix awaiting real SQL/CI confirmation, not a claimed live reproduction.
 
-The starting main already called the Backend revision 2 for empty-wait counters.
-This lane extends that revision with new Open/Operation/Outcome variants, optional
-native service methods, notifier injection and nonblocking `prepare_close`.
-The handoff documents every addition, ownership and Windows/WASM integration.
-Existing production backends and portable core/executor compile. Standalone IOCP
-and WASM spikes were not altered or represented as production implementations.
+- The observer now authenticates as the provisioned `scram_user`, which can inspect
+  its own sessions, and matches the exact BackendKeyData PID plus active query.
+  The test retains COPY input/output byte assertions, requires SQLSTATE 57014,
+  exactly one token-7 error completion with idle transaction state, and a successful
+  subsequent query on the original session. CancelRequest uses a separate socket;
+  the test waits for its protocol-defined EOF.
+- Login diagnostics name the user/SSL mode and retain server SQLSTATE/message in
+  the closing panic. A non-ignored real TCP peer regression receives the startup
+  packet, rejects `postgres`, and proves the panic preserves 28000 and the message.
+  That peer regression does not substitute for a PostgreSQL server run.
+- `/opt/homebrew/bin/postgres --version` reports **16.13 (Homebrew)**. CI now uses
+  **postgres:16.13**, replacing floating postgres:16.
+- `bootstrap-services.sh` was already removed on main; its code is now
+  `sql_ci_start` in `scripts/test-servers.py`. Both local and CI provisioning share
+  the three SSL ALTER SYSTEM settings, reload, effective SSL/pending-restart checks,
+  and version/role/timeout diagnostics. There were no timeout overrides in the
+  failing bootstrap. No speculative timeout or server restart workaround was added.
+- Local initdb uses the same `turnloop` administrator. Local max_connections now
+  retains PostgreSQL's default, matching CI; only loopback port/socket paths differ.
+  Both paths use the same HBA rules, certificate filenames, users and SSL settings.
+- `--postgres-proxy run` adds a stdlib Python loopback forwarder with separate
+  upstream connections, preserved bytes/TLS/half-closes, bounded writes and joined
+  shutdown. It reports bytes, connections and CancelRequest counts. Real socket
+  tests exercise fragmented cancellation, a 256-KiB query, distinct upstream ports,
+  half-closes, and idle-relay shutdown. This models forwarding, not Docker namespaces.
 
-Only one dependency was added: optional `futures-io = 0.3.31`. No additional futures
-executor/utility dependency; the remaining machinery uses std. The seven-day soak
-and all banned runtime/dependency gates remain unchanged.
+Sources checked: [Docker entrypoint](https://raw.githubusercontent.com/docker-library/postgres/master/docker-entrypoint.sh),
+[PostgreSQL statistics visibility](https://www.postgresql.org/docs/16/monitoring-stats.html),
+and [CancelRequest flow](https://www.postgresql.org/docs/16/protocol-flow.html#PROTOCOL-FLOW-CANCELING-REQUESTS).
 
-## Runtime coverage
+### Continue all protocol suites
 
-The final native runner executes **110 default-feature workspace tests** and
-**118 all-feature workspace tests**; its independent contract passes execute
-**42 default / 49 all-feature tests**. Ignored protocol-server tests are not counted.
+`run-tests.py protocol` (and HTTP interop) attempts every declared integration
+suite, including later targets within a failed crate. Missing/invalid metadata,
+nonzero subprocess exits, spawn errors and zero passed tests all produce FAIL.
+The runner prints a per-suite PASS/FAIL table, appends it to GITHUB_STEP_SUMMARY
+when present, and fails after all suites have run if any failed. No positive-count
+gate was relaxed. Regression subprocesses record their actual execution order;
+one failed crate, an empty suite and invalid metadata cannot hide later work.
 
-Core/contract all-feature coverage includes 5 core unit tests, 22 existing shared
-contracts, 14 native surface tests, 6 executor tests, 6 allocation gates, the
-existing descriptor lifetime test, and 2 executable rustdoc examples.
+### Logs and server data cleanup
 
-New subjects asserted: local echo bytes and both accept/connect tokens; child-loop
-stdio bytes on all three streams and regular-file/null stdio; socket transfer to
-and back from a child; exact exits and reaping including deterministic
-exit-before-registration (`waitid(WNOWAIT)`), 256 concurrent children, direct kill,
-close/drop and a live grandchild group; four-loop/four-thread signal fan-out;
-SIGCHLD/user-subscription cooperation; full openpty mode restoration and resize;
-1,024 notified waits across four loops plus inequality/deadline/cancellation;
-64-connection executor echo; timer/timeout timing; UDP/stdio traffic; pending read
-buffer replacement/shrinking; pending write buffer replacement; task cancellation
-before first poll; drop of pending I/O and unconsumed accepted sockets.
+- CI prints and saves both `docker logs "$POSTGRES_CONTAINER"` and
+  `docker logs "$MYSQL_CONTAINER"` whenever the protocol job fails. A shell
+  regression proves MySQL logs are still attempted when PostgreSQL log retrieval fails.
+- `scripts/test-servers.py logs` prints the existing bounded private-server tails
+  and stages only known log files into flat **.tools/protocol-logs/**. Artifact
+  upload is confined to that directory; the old `.tools/**/*.log` scan is removed.
+  The only fixture cache remains **.tools/redis-build**; instruction artifacts
+  retain their separate **.tools/instruction-baselines/** root.
+- Mongo Docker wrappers use the host UID/GID so mongod cannot leave root-owned
+  files in the bind mount. Cleanup checks container labels, removes containers,
+  reaps their docker-run children and verifies closed ports before deleting each
+  manifest-recorded data directory. Native Mongo children are stopped/reaped first.
+  Unverified/live instances retain their manifest and data.
+- Private PostgreSQL/MySQL data is removed after shutdown, including partial data
+  from failed initialization. Restrictive directory modes are repaired before
+  traversal; symlinks are not followed. Logs/certificates remain outside data roots.
+  Tests execute child processes and failed initializers that create restrictive
+  data, then verify reaping precedes deletion and logs survive.
+- CONTRIBUTING documents the commands, result table and lifecycle changes.
+  The supplied `docs/ci-run-34872077144-protocol.log` was deleted as requested.
 
-No-spin contracts preserve the original limits: idle future timers at 0.5/2/10 ms,
-≤2 turns and ≤1 zero-event wait per expiry. The new process/signal case proves
-60 real timer expiries with both services registered; existing socket/timer,
-queued-completion and notifier syscall gates remain intact.
+## Verification ledger
 
-Allocation counters measure the loop thread after warm-up, with exact byte/event
-counts: existing read/write/accept/timer/backlog gates, 200 IPC/socket transfers
-and cancelled waits, 200 measured file read/write cycles, 1,000 measured executor
-I/O/sleep cycles, and 16 child exits plus 200 signals and 200 notified waits.
-All six gates report zero allocations. Construction, owned caller payloads,
-process spawn/signal subscription setup and task spawning allocate; no claim of
-zero setup allocation or a global allocator measurement of helper threads is made.
+All commands ran in this clone. Full output is under ignored `.tools/verification/`.
+Cross-compilation is not runtime proof. The Python script tests initially passed
+60, then 61 and 63 tests as coverage grew; the final run passes **64**.
 
-## Verification commands
+| Command | Result |
+| --- | --- |
+| `/opt/homebrew/bin/postgres --version` | PASS: 16.13 |
+| `python3 -W error -m unittest discover -s scripts/ci -p 'test_*.py' -v` | PASS: final 64 tests; real subprocess/TCP/cleanup assertions |
+| `python3 -m py_compile scripts/test-servers.py scripts/fixtures/tcp_proxy.py scripts/ci/run-tests.py` | PASS |
+| `cargo fmt --all --check` | Initial FAIL: formatting only; `cargo fmt --all` applied it; final PASS |
+| `cargo clippy --workspace --all-targets -- -D warnings -D clippy::undocumented_unsafe_blocks` | PASS, initial and final |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks` | PASS |
+| `cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings -D clippy::undocumented_unsafe_blocks` | PASS; Linux runtime UNRUN |
+| `cargo clippy --workspace --all-targets --target x86_64-pc-windows-msvc -- -D warnings -D clippy::undocumented_unsafe_blocks` | FAIL: missing Windows SDK C headers (`assert.h`, etc.) in ring/zstd; Windows test-target checking and runtime UNRUN |
+| `cargo clippy -p turnloop-postgres --lib --target x86_64-pc-windows-msvc -- -D warnings` | PASS; library cross-check only |
+| `cargo +stable check --workspace --all-targets --all-features` | PASS, initial and final, stable 1.97.1 |
+| `cargo test -p turnloop-postgres --test server rejected_startup_reports_server_sqlstate_and_message` | PASS: actual TCP rejection and diagnostic assertions |
+| `cargo test --workspace` | PASS: 193 passed, 12 ignored; ignored subjects are not counted as executed |
+| `scripts/ci/no-tokio.sh` | PASS: every configured target/default/all-feature graph; no bans changed |
+| `python3 scripts/ci/soak.py` | PASS: 240 locked registry versions; only the inherited exact rustls security exception; seven-day policy unchanged |
+| `python3 scripts/ci/install-tools.py actionlint zizmor shellcheck` | PASS: committed checksum pins |
+| `PATH="$PWD/.tools/bin:$PATH" python3 scripts/ci/lint-workflows.py` | PASS: strict existing queue validation, supported actionlint checks, zizmor, ShellCheck |
+| `.tools/bin/actionlint -color` | FAIL: only the two inherited concurrency.queue parser errors in actionlint 1.7.12; compatibility handling unchanged |
+| `.tools/bin/zizmor --offline --min-severity low .github/workflows` | PASS: no findings |
+| `scripts/test-servers.py --services postgres --postgres-proxy run cargo test -p turnloop-postgres --test server -- --include-ignored --test-threads=1 --nocapture` | UNRUN (sandbox): command exits 1 at initdb/shmget before PostgreSQL or proxy test bodies run |
+| `scripts/test-servers.py run cargo test --workspace -- --include-ignored` | UNRUN (sandbox): command exits 1 at PostgreSQL initdb/shmget; no test bodies execute |
+| `scripts/test-servers.py --services mysql run true` | UNRUN (sandbox): mysqld initialization exits 2, signal 11 / invalid mapped-object permissions; no MySQL server or tests run |
+| `scripts/test-servers.py --services redis,mongodb,smtp,http run cargo test -p turnloop-redis -p turnloop-mongodb -p turnloop-smtp -p turnloop-http -p turnloop-tls -p turnloop-websocket -p turnloop-zstd-decoder -- --include-ignored --test-threads=1` | PASS: 145 passed, zero ignored, actual Redis/Mongo/SMTP/HTTP/TLS/WebSocket and decoder workloads |
+| `scripts/test-servers.py logs` | PASS: 23 flat log files retained; no data directories traversed |
+| Python post-run inspection of recorded Mongo ports/dbpaths and all service state files | PASS: all five ports closed, all five Mongo data directories removed, SQL data absent, all private state absent |
+| `git diff --check` | PASS |
+| `scripts/test-servers.py --ci-services run python3 scripts/ci/run-tests.py protocol` | UNRUN: Docker/Linux unavailable |
 
-[docs/core2-commands.md](docs/core2-commands.md) records every scripted verification
-invocation with PASS/FAIL and its raw log identifier. Logs are in `.tools/core2/`.
-Intermediate failures are retained, including compiler/type errors and runtime
-bugs subsequently fixed. Formatting during editing, source reads/searches and
-read-only Git inspection also succeeded; the unwrap search had no matches.
+The existing workspace allocation gates executed unchanged. No new production
+I/O operation or steady-state allocation path was introduced, so no allocation
+budget needed extending. No unsafe block, I/O unwrap, dependency or backend change
+was added. No test threshold, fixture requirement, no-spin rule or CI gate was weakened.
+Windows and WASI/web required jobs are retained; wasm fixes belong to the other lane.
 
-| Command / scope | Result |
-|---|---|
-| `cargo fmt --check` | PASS |
-| `cargo clippy --workspace --all-targets -- -D warnings -D clippy::undocumented_unsafe_blocks` | PASS |
-| Same Clippy with `--all-features` | PASS |
-| `cargo +stable check --locked --workspace --all-targets --all-features` | PASS, stable 1.97.1 |
-| `cargo test --workspace -- --test-threads=1` | PASS; serialization follows CONTRIBUTING for process/signal/allocator isolation |
-| `python3 scripts/ci/run-tests.py native` | PASS, both workspace configurations and independent contract passes |
-| `cargo test -p turnloop -p turnloop-contract --all-features -- --test-threads=1` | PASS, including both doctests |
-| `cargo test -p turnloop-contract --all-features --test allocations -- --test-threads=1` | PASS, all six gates |
-| `RUSTDOCFLAGS=-Dwarnings cargo doc --locked --workspace --all-features --no-deps` | PASS |
-| `cargo rustc -p turnloop --lib --all-features -- -Dmissing_docs` | PASS; lint subsequently made a crate-level requirement |
-| Linux x86_64 workspace/all-target Clippy, default and all features | PASS; includes pidfd and forced SIGCHLD/timerfd branches |
-| Windows MSVC core/contract/bench all-target/all-feature Clippy | PASS |
-| WASI 0.2 and web workspace/all-target/all-feature Clippy | PASS |
-| WASI 0.3 core/contract/bench all-target/all-feature Clippy, nightly-2026-09-07 | PASS; Cargo emits existing manifest/config warnings; compiler warnings denied |
-| iOS arm64 core/contract all-target/all-feature Clippy | PASS |
-| FreeBSD x86_64 core/contract all-target/all-feature Clippy | PASS after installing its target and fixing test PID width |
-| Android arm64 core/contract library/all-feature Clippy | PASS |
-| Android arm64 all-target Clippy | FAIL: pinned Clippy diagnoses `missing_const_for_thread_local` in the existing allocation-test TLS macro despite both initializers already being `const`; no lint suppressed |
-| `bash scripts/ci/no-tokio.sh` | PASS, all 8 configured target graphs with default/all features |
-| `python3 scripts/ci/soak.py` | PASS, 194 locked registry versions; resolver policy active |
-| `python3 scripts/ci/run-tests.py loom` | PASS, 5 production notifier/queue/pool models |
-| `python3 scripts/ci/run-tests.py miri` | Initial FAIL: default sysroot cache outside sandbox writable paths. PASS after setup and rerun with `MIRI_SYSROOT=$PWD/.tools/miri-sysroot`; 2 real pure-Rust tests |
-| `python3 scripts/ci/install-tools.py cargo-deny actionlint zizmor shellcheck` | PASS, all four official artifact hashes verified |
-| `cargo +nightly-2026-08-20 deny --locked check` with `.tools/bin` on PATH | FAIL: rustls advisory below; bans/licenses/sources PASS |
-| `python3 scripts/ci/lint-workflows.py` with `.tools/bin` on PATH | PASS |
-| `python3 -m unittest discover -s scripts/ci -p 'test_*.py' -v` | PASS, 15 automation tests |
-| `git diff --check` and final `cargo fmt --check` | PASS |
+## Deviations, open questions and next steps
 
-Full target spellings, flags and interim results are preserved in the ledger.
-Cross-compilation is never counted as runtime execution. No gate/test was weakened.
+No DESIGN.md changes proposed. The authoritative design, contribution guide,
+integration report and relevant CI/SQL/Mongo/KV/HTTP lane reports were read.
 
-### Advisory gate blocker
+The remaining confirmation is environmental: does CI's now-correct observer
+complete the existing COPY/cancel sequence, and do Docker cleanup/log upload pass?
+There is no live SQL reproduction claim from this sandbox. The integrator should:
 
-`cargo-deny` fetched **RUSTSEC-2026-0285 / GHSA-2mjx-qc3c-rqvc**, published
-2026-09-14. The existing protocol dev dependency `rustls 0.23.44` is affected;
-`0.23.45` fixes it. The crates.io index records publication at
-**2026-09-14 15:11:17 UTC**, so it is soak-eligible only at
-**2026-09-21 15:11:17 UTC**. Existing `0.23.44` was published
-2026-09-07 09:17:42 UTC. No advisory ignore, dependency-soak override, fabricated
-version or unrelated protocol dependency migration was introduced.
-
-Evidence: [upstream advisory](https://github.com/rustls/rustls/security/advisories/GHSA-2mjx-qc3c-rqvc)
-and the [official registry index](https://index.crates.io/ru/st/rustls).
-The native core and executor do not depend on rustls.
-
-### UNRUN
-
-- Linux and Windows native runtime suites, allocation/no-spin/syscall gates and
-  platform process races: no Linux/Windows host or Docker. Run the same generic
-  contracts, plus platform-specific fixtures, when those hosts/providers are ready.
-- FreeBSD, iOS and Android runtime suites: no corresponding runtime host/device.
-- WASI/web shared native-service/executor runtime tests: production providers and
-  shared platform test instantiations are still absent in this starting workspace.
-  The external-wait thread service explicitly rejects WASM. No zero-test success
-  is presented as platform runtime coverage; existing strict CI jobs remain on.
-- PostgreSQL/MySQL server tests: UNRUN (known sandbox shmget/initializer limits).
-  Other ignored protocol server suites were not rerun for this core lane and remain
-  UNRUN here. Normal in-process protocol suites ran in workspace verification.
-- Browser launch/integration, Linux instruction baseline/Callgrind and platform
-  syscall traces: UNRUN in this environment; no substitute measurements supplied.
-- Git commit/tag operations: UNRUN, metadata read-only; integrator owns checkpoints.
-
-## Decisions, limitations and proposed DESIGN clarifications
-
-No changes to authoritative `DESIGN.md`. Detailed proposals are in the revision 2
-handoff: local control-stream framing and duplicate ownership; nonblocking
-kill/reap-on-close with a process teardown hook; subscribed-signal disposition
-ownership; TTY Raw/Io and restoration across transport movement; generic external
-waits and buffered futures-io writes. These are concrete documented API choices.
-
-Hosts own Unix socket-path cleanup and coordinate shared descriptor flags/TTY
-state. They must not reap turnloop children or overwrite active subscribed signal
-handlers. Group kill requires an owned unreaped leader, preventing PID/PGID reuse.
-Loop destruction may wait for child termination and running file-job quiescence;
-ordinary turns and close use completion acknowledgement. External waits have a
-fixed process-wide 16,384-slot bound. UDP's AsyncRead view omits sender addresses.
-Adapters buffer writes, so flush/close before drop is required to retain output.
-
-Windows needs to implement `prepare_close` with its process/Job Object mechanism,
-retain native operation storage until acknowledgement, supply the existing spike's
-stdio/console mechanisms and instantiate the shared contracts. Signal scenarios
-accept a platform-supported signal and real delivery callback; they do not hardcode
-Unix-only signals for IOCP. Native-only capabilities on WASM remain explicit errors.
-
-## Open questions and next steps
-
-1. Integrator: review/checkpoint this coherent tree and Backend revision 2 handoff;
-   coordinate the `prepare_close` addition with the Windows production port.
-2. Run Linux default and all-feature suites (pidfd and forced SIGCHLD/timerfd),
-   Windows IOCP shared contracts, and platform runtime/no-spin/allocation gates.
-3. Once rustls 0.23.45 is soak-eligible, update the shared protocol dev pin/lock,
-   rerun protocol TLS/server tests and `cargo-deny`. Until then, release remains
-   blocked by the advisory gate; both security and soak policies stay enabled.
-4. Resolve the pinned Android test-TLS Clippy diagnostic upstream or in a toolchain
-   update; the production Android library cross-check already passes.
-5. Review the documented API/specification clarifications. Relocated Miri, final
-   Clippy, allocation, tree and format checks are complete; no remaining native
-   feature implementation is deferred.
+1. Run the exact PostgreSQL proxy command above outside the sandbox; expect all
+   four server-target tests to pass and at least one logged CancelRequest over a
+   distinct proxied connection. Review printed version/roles/settings.
+2. Run `scripts/test-servers.py run cargo test --workspace -- --include-ignored`
+   outside the sandbox, including both SQL suites.
+3. Push the checkpointed tree and watch CI: confirm all protocol suite rows run,
+   all rows pass, and artifact upload never visits a database directory. On any
+   failure inspect both SQL container logs and the staged private logs.
+4. Use native Windows CI for the test-target compile/runtime checks that require
+   Windows SDK headers. Linux/Windows/Docker runtime is UNRUN here.
