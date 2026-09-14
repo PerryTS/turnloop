@@ -99,7 +99,7 @@ export function schedules(id) {return get(id).schedules;}
 
 // Shared queue is available only through the web-worker Rust feature. No Rust
 // linear memory is shared; producers transfer two unsigned 64-bit values.
-class SharedPoster {
+export class SharedPoster {
   constructor(buffer,capacity) {
     if(!Number.isInteger(capacity) || capacity<=0 || capacity>1048576 || (capacity&(capacity-1)))throw new Error('invalid capacity');
     this.capacity=capacity;this.words=new Int32Array(buffer);

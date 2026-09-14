@@ -159,10 +159,11 @@ jobs:
         run: |
           rustup toolchain install "$TOOLCHAIN" --profile minimal --component clippy --target "$TARGET"
           bash scripts/ci/install-wasmtime.sh
-      - name: Lint and run actual WASI contracts
-        run: |
-          cargo +"$TOOLCHAIN" clippy --locked --workspace --all-targets --all-features --target "$TARGET" -- -D warnings -D clippy::undocumented_unsafe_blocks
-          python3 scripts/ci/run-tests.py wasi --target "$TARGET"
+      - name: Lint the complete WASI workspace
+        run: cargo +"$TOOLCHAIN" clippy --locked --workspace --all-targets --all-features --target "$TARGET" -- -D warnings -D clippy::undocumented_unsafe_blocks
+      - name: Run actual WASI contracts and allocation gates
+        if: '!cancelled()'
+        run: python3 scripts/ci/run-tests.py wasi --target "$TARGET"
   web:
     runs-on: ubuntu-24.04
     permissions:
@@ -191,6 +192,7 @@ jobs:
       - name: Chrome and Firefox contracts
         run: python3 scripts/ci/run-tests.py web
       - name: Node subset
+        if: '!cancelled()'
         run: python3 scripts/ci/run-tests.py node
   protocol:
     runs-on: ubuntu-24.04

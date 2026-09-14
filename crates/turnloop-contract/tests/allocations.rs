@@ -329,7 +329,7 @@ fn cancellation_reserves_survive_a_full_event_backlog() {
 }
 
 #[test]
-fn steady_udp_and_deadline_poll_allocate_nothing() {
+fn steady_udp_allocate_nothing() {
     let mut l = Loop::new(Config::default()).expect("loop");
     let addr = "127.0.0.1:0".parse().expect("address");
     let a = l.udp_bind(addr, &UdpOpts::default()).expect("UDP a");
@@ -374,6 +374,12 @@ fn steady_udp_and_deadline_poll_allocate_nothing() {
     }
     assert_eq!(bytes, 6400, "UDP allocation subject ran");
     assert_eq!(total, 0, "steady UDP allocations");
+}
+
+#[test]
+fn steady_deadline_poll_allocate_nothing() {
+    let mut l = Loop::new(Config::default()).expect("loop");
+    let mut out = Completions::default();
     let mut expiries = 0;
     ALLOCS.with(|n| n.set(0));
     ACTIVE.with(|v| v.set(true));

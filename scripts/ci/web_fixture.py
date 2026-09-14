@@ -29,8 +29,8 @@ class WebFixture:
         with urllib.request.urlopen(self.url + '/stats', timeout=5) as response:
             stats = json.load(response)
         print('Web fixture traffic: ' + json.dumps(stats), flush=True)
-        for field, threshold in {'fetches': minimum * 2, 'slow': minimum,
-                                 'aborted': minimum, 'websockets': minimum * 3,
+        for field, threshold in {'fetches': minimum * 3, 'slow': minimum,
+                                 'aborted': minimum, 'websockets': minimum * 4,
                                  'echoed': minimum * (257 + 6400)}.items():
             if stats.get(field, 0) < threshold:
                 raise RuntimeError(f'Fixture subject did not run: {field} < {threshold}: {stats}')

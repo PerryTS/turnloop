@@ -1,5 +1,7 @@
 //! Experimental direct WASI 0.3 component async backend. A persistent wait-set
 //! and fixed request return areas avoid a fresh block_on or executor per turn.
+//! Experimental: host-yield boundedness, canonical UDP return allocation and
+//! debug custom-allocator startup remain unresolved; see docs/wasm.md.
 mod abi;
 mod wait_set;
 use crate::{
@@ -485,7 +487,7 @@ unsafe impl Backend for WasiP3 {
             // A nonblocking wait-set poll does not yield the component to its
             // host. One cooperative yield lets socket subtasks progress even
             // when the embedding host repeatedly calls turn(Now).
-            if !wasip3::wit_bindgen::rt::async_support::yield_blocking() {
+            if !abi::preserving_stack(wasip3::wit_bindgen::rt::async_support::yield_blocking) {
                 return Err(Error::new(ErrorKind::Cancelled));
             }
         }
