@@ -206,6 +206,18 @@ pub enum Integration {
 #[derive(Debug)]
 /// Backend-neutral resource creation requests; unsupported kinds must fail explicitly.
 pub enum Open {
+    #[cfg(turnloop_backend = "web")]
+    /// Open a host HTTP fetch stream.
+    Fetch {
+        /// Host URL for the request.
+        url: String,
+    },
+    #[cfg(turnloop_backend = "web")]
+    /// Open a host WebSocket stream.
+    WebSocket {
+        /// Host URL for the connection.
+        url: String,
+    },
     /// Unconnected local stream.
     Pipe(crate::PipeName),
     /// Local stream listener.

@@ -332,7 +332,13 @@ impl<B: Backend> Driver<B> {
     }
     /// Return the earliest pending timer deadline in the backend clock domain.
     pub fn next_deadline(&self) -> Option<Instant> {
-        self.timers.next_deadline()
+        let deadline = self.timers.next_deadline();
+        #[cfg(target_arch = "wasm32")]
+        let deadline = match (deadline, crate::external_wait::deadline(self.owner)) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        deadline
     }
     /// Include or exclude a handle and its pending/queued operations from loop liveness.
     pub fn set_ref(&mut self, h: Handle, referenced: bool) -> Result<()> {
@@ -382,7 +388,7 @@ impl<B: Backend> Driver<B> {
             repeat,
         };
         self.timers.insert(h.key, at);
-        self.backend.deadline_changed(self.timers.next_deadline());
+        self.backend.deadline_changed(self.next_deadline());
         Ok(h)
     }
     /// Move an active timer deadline; returns false for closed, expired or foreign handles.
@@ -395,7 +401,7 @@ impl<B: Backend> Driver<B> {
         }
         self.timers.cancel(h.key);
         self.timers.insert(h.key, at);
-        self.backend.deadline_changed(self.timers.next_deadline());
+        self.backend.deadline_changed(self.next_deadline());
         true
     }
     /// Return the operation identity of an active timer, for cancellation.
@@ -677,7 +683,7 @@ impl<B: Backend> Driver<B> {
         });
         if timer {
             self.timers.cancel(op.handle.expect("timer handle").key);
-            self.backend.deadline_changed(self.timers.next_deadline());
+            self.backend.deadline_changed(self.next_deadline());
             self.finish(
                 id,
                 if stop {
@@ -690,6 +696,8 @@ impl<B: Backend> Driver<B> {
         } else {
             if op.external_wait {
                 crate::external_wait::cancel(id);
+                #[cfg(target_arch = "wasm32")]
+                self.backend.deadline_changed(self.next_deadline());
             } else if let Some(cancel) = op.job_cancel {
                 cancel.store(true, Ordering::Release);
             } else if self.backend.cancel(id).is_err() {
@@ -755,7 +763,7 @@ impl<B: Backend> Driver<B> {
         }
         Ok(h)
     }
-    /// Park a host condition on the process-wide helper. Registrations use
+    /// Register a host condition with the native helper or single-agent service. Registrations use
     /// preallocated storage; cancellation and completion follow normal OpId rules.
     pub fn external_wait(
         &mut self,
@@ -773,6 +781,8 @@ impl<B: Backend> Driver<B> {
             self.outstanding -= 1;
             return Err(e);
         }
+        #[cfg(target_arch = "wasm32")]
+        self.backend.deadline_changed(self.next_deadline());
         Ok(op)
     }
     /// Submit an owned Send closure to the bounded shared blocking pool.
@@ -914,6 +924,8 @@ impl<B: Backend> Driver<B> {
         out.clear();
         let notified = self.notifier.begin();
         let start = self.backend.now();
+        #[cfg(target_arch = "wasm32")]
+        crate::external_wait::poll(self.owner, start);
         let deadline = match (timeout.deadline(start), self.next_deadline()) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -943,6 +955,8 @@ impl<B: Backend> Driver<B> {
             self.events = events;
         }
         let now = self.backend.now();
+        #[cfg(target_arch = "wasm32")]
+        crate::external_wait::poll(self.owner, now);
         for _ in 0..self.config.events_per_turn {
             if self.buffered[TIMER_EVENTS] == self.config.events_per_turn {
                 break;
@@ -974,7 +988,7 @@ impl<B: Backend> Driver<B> {
                 }
             }
         }
-        self.backend.deadline_changed(self.timers.next_deadline());
+        self.backend.deadline_changed(self.next_deadline());
         for _ in 0..self.config.events_per_turn {
             let Some(work) = self.work_port.pop() else {
                 break;
@@ -990,7 +1004,6 @@ impl<B: Backend> Driver<B> {
                 }
             } else {
                 match work.result {
-                    #[cfg(not(target_arch = "wasm32"))]
                     Ok(crate::blocking::WorkOutput::ExternalWait(r)) => OpResult::ExternalWait(r),
                     Ok(crate::blocking::WorkOutput::Blocking(p)) => OpResult::Blocking(p),
                     Ok(crate::blocking::WorkOutput::Resolved(a)) => OpResult::Resolved(a),
@@ -1224,5 +1237,68 @@ mod clock_contract {
             .expect("timer");
         assert!(l.cancel(l.timer_op(h).expect("op")));
         assert_eq!(l.backend.deadline, None);
+    }
+}
+
+#[cfg(turnloop_backend = "web")]
+impl Driver<crate::backend::web::Web> {
+    /// Configure the host dispatcher. It is scheduled asynchronously and should
+    /// call turn(Now); no user callback runs inside a turnloop method.
+    pub fn set_schedule_turn(&mut self, schedule: &js_sys::Function) -> Result<()> {
+        self.backend.configure(schedule)?;
+        self.integration()?;
+        Ok(())
+    }
+    /// Number of coalesced host turn requests.
+    pub fn schedule_count(&self) -> u32 {
+        self.backend.schedule_count()
+    }
+    /// Attach a bounded Worker Poster. Returns a JS descriptor with `buffer`
+    /// (SharedArrayBuffer), `capacity`, and `producerSource` (SharedPoster class).
+    /// Construct that class in a Worker with the transferred descriptor; post
+    /// returns false on contention/full/closed, retaining the caller's values.
+    /// Browsers require COOP/COEP isolation and Atomics.waitAsync; see docs/wasm.md.
+    #[cfg(feature = "web-worker")]
+    pub fn worker_poster(&mut self, capacity: u32) -> Result<wasm_bindgen::JsValue> {
+        self.backend.worker_poster(capacity, self.poster())
+    }
+    /// Expose a condition to Workers through a bounded Atomics-backed queue.
+    /// The descriptor's producerSource class offers store(u64) and notify(). Both
+    /// return false on contention/full/closed; retry without losing the update.
+    /// Accepted updates apply on the owning agent in queue order. A descriptor
+    /// lives until this driver drops; the condition can notify waits on any local loop.
+    #[cfg(feature = "web-worker")]
+    pub fn worker_wait_condition(
+        &mut self,
+        condition: &WaitCondition,
+        capacity: u32,
+    ) -> Result<wasm_bindgen::JsValue> {
+        self.backend.worker_condition(condition.clone(), capacity)
+    }
+    /// Fetch one complete response into a provided or pooled buffer. Responses
+    /// larger than that buffer complete with ResourceLimit, never truncated data.
+    pub fn fetch(&mut self, url: &str, buf: ReadBuf, token: Token) -> Result<(Handle, OpId)> {
+        let h = self.open(Open::Fetch { url: url.into() })?;
+        match self.read(h, buf, token) {
+            Ok(op) => Ok((h, op)),
+            Err(e) => {
+                self.backend.release(h);
+                self.handles.remove(h.key);
+                self.refs -= 1;
+                Err(e)
+            }
+        }
+    }
+    /// Connect a browser WebSocket; subsequent read/write operations exchange
+    /// whole binary messages. Oversize messages fail with ResourceLimit.
+    pub fn websocket(&mut self, url: &str, token: Token) -> Result<Handle> {
+        let h = self.open(Open::WebSocket { url: url.into() })?;
+        if let Err(e) = self.submit(h, Operation::Connect, token) {
+            self.backend.release(h);
+            self.handles.remove(h.key);
+            self.refs -= 1;
+            return Err(e);
+        }
+        Ok(h)
     }
 }

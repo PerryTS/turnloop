@@ -451,13 +451,13 @@ fn test_ll_default() {
         .unwrap();
 
     #[cfg(feature = "std")]
-    for idx in 0..table.decode.len() {
+    for (idx, entry) in table.decode.iter().enumerate() {
         std::println!(
             "{:3}: {:3} {:3} {:3}",
             idx,
-            table.decode[idx].symbol,
-            table.decode[idx].num_bits,
-            table.decode[idx].base_line
+            entry.symbol,
+            entry.num_bits,
+            entry.base_line
         );
     }
 
