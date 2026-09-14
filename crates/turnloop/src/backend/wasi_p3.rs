@@ -1,8 +1,9 @@
 //! Experimental direct WASI 0.3 component async backend. A persistent wait-set
 //! and fixed request return areas avoid a fresh block_on or executor per turn.
-//! Experimental: host-yield boundedness, canonical UDP return allocation and
-//! debug custom-allocator startup remain unresolved; see docs/wasm.md.
+//! Experimental: host-yield boundedness is unproven. Allocation gates require
+//! release on the pinned p3 compiler; see docs/upstream/wasi-p3-wait.md.
 mod abi;
+mod return_storage;
 mod wait_set;
 use crate::{
     backend::{Backend, Event, Operation, Outcome, PollInfo, Request, Wake},
@@ -11,6 +12,7 @@ use crate::{
 use std::{
     collections::VecDeque,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6},
+    rc::Rc,
     sync::Arc,
     time::Duration,
 };
@@ -64,6 +66,7 @@ pub struct Detached {
     kind: Kind,
 }
 struct Resource {
+    _udp_return: Option<return_storage::Reservation>,
     handle: Handle,
     transport: Detached,
     connect: Option<SocketAddr>,
@@ -110,6 +113,7 @@ pub struct WasiP3 {
     pool: BufferPool,
     wake: Arc<WasiWake>,
     wait_set: WaitSet,
+    returns: Rc<return_storage::Arena>,
 }
 fn direction(op: &Operation) -> usize {
     usize::from(!matches!(
@@ -199,7 +203,9 @@ impl WasiP3 {
         if self.resources.get(h.index()).is_none_or(Option::is_some) {
             return Err(Error::new(ErrorKind::InvalidInput));
         }
+        let udp_return = (transport.kind == Kind::Udp).then(|| self.returns.reserve());
         self.resources[h.index()] = Some(Resource {
+            _udp_return: udp_return,
             handle: h,
             transport,
             connect,
@@ -323,6 +329,7 @@ unsafe impl Backend for WasiP3 {
             pool,
             wake: Arc::new(WasiWake),
             wait_set: WaitSet::new(),
+            returns: return_storage::Arena::shared(),
         })
     }
     fn now(&self) -> Instant {
@@ -585,8 +592,16 @@ fn start(p: &mut Pending, set: &WaitSet, kind: WaitKind, waitable: u32, code: u3
     }
 }
 fn result(p: &mut Pending) -> Result<()> {
-    // SAFETY: a completed subtask/future initialized a SocketResult at word 16;
-    // lifting transfers and releases any owned error text exactly once.
+    // Other(Some(string)) owns a canonical list. Consume it ourselves because
+    // it may be a retained slot; generated lifting would free it as a String.
+    if p.area[16] & 255 == 1 && p.area[17] & 255 == 14 {
+        if p.area[18] & 255 == 1 {
+            // SAFETY: completed SocketResult initialized the owned error text.
+            drop(unsafe { return_storage::ReturnBytes::take(p.area[19], p.area[20] as usize) });
+        }
+        return Err(Error::new(ErrorKind::Other));
+    }
+    // SAFETY: completed SocketResult at word 16; remaining variants own no lists.
     unsafe { (SocketResult::VTABLE.lift)(p.area.as_mut_ptr().add(16).cast()) }.map_err(error)
 }
 fn read_outcome(p: &mut Pending, n: usize) -> (Outcome<Detached>, bool) {
@@ -694,7 +709,7 @@ fn execute(
                 }
                 let len = p.area[2] as usize;
                 // SAFETY: canonical return transfers one owned byte list with len/cap len.
-                let bytes = unsafe { owned_bytes(p.area[1], len) };
+                let bytes = unsafe { return_storage::ReturnBytes::take(p.area[1], len) };
                 let from = abi::decode_addr(&p.area[3..11]);
                 let output = read_buffer(p, pool).ok_or(Error::new(ErrorKind::ResourceLimit))?;
                 let n = output.len().min(bytes.len());
@@ -948,7 +963,7 @@ fn quiesce(p: &mut Pending, set: &WaitSet, r: &mut Resource) {
             if p.area[0] & 255 == 0 {
                 let len = p.area[2] as usize;
                 // SAFETY: returned owned canonical list must be freed even when cancel wins.
-                drop(unsafe { owned_bytes(p.area[1], len) });
+                drop(unsafe { return_storage::ReturnBytes::take(p.area[1], len) });
             } else {
                 p.area.copy_within(0..5, 16);
                 let _ = result(p);
@@ -961,16 +976,5 @@ fn quiesce(p: &mut Pending, set: &WaitSet, r: &mut Resource) {
         unsafe {
             wait_set::subtask_drop(waitable);
         }
-    }
-}
-
-// SAFETY: caller transfers an owned canonical list allocated with alignment one.
-// Empty canonical lists may have a null address, which Vec cannot accept.
-unsafe fn owned_bytes(ptr: u32, len: usize) -> Vec<u8> {
-    if len == 0 {
-        Vec::new()
-    } else {
-        // SAFETY: nonempty canonical list transfers len initialized bytes/capacity.
-        unsafe { Vec::from_raw_parts(ptr as *mut u8, len, len) }
     }
 }

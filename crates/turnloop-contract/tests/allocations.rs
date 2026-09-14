@@ -406,3 +406,152 @@ fn steady_deadline_poll_allocate_nothing() {
     assert_eq!(expiries, 20);
     assert_eq!(ALLOCS.with(|n| n.get()), 0, "deadline poll return lists");
 }
+
+#[test]
+fn concurrent_udp_returns_survive_cancellation_and_loop_drop_without_allocating() {
+    const N: usize = 8;
+    const ROUNDS: usize = 20;
+    const LENGTHS: [usize; N] = [0, 1, 7, 64, 513, 2048, 4096, 8192];
+    let config = Config {
+        pooled_buffer_size: 65536,
+        pooled_buffers: 16,
+        ..Config::default()
+    };
+    let mut loops = [
+        Loop::new(config).expect("first loop"),
+        Loop::new(config).expect("second loop"),
+    ];
+    let mut outputs = [[0u8; 65536]; N];
+    // This Mac accepts 8 KiB datagrams and rejects 16 KiB with EMSGSIZE.
+    // The maximum canonical buffer size is exercised separately without the OS.
+    let payload: Vec<u8> = (0..8192).map(|i| (i % 251) as u8).collect();
+    let mut sockets = Vec::new();
+    for l in &mut loops {
+        let mut group = Vec::new();
+        for _ in 0..N {
+            let h = l
+                .udp_bind("[::1]:0".parse().expect("IPv6"), &UdpOpts::default())
+                .expect("UDP");
+            group.push((h, l.local_addr(h).expect("local address")));
+        }
+        sockets.push(group);
+    }
+    let mut out = Completions::with_capacity(1);
+    let mut received = 0;
+    let mut cancelled = 0;
+    let mut allocations = 0;
+    for round in 0..=ROUNDS {
+        ALLOCS.with(|n| n.set(0));
+        ACTIVE.with(|v| v.set(round != 0));
+        for (j, l) in loops.iter_mut().enumerate() {
+            for &(h, _) in &sockets[j] {
+                // Cancel an armed empty receive before queuing its successor.
+                let op = l
+                    .recv(h, ReadBuf::Pooled, Token(100))
+                    .expect("cancel receive");
+                l.turn(Timeout::Now, &mut out).expect("arm receive");
+                assert!(out.is_empty());
+                assert!(l.cancel(op));
+                l.turn(Timeout::Now, &mut out)
+                    .expect("cancel acknowledgement");
+                assert_eq!(out.len(), 1);
+                assert!(matches!(out[0].result, OpResult::Cancelled));
+                cancelled += usize::from(round != 0);
+            }
+            for (i, &(h, to)) in sockets[j].iter().enumerate() {
+                let buf = if j == 0 {
+                    // SAFETY: each receive owns its distinct fixed output until
+                    // all completions are drained below; storage never moves.
+                    ReadBuf::Provided(unsafe {
+                        IoBufMut::from_raw_parts(outputs[i].as_mut_ptr(), outputs[i].len())
+                    })
+                } else {
+                    ReadBuf::Pooled
+                };
+                l.recv(h, buf, Token(i as u64)).expect("receive");
+                // SAFETY: immutable retained payload lives until both loops drop.
+                let input = unsafe { IoBuf::from_raw_parts(payload.as_ptr(), LENGTHS[i]) };
+                l.send_to(h, WriteBuf::Provided(input), to, Token((N + i) as u64))
+                    .expect("send");
+            }
+        }
+        let mut seen = [[false; N * 2]; 2];
+        let mut completed = 0;
+        let until = Instant::now() + Duration::from_secs(5);
+        while completed < N * 4 {
+            assert!(Instant::now() < until, "UDP burst stalled");
+            for (j, l) in loops.iter_mut().enumerate() {
+                l.turn(Timeout::Now, &mut out).expect("interleave loops");
+                for c in out.drain() {
+                    let index = c.token.0 as usize;
+                    assert!(!seen[j][index], "duplicate UDP result");
+                    seen[j][index] = true;
+                    completed += 1;
+                    match c.result {
+                        OpResult::RecvFrom { n, from, lease } => {
+                            assert_eq!(n, LENGTHS[index]);
+                            assert_eq!(from, sockets[j][index].1);
+                            let bytes = lease
+                                .as_ref()
+                                .map_or(&outputs[index][..n], BufLease::as_slice);
+                            assert_eq!(bytes, &payload[..n]);
+                            received += usize::from(round != 0);
+                        }
+                        OpResult::Wrote(n) => assert_eq!(n, LENGTHS[index - N]),
+                        other => panic!("unexpected {other:?}"),
+                    }
+                }
+            }
+        }
+        ACTIVE.with(|v| v.set(false));
+        if round != 0 {
+            allocations += ALLOCS.with(|n| n.get());
+        }
+    }
+    assert_eq!(received, ROUNDS * N * 2);
+    assert_eq!(cancelled, ROUNDS * N * 2);
+    assert_eq!(allocations, 0, "concurrent canonical UDP return storage");
+    // Drop with multiple receives pending, then exercise a surviving/new loop.
+    for (j, l) in loops.iter_mut().enumerate() {
+        for &(h, _) in &sockets[j] {
+            l.recv(h, ReadBuf::Pooled, Token(200))
+                .expect("pending on drop");
+        }
+        l.turn(Timeout::Now, &mut out).expect("arm before drop");
+        assert!(out.is_empty());
+    }
+    let [first, mut second] = loops;
+    drop(first);
+    for &(h, _) in &sockets[1] {
+        second.close(h, Token(201)).expect("close surviving loop");
+    }
+    let mut cancellations = 0;
+    let mut closes = 0;
+    for _ in 0..N * 4 {
+        second.turn(Timeout::Now, &mut out).expect("surviving loop");
+        for c in out.drain() {
+            match c.result {
+                OpResult::Cancelled => cancellations += 1,
+                OpResult::Closed => closes += 1,
+                other => panic!("unexpected teardown {other:?}"),
+            }
+        }
+    }
+    assert_eq!((cancellations, closes), (N, N));
+    steady_udp_allocate_nothing();
+}
+
+#[cfg(target_env = "p3")]
+#[test]
+fn wasi_random_scalar_imports_allocate_nothing() {
+    let mut bytes = [0u8; 257];
+    ALLOCS.with(|n| n.set(0));
+    ACTIVE.with(|v| v.set(true));
+    for _ in 0..100 {
+        turnloop_wasi_random::fill_v03(&mut bytes).expect("entropy 0.3");
+        turnloop_wasi_random::fill_v04(&mut bytes).expect("entropy 0.4");
+        assert!(bytes.windows(2).any(|b| b[0] != b[1]));
+    }
+    ACTIVE.with(|v| v.set(false));
+    assert_eq!(ALLOCS.with(|n| n.get()), 0, "200 real entropy fills");
+}

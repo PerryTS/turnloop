@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Metadata-driven test entry points; missing suites and zero passed tests are errors."""
 import argparse
+from contextlib import nullcontext
+from browser_driver import BrowserDriver
 import os
 from pathlib import Path
 import re
@@ -54,11 +56,17 @@ def main():
         if args.target not in ('wasm32-wasip2', 'wasm32-wasip3'):
             fail('wasi requires --target wasm32-wasip2 or wasm32-wasip3')
         env['CARGO_TARGET_' + args.target.upper().replace('-', '_') + '_RUNNER'] = str(ROOT / 'scripts/ci/wasmtime-runner.sh')
+        for package in select(data, 'core'):
+            if settings(package).get('wasi-lib-tests'):
+                features = ['--features', 'wasi-p3-experimental'] if args.target == 'wasm32-wasip3' else []
+                checked_tests(base + ['-p', package['name'], '--lib', '--release'] + features
+                              + ['--', '--nocapture', '--test-threads=1'], cwd=root, env=env)
         for package in select(data, 'contract'):
             features = ['--features', 'wasi-p3-experimental'] if args.target == 'wasm32-wasip3' else []
             available = {t['name'] for t in package['targets'] if 'test' in t['kind']}
             failures = []
-            for key, profile in [('wasi-tests', []), ('wasi-allocation-tests', ['--release'])]:
+            for key, profile in [('wasi-tests', []), ('wasi-tests', ['--release']),
+                                 ('wasi-allocation-tests', ['--release'])]:
                 targets = settings(package).get(key, [])
                 if not targets:
                     fail(f'{package["name"]}: declare {key}; each binary must execute real tests')
@@ -68,7 +76,7 @@ def main():
                     try:
                         checked_tests(base + ['-p', package['name'], '--test', target] + features + profile
                                       + ['--', '--nocapture', '--test-threads=1'], cwd=root, env=env)
-                    except (subprocess.CalledProcessError, RuntimeError) as error:
+                    except (subprocess.CalledProcessError, RuntimeError, OSError) as error:
                         failures.append(str(error))
             if failures:
                 fail('WASI gates failed: ' + '; '.join(failures))
@@ -86,7 +94,7 @@ def main():
                 browsers = ([args.browser] if args.browser else ['chrome', 'firefox']) if args.suite == 'web' else ['node']
                 failures = []
                 for browser in browsers:
-                    command = ['wasm-pack', 'test']
+                    command = ['wasm-pack', 'test', '--mode', 'no-install']
                     command += ['--node'] if browser == 'node' else ['--headless', '--' + browser]
                     command += [str(Path(package['manifest_path']).parent), '--locked', '--test', target]
                     features = settings(package).get(key + '-features', [])
@@ -98,9 +106,12 @@ def main():
                     try:
                         with WebFixture(Path(package['manifest_path']).parent / fixture_path) as fixture:
                             env['TURNLOOP_WEB_FIXTURE'] = fixture.url
-                            checked_tests(command, cwd=root, env=env)
-                            fixture.verify(minimum=1)
-                    except (subprocess.CalledProcessError, RuntimeError) as error:
+                            manager = nullcontext(None) if browser == 'node' else BrowserDriver(browser, env)
+                            with manager as driver:
+                                launch = command if driver is None else command[:4] + driver.driver_args + command[4:]
+                                checked_tests(launch, cwd=root, env=env if driver is None else driver.env)
+                                fixture.verify(minimum=1)
+                    except (subprocess.CalledProcessError, RuntimeError, OSError) as error:
                         failures.append(browser + ': ' + str(error))
                 if failures:
                     fail('Web gates failed: ' + '; '.join(failures))

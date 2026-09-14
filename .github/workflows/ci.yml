@@ -161,7 +161,10 @@ jobs:
           bash scripts/ci/install-wasmtime.sh
       - name: Lint the complete WASI workspace
         run: cargo +"$TOOLCHAIN" clippy --locked --workspace --all-targets --all-features --target "$TARGET" -- -D warnings -D clippy::undocumented_unsafe_blocks
-      - name: Run actual WASI contracts and allocation gates
+      - name: Bare WASI clock measurement (release)
+        run: |
+          CARGO_TARGET_WASM32_WASIP2_RUNNER=scripts/ci/wasmtime-runner.sh CARGO_TARGET_WASM32_WASIP3_RUNNER=scripts/ci/wasmtime-runner.sh cargo +"$TOOLCHAIN" run --locked -p turnloop-contract --release --all-features --target "$TARGET" --example wasi_timer_baseline
+      - name: WASI debug and release contracts; mandatory release allocation gates
         if: '!cancelled()'
         run: python3 scripts/ci/run-tests.py wasi --target "$TARGET"
   web:
@@ -187,8 +190,7 @@ jobs:
           rustup target add --toolchain nightly-2026-08-20 wasm32-unknown-unknown
           python3 scripts/ci/install-tools.py wasm-pack
           python3 scripts/ci/install-web-tools.py
-          google-chrome --version
-          firefox --version
+          python3 scripts/ci/install-browsers.py
       - name: Chrome and Firefox contracts
         run: python3 scripts/ci/run-tests.py web
       - name: Node subset

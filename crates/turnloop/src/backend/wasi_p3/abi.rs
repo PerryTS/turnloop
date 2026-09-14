@@ -60,12 +60,13 @@ pub(super) fn preserving_stack<T>(f: impl FnOnce() -> T) -> T {
     // SAFETY: pinned wasm32-wasip3 toolchain's shadow-stack accessors; the saved
     // value identifies this still-live caller frame, never another task's stack.
     let stack = unsafe { __wasm_get_stack_pointer() };
-    let result = f();
-    // SAFETY: f has returned synchronously; restore this caller's live stack.
-    unsafe {
-        __wasm_set_stack_pointer(stack);
-    }
-    result
+    super::return_storage::scoped(|| {
+        let result = f();
+        // SAFETY: f has returned synchronously; restore this caller's live stack
+        // before the canonical allocation scope runs its Rust destructors.
+        unsafe { __wasm_set_stack_pointer(stack) };
+        result
+    })
 }
 pub(super) unsafe fn connect(params: *mut u32, result: *mut u32) -> u32 {
     // SAFETY: caller owns pinned canonical parameters/return area until acknowledgement.

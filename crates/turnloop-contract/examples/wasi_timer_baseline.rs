@@ -76,6 +76,10 @@ fn main() {
     }
     println!("bare WASI lateness_ns={samples:?}");
     samples.sort_unstable();
-    println!("bare WASI expiries={} median_ns={}", samples.len(), samples[10]);
+    println!(
+        "bare WASI expiries={} median_ns={}",
+        samples.len(),
+        samples[10]
+    );
     assert_eq!(samples.len(), 20);
 }
