@@ -16,15 +16,17 @@ fn count() {
 // SAFETY: all allocation operations delegate unchanged to the system allocator.
 unsafe impl GlobalAlloc for Counter {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        count(); /* SAFETY: caller provides GlobalAlloc's layout contract. */
+        count();
+        // SAFETY: caller provides GlobalAlloc's layout contract.
         unsafe { System.alloc(layout) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        /* SAFETY: allocation ownership and layout are forwarded unchanged. */
+        // SAFETY: allocation ownership and layout are forwarded unchanged.
         unsafe { System.dealloc(ptr, layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        count(); /* SAFETY: caller supplies the original allocation and valid new size. */
+        count();
+        // SAFETY: caller supplies the original allocation and valid new size.
         unsafe { System.realloc(ptr, layout, size) }
     }
 }

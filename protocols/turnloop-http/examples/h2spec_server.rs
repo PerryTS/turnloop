@@ -9,11 +9,12 @@ use turnloop_http::{
     http1::Header,
     http2::{Connection, Event, Role},
 };
-fn serve(mut socket: TcpStream) {
-    socket
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-    let mut engine = Connection::new(Role::Server, Default::default()).unwrap();
+const BODY: [u8; 16384] = [b'x'; 16384];
+
+fn serve(mut socket: TcpStream) -> std::io::Result<()> {
+    socket.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let mut engine =
+        Connection::new(Role::Server, Default::default()).map_err(std::io::Error::other)?;
     let mut input = Vec::new();
     let mut pending: Vec<(u32, usize)> = Vec::new();
     loop {
@@ -50,17 +51,17 @@ fn serve(mut socket: TcpStream) {
                 id,
                 &[
                     Header::new(":status", "200"),
-                    Header::new("content-length", "2"),
+                    Header::new("content-length", "16384"),
                 ],
                 false,
             );
             pending.push((id, 0));
         }
         pending.retain_mut(
-            |(id, pos)| match engine.send_data(*id, &b"ok"[*pos..], true) {
+            |(id, pos)| match engine.send_data(*id, &BODY[*pos..], true) {
                 Ok(n) => {
                     *pos += n;
-                    *pos < 2
+                    *pos < BODY.len()
                 }
                 Err(_) => false,
             },
@@ -69,7 +70,7 @@ fn serve(mut socket: TcpStream) {
             break;
         }
         let n = engine.output().len();
-        engine.consume_output(n).unwrap();
+        engine.consume_output(n).map_err(std::io::Error::other)?;
         if stop {
             break;
         }
@@ -82,16 +83,20 @@ fn serve(mut socket: TcpStream) {
             }
         }
     }
+    Ok(())
 }
-fn main() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    println!("{}", listener.local_addr().unwrap().port());
+fn main() -> std::io::Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    println!("{}", listener.local_addr()?.port());
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                thread::spawn(move || serve(stream));
+                thread::spawn(move || {
+                    let _ = serve(stream);
+                });
             }
             Err(_) => break,
         }
     }
+    Ok(())
 }

@@ -58,14 +58,14 @@ enum Engine {
         ints: IntPool,
         codes: CodePool,
     },
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(any(target_arch = "wasm32", feature = "pure-rust-zstd")))]
     Zstd {
         decoder: zstd::stream::raw::Decoder<'static>,
         boundary: bool,
     },
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(any(target_arch = "wasm32", feature = "pure-rust-zstd"))]
     Zstd {
-        decoder: ruzstd::decoding::FrameDecoder,
+        decoder: turnloop_zstd_decoder::decoding::FrameDecoder,
         reset: bool,
         boundary: bool,
     },
@@ -112,7 +112,7 @@ impl StreamingDecoder {
                     codes,
                 }
             }
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(not(any(target_arch = "wasm32", feature = "pure-rust-zstd")))]
             "zstd" => {
                 let mut decoder = zstd::stream::raw::Decoder::new().map_err(|_| corrupt())?;
                 decoder
@@ -123,9 +123,9 @@ impl StreamingDecoder {
                     boundary: false,
                 }
             }
-            #[cfg(target_arch = "wasm32")]
+            #[cfg(any(target_arch = "wasm32", feature = "pure-rust-zstd"))]
             "zstd" => Engine::Zstd {
-                decoder: ruzstd::decoding::FrameDecoder::new(),
+                decoder: turnloop_zstd_decoder::decoding::FrameDecoder::new(),
                 reset: true,
                 boundary: false,
             },
@@ -171,13 +171,13 @@ impl StreamingDecoder {
             } => {
                 **state = BrotliState::new(bytes.clone(), ints.clone(), codes.clone());
             }
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(not(any(target_arch = "wasm32", feature = "pure-rust-zstd")))]
             Engine::Zstd { decoder, boundary } => {
                 use zstd::stream::raw::Operation;
                 decoder.reinit().map_err(|_| corrupt())?;
                 *boundary = false;
             }
-            #[cfg(target_arch = "wasm32")]
+            #[cfg(any(target_arch = "wasm32", feature = "pure-rust-zstd"))]
             Engine::Zstd {
                 reset, boundary, ..
             } => {
@@ -329,7 +329,7 @@ impl StreamingDecoder {
                     _ => {}
                 }
             }
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(not(any(target_arch = "wasm32", feature = "pure-rust-zstd")))]
             Engine::Zstd { decoder, boundary } => {
                 use zstd::stream::raw::Operation;
                 if input.is_empty() && end && *boundary {
@@ -352,7 +352,7 @@ impl StreamingDecoder {
                     return Err(corrupt());
                 }
             }
-            #[cfg(target_arch = "wasm32")]
+            #[cfg(any(target_arch = "wasm32", feature = "pure-rust-zstd"))]
             Engine::Zstd {
                 decoder,
                 reset,

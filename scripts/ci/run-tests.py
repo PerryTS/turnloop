@@ -30,7 +30,7 @@ def checked_tests(command, *, cwd, env=None, minimum_groups=1):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('suite', choices=['native', 'wasi', 'web', 'node', 'loom', 'miri', 'protocol'])
+    parser.add_argument('suite', choices=['native', 'wasi', 'web', 'node', 'loom', 'miri', 'protocol', 'protocol-wasi'])
     parser.add_argument('--manifest-path', default='Cargo.toml')
     parser.add_argument('--target')
     args = parser.parse_args()
@@ -48,12 +48,25 @@ def main():
             checked_tests(base + ['--workspace'] + features + ['--', '--test-threads=1'], cwd=root)
             for package in select(data, 'contract'):
                 checked_tests(base + ['-p', package['name']] + features + ['--', '--test-threads=1'], cwd=root)
-    elif args.suite == 'wasi':
+    elif args.suite in ('wasi', 'protocol-wasi'):
         if args.target not in ('wasm32-wasip2', 'wasm32-wasip3'):
             fail('wasi requires --target wasm32-wasip2 or wasm32-wasip3')
         env['CARGO_TARGET_' + args.target.upper().replace('-', '_') + '_RUNNER'] = str(ROOT / 'scripts/ci/wasmtime-runner.sh')
-        for package in select(data, 'contract'):
-            checked_tests(base + ['-p', package['name'], '--', '--test-threads=1'], cwd=root, env=env)
+        if args.suite == 'protocol-wasi':
+            selected = [(p, settings(p).get('wasi-tests', [])) for p in members(data)
+                        if settings(p).get('wasi-tests')]
+            if not selected:
+                fail('No wasi-tests metadata: protocol runtime coverage is required')
+            for package, targets in selected:
+                available = {t['name'] for t in package['targets'] if 'test' in t['kind']}
+                for target in targets:
+                    if target not in available:
+                        fail(f'Unknown WASI test target: {package["name"]}/{target}')
+                    checked_tests(base + ['-p', package['name'], '--test', target,
+                        '--', '--test-threads=1'], cwd=root, env=env)
+        else:
+            for package in select(data, 'contract'):
+                checked_tests(base + ['-p', package['name'], '--', '--test-threads=1'], cwd=root, env=env)
     elif args.suite in ('web', 'node'):
         env['RUSTUP_TOOLCHAIN'] = PIN
         for package in select(data, 'contract'):

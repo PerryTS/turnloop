@@ -1,7 +1,8 @@
+#![cfg(not(target_arch = "wasm32"))]
 use std::{
-    io::{BufRead, BufReader, Read, Write},
+    io::{Read, Write},
     net::{TcpListener, TcpStream},
-    process::{Child, Command, Stdio},
+    process::Command,
     thread,
     time::{Duration, Instant},
 };
@@ -12,29 +13,16 @@ use turnloop_http::{
 };
 #[path = "../../turnloop-tls/tests/support/mod.rs"]
 mod tls_support;
-struct Process(Child);
-impl Drop for Process {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-fn node_server(mode: &str) -> (Process, u16) {
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../scripts/private-http-server.mjs"
-    );
-    let mut child = Command::new("node")
-        .args([path, mode])
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut line = String::new();
-    BufReader::new(child.stdout.take().unwrap())
-        .read_line(&mut line)
-        .unwrap();
-    let port = line.trim().parse().unwrap();
-    (Process(child), port)
+fn node_port(mode: &str) -> u16 {
+    let key = if mode == "h1" {
+        "TURNLOOP_TEST_HTTP_PORT"
+    } else {
+        "TURNLOOP_TEST_HTTP2_PORT"
+    };
+    std::env::var(key)
+        .expect("run through scripts/test-servers.py --services http run")
+        .parse()
+        .expect("fixture port must be a u16")
 }
 fn socket(port: u16) -> TcpStream {
     let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -103,8 +91,9 @@ fn send(stream: &mut impl Write, request: &Request) {
     stream.write_all(&bytes).unwrap();
 }
 #[test]
+#[ignore = "requires the private HTTP fixture from scripts/test-servers.py"]
 fn node_h1_redirect_compression_trailers_and_socket_reuse() {
-    let (_server, port) = node_server("h1");
+    let port = node_port("h1");
     let mut socket = socket(port);
     let mut decoder = http1::Decoder::new(http1::Mode::Response, Default::default());
     let mut request = Request::new(&format!("http://127.0.0.1:{port}/redirect"), "GET").unwrap();
@@ -338,8 +327,9 @@ fn curl_and_node_h2_hundred_streams_against_native_server() {
     }
 }
 #[test]
+#[ignore = "requires the private HTTP fixture from scripts/test-servers.py"]
 fn native_h2_client_against_node_hundred_streams() {
-    let (_server, port) = node_server("h2");
+    let port = node_port("h2");
     let mut socket = socket(port);
     let mut engine = http2::Connection::new(http2::Role::Client, Default::default()).unwrap();
     for _ in 0..100 {

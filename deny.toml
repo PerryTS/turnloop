@@ -12,7 +12,9 @@ highlight = "all"
 deny = [
   { name = "tokio" }, { name = "tokio-util" }, { name = "hyper" }, { name = "h2" },
   { name = "async-std" }, { name = "smol" }, { name = "async-io" },
-  { name = "async-executor" },
+  { name = "async-executor" }, { name = "async-global-executor" },
+  { name = "futures-executor" }, { name = "futures-runtime" },
+  { name = "http-body" }, { name = "http-body-util" },
 ]
 
 # quoted_printable (lettre's MIME builder) uses the permissive 0BSD license.

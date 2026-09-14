@@ -9,7 +9,7 @@
 use rustls::{
     CertificateError, DigitallySignedStruct, Error, SignatureScheme,
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
-    pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime},
+    pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime, pem::PemObject},
 };
 use std::{
     sync::{
@@ -72,7 +72,7 @@ impl ClientConfig {
             }
         } else {
             roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            for cert in rustls_pemfile::certs(&mut options.extra_ca_pem.as_slice()) {
+            for cert in CertificateDer::pem_slice_iter(&options.extra_ca_pem) {
                 roots.add(cert.map_err(|e| Error::General(e.to_string()))?)?;
             }
         }

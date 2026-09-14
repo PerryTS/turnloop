@@ -1,36 +1,34 @@
-# Integration lane report
+# http-integrate lane report
 
-Updated 2026-09-14. Wave-1 integration and local verification are complete; external
-release prerequisites remain explicitly pending. The integrator makes commits because Git metadata is read-only.
+Updated 2026-09-14. Integration in progress; no commits or uploads (integrator owns Git).
 
-Implemented: full turnloop rename; eight-member workspace (six publishable crates,
-two private helpers); stable 1.97.1 metadata; shared soaked dependencies; private
-start/stop/run server runner and common TURNLOOP_TEST_* ports; consolidated CI with
-explicit pending platform/baseline gates; native and cross-target test fixes;
-no-spin contract and the cached-readiness/EAGAIN core fix.
+## Implemented
 
-PASS: default workspace tests, strict native/Linux/WASI/web Clippy, stable
-1.97.1, rustdoc, five loom models, two Miri suites, no-tokio on all eight target
-graphs, seven-day soak, cargo-deny, workflow lint wrapper and 15 automation tests. All six
-publishable crates passed fully verified cargo publish dry runs; no --no-verify
-was needed and nothing was uploaded. Redis (single/ACL/TLS/cluster/Sentinel), MongoDB
-(standalone/replicas/auth/TLS), and SMTP real-server subset passed.
+- Unified HTTP/TLS/WebSocket shared dependencies and publication metadata; retained
+  ring/std/tls12 for all rustls users. Removed reintroduced rustls-pemfile in favor
+  of maintained rustls-pki-types PEM parsing. The seven-day soak is unchanged.
+- Promoting the existing allocation fork into `turnloop-zstd-decoder`, with explicit
+  versioned HTTP dependency, upstream MIT license, attribution and provenance.
+  No root patch. Upstream 0.8.3 and soaked 0.9.0 both still allocate six times per
+  default-table frame internally; no public API/configuration bypasses those sites.
+- Restoring upstream corpus fixtures so workspace membership runs its tests.
 
-UNRUN: SQL test bodies (PostgreSQL shmget denied; MySQL initializer crashes in this
-sandbox), Linux/Windows runtime suites, full Windows test-target Clippy (ring needs
-Windows SDK headers), Docker CI fixture path, Windows/WASI/web production contracts,
-and Linux instruction measurements. Their gates have not been weakened or skipped.
+## Verification ledger
 
-Audit changes: removed unmaintained rustls-pemfile; updated the iai-callgrind gate
-to its maintained Gungraun 0.19.4 successor to remove proc-macro-error2; kept all
-thresholds and v6 summary checks. Pinned email-encoding 0.4.1 to share base64 0.22.1.
-Added permissive 0BSD for quoted_printable, with no advisory/runtime exceptions.
+PASS: complete required design/contribution/integration and relevant lane report reads;
+upstream 0.9.0 archive SHA-256 verified against registry metadata and allocation
+sites inspected. Workspace lock regeneration and initial strict Clippy are running.
+All final gates, server tests, h2spec and packaged dry runs are currently UNRUN.
 
-The detailed command history, earlier failures and remaining lane questions are in
-[docs/INTEGRATION_REPORT.md](docs/INTEGRATION_REPORT.md) and its linked command log.
-Next: integrator reruns SQL and hosted CI, integrates
-wave-2 backends/HTTP, obtains the Linux baseline and handles first publications.
+## Deviations / DESIGN proposals
 
-Earlier failures, including a loaded timer-precision run, remain in the report.
-The unchanged full native gate passed afterward. Raw actionlint still rejects
-GitHub concurrency.queue; the strict validated compatibility wrapper passes.
+No DESIGN rule changes or gate relaxations. Fork is option (b) from the brief.
+The Rust standard library internal build feature is omitted from the standalone
+fork; upstream decoder/encoder behavior and test expectations are retained.
+
+## Open questions and next steps
+
+Finish server lifecycle consolidation, h2spec full-suite enforcement, CI wiring,
+portable compiler/test fixes, all requested verification and publish-order report.
+Linux/Windows runtime and Docker unavailable; SQL sandbox limitations will be
+recorded only after attempting the required invocations.

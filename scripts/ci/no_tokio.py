@@ -5,8 +5,8 @@ import re
 import tomllib
 from common import PIN, P3_PIN, ROOT, cargo, entrypoint, fail, members, metadata, run
 
-BANNED = frozenset({'tokio', 'tokio-util', 'hyper', 'h2', 'async-std', 'smol',
-                    'async-io', 'async-executor'})
+POLICY = tomllib.loads((ROOT / 'scripts/ci/policy.toml').read_text())
+BANNED = frozenset(POLICY['dependencies']['banned'])
 
 
 def check_tree(tree):
