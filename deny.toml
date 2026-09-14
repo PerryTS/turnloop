@@ -1,0 +1,26 @@
+[graph]
+all-features = true
+# With no target filter cargo-deny checks the union of all platform dependencies.
+
+[advisories]
+yanked = "deny"
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+deny = [
+  { name = "tokio" }, { name = "tokio-util" }, { name = "hyper" }, { name = "h2" },
+  { name = "async-std" }, { name = "smol" }, { name = "async-io" },
+  { name = "async-executor" },
+]
+
+[licenses]
+confidence-threshold = 0.95
+allow = ["MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Zlib", "Unicode-3.0", "CC0-1.0"]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

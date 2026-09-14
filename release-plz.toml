@@ -1,0 +1,13 @@
+[workspace]
+release_always = false
+# Keep third-party upgrades in Dependabot PRs governed by the seven-day soak.
+dependencies_update = false
+semver_check = true
+changelog_update = true
+git_release_enable = true
+git_tag_enable = true
+publish = true
+publish_no_verify = false
+publish_allow_dirty = false
+publish_timeout = "10m"
+pr_branch_prefix = "release-plz-"

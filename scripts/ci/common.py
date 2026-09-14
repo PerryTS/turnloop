@@ -56,7 +56,7 @@ def members(data):
 
 
 def settings(package):
-    return package.get('metadata', {}).get('turnloop-ci', {})
+    return (package.get('metadata') or {}).get('turnloop-ci', {})
 
 
 def role(package):
@@ -95,7 +95,7 @@ def publish_order(data):
         for dep in selected[name]['dependencies']:
             if dep['kind'] == 'dev':
                 continue
-            if dep['path'] if 'path' in dep else False:
+            if dep.get('path'):
                 if dep['name'] not in selected:
                     fail(f'{name} depends on non-publishable workspace/path crate {dep["name"]}')
                 if dep['req'] == '*':
