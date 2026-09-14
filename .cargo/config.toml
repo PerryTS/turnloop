@@ -5,3 +5,8 @@ min-publish-age = true
 
 [registry]
 global-min-publish-age = "7 days"
+
+# BSON's rand 0.9 still uses getrandom 0.3 (no built-in p3 backend).
+# The explicit turnloop-wasi-random linkage supplies both 0.3 and 0.4 symbols.
+[target.wasm32-wasip3]
+rustflags = ['--cfg', 'getrandom_backend="custom"']

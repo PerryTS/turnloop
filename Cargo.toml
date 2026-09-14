@@ -11,6 +11,7 @@ license = "MIT"
 repository = "https://github.com/PerryTS/turnloop"
 
 [workspace.dependencies]
+turnloop-wasi-random = { path = "crates/turnloop-wasi-random", version = "0.1.0" }
 turnloop = { path = "crates/turnloop", version = "0.1.0" }
 turnloop-contract = { path = "crates/turnloop-contract", version = "0.1.0" }
 libc = "=0.2.175"

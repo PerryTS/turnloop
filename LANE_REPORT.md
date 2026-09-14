@@ -1,3 +1,11 @@
+# wasm3 continuation — work in progress
+
+Reading complete: prior lane report, DESIGN.md, CONTRIBUTING.md, integration and wasm/core/CI/Mongo lane reports. No applicable AGENTS.md. Working through UDP canonical allocation, p3 workspace entropy, measured WASI timer bound, debug allocation harness, boundedness documentation and pinned browser CI. New command ledger: `.tools/wasm3/commands.jsonl`.
+
+Integrator correction: Node web contracts 7/7 PASS outside sandbox; ChromeDriver SIGKILL is a Mac host restriction, not a sandbox issue. Linux CI browser execution remains required.
+
+---
+
 # wasm2 lane report
 
 2026-09-14 handoff. Implemented WASI p2, experimental p3, web, target contracts

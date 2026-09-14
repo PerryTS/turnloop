@@ -1,0 +1,19 @@
+[package]
+name = "turnloop-wasi-random"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Explicit WASI p3 getrandom custom-backend linkage for turnloop consumers"
+readme = "README.md"
+
+[package.metadata.turnloop-ci]
+role = "support"
+
+[lints]
+workspace = true
+
+[target.'cfg(all(target_os = "wasi", target_env = "p3"))'.dependencies]
+getrandom03 = { package = "getrandom", version = "=0.3.4" }
+getrandom04 = { package = "getrandom", version = "=0.4.3" }

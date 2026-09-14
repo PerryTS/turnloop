@@ -1461,9 +1461,12 @@ dependencies = [
 name = "turnloop-contract"
 version = "0.1.0"
 dependencies = [
+ "bson",
  "js-sys",
  "libc",
  "turnloop",
+ "turnloop-wasi-random",
+ "wasip2",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "wasm-bindgen-test",
@@ -1485,6 +1488,7 @@ dependencies = [
  "sha1",
  "sha2",
  "stringprep",
+ "turnloop-wasi-random",
 ]
 
 [[package]]
@@ -1496,6 +1500,7 @@ dependencies = [
  "getrandom 0.4.3",
  "mysql_common",
  "rustls",
+ "turnloop-wasi-random",
 ]
 
 [[package]]
@@ -1506,6 +1511,7 @@ dependencies = [
  "postgres-protocol",
  "rustls",
  "sha2",
+ "turnloop-wasi-random",
 ]
 
 [[package]]
@@ -1523,6 +1529,14 @@ dependencies = [
  "email-encoding",
  "lettre",
  "rustls",
+]
+
+[[package]]
+name = "turnloop-wasi-random"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.3.4",
+ "getrandom 0.4.3",
 ]
 
 [[package]]

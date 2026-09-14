@@ -6,6 +6,9 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![forbid(unsafe_code)]
 
+#[cfg(all(target_os = "wasi", target_env = "p3"))]
+use turnloop_wasi_random as _;
+
 pub use bson;
 pub mod auth;
 pub mod command;

@@ -181,3 +181,31 @@ fn cancelled_head_restarts_queued_read() {
     }
     assert_eq!(reads, 32);
 }
+
+#[cfg(target_env = "p3")]
+#[test]
+fn wasi_random_fills_both_getrandom_generations_and_bson() {
+    let mut generated = 0;
+    for len in [1, 7, 8, 9, 31, 64, 257] {
+        let mut first = vec![0; len];
+        let mut second = vec![0; len];
+        turnloop_wasi_random::fill_v03(&mut first).expect("WASI entropy 0.3");
+        turnloop_wasi_random::fill_v04(&mut second).expect("WASI entropy 0.4");
+        // Single bytes can legitimately be zero/equal. Assert on long samples.
+        if len >= 31 {
+            assert!(first.iter().any(|&b| b != 0));
+            assert!(first.windows(2).any(|b| b[0] != b[1]));
+            assert!(second.windows(2).any(|b| b[0] != b[1]));
+            assert_ne!(first, second);
+        }
+        generated += 2 * len;
+    }
+    assert_eq!(generated, 754);
+    turnloop_wasi_random::fill_v03(&mut []).expect("empty entropy");
+    turnloop_wasi_random::fill_v04(&mut []).expect("empty entropy");
+    let a = bson::oid::ObjectId::new();
+    let b = bson::oid::ObjectId::new();
+    assert_ne!(a, b);
+    assert!(a.bytes()[4..9].iter().any(|&b| b != 0));
+    println!("entropy subject: {generated} bytes, two getrandom generations, two BSON ObjectIds");
+}

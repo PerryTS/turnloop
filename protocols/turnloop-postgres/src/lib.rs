@@ -6,6 +6,9 @@
 //! only transmitted bytes with `consume_output`. Events borrow reusable storage.
 //! The host owns sockets, TLS, entropy, time and result materialization.
 
+#[cfg(all(target_os = "wasi", target_env = "p3"))]
+use turnloop_wasi_random as _;
+
 use bytes::BytesMut;
 pub use postgres_protocol::authentication::sasl::{ChannelBinding, ScramSha256};
 use postgres_protocol::{

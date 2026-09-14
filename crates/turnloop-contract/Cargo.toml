@@ -43,3 +43,10 @@ path = "tests/web/node.rs"
 [features]
 wasi-p3-experimental = ["turnloop/wasi-p3-experimental"]
 web-worker = ["turnloop/web-worker"]
+
+[target.'cfg(all(target_os = "wasi", target_env = "p2"))'.dev-dependencies]
+wasip2 = "=1.0.3"
+
+[target.'cfg(all(target_os = "wasi", target_env = "p3"))'.dev-dependencies]
+turnloop-wasi-random.workspace = true
+bson.workspace = true
