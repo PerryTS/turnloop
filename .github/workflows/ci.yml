@@ -19,12 +19,6 @@ defaults:
     shell: bash
 env:
   CARGO_TERM_COLOR: always
-  CC_wasm32_wasip2: clang
-  AR_wasm32_wasip2: llvm-ar
-  CC_wasm32_wasip3: clang
-  AR_wasm32_wasip3: llvm-ar
-  CC_wasm32_unknown_unknown: clang
-  AR_wasm32_unknown_unknown: llvm-ar
   RUST_BACKTRACE: '1'
 jobs:
   workflow-lint:
@@ -47,6 +41,7 @@ jobs:
         run: python3 scripts/ci/install-tools.py actionlint zizmor shellcheck
       - name: Lint automation and exercise gate failures
         run: |
+          python3 scripts/ci/check-paths.py
           python3 scripts/ci/lint-workflows.py
           python3 -m unittest discover -s scripts/ci -p 'test_*.py' -v
   lint-native:
@@ -99,6 +94,8 @@ jobs:
           persist-credentials: false
       - name: Install pinned Rust
         run: rustup toolchain install nightly-2026-08-20 --profile minimal --component rustfmt,clippy
+      - name: Install checksum-pinned wasm C compiler and archiver
+        run: python3 scripts/ci/install-wasm-toolchain.py
       - name: Cross-target Clippy and stable
         run: |
           rustup target add --toolchain nightly-2026-08-20 "$TARGET"
@@ -186,6 +183,8 @@ jobs:
         run: |
           rustup toolchain install "$TOOLCHAIN" --profile minimal --component clippy --target "$TARGET"
           bash scripts/ci/install-wasmtime.sh
+      - name: Install checksum-pinned wasm C compiler and archiver
+        run: python3 scripts/ci/install-wasm-toolchain.py
       - name: Lint and run actual WASI contracts
         run: |
           cargo +"$TOOLCHAIN" clippy --locked --workspace --all-targets --all-features --target "$TARGET" -- -D warnings -D clippy::undocumented_unsafe_blocks
@@ -215,6 +214,8 @@ jobs:
           python3 scripts/ci/install-tools.py wasm-pack
           google-chrome --version
           firefox --version
+      - name: Install checksum-pinned wasm C compiler and archiver
+        run: python3 scripts/ci/install-wasm-toolchain.py
       - name: Chrome and Firefox contracts
         run: python3 scripts/ci/run-tests.py web
       - name: Node subset
@@ -350,7 +351,9 @@ jobs:
         run: |
           rustup toolchain install "$TOOLCHAIN" --profile minimal --target "$TARGET"
           bash scripts/ci/install-wasmtime.sh
-      - name: Execute HTTP codecs and all streaming allocation gates
+      - name: Install checksum-pinned wasm C compiler and archiver
+        run: python3 scripts/ci/install-wasm-toolchain.py
+      - name: Execute TLS, HTTP codecs and all streaming allocation gates
         run: python3 scripts/ci/run-tests.py protocol-wasi --target "$TARGET"
 
   dependencies:

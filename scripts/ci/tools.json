@@ -157,5 +157,19 @@
     "commit": "70ac2294010887f48b18e2d64f5cccd48421fad1",
     "url": "https://codeload.github.com/summerwind/h2spec/tar.gz/70ac2294010887f48b18e2d64f5cccd48421fad1",
     "sha256": "791b995048c7e2a2895ed2c019eb9abe46015c3a7a6107cb9ea3f5e5f311da39"
+  },
+  "wasi-sdk": {
+    "Darwin-aarch64": {
+      "version": "34.0",
+      "url": "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/wasi-sdk-34.0-arm64-macos.tar.gz",
+      "sha256": "9c59398106b417f8f14913380fdf0097a8cc0ff4af9eb3ce0065a859e88d49e9",
+      "directory": "wasi-sdk-34.0-arm64-macos"
+    },
+    "Linux-x86_64": {
+      "version": "34.0",
+      "url": "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/wasi-sdk-34.0-x86_64-linux.tar.gz",
+      "sha256": "b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4",
+      "directory": "wasi-sdk-34.0-x86_64-linux"
+    }
   }
 }

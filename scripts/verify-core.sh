@@ -1,5 +1,6 @@
 #!/bin/sh
 set -eu
+python3 scripts/ci/check-paths.py
 # Explicit toolchain avoids rustup trying to repair unrelated Wasm components.
 export RUSTUP_TOOLCHAIN=nightly-2026-08-20
 cargo fmt --all -- --check
