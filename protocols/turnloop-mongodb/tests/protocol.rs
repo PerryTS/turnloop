@@ -627,3 +627,49 @@ fn client_option_inheritance_keeps_explicit_command_fields() {
         "majority"
     );
 }
+
+#[test]
+fn incompatible_handshake_and_change_stream_empty_batch_resume_budget() {
+    let mut c = Connection::new(Options::parse("mongodb://a/").unwrap());
+    c.connected(Instant::now(), "").unwrap();
+    let req = wire::i32_at(c.transmit(), 4).unwrap();
+    let n = c.transmit().len();
+    c.consume_transmit(n).unwrap();
+    let mut reply = Vec::new();
+    wire::encode(
+        &mut reply,
+        1,
+        req,
+        0,
+        &raw(&doc! {"ok":1,"minWireVersion":99,"maxWireVersion":100}),
+        &[],
+        1000,
+    )
+    .unwrap();
+    let mut at = 0;
+    let mut failed = false;
+    while at < reply.len() {
+        match c.receive(&reply[at..]) {
+            Ok(n) => {
+                assert!(n > 0);
+                at += n;
+            }
+            Err(_) => {
+                failed = true;
+                break;
+            }
+        }
+    }
+    assert!(failed);
+    assert!(matches!(
+        c.poll_event(),
+        Some(ConnectionEvent::Failed { token: None, .. })
+    ));
+    assert!(matches!(c.poll_event(), Some(ConnectionEvent::Closed)));
+    let mut stream = turnloop_mongodb::session::ChangeStream::default();
+    let e = Error::new(ErrorKind::Network, "reset");
+    assert!(stream.should_resume(&e, 27));
+    assert!(!stream.should_resume(&e, 27));
+    stream.finish_batch(None).unwrap();
+    assert!(stream.should_resume(&e, 27));
+}

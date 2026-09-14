@@ -91,20 +91,23 @@ requests, and report a connection ready only after its TLS/handshake/authenticat
 finishes. Checkout tokens are FIFO. Checked-out connections from old generations close
 on checkin. Poll and handle its next_timeout for waiters and idle expiry.
 
-`Options::raw` retains accepted write/read concern URI settings. The adapter must apply
-client/database/collection option inheritance while building commands; `Connection`
-itself does not add write concern or read preference to arbitrary user commands.
+`Options::raw` retains accepted write/read concern URI settings. Use `Command::apply_client_options` for URI defaults; existing command values take
+precedence. The adapter handles database/collection inheritance. `Connection` itself
+does not add concerns or read preference to arbitrary user commands.
 
 ## Sessions and change streams
 
-`Session` decorates explicit sessions and transactions, tracks transaction numbers and
-observed operation/cluster times, and builds commit/abort. Retrying commit requests
-majority write concern with a 10-second wtimeout. Session pooling, causal/snapshot
-read-concern decoration, recovery tokens and a withTransaction retry controller are
-remaining work. Do not treat the helpers as full transaction-spec conformance.
+`Session` decorates explicit sessions and transactions, tracks transaction numbers,
+gossips cluster time, provides causal-read decoration, caches recovery tokens, and
+builds commit/abort. `SessionPool` reuses clean identities until their host-driven expiry.
+`TransactionEnd` coordinates one commit/abort retry and final error labeling; failed
+abort results are suppressed after that attempt as the specification requires. Retried
+commit uses majority, preserves configured wtimeout, and supplies 10 seconds if absent.
+Mongos pin/unpin is explicit. Snapshot sessions, a withTransaction callback/replay
+controller and complete transaction-spec conformance remain work.
 
 `ChangeStream` tracks resume tokens, startAfter/resumeAfter transition and one-resume
-error policy. Call observe_document for each emitted event and finish_batch only after
+error policy for getMore failures. Initial aggregate errors are terminal. Call observe_document for each emitted event and finish_batch only after
 the whole batch is consumed. Build the new aggregate with stage() on resume; preserve
 user pipeline/options in the adapter. Closing cursors and driving getMore remain
 explicit. Full stream lifecycle orchestration is not yet included.

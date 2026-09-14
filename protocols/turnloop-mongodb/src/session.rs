@@ -329,6 +329,7 @@ impl ChangeStream {
     }
     /// Call only after consuming every document in the batch, including an empty batch.
     pub fn finish_batch(&mut self, token: Option<&RawDocument>) -> Result<()> {
+        self.resumed = false;
         if let Some(t) = token {
             self.resume_token = Some(
                 t.try_into()

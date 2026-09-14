@@ -300,9 +300,9 @@ impl Connection {
         self.expanded.clear();
         if self.state == State::Handshake {
             let wire_version = d.get_i32("maxWireVersion").unwrap_or(0);
-            if wire_version < 6 {
+            if wire_version < 6 || d.get_i32("minWireVersion").unwrap_or(0) > 27 {
                 return Err(Error::protocol(
-                    "MongoDB server must support OP_MSG (MongoDB 3.6+)",
+                    "MongoDB server wire version is incompatible (client supports 6 through 27)",
                 ));
             }
             for (key, target, min) in [
