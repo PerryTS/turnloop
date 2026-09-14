@@ -1,0 +1,16 @@
+[package]
+name = "turnloop-mysql"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Pull-driven sans-I/O MySQL client protocol"
+
+[dependencies]
+bytes.workspace = true
+mysql_common.workspace = true
+flate2.workspace = true
+
+[dev-dependencies]
+rustls.workspace = true
+

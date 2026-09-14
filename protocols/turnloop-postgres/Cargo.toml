@@ -1,0 +1,15 @@
+[package]
+name = "turnloop-postgres"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Pull-driven sans-I/O PostgreSQL client protocol"
+
+[dependencies]
+bytes.workspace = true
+postgres-protocol.workspace = true
+
+[dev-dependencies]
+rustls.workspace = true
+
