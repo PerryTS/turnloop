@@ -32,6 +32,9 @@ host all postgres 127.0.0.1/32 trust
 """
 
 MYSQL_USERS = """CREATE DATABASE IF NOT EXISTS turnloop_test;
+CREATE USER IF NOT EXISTS 'auth_admin'@'127.0.0.1' IDENTIFIED WITH caching_sha2_password BY 'fixture-password' REQUIRE SSL;
+GRANT RELOAD ON *.* TO 'auth_admin'@'127.0.0.1';
+GRANT SELECT ON turnloop_test.* TO 'auth_admin'@'127.0.0.1';
 CREATE USER IF NOT EXISTS 'auth_rsa_user'@'127.0.0.1' IDENTIFIED WITH caching_sha2_password BY 'fixture-password';
 GRANT ALL ON turnloop_test.* TO 'auth_rsa_user'@'127.0.0.1';
 CREATE USER IF NOT EXISTS 'sql_user'@'127.0.0.1' IDENTIFIED WITH caching_sha2_password BY 'fixture-password';

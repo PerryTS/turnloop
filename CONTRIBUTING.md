@@ -50,6 +50,33 @@ checks their index timestamps/checksums, because the resolver alone permits lock
 young versions. A too-young version fails with its publish and eligible timestamps;
 choose an older version. No soak override is accepted in CI.
 
+### Security fixes younger than the soak window
+
+For a reviewed security fix, add a `[[security-exceptions]]` entry to
+`scripts/ci/policy.toml` with `crate`, one exact `version`, a `RUSTSEC-YYYY-NNNN`
+`advisory`, a nonempty `reason`, and `expires` equal to the registry publish date
+plus seven days (UTC). See the rustls 0.23.45 entry for RUSTSEC-2026-0285.
+The gate still verifies the registry checksum and all other versions' ages,
+prints every active exception, and fails if an entry is expired, unused, or has
+the wrong expiry. Remove the entry when its exact seven-day timestamp is reached,
+or immediately if that crate/version leaves the lockfile.
+
+Scope the resolver override to the one precise update command. This environment
+form was verified on the pinned nightly; do not export it or edit `.cargo/config.toml`:
+
+```bash
+env CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE='0 days' \
+  cargo +nightly-2026-08-20 update -p rustls --precise 0.23.45
+python3 scripts/ci/soak.py
+cargo +nightly-2026-08-20 deny --locked check
+bash scripts/ci/no-tokio.sh
+```
+
+Review the lockfile diff and the advisory's patched range; commit the exception
+and lockfile together. Do not add a cargo-deny advisory ignore. rustls 0.23.45 was
+published at `2026-09-14T15:11:17Z`, so its exception is no longer usable at
+`2026-09-21T15:11:17Z`, even though the policy stores only the date `2026-09-21`.
+
 ## Workspace discovery and test metadata
 
 Scripts use `cargo metadata` and its `workspace_members`, never a crate list or
@@ -155,6 +182,13 @@ installed binaries on PATH (with macOS/PostgreSQL installation fallbacks); it do
 not install or upgrade system software. PostgreSQL supports cleartext, MD5,
 SCRAM and TLS/PLUS fixtures; MySQL covers caching-SHA2 fast/full/RSA and TLS, and
 records native-password plugin availability (MySQL 9 removed that plugin).
+The MySQL auth test deliberately warms its RSA and TLS accounts, then clears
+the server authentication cache with `FLUSH PRIVILEGES` through the private TLS
+`auth_admin` account (password `fixture-password`, RELOAD privilege). It asserts
+the reset's successful acknowledgement, full RSA auth, full TLS auth without RSA,
+and later fast hits on both accounts. This also covers repeated tests after CI's
+independent TLS probe. Run fixture suites serially; cache invalidation is global
+to the disposable server.
 MongoDB cleanup is an explicit example invoked only by `stop`, never a test that
 could shut down a concurrently running suite. SMTP's installed-sink test uses the
 runner; in-process TLS/auth SMTP peers remain normal tests.
@@ -164,7 +198,7 @@ MySQL initialization crashes. Those real-server tests are **UNRUN (sandbox)**;
 run the full command outside the sandbox. Do not remove their ignored test bodies
 or treat a failed initializer as a test pass.
 
-CI's PostgreSQL 16/MySQL 9 service containers are provisioned by
+CI's PostgreSQL 16/MySQL **9.6.0** service containers are provisioned by
 `scripts/test-servers.py --ci-services`. That mode launches the same six-node
 Redis topology and five MongoDB instances using private named Linux containers,
 with the same configurations, auth, certificates and environment variables as the
@@ -174,10 +208,19 @@ Docker path is **UNRUN locally** because the development sandbox has no Docker.
 
 ## Pending platform and measurement gates
 
-The `wasi`, `web`, Windows shared-contract portion of `test-native`, and
-`instructions` jobs intentionally remain required and failing until their missing
-inputs land. Their commands and the strict `ci-gate` fan-in are retained. No
-`continue-on-error`, empty-test success or expected skip is permitted for them.
+The `wasi`, `web`, and `instructions` jobs remain required and fail until their
+missing inputs land. The strict `ci-gate` fan-in is retained. Windows `test-native`
+runs the workspace and independently requires positive counts for core and every
+protocol member, with default and all features. The existing sans-IO unit, wire,
+SCRAM, SDAM/selection fixture and allocation tests are portable. No unnecessary
+Unix test cfg exclusions were found.
+
+Production IOCP contracts are explicitly pending through the contract member's
+`windows-contracts-pending = "WINDOWS_HANDOFF.md"` metadata. The runner lists their
+scope and handoff in the Windows job summary. Remove this metadata when IOCP lands;
+the ordinary independent positive-count contract gate then applies on Windows too.
+This marker applies only to Windows contracts; core/protocol zero counts and Unix
+contract zero counts always fail.
 
 - **Wave 2 Windows:** adapt `spikes/iocp` to the production Backend, instantiate
   `turnloop-contract` on IOCP, run all contracts (including no-spin) on Windows.
@@ -214,10 +257,38 @@ Ubuntu 24.04 x86_64, generate candidates with:
 python3 scripts/ci/instructions.py --record .tools/instruction-candidates.json
 ```
 
-Review all three fresh-process rounds, choose stable counts, identify controls,
-and commit the baseline in the bench crate. Candidate recording is **not** a gate
-pass and never overwrites a baseline. Standard CI runs
-`python3 scripts/ci/instructions.py`, never `--record`.
+Declare every expected summary key in `instruction-cases` and the exact control
+keys in `instruction-controls` in the bench package's CI metadata. Recording
+requires all declared cases in all three fresh-process rounds, positive counts,
+exact controls, and the same 3% ceiling. Candidate counts use the smallest measured
+count for each case; all three rounds must pass comparison against those counts.
+Candidate recording never overwrites the committed baseline.
+
+Standard CI runs `python3 scripts/ci/instructions.py`. If a baseline is missing,
+the job measures all benchmarks, uploads artifact **`instruction-baselines`**, and
+**fails** with commit instructions. The artifact contains ready-to-review baseline
+files at their repository-relative paths, `measurements.json` with all three rounds,
+and `README.txt` with the exact commands. It contains no invented Linux counts.
+
+To request a fresh baseline even when one exists, run the CI workflow manually
+with the boolean `record_baselines: true` (or `gh workflow run ci.yml -f record_baselines=true`).
+The instruction job then runs `instructions.py --record-baselines`, uploads the
+same artifact, and succeeds after valid measurement without claiming a regression
+comparison passed. All other required jobs still run normally.
+
+Review the rounds and control counts, then from the repository root:
+
+```bash
+gh run download <RUN_ID> --repo PerryTS/turnloop --name instruction-baselines --dir .tools/instruction-baselines
+mkdir -p crates/turnloop-bench/benchmarks
+cp .tools/instruction-baselines/crates/turnloop-bench/benchmarks/instructions.json crates/turnloop-bench/benchmarks/instructions.json
+git add crates/turnloop-bench/benchmarks/instructions.json
+git commit -m "Record Linux instruction baselines"
+```
+
+Push the reviewed baseline and rerun ordinary CI to execute the regression check.
+The first bootstrap cannot be verified by macOS execution; Linux runtime counts
+must come from the Ubuntu 24.04 x86_64 runner.
 
 The gate builds with one codegen unit, requires new v6 summaries and nonzero
 counts, rejects missing/extra benchmarks and fails above **3%** growth in any

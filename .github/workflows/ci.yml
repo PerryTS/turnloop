@@ -3,6 +3,12 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      record_baselines:
+        description: Record Linux instruction baselines for review
+        type: boolean
+        default: false
 permissions: {}
 concurrency:
   group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
@@ -211,7 +217,7 @@ jobs:
           --health-cmd "pg_isready -h 127.0.0.1 -U turnloop -d turnloop"
           --health-interval 5s --health-timeout 5s --health-retries 30
       mysql:
-        image: mysql:9
+        image: mysql:9.6.0
         env:
           MYSQL_DATABASE: turnloop
           MYSQL_USER: turnloop
@@ -326,7 +332,23 @@ jobs:
           sudo apt-get install --yes valgrind
           python3 scripts/ci/install-tools.py gungraun-runner
       - name: Three fresh-process instruction counts against reviewed baselines
-        run: python3 scripts/ci/instructions.py
+        env:
+          RECORD_BASELINES: ${{ github.event_name == 'workflow_dispatch' && inputs.record_baselines }}
+        run: |
+          if [[ "$RECORD_BASELINES" == "true" ]]; then
+            python3 scripts/ci/instructions.py --record-baselines
+          else
+            python3 scripts/ci/instructions.py
+          fi
+      - name: Upload measured baseline candidates, including missing-baseline failures
+        if: ${{ !cancelled() && hashFiles('.tools/instruction-baselines/measurements.json') != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: instruction-baselines
+          path: .tools/instruction-baselines/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
   ci-gate:
     name: ci-gate
     if: always()
