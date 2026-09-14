@@ -1,0 +1,18 @@
+[package]
+name = "turnloop-tls"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rustls.workspace = true
+webpki-roots = "1"
+rustls-pemfile = "2"
+
+[dev-dependencies]
+rcgen.workspace = true
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+ring = { version = "0.17", features = ["wasm32_unknown_unknown_js"] }
+rustls-pki-types = { version = "1", features = ["web"] }
