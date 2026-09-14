@@ -40,6 +40,7 @@ struct Op {
     token: Token,
     cancel: bool,
     stop: bool,
+    external_wait: bool,
     job_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     previous: Option<OpId>,
     next: Option<OpId>,
@@ -80,6 +81,7 @@ pub struct Driver<B: Backend> {
     _local: PhantomData<Rc<()>>,
 }
 impl<B: Backend> Driver<B> {
+    /// Construct a loop on this thread and allocate its fixed operation and completion storage.
     pub fn new(config: Config) -> Result<Self> {
         if config.max_handles == 0
             || config.max_handles > u32::MAX as usize
@@ -97,11 +99,12 @@ impl<B: Backend> Driver<B> {
             .and_then(|n| n.checked_add(config.max_operations))
             .and_then(|n| n.checked_add(config.max_handles))
             .ok_or(Error::new(ErrorKind::InvalidInput))?;
-        let backend = B::new(
+        let mut backend = B::new(
             &config,
             BufferPool::new(config.pooled_buffers, config.pooled_buffer_size),
         )?;
         let notifier = Notifier::new(backend.waker());
+        backend.set_notifier(notifier.clone());
         let poster = Poster::new(config.post_capacity, notifier.clone());
         let work_port = crate::blocking::WorkPort::new(config.max_operations, notifier.clone());
         let owner = loop {
@@ -190,6 +193,7 @@ impl<B: Backend> Driver<B> {
                 cancel: false,
                 stop: false,
                 job_cancel: None,
+                external_wait: false,
                 previous,
                 next: None,
             })
@@ -318,6 +322,7 @@ impl<B: Backend> Driver<B> {
             }
         }
     }
+    /// Return O(1) reference-counted liveness, including undelivered terminal completions.
     pub fn alive(&self) -> bool {
         self.refs != 0
     }
@@ -325,9 +330,11 @@ impl<B: Backend> Driver<B> {
     pub fn now(&self) -> Instant {
         self.backend.now()
     }
+    /// Return the earliest pending timer deadline in the backend clock domain.
     pub fn next_deadline(&self) -> Option<Instant> {
         self.timers.next_deadline()
     }
+    /// Include or exclude a handle and its pending/queued operations from loop liveness.
     pub fn set_ref(&mut self, h: Handle, referenced: bool) -> Result<()> {
         let r = self.resource(h)?;
         let weight = r.pending + usize::from(matches!(r.kind, Kind::Socket) || r.closing.is_some());
@@ -357,6 +364,7 @@ impl<B: Backend> Driver<B> {
         }
         Ok(())
     }
+    /// Create a timer and its operation; repeats coalesce missed intervals and must be nonzero.
     pub fn timer(&mut self, at: Instant, repeat: Option<Duration>, token: Token) -> Result<Handle> {
         if repeat.is_some_and(|r| r.is_zero()) {
             return Err(Error::new(ErrorKind::InvalidInput));
@@ -377,6 +385,7 @@ impl<B: Backend> Driver<B> {
         self.backend.deadline_changed(self.timers.next_deadline());
         Ok(h)
     }
+    /// Move an active timer deadline; returns false for closed, expired or foreign handles.
     pub fn timer_reset(&mut self, h: Handle, at: Instant) -> bool {
         let Ok(r) = self.resource(h) else {
             return false;
@@ -389,6 +398,7 @@ impl<B: Backend> Driver<B> {
         self.backend.deadline_changed(self.timers.next_deadline());
         true
     }
+    /// Return the operation identity of an active timer, for cancellation.
     pub fn timer_op(&self, h: Handle) -> Option<OpId> {
         match self.resource(h).ok()?.kind {
             Kind::Timer { op, .. } => op,
@@ -404,12 +414,151 @@ impl<B: Backend> Driver<B> {
         }
         Ok(h)
     }
+    /// Bind and listen for TCP connections; port zero chooses an ephemeral port.
     pub fn tcp_listen(&mut self, addr: SocketAddr, opts: &ListenOpts) -> Result<Handle> {
         self.open(Open::Listener { addr, opts: *opts })
     }
+    /// Listen for local IPC streams. Unix socket path removal belongs to the host.
+    pub fn pipe_listen(&mut self, name: &PipeName, opts: &ListenOpts) -> Result<Handle> {
+        self.open(Open::PipeListener {
+            name: name.clone(),
+            opts: *opts,
+        })
+    }
+    /// Connect a local stream, completing with Connected or an error.
+    pub fn pipe_connect(&mut self, name: &PipeName, token: Token) -> Result<Handle> {
+        let h = self.open(Open::Pipe(name.clone()))?;
+        if let Err(e) = self.submit(h, Operation::Connect, token) {
+            self.backend.release(h);
+            self.handles.remove(h.key);
+            self.refs -= 1;
+            return Err(e);
+        }
+        Ok(h)
+    }
+    /// Duplicate standard input, output or error, classifying pipe/file/terminal.
+    pub fn open_stdio(&mut self, which: Stdio) -> Result<Handle> {
+        self.open(Open::Stdio(which))
+    }
+    /// Pass an independent reference to a socket over local IPC. The source stays
+    /// owned by this loop; close or detach it explicitly when migration is desired.
+    pub fn send_handle(&mut self, pipe: Handle, h: Handle, token: Token) -> Result<OpId> {
+        if self.resource(h)?.closing.is_some() {
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
+        self.submit(pipe, Operation::SendHandle(h), token)
+    }
+    /// Receive and attach one passed socket. Use a dedicated IPC control stream;
+    /// ordinary reads must not consume the handle-transfer framing byte.
+    pub fn recv_handle(&mut self, pipe: Handle, token: Token) -> Result<OpId> {
+        self.submit(pipe, Operation::RecvHandle, token)
+    }
+    /// Spawn a child and submit its exactly-once exit operation. Closing a live
+    /// child initiates termination, then waits through ordinary turns for reaping
+    /// before Cancelled and Closed; a new process group enables `kill_group`.
+    pub fn spawn(&mut self, spec: &ProcessSpec, token: Token) -> Result<Process> {
+        let h = self.new_handle(Kind::Socket)?;
+        let mut pipes = [None; 3];
+        let result = (|| {
+            for (i, stdio) in spec.stdio.iter().enumerate() {
+                if let ProcessStdio::Handle(source) = stdio {
+                    self.resource(*source)?;
+                }
+                if *stdio == ProcessStdio::Pipe {
+                    pipes[i] = Some(self.new_handle(Kind::Socket)?);
+                }
+            }
+            // Reserve the terminal completion before creating an OS child.
+            let op = self.new_op(Some(h), token)?;
+            let result = self.backend.spawn(h, pipes, spec).and_then(|pid| {
+                self.backend.submit(Request {
+                    op,
+                    handle: h,
+                    operation: Operation::ProcessExit,
+                })?;
+                Ok(pid)
+            });
+            if result.is_err() {
+                self.retire(op);
+                self.outstanding -= 1;
+            }
+            result
+        })();
+        match result {
+            Ok(pid) => Ok(Process {
+                handle: h,
+                pid,
+                stdin: pipes[0],
+                stdout: pipes[1],
+                stderr: pipes[2],
+            }),
+            Err(e) => {
+                for handle in std::iter::once(h).chain(pipes.into_iter().flatten()) {
+                    self.backend.release(handle);
+                    if self.handles.remove(handle.key).is_some() {
+                        self.refs -= 1;
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+    /// Signal a child still owned by this loop.
+    pub fn kill(&mut self, process: Handle, signal: Signal) -> Result<()> {
+        self.resource(process)?;
+        self.backend.kill(process, signal, false)
+    }
+    /// Signal an isolated process group, including grandchildren.
+    pub fn kill_group(&mut self, process: Handle, signal: Signal) -> Result<()> {
+        self.resource(process)?;
+        self.backend.kill(process, signal, true)
+    }
+    /// Subscribe this loop to a process-wide signal. Repeated deliveries may
+    /// coalesce; every subscribed loop gets its own completion.
+    pub fn signal_start(&mut self, signal: Signal, token: Token) -> Result<Handle> {
+        let h = self.new_handle(Kind::Socket)?;
+        if let Err(e) = self
+            .backend
+            .signal(h, signal)
+            .and_then(|()| self.submit(h, Operation::WatchSignal, token).map(|_| ()))
+        {
+            self.backend.release(h);
+            self.handles.remove(h.key);
+            self.refs -= 1;
+            return Err(e);
+        }
+        Ok(h)
+    }
+    /// Stop a signal subscription, delivering Stopped before the final Closed.
+    pub fn signal_stop(&mut self, h: Handle, token: Token) -> Result<()> {
+        let mut next = self.resource(h)?.head;
+        while let Some(op) = next {
+            next = self.ops.get(op.key).and_then(|op| op.next);
+            self.stop(op);
+        }
+        self.close(h, token)
+    }
+    /// Set terminal mode; its original settings are restored on close or drop.
+    pub fn tty_set_mode(&mut self, h: Handle, mode: TtyMode) -> Result<()> {
+        self.resource(h)?;
+        self.backend.tty_set_mode(h, mode)
+    }
+    /// Query terminal rows and columns.
+    pub fn tty_window_size(&self, h: Handle) -> Result<WindowSize> {
+        self.resource(h)?;
+        self.backend.tty_window_size(h)
+    }
+    /// Subscribe to resize notifications after validating the terminal. On a
+    /// Signal(WinCh) completion, query `tty_window_size` for its current size.
+    pub fn tty_resize_start(&mut self, h: Handle, token: Token) -> Result<Handle> {
+        self.tty_window_size(h)?;
+        self.signal_start(Signal::WinCh, token)
+    }
+    /// Bind a UDP socket; port zero chooses an ephemeral port.
     pub fn udp_bind(&mut self, addr: SocketAddr, opts: &UdpOpts) -> Result<Handle> {
         self.open(Open::Udp { addr, opts: *opts })
     }
+    /// Create a TCP socket and submit its connection operation with the supplied token.
     pub fn tcp_connect(
         &mut self,
         addr: SocketAddr,
@@ -425,6 +574,7 @@ impl<B: Backend> Driver<B> {
         }
         Ok(h)
     }
+    /// Return the local IP endpoint of a bound socket.
     pub fn local_addr(&self, h: Handle) -> Result<SocketAddr> {
         self.resource(h)?;
         self.backend.local_addr(h)
@@ -446,12 +596,15 @@ impl<B: Backend> Driver<B> {
         }
         Ok(op)
     }
+    /// Accept one incoming TCP or local connection.
     pub fn accept(&mut self, h: Handle, token: Token) -> Result<OpId> {
         self.submit(h, Operation::Accept { multishot: false }, token)
     }
+    /// Continuously accept connections until stopped or cancelled.
     pub fn accept_start(&mut self, h: Handle, token: Token) -> Result<OpId> {
         self.submit(h, Operation::Accept { multishot: true }, token)
     }
+    /// Read once into stable provided memory or a pooled buffer.
     pub fn read(&mut self, h: Handle, buf: ReadBuf, token: Token) -> Result<OpId> {
         self.submit(
             h,
@@ -462,6 +615,7 @@ impl<B: Backend> Driver<B> {
             token,
         )
     }
+    /// Read repeatedly into pooled leases until EOF, stop, cancellation or error.
     pub fn read_start(&mut self, h: Handle, token: Token) -> Result<OpId> {
         self.submit(
             h,
@@ -472,12 +626,15 @@ impl<B: Backend> Driver<B> {
             token,
         )
     }
+    /// Write the complete buffer; internal partial writes preserve operation ordering.
     pub fn write(&mut self, h: Handle, buf: WriteBuf, token: Token) -> Result<OpId> {
         self.submit(h, Operation::Write(buf), token)
     }
+    /// Write all inline segments in order without allocating descriptor storage.
     pub fn writev(&mut self, h: Handle, bufs: WriteVectored, token: Token) -> Result<OpId> {
         self.submit(h, Operation::Writev(bufs), token)
     }
+    /// Send the buffer as one UDP datagram to the specified endpoint.
     pub fn send_to(
         &mut self,
         h: Handle,
@@ -487,15 +644,19 @@ impl<B: Backend> Driver<B> {
     ) -> Result<OpId> {
         self.submit(h, Operation::SendTo { buf, to }, token)
     }
+    /// Receive one UDP datagram into provided or pooled storage.
     pub fn recv(&mut self, h: Handle, buf: ReadBuf, token: Token) -> Result<OpId> {
         self.submit(h, Operation::RecvFrom(buf), token)
     }
+    /// Queue stream write-side shutdown after earlier writes.
     pub fn shutdown(&mut self, h: Handle, token: Token) -> Result<OpId> {
         self.submit(h, Operation::Shutdown, token)
     }
+    /// Request cancellation; terminal acknowledgement must precede memory reuse.
     pub fn cancel(&mut self, id: OpId) -> bool {
         self.cancel_inner(id, false)
     }
+    /// Stop a multishot operation with a final Stopped acknowledgement.
     pub fn stop(&mut self, id: OpId) -> bool {
         self.cancel_inner(id, true)
     }
@@ -527,7 +688,9 @@ impl<B: Backend> Driver<B> {
                 true,
             );
         } else {
-            if let Some(cancel) = op.job_cancel {
+            if op.external_wait {
+                crate::external_wait::cancel(id);
+            } else if let Some(cancel) = op.job_cancel {
                 cancel.store(true, Ordering::Release);
             } else if self.backend.cancel(id).is_err() {
                 return false;
@@ -545,6 +708,7 @@ impl<B: Backend> Driver<B> {
         if r.closing.is_some() {
             return Err(Error::new(ErrorKind::InvalidInput));
         }
+        self.backend.prepare_close(h)?;
         let r = self.handles.get_mut(h.key).expect("validated");
         r.closing = Some(token);
         // Socket handles already carry a reference. Inactive timer handles do
@@ -560,6 +724,7 @@ impl<B: Backend> Driver<B> {
         self.maybe_closed(h);
         Ok(())
     }
+    /// Cancel pending operations and detach once acknowledgements are delivered; WouldBlock means turn and retry.
     pub fn detach(&mut self, h: Handle) -> Result<B::Detached> {
         let r = self.resource(h)?;
         if r.closing.is_some() || !matches!(r.kind, Kind::Socket) {
@@ -580,6 +745,7 @@ impl<B: Backend> Driver<B> {
         }
         Ok(d)
     }
+    /// Register an owning transport on this loop; failure drops the rejected transport.
     pub fn attach(&mut self, d: B::Detached, _token: Token) -> Result<Handle> {
         let h = self.new_handle(Kind::Socket)?;
         if let Err(e) = self.backend.attach(h, d) {
@@ -589,6 +755,27 @@ impl<B: Backend> Driver<B> {
         }
         Ok(h)
     }
+    /// Park a host condition on the process-wide helper. Registrations use
+    /// preallocated storage; cancellation and completion follow normal OpId rules.
+    pub fn external_wait(
+        &mut self,
+        condition: &WaitCondition,
+        expected: u64,
+        deadline: Option<Instant>,
+        token: Token,
+    ) -> Result<OpId> {
+        let op = self.new_op(None, token)?;
+        self.ops.get_mut(op.key).expect("new wait").external_wait = true;
+        if let Err(e) =
+            crate::external_wait::submit(op, self.work_port.clone(), condition, expected, deadline)
+        {
+            self.retire(op);
+            self.outstanding -= 1;
+            return Err(e);
+        }
+        Ok(op)
+    }
+    /// Submit an owned Send closure to the bounded shared blocking pool.
     pub fn blocking<F: FnOnce() -> BlockingResult + Send + 'static>(
         &mut self,
         f: F,
@@ -596,6 +783,7 @@ impl<B: Backend> Driver<B> {
     ) -> Result<OpId> {
         self.submit_work(crate::blocking::blocking(f), token)
     }
+    /// Resolve an owned hostname on the shared native blocking pool.
     pub fn resolve(&mut self, request: crate::DnsRequest, token: Token) -> Result<OpId> {
         self.submit_work(crate::blocking::resolve(request), token)
     }
@@ -620,12 +808,15 @@ impl<B: Backend> Driver<B> {
         }
         Ok(op)
     }
+    /// Clone the thread-safe wake endpoint for this loop.
     pub fn notifier(&self) -> Notifier {
         self.notifier.clone()
     }
+    /// Clone the bounded posting endpoint routed to this loop only.
     pub fn poster(&self) -> Poster {
         self.poster.clone()
     }
+    /// Opt into external host waiting and return the borrowed integration primitive.
     pub fn integration(&mut self) -> Result<Integration> {
         let integration = self.backend.integration()?;
         self.external = true;
@@ -688,6 +879,17 @@ impl<B: Backend> Driver<B> {
             }
         } else {
             match e.result {
+                Ok(Outcome::Exited(status)) => OpResult::Exited(status),
+                Ok(Outcome::Signal(signal)) => OpResult::Signal(signal),
+                Ok(Outcome::PipeAccepted(d)) => match self.attach(d, op.token) {
+                    Ok(conn) => OpResult::PipeAccepted { conn },
+                    Err(e) => OpResult::Err(e),
+                },
+                Ok(Outcome::HandleReceived(d)) => match self.attach(d, op.token) {
+                    Ok(handle) => OpResult::HandleReceived { handle },
+                    Err(e) => OpResult::Err(e),
+                },
+                Ok(Outcome::HandleSent) => OpResult::HandleSent,
                 Err(e) => OpResult::Err(e),
                 Ok(Outcome::Connected) => OpResult::Connected,
                 Ok(Outcome::Accepted { transport, peer }) => match self.attach(transport, op.token)
@@ -705,6 +907,7 @@ impl<B: Backend> Driver<B> {
         };
         self.finish(e.op, result, e.terminal);
     }
+    /// Collect bounded completions with at most one OS wait, never invoking host callbacks.
     pub fn turn(&mut self, timeout: Timeout, out: &mut Completions) -> Result<TurnInfo> {
         self.assert_owner();
         self.backend.validate_timeout(timeout)?;
@@ -787,6 +990,8 @@ impl<B: Backend> Driver<B> {
                 }
             } else {
                 match work.result {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    Ok(crate::blocking::WorkOutput::ExternalWait(r)) => OpResult::ExternalWait(r),
                     Ok(crate::blocking::WorkOutput::Blocking(p)) => OpResult::Blocking(p),
                     Ok(crate::blocking::WorkOutput::Resolved(a)) => OpResult::Resolved(a),
                     Err(e) => OpResult::Err(e),
@@ -835,6 +1040,7 @@ impl<B: Backend> Driver<B> {
 
 impl<B: Backend> Drop for Driver<B> {
     fn drop(&mut self) {
+        crate::external_wait::close(self.owner);
         self.work_port.close();
         self.poster.close();
         self.notifier.close();
@@ -920,6 +1126,68 @@ mod clock_contract {
         fn integration(&mut self) -> Result<Integration> {
             Ok(Integration::HostCallback)
         }
+    }
+    #[test]
+    fn optional_native_capabilities_reject_without_leaking_core_reservations() {
+        let mut l = Driver::<Host>::new(Config::default()).expect("host loop");
+        let mut spec = ProcessSpec::new("unused-native-program");
+        spec.stdio = [ProcessStdio::Pipe; 3];
+        assert_eq!(
+            l.spawn(&spec, Token(1))
+                .expect_err("unsupported spawn")
+                .kind,
+            ErrorKind::Unsupported
+        );
+        assert_eq!(
+            l.signal_start(Signal::Int, Token(2))
+                .expect_err("unsupported signal")
+                .kind,
+            ErrorKind::Unsupported
+        );
+        assert_eq!(
+            l.open_stdio(Stdio::Stdin)
+                .expect_err("unsupported stdio")
+                .kind,
+            ErrorKind::Unsupported
+        );
+        assert_eq!(
+            l.pipe_listen(&PipeName("unused".into()), &ListenOpts::default())
+                .expect_err("unsupported pipe")
+                .kind,
+            ErrorKind::Unsupported
+        );
+        assert!(
+            !l.alive(),
+            "failed native setup must roll back every reservation"
+        );
+        let h = l
+            .timer(l.now(), None, Token(3))
+            .expect("core timer still works");
+        assert_eq!(
+            l.kill(h, Signal::Kill).expect_err("unsupported kill").kind,
+            ErrorKind::Unsupported
+        );
+        assert_eq!(
+            l.tty_set_mode(h, TtyMode::Raw)
+                .expect_err("unsupported TTY")
+                .kind,
+            ErrorKind::Unsupported
+        );
+        assert_eq!(
+            l.tty_window_size(h)
+                .expect_err("unsupported dimensions")
+                .kind,
+            ErrorKind::Unsupported
+        );
+        let mut out = Completions::default();
+        l.turn(Timeout::Now, &mut out).expect("core turn");
+        assert_eq!(out.len(), 1);
+        assert!(matches!(out[0].result, OpResult::Timer));
+        l.close(h, Token(4)).expect("timer close");
+        l.turn(Timeout::Now, &mut out).expect("closed turn");
+        assert_eq!(out.len(), 1);
+        assert!(matches!(out[0].result, OpResult::Closed));
+        assert!(!l.alive());
     }
     #[test]
     fn host_clock_arms_deadline_and_validates_queued_turns() {

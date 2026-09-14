@@ -15,6 +15,8 @@ pub(crate) trait Poller: Sized {
     fn waker(&self) -> Arc<Self::W>;
     fn register(&mut self, fd: RawFd, key: u64) -> Result<()>;
     fn deregister(&mut self, fd: RawFd) -> Result<()>;
+    fn process(&mut self, pid: u32, key: u64) -> Result<Option<std::os::fd::OwnedFd>>;
+    fn remove_process(&mut self, pid: u32, fd: Option<RawFd>);
     fn wait(&mut self, timeout: Option<Duration>, out: &mut Vec<Ready>) -> Result<PollInfo>;
     fn fd(&self) -> RawFd;
 }

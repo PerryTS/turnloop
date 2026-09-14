@@ -14,21 +14,27 @@ mod web {
     #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
     pub struct Instant(Duration);
     impl Instant {
+        /// Construct a timestamp from a monotonic host clock reading.
         pub const fn from_duration(ticks: Duration) -> Self {
             Self(ticks)
         }
+        /// Return the underlying host-clock timestamp.
         pub const fn as_duration(self) -> Duration {
             self.0
         }
+        /// Add a duration, returning None on timestamp overflow.
         pub fn checked_add(self, duration: Duration) -> Option<Self> {
             self.0.checked_add(duration).map(Self)
         }
+        /// Subtract a duration, returning None on timestamp underflow.
         pub fn checked_sub(self, duration: Duration) -> Option<Self> {
             self.0.checked_sub(duration).map(Self)
         }
+        /// Elapsed duration since an earlier timestamp, clamped to zero.
         pub fn saturating_duration_since(self, earlier: Self) -> Duration {
             self.0.saturating_sub(earlier.0)
         }
+        /// Elapsed duration since an earlier timestamp, clamped to zero.
         pub fn duration_since(self, earlier: Self) -> Duration {
             self.saturating_duration_since(earlier)
         }

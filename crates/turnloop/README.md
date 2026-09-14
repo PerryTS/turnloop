@@ -7,13 +7,13 @@ runtime thread and no tokio dependency.
 
 **Pre-alpha.** This workspace contains the Unix driver and runtime-independent
 PostgreSQL, MySQL, Redis, MongoDB and SMTP protocol engines. APIs can change.
-Protocol engines consume bytes and produce actions; host transport and executor
-adapters are still being integrated. Perry is the first intended consumer.
+Protocol engines consume bytes and produce actions; host transport adapters are still being integrated. The optional local executor
+drives futures-io streams, sleep and timeout from host turns. Perry is the first intended consumer.
 
 | Platform | Current implementation | Validation |
 |---|---|---|
-| macOS arm64 | kqueue driver, sockets, timers, posts and pool | Native contracts and allocation tests |
-| Linux x86_64 / arm64 | epoll, nanosecond waits, timerfd fallback | Cross-checked locally; native CI required |
+| macOS arm64 | kqueue, TCP/UDP/local IPC, stdio, processes, signals, TTY, timers and shared services | Native contracts, six allocation gates and executor tests |
+| Linux x86_64 / arm64 | epoll, pidfd/SIGCHLD, native services, nanosecond waits and timerfd fallback | Cross-checked locally; native CI required |
 | FreeBSD / Apple mobile / Android | Unix backend paths | Best effort; runtime validation pending |
 | Windows x86_64 | Standalone IOCP spike | Cross-checked; production adapter and native contracts pending |
 | WASI 0.2 / 0.3 | Standalone polling / component async spikes | Production adapters and shared contracts pending |
@@ -36,6 +36,13 @@ driver.turn(Timeout::Until(deadline), &mut completions)?;
 // Dispatch completions in the host's own event-loop phase.
 # Ok::<(), turnloop::Error>(())
 ```
+
+Enable `executor` for `LocalExecutor<B>` and its futures-io adapters. Read/write
+staging and task tables are reserved at construction. Writes are buffered; flush
+or close before dropping an adapter to confirm underlying completion. The crate's
+rustdoc includes runnable loop and executor examples. See the
+[revision 2 handoff](https://github.com/PerryTS/turnloop/blob/main/docs/BACKEND_REVISION_2.md)
+for native ownership, process teardown, platform integration and contract details.
 
 Use the pinned nightly for dependency resolution under the seven-day publication
 soak. The workspace also builds with stable Rust 1.97.1.
