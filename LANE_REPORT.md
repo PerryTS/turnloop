@@ -203,3 +203,7 @@ packages, not only the native production tree.
   policy for backpressure, CSOT extensions, load balancers and other URI/auth features.
 - Benchmark throughput/CRC costs and allocation coverage for more BSON types, bulk sizes,
   sessions, pooling and adversarial workloads. No throughput claim was made here.
+
+## Integrator verification
+
+- 2026-09-14, integrator, outside the Codex sandbox (macOS arm64): `cargo test --all-targets --locked` — **PASS, 17 test functions, 0 failed** (2 server-only tests ignored), including the official SDAM JSON runner, which asserts it executed exactly 177 fixture files and more than 200 phases; `python3 scripts/mongodb.py run` — **PASS** against a private standalone, a 3-member replica set and a TLS standalone (26 s), with all private mongod processes stopped afterwards; `cargo tree -i tokio` is empty for x86_64-unknown-linux-gnu, wasm32-wasip2 and wasm32-unknown-unknown.
