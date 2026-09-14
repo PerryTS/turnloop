@@ -11,3 +11,8 @@
 | 2026-09-14T19:45:01.641462+00:00 | FAIL | `cargo test -p turnloop-http -p turnloop-websocket --features turnloop-http/turnloop,turnloop-websocket/turnloop --test asynchronous -- --test-threads=1` | `.tools/adapters-net/async-regressions-framing.log` |
 | 2026-09-14T19:45:42.343409+00:00 | PASS | `cargo test -p turnloop-http -p turnloop-websocket --features turnloop-http/turnloop,turnloop-websocket/turnloop --test asynchronous -- --test-threads=1` | `.tools/adapters-net/async-regressions-fixed.log` |
 | 2026-09-14T19:47:35.208103+00:00 | PASS | `python3 scripts/test-servers.py --services http run python3 scripts/ci/run-tests.py interop --mode all-features` | `.tools/adapters-net/interop.log` |
+| 2026-09-14T19:49:49.385770+00:00 | PASS | `cargo test -p turnloop-websocket --features turnloop --test async_allocations` | `.tools/adapters-net/async-allocations.log` |
+| 2026-09-14T19:50:43.558652+00:00 | FAIL | `cargo test -p turnloop-io --test allocations -- --test-threads=1` | `.tools/adapters-net/tcp-allocations.log` |
+| 2026-09-14T19:50:58.345200+00:00 | PASS | `cargo test -p turnloop-io --test allocations -- --test-threads=1` | `.tools/adapters-net/tcp-allocations-fixed.log` |
+| 2026-09-14T19:51:24.520027+00:00 | PASS | `python3 scripts/ci/install-wasm-toolchain.py` | `.tools/adapters-net/wasm-sdk.log` |
+| 2026-09-14T19:51:56.201704+00:00 | FAIL | `cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks` | `.tools/adapters-net/clippy-native.log` |

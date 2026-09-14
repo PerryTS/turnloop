@@ -48,7 +48,8 @@ impl<S: Stream> Http1<S> {
         length: http1::BodyLength,
     ) -> io::Result<()> {
         let length = response_length(head, length);
-        self.encoder = Some(http1::Encoder::start(head, length, &mut self.output).map_err(io::Error::other)?);
+        self.encoder =
+            Some(http1::Encoder::start(head, length, &mut self.output).map_err(io::Error::other)?);
         self.flush().await
     }
     pub async fn send_body(&mut self, bytes: &[u8]) -> io::Result<()> {
@@ -250,9 +251,16 @@ impl<S: Stream> Http2<S> {
     }
 }
 
-fn response_length(head:&http1::Head,length:http1::BodyLength)->http1::BodyLength {
-    if matches!(length,http1::BodyLength::Empty) && head.status>=200 && !matches!(head.status,204|304){http1::BodyLength::Known(0)}else{length}
+fn response_length(head: &http1::Head, length: http1::BodyLength) -> http1::BodyLength {
+    if matches!(length, http1::BodyLength::Empty)
+        && head.status >= 200
+        && !matches!(head.status, 204 | 304)
+    {
+        http1::BodyLength::Known(0)
+    } else {
+        length
+    }
 }
 
-#[cfg(all(target_arch="wasm32",target_os="unknown"))]
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 pub mod web;

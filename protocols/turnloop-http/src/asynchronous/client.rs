@@ -291,7 +291,9 @@ impl<B: Backend> Client<B> {
                     .map_err(io::Error::other)?;
                 lease.connection = Some(match protocol {
                     Protocol::Http1 => Connection::H1(Http1::new(transport, Mode::Response)),
-                    Protocol::Http2 => Connection::H2(Box::new(Http2::new(transport, http2::Role::Client)?)),
+                    Protocol::Http2 => {
+                        Connection::H2(Box::new(Http2::new(transport, http2::Role::Client)?))
+                    }
                 });
             }
             let head = route.request_head(request, None);
