@@ -49,15 +49,6 @@ impl<T> Table<T> {
         }
         Some(value)
     }
-    pub fn at(&self, index: usize) -> Option<(u64, &T)> {
-        let s = self.slots.get(index)?;
-        s.value
-            .as_ref()
-            .map(|v| (((s.generation as u64) << 32) | index as u64, v))
-    }
-    pub fn capacity(&self) -> usize {
-        self.slots.len()
-    }
 }
 #[cfg(test)]
 mod tests {

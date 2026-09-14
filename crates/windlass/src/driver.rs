@@ -28,6 +28,8 @@ struct Resource {
     pending: usize,
     closing: Option<Token>,
     closed_queued: bool,
+    head: Option<OpId>,
+    tail: Option<OpId>,
 }
 #[derive(Clone)]
 struct Op {
@@ -36,6 +38,8 @@ struct Op {
     cancel: bool,
     stop: bool,
     job_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    previous: Option<OpId>,
+    next: Option<OpId>,
 }
 
 /// A driver belongs to its constructing thread. Backend is an internal extension
@@ -134,6 +138,8 @@ impl<B: Backend> Driver<B> {
                 pending: 0,
                 closing: None,
                 closed_queued: false,
+                head: None,
+                tail: None,
             })
             .ok_or(Error::new(ErrorKind::ResourceLimit))?;
         if matches!(kind, Kind::Socket) {
@@ -148,6 +154,7 @@ impl<B: Backend> Driver<B> {
         if self.outstanding == self.config.max_operations {
             return Err(Error::new(ErrorKind::ResourceLimit));
         }
+        let previous = h.and_then(|h| self.handles.get(h.key).and_then(|r| r.tail));
         let key = self
             .ops
             .insert(Op {
@@ -156,10 +163,23 @@ impl<B: Backend> Driver<B> {
                 cancel: false,
                 stop: false,
                 job_cancel: None,
+                previous,
+                next: None,
             })
             .ok_or(Error::new(ErrorKind::ResourceLimit))?;
+        let id = OpId {
+            owner: self.owner,
+            key,
+        };
+        if let Some(previous) = previous {
+            self.ops.get_mut(previous.key).expect("previous").next = Some(id);
+        }
         if let Some(h) = h {
             let r = self.handles.get_mut(h.key).expect("validated handle");
+            if r.head.is_none() {
+                r.head = Some(id);
+            }
+            r.tail = Some(id);
             r.pending += 1;
             if r.referenced {
                 self.refs += 1;
@@ -175,8 +195,20 @@ impl<B: Backend> Driver<B> {
     }
     fn retire(&mut self, id: OpId) -> Option<Op> {
         let op = self.ops.remove(id.key)?;
+        if let Some(previous) = op.previous {
+            self.ops.get_mut(previous.key).expect("previous").next = op.next;
+        }
+        if let Some(next) = op.next {
+            self.ops.get_mut(next.key).expect("next").previous = op.previous;
+        }
         if let Some(h) = op.handle {
             if let Some(r) = self.handles.get_mut(h.key) {
+                if r.head == Some(id) {
+                    r.head = op.next;
+                }
+                if r.tail == Some(id) {
+                    r.tail = op.previous;
+                }
                 r.pending -= 1;
                 if r.referenced {
                     self.refs -= 1;
@@ -432,15 +464,10 @@ impl<B: Backend> Driver<B> {
             return Err(Error::new(ErrorKind::InvalidInput));
         }
         self.handles.get_mut(h.key).expect("validated").closing = Some(token);
-        for i in 0..self.ops.capacity() {
-            if let Some((key, op)) = self.ops.at(i)
-                && op.handle == Some(h)
-            {
-                self.cancel(OpId {
-                    owner: self.owner,
-                    key,
-                });
-            }
+        let mut next = self.resource(h)?.head;
+        while let Some(id) = next {
+            next = self.ops.get(id.key).and_then(|op| op.next);
+            self.cancel(id);
         }
         self.maybe_closed(h);
         Ok(())
@@ -450,15 +477,10 @@ impl<B: Backend> Driver<B> {
         if r.closing.is_some() || !matches!(r.kind, Kind::Socket) {
             return Err(Error::new(ErrorKind::InvalidInput));
         }
-        for i in 0..self.ops.capacity() {
-            if let Some((key, op)) = self.ops.at(i)
-                && op.handle == Some(h)
-            {
-                self.cancel(OpId {
-                    owner: self.owner,
-                    key,
-                });
-            }
+        let mut next = self.resource(h)?.head;
+        while let Some(id) = next {
+            next = self.ops.get(id.key).and_then(|op| op.next);
+            self.cancel(id);
         }
         if self.resource(h)?.pending != 0 || self.queued.iter().any(|c| c.handle == Some(h)) {
             return Err(Error::new(ErrorKind::WouldBlock));

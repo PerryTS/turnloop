@@ -177,6 +177,18 @@ mod native {
     use super::*;
     type B = windlass::backend::Platform;
     #[test]
+    fn external_waiter() {
+        integration_fd::<B>();
+    }
+    #[test]
+    fn vectored_stream_shutdown() {
+        writev_and_shutdown::<B>();
+    }
+    #[test]
+    fn bounded_capacity_and_stale_ids() {
+        capacity_and_stale_ids::<B>();
+    }
+    #[test]
     fn cancellation_close() {
         cancel_close_ordering::<B>();
     }
@@ -549,3 +561,126 @@ pub fn cross_post<B: Backend>(threads: usize, per_peer: usize) {
 }
 mod extended;
 pub use extended::*;
+
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd"
+))]
+mod integration;
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd"
+))]
+pub use integration::integration_fd;
+
+pub fn writev_and_shutdown<B: Backend>() {
+    let mut l = Driver::<B>::new(Config::default()).expect("loop");
+    let (_, a, b) = pair(&mut l);
+    const HALF: usize = 256 * 1024;
+    let v = WriteVectored::new([
+        WriteBuf::Owned(vec![0xa3; HALF]),
+        WriteBuf::Owned(vec![0x5c; HALF]),
+    ])
+    .expect("iovecs");
+    let read = l.read_start(b, Token(1)).expect("read_start");
+    l.writev(a, v, Token(2)).expect("writev");
+    l.shutdown(a, Token(3)).expect("shutdown after write");
+    let mut count = 0;
+    let mut writes = 0;
+    let mut shutdowns = 0;
+    let mut eof = false;
+    let mut chunks = 0;
+    let until = Instant::now() + Duration::from_secs(5);
+    let mut out = Completions::default();
+    while !eof || writes == 0 || shutdowns == 0 {
+        assert!(Instant::now() < until);
+        l.turn(Timeout::Until(until), &mut out).expect("turn");
+        for c in out.drain() {
+            match c.result {
+                OpResult::Read {
+                    n,
+                    lease: Some(data),
+                } => {
+                    assert!(!c.terminal);
+                    assert_eq!(c.op, Some(read));
+                    assert!(n > 0);
+                    chunks += 1;
+                    for &byte in data.as_slice() {
+                        assert_eq!(byte, if count < HALF { 0xa3 } else { 0x5c });
+                        count += 1;
+                    }
+                }
+                OpResult::Wrote(n) => {
+                    assert_eq!(n, 2 * HALF);
+                    writes += 1;
+                }
+                OpResult::Shutdown => {
+                    shutdowns += 1;
+                }
+                OpResult::Eof => {
+                    assert!(c.terminal);
+                    assert_eq!(c.op, Some(read));
+                    assert_eq!(count, 2 * HALF);
+                    eof = true;
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+    assert!(chunks > 1);
+    assert_eq!(writes, 1);
+    assert_eq!(shutdowns, 1);
+    assert!(!l.cancel(read));
+}
+
+pub fn capacity_and_stale_ids<B: Backend>() {
+    let config = Config {
+        max_handles: 4,
+        max_operations: 2,
+        events_per_turn: 1,
+        ..Config::default()
+    };
+    let mut a = Driver::<B>::new(config).expect("a");
+    let mut b = Driver::<B>::new(config).expect("b");
+    let at = Instant::now() + Duration::from_secs(30);
+    let h = a.timer(at, None, Token(1)).expect("timer");
+    let op = a.timer_op(h).expect("op");
+    assert!(a.cancel(op));
+    a.close(h, Token(2)).expect("close");
+    let other = b.timer(at, None, Token(3)).expect("other loop timer");
+    assert!(!a.cancel(b.timer_op(other).expect("op")));
+    assert!(a.set_ref(other, false).is_err());
+    let h2 = a.timer(at, None, Token(4)).expect("second credit");
+    let op2 = a.timer_op(h2).expect("op");
+    assert!(a.cancel(op2));
+    assert!(
+        matches!(
+            a.timer(at, None, Token(5)),
+            Err(Error {
+                kind: ErrorKind::ResourceLimit,
+                ..
+            })
+        ),
+        "undelivered completions retain credits"
+    );
+    let mut out = Completions::with_capacity(1);
+    let mut count = 0;
+    while count < 3 {
+        let info = a
+            .turn(Timeout::Forever, &mut out)
+            .expect("queued work never waits");
+        assert_eq!(info.os_waits, 0);
+        assert_eq!(out.len(), 1);
+        count += 1;
+    }
+    let h3 = a.timer(at, None, Token(6)).expect("reused storage");
+    assert_ne!(h3, h);
+    assert!(a.set_ref(h, true).is_err());
+    assert!(!a.cancel(op));
+    assert!(a.cancel(a.timer_op(h3).expect("op")));
+    assert_eq!(count, 3);
+}
