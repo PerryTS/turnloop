@@ -350,6 +350,7 @@ fn real_standalone_replica_scram_tls() {
     crud(&mut d);
     transactions_and_changes(&mut d);
     retry_coordinator(&mut d);
+    failover(&mut d, primary_port, &ports, &mut topology);
     eprintln!("Verified standalone, 3-member replica set, SCRAM SHA-1/SHA-256/default, TLS, zlib, CRUD, cursors, transactions, retry identity and change stream events");
 }
 fn transactions_and_changes(d: &mut Driver) {
@@ -593,6 +594,90 @@ fn retry_coordinator(d: &mut Driver) {
     Error::from_response(&raw(&d.raw_command(w.as_raw().unwrap(), &[]).unwrap())).unwrap();
     assert_eq!(
         d.run(db, doc! {"count":"items"})
+            .unwrap()
+            .get_i32("n")
+            .unwrap(),
+        2
+    );
+    // Abort retries exactly once and leaves no inserted document visible.
+    use turnloop_mongodb::session::{EndAction, EndKind, TransactionEnd};
+    s.start_transaction().unwrap();
+    w.clear();
+    w.string("insert", "items").unwrap();
+    s.decorate(&mut w, false).unwrap();
+    w.string("$db", db).unwrap();
+    w.finish().unwrap();
+    let item = raw(&doc! {"_id":3});
+    Error::from_response(&raw(&d
+        .raw_command(w.as_raw().unwrap(), &[("documents", &[&item])])
+        .unwrap()))
+    .unwrap();
+    d.run("admin",doc!{"configureFailPoint":"failCommand","mode":{"times":1},"data":{"failCommands":["abortTransaction"],"errorCode":91,"errorLabels":["RetryableWriteError"]}}).unwrap();
+    s.abort(&mut w).unwrap();
+    let first = d.raw_command(w.as_raw().unwrap(), &[]).unwrap();
+    let error = Error::from_response(&raw(&first)).unwrap_err();
+    let mut end = TransactionEnd::new(EndKind::Abort);
+    assert!(matches!(
+        end.failed(&mut s, error, 27, &mut w).unwrap(),
+        EndAction::Retry
+    ));
+    Error::from_response(&raw(&d.raw_command(w.as_raw().unwrap(), &[]).unwrap())).unwrap();
+    let result = d.run(db, doc! {"count":"items"}).unwrap();
+    assert_eq!(result.get_i32("n").unwrap(), 2);
+    s.observe(&result);
+    w.clear();
+    w.string("find", "items").unwrap();
+    s.decorate_causal_read(&mut w, Some("majority")).unwrap();
+    w.string("$db", db).unwrap();
+    w.finish().unwrap();
+    let found = d.raw_command(w.as_raw().unwrap(), &[]).unwrap();
+    Error::from_response(&raw(&found)).unwrap();
+    assert_eq!(rows(&found).len(), 2);
+}
+
+fn failover(d: &mut Driver, old_primary: u16, ports: &[(String, u16)], topology: &mut Topology) {
+    let response = d.run("admin", doc! {"replSetStepDown":60,"force":true});
+    assert!(
+        response.is_ok() || response.is_err_and(|e| e.kind == turnloop_mongodb::ErrorKind::Network)
+    );
+    let deadline = Instant::now() + Duration::from_secs(40);
+    let new_primary = loop {
+        let mut primary = None;
+        for (name, port) in ports {
+            if !name.starts_with("rs") || *port == old_primary {
+                continue;
+            }
+            if let Ok(mut peer) = Driver::connect(&uri(*port, "")) {
+                if let Ok(hello) = peer.run("admin", doc! {"hello":1}) {
+                    topology.update(
+                        &format!("127.0.0.1:{port}"),
+                        &hello,
+                        Instant::now(),
+                        Duration::from_millis(3),
+                    );
+                    if hello.get_bool("isWritablePrimary").unwrap_or(false) {
+                        primary = Some((*port, peer));
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(p) = primary {
+            break p;
+        }
+        assert!(Instant::now() < deadline, "No new primary after stepdown");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let (port, mut peer) = new_primary;
+    assert_ne!(port, old_primary);
+    assert_eq!(topology.kind, TopologyType::ReplicaSetWithPrimary);
+    let mut candidates = Vec::new();
+    topology
+        .candidates(ReadPreference::Primary, &[], None, &mut candidates)
+        .unwrap();
+    assert_eq!(candidates, [format!("127.0.0.1:{port}")]);
+    assert_eq!(
+        peer.run("lane_retry", doc! {"count":"items"})
             .unwrap()
             .get_i32("n")
             .unwrap(),
