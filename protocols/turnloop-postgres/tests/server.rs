@@ -243,7 +243,10 @@ fn authentication_queries_pipeline_copy_cancel() {
         TransactionStatus::Failed
     );
     assert_eq!(d.query("ROLLBACK").completed[0].2, TransactionStatus::Idle);
-    let r = d.query("DO $$ BEGIN RAISE NOTICE 'fixture notice'; END $$; LISTEN changes; NOTIFY changes, 'payload'");
+    let mut r = d.query("DO $$ BEGIN RAISE NOTICE 'fixture notice'; END $$; LISTEN changes; NOTIFY changes, 'payload'");
+    while r.notifications.is_empty() {
+        d.step(&mut r, None);
+    }
     assert_eq!(r.notices, 1);
     assert_eq!(r.notifications, [("changes".into(), "payload".into())]);
     d.core.query(6, "COPY items FROM STDIN", None).unwrap();
@@ -275,4 +278,145 @@ fn authentication_queries_pipeline_copy_cancel() {
         d.query("SELECT count(*) FROM items").rows[0][0],
         Some(b"4".to_vec())
     );
+}
+
+#[test]
+#[ignore = "requires private PostgreSQL 16; use scripts/sql-servers.py run"]
+fn all_common_types_in_text_binary_and_arrays() {
+    use turnloop_postgres::types::{Value, decode};
+    let mut d = Driver::connect("scram_user", SslMode::Disable);
+    let cases = [
+        (21, "7::int2"),
+        (23, "42::int4"),
+        (20, "9223372036854775807::int8"),
+        (700, "1.5::float4"),
+        (701, "1.25::float8"),
+        (1700, "1234567890.2300::numeric"),
+        (16, "true"),
+        (25, "'hello'::text"),
+        (1043, "'hello'::varchar"),
+        (17, "decode('00ff','hex')"),
+        (1082, "'2026-09-14'::date"),
+        (1114, "'2026-09-14 12:34:56.123456'::timestamp"),
+        (1184, "'2026-09-14 12:34:56.123456+00'::timestamptz"),
+        (114, "'{\"x\":1}'::json"),
+        (3802, "'{\"x\":1}'::jsonb"),
+        (2950, "'550e8400-e29b-41d4-a716-446655440000'::uuid"),
+    ];
+    for (oid, expression) in cases {
+        let sql = format!("SELECT {expression} AS value");
+        let text = d.query(&sql);
+        assert!(text.errors.is_empty(), "{text:?}");
+        assert_eq!(text.rows.len(), 1);
+        assert_eq!(text.fields[0].1, oid);
+        let text_value = decode(oid, 0, text.rows[0][0].as_deref()).unwrap();
+        assert!(!matches!(text_value, Value::Null | Value::Raw { .. }));
+        d.core
+            .execute(
+                2,
+                ExtendedQuery {
+                    name: "",
+                    sql: &sql,
+                    oids: &[],
+                    params: &[],
+                    result_formats: &[1],
+                },
+                None,
+            )
+            .unwrap();
+        let binary = d.drain(None);
+        assert!(binary.errors.is_empty(), "{binary:?}");
+        assert_eq!(binary.rows.len(), 1);
+        let binary_value = decode(oid, 1, binary.rows[0][0].as_deref()).unwrap();
+        if !matches!(oid, 1082 | 1114 | 1184) {
+            assert_eq!(text_value, binary_value, "OID {oid}");
+        } else {
+            assert!(matches!(
+                binary_value,
+                Value::Date(_) | Value::Timestamp { .. }
+            ));
+        }
+        let sql = format!("SELECT ARRAY[{expression},NULL] AS values");
+        let r = d.query(&sql);
+        assert!(r.errors.is_empty(), "{r:?}");
+        let array_oid = r.fields[0].1;
+        let v = decode(array_oid, 0, r.rows[0][0].as_deref()).unwrap();
+        let Value::Array(values) = v else {
+            panic!("array not decoded")
+        };
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0], text_value);
+        assert_eq!(values[1], Value::Null);
+        d.core
+            .execute(
+                3,
+                ExtendedQuery {
+                    name: "",
+                    sql: &sql,
+                    oids: &[],
+                    params: &[],
+                    result_formats: &[1],
+                },
+                None,
+            )
+            .unwrap();
+        let r = d.drain(None);
+        let Value::Array(values) = decode(array_oid, 1, r.rows[0][0].as_deref()).unwrap() else {
+            panic!("binary array not decoded")
+        };
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0], binary_value);
+        assert_eq!(values[1], Value::Null);
+    }
+}
+
+#[test]
+#[ignore = "requires private PostgreSQL 16; use scripts/sql-servers.py run"]
+fn pool_reuses_real_connection_and_explicit_idle_timeout() {
+    use turnloop_postgres::pool::{Config, Event, Pool};
+    let now = Instant::now();
+    let mut pool = Pool::new(Config {
+        max: 1,
+        ..Config::default()
+    })
+    .unwrap();
+    pool.checkout(1, now, None).unwrap();
+    let Some(Event::Connect(id)) = pool.next_event() else {
+        panic!()
+    };
+    let mut connection = Driver::connect("scram_user", SslMode::Disable);
+    assert!(
+        connection
+            .query("CREATE TEMP TABLE pooled(id int); INSERT INTO pooled VALUES(42)")
+            .errors
+            .is_empty()
+    );
+    pool.connected(id, now).unwrap();
+    pool.next_event();
+    let Some(Event::Acquired(lease)) = pool.next_event() else {
+        panic!()
+    };
+    pool.checkin(lease, now, false).unwrap();
+    pool.next_event();
+    pool.checkout(2, now, None).unwrap();
+    let Some(Event::Acquired(lease)) = pool.next_event() else {
+        panic!()
+    };
+    assert_eq!(lease.connection, id);
+    assert_eq!(
+        connection.query("SELECT id FROM pooled").rows[0][0],
+        Some(b"42".to_vec())
+    );
+    pool.checkin(lease, now, false).unwrap();
+    pool.next_event();
+    pool.handle_timeout(pool.next_timeout().unwrap());
+    assert_eq!(pool.next_event(), Some(Event::Close(id)));
+    connection.core.end().unwrap();
+    connection.flush();
+    assert!(matches!(
+        connection.core.next_event().unwrap(),
+        Some(turnloop_postgres::Event::Closed { .. })
+    ));
+    pool.closed(id, now).unwrap();
+    assert_eq!(pool.total_count(), 0);
 }

@@ -531,4 +531,64 @@ mod tests {
         p.closed(id, now).unwrap();
         assert_eq!(p.next_event(), Some(Event::Removed(id)));
     }
+    #[test]
+    fn min_queue_limit_and_end_semantics() {
+        let now = Instant::now();
+        let mut p = Pool::new(Config {
+            max: 2,
+            min: 1,
+            queue_limit: Some(1),
+            ..Config::default()
+        })
+        .unwrap();
+        let mut leases = Vec::new();
+        for token in [1, 2] {
+            p.checkout(token, now, None).unwrap();
+            let Some(Event::Connect(id)) = p.next_event() else {
+                panic!()
+            };
+            p.connected(id, now).unwrap();
+            p.next_event();
+            let Some(Event::Acquired(lease)) = p.next_event() else {
+                panic!()
+            };
+            leases.push(lease);
+        }
+        p.checkout(3, now, None).unwrap();
+        assert_eq!(p.checkout(4, now, None), Err(Error::QueueLimit));
+        p.checkin(leases[0], now, false).unwrap();
+        p.next_event();
+        let Some(Event::Acquired(lease)) = p.next_event() else {
+            panic!()
+        };
+        assert_eq!(lease.token, 3);
+        p.checkin(lease, now, false).unwrap();
+        p.next_event();
+        p.checkin(leases[1], now, false).unwrap();
+        p.next_event();
+        let deadline = p.next_timeout().unwrap();
+        p.handle_timeout(deadline);
+        let Some(Event::Close(id)) = p.next_event() else {
+            panic!()
+        };
+        assert!(p.next_event().is_none());
+        p.closed(id, deadline).unwrap();
+        p.next_event();
+        assert_eq!(p.idle_count(), 1);
+        assert!(p.next_timeout().is_none());
+        p.checkout(5, deadline, None).unwrap();
+        let Some(Event::Acquired(lease)) = p.next_event() else {
+            panic!()
+        };
+        p.end().unwrap();
+        if !MYSQL {
+            assert!(p.next_event().is_none());
+            p.checkin(lease, deadline, false).unwrap();
+            assert_eq!(p.next_event(), Some(Event::Released(lease.connection)));
+        }
+        assert_eq!(p.next_event(), Some(Event::Close(lease.connection)));
+        p.closed(lease.connection, deadline).unwrap();
+        p.next_event();
+        assert_eq!(p.next_event(), Some(Event::Ended));
+    }
 }

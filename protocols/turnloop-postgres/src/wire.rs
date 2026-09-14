@@ -179,6 +179,39 @@ impl<'a> ServerError<'a> {
     pub fn hint(self) -> Option<&'a str> {
         self.get(b'H')
     }
+    pub fn internal_position(self) -> Option<&'a str> {
+        self.get(b'p')
+    }
+    pub fn internal_query(self) -> Option<&'a str> {
+        self.get(b'q')
+    }
+    pub fn context(self) -> Option<&'a str> {
+        self.get(b'W')
+    }
+    pub fn schema(self) -> Option<&'a str> {
+        self.get(b's')
+    }
+    pub fn table(self) -> Option<&'a str> {
+        self.get(b't')
+    }
+    pub fn column(self) -> Option<&'a str> {
+        self.get(b'c')
+    }
+    pub fn data_type(self) -> Option<&'a str> {
+        self.get(b'd')
+    }
+    pub fn constraint(self) -> Option<&'a str> {
+        self.get(b'n')
+    }
+    pub fn file(self) -> Option<&'a str> {
+        self.get(b'F')
+    }
+    pub fn line(self) -> Option<&'a str> {
+        self.get(b'L')
+    }
+    pub fn routine(self) -> Option<&'a str> {
+        self.get(b'R')
+    }
     pub fn position(self) -> Option<&'a str> {
         self.get(b'P')
     }

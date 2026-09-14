@@ -587,32 +587,31 @@ impl Connection {
         if matches!(self.state, State::Closed | State::Tls | State::Scram(_)) {
             return Ok(None);
         }
-        loop {
-            if self.state == State::Ssl {
-                let Some(&reply) = self.input.get(self.input_at) else {
-                    return Ok(None);
-                };
-                self.input_at += 1;
-                match reply {
-                    b'S' => {
-                        if self.input.len() != self.input_at {
-                            return Err(Error::Protocol("plaintext after TLS acceptance"));
-                        }
-                        self.state = State::Tls;
-                        return Ok(Some(Event::UpgradeTls));
+        if self.state == State::Ssl {
+            let Some(&reply) = self.input.get(self.input_at) else {
+                return Ok(None);
+            };
+            self.input_at += 1;
+            match reply {
+                b'S' => {
+                    if self.input.len() != self.input_at {
+                        return Err(Error::Protocol("plaintext after TLS acceptance"));
                     }
-                    b'N' if self.config.ssl == SslMode::Prefer => {
-                        self.startup()?;
-                        continue;
-                    }
-                    b'N' => {
-                        return Err(Error::Protocol(
-                            "The server does not support SSL connections",
-                        ));
-                    }
-                    _ => return Err(Error::Protocol("invalid SSLRequest response")),
+                    self.state = State::Tls;
+                    return Ok(Some(Event::UpgradeTls));
                 }
+                b'N' if self.config.ssl == SslMode::Prefer => {
+                    self.startup()?;
+                }
+                b'N' => {
+                    return Err(Error::Protocol(
+                        "The server does not support SSL connections",
+                    ));
+                }
+                _ => return Err(Error::Protocol("invalid SSLRequest response")),
             }
+        }
+        loop {
             let available = &self.input[self.input_at..];
             let Some(header) = Header::parse(available)? else {
                 return Ok(None);

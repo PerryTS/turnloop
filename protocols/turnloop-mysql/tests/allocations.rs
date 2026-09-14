@@ -93,5 +93,68 @@ fn warm_ping_and_compressed_ping_allocate_nothing() {
         });
         assert_eq!(count, 0, "compression={compression}");
         assert_eq!(complete, 1010);
+        // Rows use metadata and a compressed 512-byte value from the independent
+        // upstream encoder, exercising retained decompression state as well.
+        server.reset_seq_id();
+        c.query(3, "SELECT REPEAT('x',512)", None).unwrap();
+        let mut request = BytesMut::from(c.output());
+        auth.clear();
+        assert!(server.decode(&mut request, &mut auth).unwrap());
+        assert_eq!(auth[0], 3);
+        c.consume_output(c.output().len()).unwrap();
+        let mut column = Vec::new();
+        mysql_common::packets::Column::new(ColumnType::MYSQL_TYPE_VAR_STRING)
+            .with_name(b"value")
+            .with_character_set(45)
+            .serialize(&mut column);
+        let mut row = vec![0xfc, 0, 2];
+        row.extend_from_slice(&[b'x'; 512]);
+        wire.clear();
+        for packet in [
+            &[1][..],
+            &column,
+            &[0xfe, 0, 0, 2, 0],
+            &row,
+            &[0xfe, 0, 0, 2, 0],
+        ] {
+            server.encode(&mut &packet[..], &mut wire).unwrap();
+        }
+        let response = wire.to_vec();
+        c.receive(&response).unwrap();
+        while c.next_event().unwrap().is_some() {}
+        let mut rows = 0;
+        let mut complete = 0;
+        let mut run = || {
+            c.query(3, "SELECT REPEAT('x',512)", None).unwrap();
+            c.consume_output(c.output().len()).unwrap();
+            c.receive(&response).unwrap();
+            while let Some(e) = c.next_event().unwrap() {
+                match e {
+                    Event::Row { mut row, .. } => {
+                        let RawValue::Bytes(bytes) = row.next().unwrap().unwrap() else {
+                            panic!()
+                        };
+                        assert_eq!(bytes, &[b'x'; 512]);
+                        rows += 1;
+                    }
+                    Event::Completed { outcome, .. } => {
+                        assert_eq!(outcome, Outcome::Success);
+                        complete += 1;
+                    }
+                    _ => {}
+                }
+            }
+        };
+        for _ in 0..10 {
+            run();
+        }
+        let count = allocation::allocations(|| {
+            for _ in 0..1000 {
+                run();
+            }
+        });
+        assert_eq!(count, 0, "row compression={compression}");
+        assert_eq!(rows, 1010);
+        assert_eq!(complete, 1010);
     }
 }

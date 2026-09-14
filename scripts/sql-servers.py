@@ -62,7 +62,8 @@ def start():
     only_mysql = os.environ.get('TURNLOOP_SQL_SERVER') == 'mysql'
     pg = TOOLS / 'pgdata'
     if not only_mysql and not (pg / 'PG_VERSION').exists():
-        command([BIN / 'initdb', '-D', pg, '--username=postgres', '--auth=trust', '--encoding=UTF8', '--locale=C'], stdout=subprocess.DEVNULL)
+        with open(TOOLS / 'postgres-init.log', 'ab') as log:
+            command([BIN / 'initdb', '-D', pg, '--username=postgres', '--auth=trust', '--encoding=UTF8', '--locale=C'], stdout=log, stderr=log)
     pgport, myport = port(), port()
     while myport == pgport:
         myport = port()
@@ -113,6 +114,8 @@ def start():
         ready(p, [*mysql, '-e', 'SELECT 1'])
         command(mysql, input="""
 CREATE DATABASE IF NOT EXISTS turnloop_test;
+CREATE USER IF NOT EXISTS 'auth_rsa_user'@'127.0.0.1' IDENTIFIED WITH caching_sha2_password BY 'fixture-password';
+GRANT ALL ON turnloop_test.* TO 'auth_rsa_user'@'127.0.0.1';
 CREATE USER IF NOT EXISTS 'sql_user'@'127.0.0.1' IDENTIFIED WITH caching_sha2_password BY 'fixture-password';
 CREATE USER IF NOT EXISTS 'tls_user'@'127.0.0.1' IDENTIFIED WITH caching_sha2_password BY 'fixture-password' REQUIRE SSL;
 GRANT ALL ON turnloop_test.* TO 'sql_user'@'127.0.0.1';

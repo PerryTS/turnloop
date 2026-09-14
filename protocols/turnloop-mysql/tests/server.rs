@@ -138,10 +138,10 @@ impl Driver {
 #[ignore = "requires private MySQL 9.6; use scripts/sql-servers.py run"]
 fn auth_prepared_transactions_compression_and_infile() {
     // First connection must encounter an empty caching_sha2 server cache.
-    let mut d = Driver::connect("sql_user", false, false, true);
+    let mut d = Driver::connect("auth_rsa_user", false, false, true);
     assert_eq!(d.full, 1);
     assert_eq!(d.rsa, 1);
-    let cached = Driver::connect("sql_user", false, false, false);
+    let cached = Driver::connect("auth_rsa_user", false, false, false);
     assert_eq!(cached.fast, 1);
     assert_eq!(cached.rsa, 0);
     let secure = Driver::connect("tls_user", true, false, false);
@@ -245,4 +245,96 @@ fn auth_prepared_transactions_compression_and_infile() {
         d.core.next_event().unwrap(),
         Some(Event::Closed { .. })
     ));
+}
+
+#[test]
+#[ignore = "requires private MySQL 9.6; use scripts/sql-servers.py run"]
+fn common_column_types_and_binary_null_bitmap() {
+    let mut d = Driver::connect("sql_user", false, false, false);
+    let r=d.query("CREATE TEMPORARY TABLE types_fixture (id TINYINT, n BIGINT UNSIGNED, deci DECIMAL(30,4), d DATE, dt DATETIME(6), j JSON, b BLOB, s VARCHAR(30), f DOUBLE); INSERT INTO types_fixture VALUES (1,18446744073709551615,12345678901234567890.2300,'2026-09-14','2026-09-14 12:34:56.123456','{\"x\":1}',X'00FF','hello',1.25)");
+    assert!(r.errors.is_empty(), "{r:?}");
+    assert!(r.oks.iter().any(|v| v.0 == 1));
+    let text = d.query("SELECT * FROM types_fixture");
+    assert_eq!(text.rows.len(), 1);
+    assert_eq!(
+        text.rows[0][1],
+        Value::Bytes(b"18446744073709551615".to_vec())
+    );
+    assert_eq!(
+        text.rows[0][2],
+        Value::Bytes(b"12345678901234567890.2300".to_vec())
+    );
+    assert_eq!(text.rows[0][6], Value::Bytes(vec![0, 255]));
+    d.core
+        .prepare(2, "SELECT * FROM types_fixture WHERE id=?", None)
+        .unwrap();
+    let stmt = d.drain(None).statement.unwrap();
+    d.core.execute(3, stmt.id, &[Value::Int(1)], None).unwrap();
+    let r = d.drain(None);
+    assert_eq!(r.rows.len(), 1);
+    assert_eq!(r.rows[0][0], Value::Int(1));
+    assert_eq!(r.rows[0][1], Value::UInt(u64::MAX));
+    assert_eq!(r.rows[0][2], text.rows[0][2]);
+    assert_eq!(r.rows[0][3], Value::Date(2026, 9, 14, 0, 0, 0, 0));
+    assert_eq!(r.rows[0][4], Value::Date(2026, 9, 14, 12, 34, 56, 123456));
+    assert_eq!(r.rows[0][5], text.rows[0][5]);
+    assert_eq!(r.rows[0][6], Value::Bytes(vec![0, 255]));
+    assert_eq!(r.rows[0][7], Value::Bytes(b"hello".to_vec()));
+    assert_eq!(r.rows[0][8], Value::Double(1.25));
+    d.query("UPDATE types_fixture SET n=NULL, deci=NULL, d=NULL, dt=NULL, j=NULL, b=NULL, s=NULL, f=NULL");
+    d.core.execute(4, stmt.id, &[Value::Int(1)], None).unwrap();
+    let r = d.drain(None);
+    assert_eq!(r.rows.len(), 1);
+    assert!(r.rows[0][1..].iter().all(|v| *v == Value::NULL));
+}
+
+#[test]
+#[ignore = "requires private MySQL 9.6; use scripts/sql-servers.py run"]
+fn pool_reuses_real_session_and_closes_on_end() {
+    use turnloop_mysql::pool::{Config, Event, Pool};
+    let now = std::time::Instant::now();
+    let mut p = Pool::new(Config {
+        max: 1,
+        ..Config::default()
+    })
+    .unwrap();
+    p.checkout(1, now, None).unwrap();
+    let Some(Event::Connect(id)) = p.next_event() else {
+        panic!()
+    };
+    let mut connection = Driver::connect("sql_user", false, false, false);
+    assert_eq!(
+        connection.query("SET @pooled_value=42").completed,
+        [Outcome::Success]
+    );
+    p.connected(id, now).unwrap();
+    p.next_event();
+    let Some(Event::Acquired(a)) = p.next_event() else {
+        panic!()
+    };
+    p.checkout(2, now, None).unwrap();
+    assert_eq!(p.waiting_count(), 1);
+    p.checkin(a, now, false).unwrap();
+    p.next_event();
+    let Some(Event::Acquired(b)) = p.next_event() else {
+        panic!()
+    };
+    assert_eq!(b.connection, id);
+    assert_eq!(b.token, 2);
+    assert_eq!(
+        connection.query("SELECT @pooled_value").rows[0][0],
+        Value::Bytes(b"42".to_vec())
+    );
+    p.end().unwrap();
+    assert_eq!(p.next_event(), Some(Event::Close(id)));
+    connection.core.quit().unwrap();
+    connection.flush();
+    assert!(matches!(
+        connection.core.next_event().unwrap(),
+        Some(turnloop_mysql::Event::Closed { .. })
+    ));
+    p.closed(id, now).unwrap();
+    assert_eq!(p.next_event(), Some(Event::Removed(id)));
+    assert_eq!(p.next_event(), Some(Event::Ended));
+    assert_eq!(p.total_count(), 0);
 }
