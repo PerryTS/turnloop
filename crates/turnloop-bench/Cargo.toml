@@ -1,0 +1,32 @@
+[package]
+name = "turnloop-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[features]
+timer-btree = ["turnloop/timer-btree"]
+
+[dependencies]
+turnloop.workspace = true
+turnloop-contract.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.turnloop-ci]
+role = "bench"
+instruction-baseline = "benchmarks/instructions.json"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+gungraun.workspace = true
+
+[[bench]]
+name = "instructions"
+harness = false

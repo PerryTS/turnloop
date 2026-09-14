@@ -1,0 +1,21 @@
+<!doctype html><meta charset="utf-8"><title>Worker Poster contract</title><pre id="result">RUNNING</pre>
+<script type="module">
+import { Poster } from '/worker-poster.js';
+const result=document.getElementById('result');
+try {
+  if(!crossOriginIsolated)throw new Error('Cross-origin isolation required');
+  const p=new Poster(), worker=new Worker('/worker-browser.js',{type:'module'});
+  const done=new Promise((resolve,reject)=>{worker.onerror=reject;worker.onmessage=({data})=>{if(data.count)resolve(data);};});
+  worker.postMessage({buffer:p.words.buffer,count:1000});
+  const deadline=performance.now()+10000;
+  while(Atomics.load(p.words,4)!==1){if(performance.now()>deadline)throw new Error('worker never parked');await new Promise(r=>setTimeout(r,1));}
+  for(let i=0;i<1000;i++){
+    const token=0xabcd000000000000n|BigInt(i);
+    while(!p.post(token,token^0xfedcba9876543210n)){if(performance.now()>deadline)throw new Error('posting timeout');await new Promise(r=>setTimeout(r,0));}
+  }
+  const stats=await Promise.race([done,new Promise((_,reject)=>setTimeout(()=>reject(Error('completion timeout')),10000))]);
+  worker.terminate();
+  if(stats.count!==1000||stats.unique!==1000||Atomics.load(p.words,5)===0)throw new Error('subject did not run');
+  result.textContent='PASS '+JSON.stringify({...stats,notify_calls:Atomics.load(p.words,5),crossOriginIsolated});
+} catch(e){result.textContent='FAIL '+String(e);}
+</script>

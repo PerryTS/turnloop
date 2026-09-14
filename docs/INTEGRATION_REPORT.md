@@ -1,0 +1,296 @@
+# Integration report
+
+Updated 2026-09-14. The wave-1 tree is a coherent pre-alpha workspace. Native
+workspace tests, supported cross-checks, audits and all six publication dry runs
+pass. This is **not a first-release readiness claim**: SQL execution is blocked by
+the sandbox, Windows/WASM production adapters await wave 2, and the Linux
+instruction baseline has not been measured. Required gates remain in place.
+
+No commits, pushes, remotes, repositories or registry uploads were performed by
+this agent. The integrator checkpoints the working tree. No other lane was
+written. Builds, downloaded tools, private servers and logs use this checkout,
+Cargo/Rustup caches and temporary build support paths. A temporary editing helper
+was moved into `.tools/`; no external project was modified.
+
+## Implemented
+
+- Renamed core/helper directories, packages, identifiers, cfg/environment names,
+  benchmark names, scripts, comments and documentation. Historical lane reports
+  remain under `docs/lanes/`. Rewrote README with pre-alpha status and actual
+  platform coverage. Removed the duplicate `core.yml` workflow.
+- Root members are `crates/*` and `protocols/*`; `spikes/*` are excluded. Edition
+  2024, resolver 3, MIT, public repository metadata, shared dependencies and
+  inherited unsafe/cfg lints. All six publishable packages have descriptions,
+  README, keywords, categories and documentation URLs. Path dependencies have
+  explicit versions. Contract and benchmark helpers are private; no protocol
+  depends on the contract helper, including for tests.
+- Stable here is **rustc 1.97.1**, despite the environment description's 1.98.
+  Declared and verified MSRV is 1.97.1; CI checks both that version and floating
+  stable. The root lockfile was regenerated with nightly-2026-08-20 and the
+  unchanged seven-day resolver soak, then independently age/checksum-audited.
+- One port-based `TURNLOOP_TEST_*` convention is documented in CONTRIBUTING and
+  consumed by every native protocol harness. Missing fixtures are fatal even
+  without `TURNLOOP_TEST_REQUIRED=1`; real-server tests remain ignored by default.
+- `scripts/test-servers.py` owns start/stop/run, private data and cleanup. Preserved
+  PostgreSQL cleartext/MD5/SCRAM/TLS/PLUS users; MySQL caching-SHA2 fast/full/RSA/TLS,
+  native-plugin availability probe, compression and LOCAL INFILE; Redis ACL,
+  single/TLS, six-node cluster (three masters/three replicas) and Sentinel;
+  MongoDB standalone, three authenticated replicas and TLS; Postfix SMTP sink
+  with actual message-byte assertions. PostgreSQL fixture users now receive
+  schema privileges needed by PostgreSQL 16 tests. Certificates refresh on expiry.
+- Deleted superseded SQL/Redis/Mongo scripts and CI bootstrap/cleanup scripts.
+  MongoDB shutdown is an explicit lifecycle example, not an ignored test that
+  `--include-ignored` could execute before another suite. SMTP uses a private,
+  authenticated local supervisor socket so separate start/stop invocations work
+  without `ps`, PID-reuse guesses or system service shutdown.
+- Linux CI uses the same runner/configuration/environment. It provisions the
+  explicitly named PostgreSQL/MySQL service containers, performs independent
+  verified TLS probes, and creates private Redis/Mongo containers with ownership
+  labels. Mocked wrapper/lifecycle regressions run in CI; actual Docker execution
+  remains UNRUN locally. The full service suite is still required.
+- Kept native/default/all-feature, stable/MSRV, wasm cross-lints, docs, no-tokio,
+  cargo-deny, soak, loom, Miri, instruction and ci-gate checks. Retained core's
+  portable timer benchmark. All-feature Linux tests select the timerfd fallback;
+  default tests select epoll_pwait2 where available.
+- Added actual Callgrind workload functions: idle waits, notifier consumption,
+  timer cancel/close and an independent integer control. Each asserts execution.
+  Migrated the iai-callgrind gate to its maintained successor Gungraun 0.19.4;
+  retained cgu=1, v6 summaries, three fresh processes, positive counts, exact
+  controls and the 3% ceiling. No baseline was invented.
+- Native harness dependencies are target-gated away from WASM; portable SQL/Mongo
+  tests now use their crate's host-supplied browser clock. PostgreSQL SCRAM wire
+  fixtures use portable SHA256 rather than requiring a native TLS provider.
+  Native MongoDB test entropy uses rustls's provider instead of `/dev/urandom`.
+
+## No-spin contract and core fix
+
+`turnloop-contract::no_spin` opens a real registered TCP pair and leaves a read
+pending. It measures twenty expiries each at **500 us, 2 ms and 10 ms**, asserts
+one timer completion with the correct token/handle per expiry, no early expiry,
+**at most two turns and one zero-event OS wait per expiry**, and actual wait
+execution. The idle read must remain cancellable after all sixty expiries.
+
+The new test initially failed at 500 us: cached readiness ending in EAGAIN consumed
+a turn without waiting, and `Driver::turn` forced zero timeout whenever cached
+work existed. The fix preserves the exact timeout, attempts cached I/O first, and
+uses the one permitted OS wait when no completion or runnable work remains.
+Queued completions still avoid waiting; output capacity remains bounded. Native
+allocation, cancellation, liveness, fairness, timer and descriptor tests pass.
+
+Backend contract revision 2 adds `PollInfo::zero_event_waits`, forwarded through
+`TurnInfo`. The counter records **raw OS results**, including interrupted waits;
+it is not inferred from the number of user completions. kqueue and epoll implement
+it. Wave-2 providers must populate it when they implement the shared contracts.
+Kqueue execution PASS; epoll and forced timerfd compilation PASS, runtime UNRUN.
+
+## Verification commands and outcomes
+
+[The complete verification command ledger](integration-commands.md) records each
+invocation and exit status, including intermediate failures and deliberate failure
+probes. Full local output is in `.tools/verification/`. `verify-integration.py`
+passes through each command's exit status. An ignored or unbuilt test is never
+counted as executed.
+
+| Command / group | Final result |
+|---|---|
+| `cargo fmt --check` and `cargo fmt --all` | PASS |
+| `cargo clippy --workspace --all-targets -- -D warnings -D clippy::undocumented_unsafe_blocks` | PASS; all-features variant also PASS |
+| Same all-features Clippy with `--target x86_64-unknown-linux-gnu` | PASS, including no-spin contract and Gungraun benchmark compilation; execution UNRUN |
+| Same with `--target wasm32-wasip2` and `wasm32-unknown-unknown` | PASS, whole workspace/all targets; WASM test execution UNRUN |
+| Same with `--target x86_64-pc-windows-msvc` | FAIL in ring C compilation: `fatal error: 'assert.h' file not found`; full protocol test-target checking UNRUN without Windows SDK headers |
+| `cargo clippy --workspace --lib --target x86_64-pc-windows-msvc -- -D warnings` | PASS for every library |
+| Windows `cargo clippy -p turnloop -p turnloop-contract -p turnloop-bench --all-targets ...` | PASS, including strict unsafe-comment lint; Windows execution UNRUN |
+| `cargo +stable check --workspace` and `--all-targets --all-features` | PASS on installed 1.97.1 |
+| `cargo test --workspace` | PASS; ten real-server tests ignored by default, not counted as executed |
+| `python3 scripts/ci/run-tests.py native` | PASS: default and all features, with contract helper independently required to run positive tests; 25 contract tests per configuration |
+| `cargo test -p turnloop-contract idle_socket_timers_do_not_spin -- --nocapture` | Initial FAIL reproduced the bug; final PASS with unchanged numerical limits |
+| `python3 scripts/ci/run-tests.py loom` | PASS, all five production models |
+| `env MIRI_SYSROOT=.tools/miri-sysroot cargo miri setup` then `env MIRI_SYSROOT=.tools/miri-sysroot python3 scripts/ci/run-tests.py miri` | PASS, timer and generation-table suites; initial default cache location was sandbox-denied, and relative-path handling was fixed |
+| `env RUSTDOCFLAGS=-Dwarnings cargo doc --workspace --all-features --no-deps` | PASS |
+| `scripts/ci/no-tokio.sh` | PASS, eight targets × default/all features, normal/build/dev dependencies; no exceptions |
+| `python3 scripts/ci/soak.py` | PASS, 193 locked registry versions, timestamps and checksums |
+| `cargo deny check` with `.tools/bin` on PATH | PASS advisories, bans, licenses, sources; unavoidable transitive-major duplicates remain warnings |
+| `python3 scripts/ci/install-tools.py actionlint zizmor shellcheck cargo-deny` | PASS, official archives and committed SHA256 pins |
+| `python3 scripts/ci/lint-workflows.py` with `.tools/bin` on PATH | PASS: exact queue-policy validation, all supported actionlint checks, zizmor and ShellCheck |
+| `.tools/bin/actionlint -color` | FAIL only on the two `concurrency.queue` keys unsupported by v1.7.12; the inherited wrapper validates those exact expressions before filtering only that parser diagnostic |
+| `python3 -W error -m unittest discover -s scripts/ci -p 'test_*.py' -v` | PASS, 15 tests (13 gate tests plus failed-start cleanup and Docker-wrapper ownership/path tests) |
+| `python3 -m py_compile scripts/test-servers.py` | PASS |
+| Standalone spike Clippy: IOCP Windows, p2 WASI, p3 WASI using nightly-2026-09-07, web with all features | PASS after rename; all spike runtime tests in this session UNRUN |
+| `cargo publish --dry-run --allow-dirty -p turnloop` and `--locked` for each protocol crate | PASS for all six, including packaged-library recompilation; upload explicitly aborted by dry run |
+| `python3 scripts/ci/release.py order` | PASS, six packages, helpers excluded |
+| `python3 scripts/ci/instructions.py` | FAIL precondition: requires Ubuntu 24.04 x86_64/Valgrind; measurements and regression comparison UNRUN |
+| `git diff --check` | PASS after fixing whitespace |
+
+Additional read-only verification: `rustc +stable --version`; `cargo info` and
+installed manifests for the benchmark/encoding migration; upstream release API,
+changelog, runner v6 schema and environment-name inspection; SHA256 verification
+of the downloaded official Linux Gungraun 0.19.4 archive
+(`f88194dac725ef0599b2812396518e9bd74aadaf75f5baf78df91ddb9eec67d3`); crates.io API
+checks for all six names (all unpublished); `rg` rename/dependency/env-var checks;
+workspace/package inventory and Git status/diff inspection. All PASS unless a
+specific failure is listed below. Initial `.tools` and two guessed source paths
+did not exist; subsequent reads used discovered paths. `DESIGN.md` and `LANES.md`
+were read completely, and all lane reports/manifests were inspected for handoff
+requirements and outstanding work.
+
+### Real-server commands
+
+| Command | Result |
+|---|---|
+| `scripts/test-servers.py run cargo test --workspace -- --include-ignored` | Command FAIL at PostgreSQL initdb; **all test bodies UNRUN (sandbox)** for this full invocation |
+| `scripts/test-servers.py --services postgres run true` | Initialization FAIL: `FATAL: could not create shared memory segment: Operation not permitted`, failed `shmget`; PostgreSQL tests **UNRUN (sandbox)** |
+| `scripts/test-servers.py --services mysql run true` | Initialization FAIL, exit 2 with fatal-signal stack in `memory::Aligned_atomic`, `Shared_spin_lock`, `delegates_init`; MySQL tests **UNRUN (sandbox)** |
+| `scripts/test-servers.py --services redis,mongodb,smtp run cargo test -p turnloop-redis -p turnloop-mongodb -p turnloop-smtp -- --include-ignored --test-threads=1` | PASS twice, including final shared crypto/base64/PEM/supervisor changes. Four external-service tests execute, alongside the ordinary protocol suites |
+| `scripts/test-servers.py --services smtp start` then `scripts/test-servers.py stop` | PASS, independent processes, private supervisor shutdown |
+| `scripts/test-servers.py --services mongodb start` then `scripts/test-servers.py stop` | PASS when serialized; all five recorded private ports closed |
+| `scripts/test-servers.py --services redis run false` | Expected exit 1 from the deliberate failing child; private cluster was started and cleaned up, state files absent afterward |
+| CI `scripts/test-servers.py --ci-services run python3 scripts/ci/run-tests.py protocol` | **UNRUN**: no Docker/Linux host; CI retains this required command |
+
+Earlier failed fixture probes are preserved in the ledger: cleanup initially
+assumed an SMTP PID existed after SQL initialization failed; fixed and covered by
+an adversarial test. A lifecycle probe was inadvertently started while another
+fixture run still owned the state: start correctly refused, and the separately
+issued cleanup timed out after the owner had already stopped MongoDB. Sequential
+MongoDB start/stop was then verified. Lifecycle commands must be serialized within
+a checkout. Final inspection found no private server state or SMTP control socket.
+
+One loaded native CI-wrapper run failed the existing timer-precision median gate:
+`systematic timer floor: median lateness 672.208 us` (required <500 us), while
+compilation/server work was also active. The unchanged complete default/all-feature
+wrapper passed after those operations finished. No timing threshold, sample count,
+assertion or test was weakened; scheduler sensitivity remains a practical risk.
+
+Other corrected intermediate failures: inherited safety-comment placement and
+Clippy style diagnostics under the unified edition/MSRV; RustCrypto API changes
+(`KeyInit`, MD5 formatting); an incorrect temporary assumption about PBKDF2's
+return type; portable test clock/TLS imports; the mock Docker test's macOS
+`/var` versus `/private/var` path alias; one trailing-whitespace edit and a final SQL-constant formatting syntax error
+(caught by the fixture tests, restored, and all 15 automation tests rerun PASS). The ledger
+keeps their original FAIL entries and later PASS commands.
+
+## Dependencies chosen
+
+All workspace consumers inherit one definition per shared dependency. The final
+lock has one rustls, sha1, sha2, hmac, md-5, pbkdf2, flate2 and base64 version.
+
+| Dependency | Locked version | Reason |
+|---|---|---|
+| libc | 0.2.175 | Retain core's reviewed Unix FFI baseline |
+| bytes | 1.12.1 | Shared retained wire buffers |
+| postgres-protocol | 0.6.12 | Lane's pinned sans-IO codec/auth implementation |
+| mysql_common | 0.38.2 | Lane's pinned codec/auth, default features off |
+| bson | 3.1.0 | Lane's pinned raw/serde codec, default features off |
+| rustls | 0.23.44 | Shared native test TLS with ring/std/tls12; 0.23.45 was inside soak |
+| base64 | 0.22.1 | Shared by DB codecs and SMTP/Mongo authentication |
+| email-encoding | 0.4.1 | Explicit compatible lettre helper pin keeps base64 unified; 0.4.2 introduces base64 0.23 |
+| lettre | 0.11.23 | Builder-only MIME implementation; no async transport |
+| sha1 / sha2 / md-5 | 0.11.0 each | Unified with upstream DB codecs; real Mongo auth and vectors pass |
+| hmac / pbkdf2 | 0.13.0 each | Same RustCrypto generation as the shared digests |
+| stringprep | 0.1.5 | SCRAM SASLprep |
+| flate2 | 1.1.10 | Pure-Rust compression with retained buffers |
+| serde_json | 1.0.151 | Protocol JSON fixtures |
+| getrandom | Direct 0.4.3 | Browser entropy feature unification for SQL/BSON upstream APIs |
+| loom | 0.7.2 | Existing production model instrumentation |
+| gungraun | 0.19.4 | Maintained iai-callgrind successor; Linux-only benchmark dev dependency |
+
+`getrandom` 0.2/0.3/0.4, rand generations and proc-macro syn generations remain
+transitively necessary because ring/BSON/DB codecs/macros require incompatible
+major versions. They are not independently selected duplicate workspace APIs.
+No registry forks, dependency patches, soak override or runtime-ban exception was
+introduced. Newer bitflags, cc, crc32fast, hybrid-array, smallvec, tinyvec, uuid and
+zerocopy releases were explicitly excluded by the seven-day resolver.
+
+The first audit rejected unmaintained `rustls-pemfile`
+([RUSTSEC-2025-0134](https://rustsec.org/advisories/RUSTSEC-2025-0134)); it was removed
+in favor of rustls-pki-types' maintained PEM API, through rustls's re-export.
+Adding the originally prescribed iai-callgrind 0.16.1 exposed unmaintained
+`proc-macro-error2` ([RUSTSEC-2026-0173](https://rustsec.org/advisories/RUSTSEC-2026-0173)).
+The [upstream 0.19.4 changelog](https://github.com/gungraun/gungraun/blob/v0.19.4/CHANGELOG.md)
+records the maintained replacement. The gate, installer checksum and benchmark
+pin were migrated together. The audited permissive **0BSD** license was added for
+lettre's quoted_printable dependency; no advisory was ignored.
+
+## Publish order and bootstrap
+
+All packages currently use **0.1.0**. The metadata-derived order is:
+
+1. `turnloop`
+2. `turnloop-mongodb`
+3. `turnloop-mysql`
+4. `turnloop-postgres`
+5. `turnloop-redis`
+6. `turnloop-smtp`
+
+The protocol engines currently have no workspace path dependencies, so their
+relative order is interchangeable. Each dry run packaged and rebuilt its library;
+**none used `--no-verify`**. `--allow-dirty` is necessary while the integrator owns
+commits. Neither `turnloop-contract` nor `turnloop-bench` is published.
+
+Read-only crates.io API checks returned 404 for all six names on 2026-09-14:
+**every name needs the first-publish/Trusted Publisher bootstrap in RELEASING.md**.
+That action, semver comparison against an existing release, actual uploads,
+tags/releases, OIDC exchange and owner/repository settings are UNRUN. The dry runs
+do not claim any of those actions occurred.
+
+## Pending CI gates and exact follow-ups
+
+| Gate | Follow-up; current status |
+|---|---|
+| Windows native contracts | Wave 2: implement production IOCP Backend and instantiate the unchanged shared tests, including no-spin. Run `python3 scripts/ci/run-tests.py native` on Windows. Required job is retained; runtime **UNRUN** |
+| WASI 0.2/0.3 contracts | Integrate providers and nonzero shared suites; solve persistent p3 bounded waitable-set stepping. Run `python3 scripts/ci/run-tests.py wasi --target wasm32-wasip2` and the p3 equivalent. Required jobs are explicitly pending; shared execution **UNRUN** |
+| Browser/Node contracts | Add actual wasm-bindgen-test targets plus `web-tests`/`node-tests` metadata. Run `python3 scripts/ci/run-tests.py web` (Chrome AND Firefox) and `node`. Required job retained; shared execution **UNRUN** |
+| Instruction baseline | On Ubuntu 24.04 x86_64 install pinned Gungraun runner and Valgrind; run `python3 scripts/ci/instructions.py --record .tools/instruction-candidates.json`, review three rounds and controls, commit `crates/turnloop-bench/benchmarks/instructions.json`. Then run the gate without `--record`. No measured baseline or comparison exists: **UNRUN** |
+| SQL/full protocol services | Run the full local command outside the sandbox, and run the Docker CI job. SQL bodies, independent CI TLS probes and Docker cleanup are **UNRUN** here |
+| Windows full cross-test lint | Supply real Windows SDK headers for ring or use the native Windows runner; no test-target cfg was removed to hide this limitation |
+| Raw actionlint queue support | Upgrade to a checksum-pinned official release that understands `concurrency.queue`, then remove only the existing compatibility filter. Strict queue validation remains active |
+| ci-gate/release workflow | Run on GitHub after missing provider/baseline inputs land. The fan-in rejects failures, cancellations and every skip except the already documented optional self-hosted Windows job. No new skip exemptions |
+
+A real GitHub run, Linux x86_64/arm64, Windows, FreeBSD/mobile/Android runtime
+validation, Wasmtime/browser/Node shared contracts, instruction measurements,
+long soak/fault campaigns and Perry migration/A-B measurements are all **UNRUN**.
+No standalone spike or cross-compilation result substitutes for those tests.
+
+## Remaining lane questions and spec clarifications
+
+- **Core:** preserve explicit-release pooled leases; asynchronous detach may return
+  WouldBlock until cancellation is delivered; external integration keeps the
+  notifier logically parked. First shared-pool configuration wins. Host async
+  jobs/DNS on WASM, processes/signals/TTY/pipes/files APIs, executor and Perry ABI
+  adapters are later work. Confirm these API clarifications and collect Perry
+  allocation/instruction/fault/soak evidence. Revision-2 wait counters must be
+  wired into every new backend.
+- **Windows:** decide APC callbacks versus feature-detected NT timer packets and
+  minimum supported Windows; IOCP association prevents naive detach/reassociate;
+  define socket/named-pipe transfer and fatal teardown policy. Parent child-stdio
+  ends should be overlapped, child ends synchronous. Deferred CTRL_CLOSE cleanup
+  is best effort. All 18 spike runtime tests, ETW/cycle/allocation/leak and precision
+  distributions remain UNRUN; replace draft linear lookup/mutex queues at integration.
+- **WASM:** allocation-free p2 storage remains unresolved; p3 convenience async
+  collection is not bounded stepping. Browser host allocation accounting,
+  cancellation lifetime and worker scheduling need explicit contracts. The lane
+  proposes distinguishing nanosecond deadline representation from runtime wake
+  precision, and documenting WASI terminal detection rather than terminal size.
+  Inline blocking jobs would violate D1/D7; use Unsupported or host async requests.
+- **SQL:** run all six real-server bodies outside the sandbox. MySQL 9 cannot test
+  native-password auth; add a MySQL 8.4 instance with that plugin for real-server
+  coverage (wire coverage exists). Pin Node/pg/mysql2 compatibility versions and
+  finish JS conversions, charset/date/error mappings, prepare caching and adapters.
+  Preserve borrowed-buffer and terminal parser-error/abort ownership rules.
+- **Redis/SMTP:** choose ioredis version/retry policy; exactly-once completion does
+  not imply exactly-once replayed Redis execution. Streaming RESP3/MIME, host result
+  conversions, full pooling/topology policy and sustained failover remain open.
+- **MongoDB:** agree on shared time/token/transport interfaces; complete the
+  Node/Perry facade, full official CRUD/transaction/change-stream suites and
+  backpressure-v2. Selected SDAM/selection fixtures and real-server tests do not
+  establish full Node driver parity or allocation freedom for the entire facade.
+- **CI/release:** FreeBSD nightly, mobile runners, long-duration native churn,
+  exact-SHA hosted release/OIDC behavior and owner setup still need execution or
+  definitions. No release baseline or first upload exists.
+- **HTTP/TLS/WebSocket:** lane still outstanding; no replacement crates were
+  created here. Merge it later, unify its dependencies/metadata and run these same
+  gates before release.
+
+No DESIGN.md rule was relaxed. The only implementation-driven contract addition
+is the observable empty-wait counter; the fixture convention and maintained
+benchmark-tool migration are documented integration decisions. Outstanding lane
+spec proposals above are recorded for review, not silently adopted.

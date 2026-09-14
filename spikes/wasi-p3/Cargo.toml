@@ -1,0 +1,17 @@
+[package]
+name = "turnloop-wasi-p3-spike"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+wasip3 = "=0.8.0"
+
+[profile.release]
+codegen-units = 1
+lto = true
+
+[lib]
+crate-type = ["cdylib"]

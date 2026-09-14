@@ -1,0 +1,31 @@
+[package]
+name = "turnloop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["event-loop", "networking", "sans-io"]
+categories = ["network-programming", "asynchronous"]
+documentation = "https://docs.rs/turnloop"
+description = "An embeddable event-loop driver, turned by its host"
+
+[features]
+default = []
+timer-btree = []
+epoll-timerfd = []
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[lints]
+workspace = true
+
+[target.'cfg(loom)'.dependencies]
+loom.workspace = true
+
+[package.metadata.turnloop-ci]
+role = "core"
+loom-filters = ["models"]
+miri-filters = ["timer::tests", "table::tests"]

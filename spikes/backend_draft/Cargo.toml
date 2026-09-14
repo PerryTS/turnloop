@@ -1,0 +1,11 @@
+[package]
+name = "turnloop-wasm-backend-draft"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[target.'cfg(all(target_os = "wasi", target_env = "p2"))'.dependencies]
+turnloop-wasi-p2-spike = { path = "../wasi-p2" }
+wasi = "=0.14.7"

@@ -2,3 +2,11 @@
 **/target
 *.swp
 .DS_Store
+.tools/
+**/node_modules
+**/pkg
+__pycache__/
+**/pkg/
+**/node_modules/
+
+/.tools/

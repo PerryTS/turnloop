@@ -1,0 +1,17 @@
+[workspace]
+members = ["protocols/turnloop-postgres", "protocols/turnloop-mysql"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT"
+
+[workspace.dependencies]
+bytes = "1.11"
+postgres-protocol = "=0.6.12"
+mysql_common = { version = "=0.38.2", default-features = false }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+

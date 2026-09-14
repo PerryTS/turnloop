@@ -1,10 +1,9 @@
 # Implementation lanes (M1/M2)
 
-Each lane is a separate clone under `/Users/amlug/projects/perry/windlass-lanes/<lane>` on branch `lane/<lane>`.
-The integrator (the orchestrating Claude session) merges lanes into `main` of `/Users/amlug/projects/perry/windlass`.
-The GitHub repository is `github.com/PerryTS/turnloop` (private for now); only the integrator pushes.
-
-Note: the project was renamed from the working name `windlass` to `turnloop` on 2026-09-14. The local directories (`windlass/`, `windlass-lanes/`) and the first-wave crate names (`crates/windlass*`) keep the old name until the running lanes finish; the integrator renames them when merging.
+Each lane works in its own clone. Only the integrator merges into the public
+[PerryTS/turnloop repository](https://github.com/PerryTS/turnloop). Read other
+clones when needed; never write to them. Git commits are made by the integrator
+when the working sandbox exposes Git metadata read-only.
 
 | lane | owns | first deliverable |
 |---|---|---|

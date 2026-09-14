@@ -1,0 +1,14 @@
+[package]
+name = "turnloop-wasi-p2-spike"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+wasi = "=0.14.7"
+
+[profile.release]
+codegen-units = 1
+lto = true
