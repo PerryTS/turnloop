@@ -235,3 +235,7 @@ socket paths for separate stop invocations; it never uses a default instance.
 - [MySQL native-plugin removal](https://dev.mysql.com/doc/mysql-security-excerpt/8.0/en/native-pluggable-authentication.html),
   [MySQL handshake protocol](https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_connection_phase_packets_protocol_handshake_response.html),
   [PostgreSQL kernel resources](https://www.postgresql.org/docs/16/kernel-resources.html).
+
+## Integrator verification
+
+- 2026-09-14, integrator, outside the Codex sandbox (macOS arm64): `python3 scripts/sql-servers.py run cargo test --workspace -- --include-ignored --test-threads=1` — **PASS, 29 tests, including all 6 real-server tests** (PostgreSQL 16: clear/MD5/SCRAM/TLS users, COPY, notices; MySQL 9.6: caching_sha2 fast/full/RSA, TLS-required user). The sandbox failures (PostgreSQL `shmget` denied, MySQL init segfault) were sandbox limits, not code defects; the half-initialized `.tools/mysqldata` from the sandbox attempt was moved aside first. `cargo tree -i tokio` is empty for x86_64-unknown-linux-gnu and wasm32-wasip2.
