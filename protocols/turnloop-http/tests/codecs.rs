@@ -430,3 +430,99 @@ fn gzip_deflate_br_zstd_decoding() {
         assert_eq!(out, body);
     }
 }
+
+#[test]
+fn vendored_hpack_interop_corpus() {
+    use std::io::Read;
+    let mut corpus = String::new();
+    flate2::read::GzDecoder::new(include_bytes!("hpack-corpus/stories.txt.gz").as_slice())
+        .read_to_string(&mut corpus)
+        .unwrap();
+    let mut decoder = hpack::Decoder::new(4096, 1 << 20);
+    let mut actual = Vec::new();
+    let mut expected = Vec::new();
+    let mut story = "";
+    let mut count = 0;
+    for line in corpus.lines() {
+        if let Some(name) = line.strip_prefix("S ") {
+            story = name;
+            decoder = hpack::Decoder::new(4096, 1 << 20);
+        } else if let Some(wire) = line.strip_prefix("C ") {
+            decoder
+                .decode(&hex(wire), &mut actual)
+                .unwrap_or_else(|e| panic!("{story} case {count}: {e}"));
+            expected.clear();
+        } else if let Some(header) = line.strip_prefix("H ") {
+            let (n, v) = header.split_once(' ').unwrap();
+            expected.push(Header {
+                name: String::from_utf8(hex(n)).unwrap(),
+                value: hex(v),
+            });
+        } else if line == "E" {
+            assert_eq!(actual, expected, "{story}, case {count}");
+            count += 1;
+        } else {
+            panic!("bad fixture")
+        }
+    }
+    assert_eq!(count, 3754, "corpus cases must all run");
+}
+
+#[test]
+fn expect_continue_streaming_abort_and_reuse() {
+    let now = Instant::now();
+    let mut connection = Http1Connection::new(Default::default());
+    let mut head = Request::new("http://localhost/upload", "POST")
+        .unwrap()
+        .head(false);
+    head.headers.push(Header::new("expect", "100-continue"));
+    connection
+        .start(
+            &head,
+            BodyLength::Known(4),
+            Some(now + Duration::from_secs(5)),
+            Some(now + Duration::from_secs(1)),
+        )
+        .unwrap();
+    assert!(!connection.can_send_body());
+    assert!(connection.send_body(b"body").is_err());
+    let n = connection.output().len();
+    connection.consume_output(n).unwrap();
+    assert!(
+        connection
+            .start(&head, BodyLength::Empty, None, None)
+            .is_err()
+    );
+    connection
+        .receive(b"HTTP/1.1 100 Continue\r\n\r\n")
+        .unwrap();
+    assert!(connection.can_send_body());
+    connection.send_body(b"bo").unwrap();
+    connection.send_body(b"dy").unwrap();
+    connection.finish_body(&[]).unwrap();
+    assert_eq!(connection.output(), b"body");
+    connection.consume_output(4).unwrap();
+    connection
+        .receive(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n")
+        .unwrap();
+    assert_eq!(connection.receive(b"OK").unwrap().consumed, 2);
+    connection.receive(&[]).unwrap();
+    assert_eq!(connection.poll_completion(), Some(Completion::Success));
+    assert_eq!(connection.poll_completion(), None);
+    assert!(connection.reusable());
+    connection
+        .start(&head, BodyLength::Known(4), None, Some(now))
+        .unwrap();
+    connection.handle_timeout(now);
+    assert!(connection.can_send_body());
+    connection.abort();
+    assert_eq!(
+        connection.poll_completion().unwrap(),
+        Completion::Error(turnloop_http::Error::new(
+            "UND_ERR_ABORTED",
+            "Request aborted"
+        ))
+    );
+    assert_eq!(connection.poll_completion(), None);
+    assert!(!connection.reusable());
+}

@@ -276,7 +276,7 @@ fn serve_h2(mut socket: TcpStream, total: usize) {
                 )
                 .unwrap();
             assert_eq!(engine.send_data(stream, b"native-h2", true).unwrap(), 9);
-            count += 1; eprintln!("h2 served {count}/{total}");
+            count += 1;
         }
         input.drain(..consumed);
         flush_h2(&mut engine, &mut socket);

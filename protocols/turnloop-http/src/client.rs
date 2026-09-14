@@ -537,3 +537,202 @@ pub fn transport_error(kind: std::io::ErrorKind) -> Error {
         _ => Error::new("UND_ERR_SOCKET", "socket error"),
     }
 }
+
+/// A single non-pipelined HTTP/1 client connection. All byte buffers are reused.
+/// The host submits output, acknowledges completion, and supplies received bytes.
+/// Do not mutate the connection while a completion-layer write borrows `output()`.
+pub struct Http1Connection {
+    decoder: crate::http1::Decoder,
+    encoder: Option<crate::http1::Encoder>,
+    output: Vec<u8>,
+    output_pos: usize,
+    lifecycle: Lifecycle,
+    active: bool,
+    used: bool,
+    upload_finished: bool,
+    close_requested: bool,
+    expect_deadline: Option<Instant>,
+    waiting_continue: bool,
+}
+impl Http1Connection {
+    pub fn new(limits: crate::http1::Limits) -> Self {
+        Self {
+            decoder: crate::http1::Decoder::new(crate::http1::Mode::Response, limits),
+            encoder: None,
+            output: Vec::new(),
+            output_pos: 0,
+            lifecycle: Lifecycle::default(),
+            active: false,
+            used: false,
+            upload_finished: false,
+            close_requested: false,
+            expect_deadline: None,
+            waiting_continue: false,
+        }
+    }
+    pub fn start(
+        &mut self,
+        head: &Head,
+        length: crate::http1::BodyLength,
+        headers_deadline: Option<Instant>,
+        continue_deadline: Option<Instant>,
+    ) -> Result<()> {
+        if self.active || !self.output().is_empty() || self.used && !self.reusable() {
+            return Err(Error::new(
+                "UND_ERR_NOT_SUPPORTED",
+                "HTTP/1 pipelining is disabled or connection closed",
+            ));
+        }
+        let encoder = crate::http1::Encoder::start(head, length, &mut self.output)?;
+        if self.used {
+            self.decoder.reset()?;
+        }
+        self.decoder.response_to(&head.method);
+        self.encoder = Some(encoder);
+        self.active = true;
+        self.used = true;
+        self.upload_finished = false;
+        self.close_requested = head.token("connection", "close");
+        self.lifecycle = Lifecycle::default();
+        self.lifecycle.transition(Phase::Headers, headers_deadline);
+        self.waiting_continue = head.token("expect", "100-continue")
+            && !matches!(
+                length,
+                crate::http1::BodyLength::Empty | crate::http1::BodyLength::Known(0)
+            );
+        self.expect_deadline = if self.waiting_continue {
+            continue_deadline
+        } else {
+            None
+        };
+        Ok(())
+    }
+    pub fn can_send_body(&self) -> bool {
+        self.active
+            && !self.waiting_continue
+            && !self.upload_finished
+            && self.lifecycle.terminal.is_none()
+    }
+    pub fn send_body(&mut self, bytes: &[u8]) -> Result<()> {
+        if !self.can_send_body() {
+            return Err(Error::new(
+                "UND_ERR_INVALID_ARG",
+                "request body is not writable",
+            ));
+        }
+        self.encoder.as_mut().unwrap().body(bytes, &mut self.output)
+    }
+    pub fn finish_body(&mut self, trailers: &[Header]) -> Result<()> {
+        if !self.can_send_body() {
+            return Err(Error::new(
+                "UND_ERR_INVALID_ARG",
+                "request body is not writable",
+            ));
+        }
+        self.encoder
+            .as_mut()
+            .unwrap()
+            .finish(trailers, &mut self.output)?;
+        self.upload_finished = true;
+        Ok(())
+    }
+    pub fn output(&self) -> &[u8] {
+        &self.output[self.output_pos..]
+    }
+    pub fn consume_output(&mut self, n: usize) -> Result<()> {
+        if n > self.output().len() {
+            return Err(Error::new(
+                "UND_ERR_INVALID_ARG",
+                "write acknowledgement exceeds output",
+            ));
+        }
+        self.output_pos += n;
+        if self.output_pos == self.output.len() {
+            self.output.clear();
+            self.output_pos = 0;
+        }
+        Ok(())
+    }
+    pub fn receive<'a>(&mut self, input: &'a [u8]) -> Result<crate::http1::Step<'a>> {
+        if !self.active || self.lifecycle.terminal.is_some() {
+            return Err(Error::new("UND_ERR_CLOSED", "no active request"));
+        }
+        let step = match self.decoder.receive(input) {
+            Ok(step) => step,
+            Err(e) => {
+                self.fail(e);
+                return Err(e);
+            }
+        };
+        match &step.event {
+            Some(crate::http1::Event::Informational(h)) if h.status == 100 => {
+                self.waiting_continue = false;
+                self.expect_deadline = None;
+            }
+            Some(crate::http1::Event::Head(_)) => {
+                self.expect_deadline = None;
+                self.waiting_continue = false;
+                if !self.upload_finished {
+                    self.close_requested = true;
+                    self.upload_finished = true;
+                }
+                self.lifecycle.transition(Phase::Body, None);
+            }
+            Some(crate::http1::Event::End | crate::http1::Event::Upgrade) => {
+                self.lifecycle.finish(Completion::Success);
+                self.active = false;
+            }
+            _ => {}
+        }
+        Ok(step)
+    }
+    /// Refresh body timeout on progress using host-supplied time.
+    pub fn set_body_deadline(&mut self, deadline: Option<Instant>) {
+        self.lifecycle.transition(Phase::Body, deadline);
+    }
+    pub fn eof(&mut self) -> Result<()> {
+        match self.decoder.eof() {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.fail(e);
+                Err(e)
+            }
+        }
+    }
+    pub fn next_timeout(&self) -> Option<Instant> {
+        self.lifecycle
+            .next_timeout()
+            .into_iter()
+            .chain(self.expect_deadline)
+            .min()
+    }
+    pub fn handle_timeout(&mut self, now: Instant) {
+        self.lifecycle.handle_timeout(now);
+        if self.lifecycle.terminal.is_some() {
+            self.active = false;
+            self.close_requested = true;
+            self.expect_deadline = None;
+        } else if self.expect_deadline.is_some_and(|d| d <= now) {
+            self.waiting_continue = false;
+            self.expect_deadline = None;
+        }
+    }
+    pub fn abort(&mut self) {
+        self.lifecycle.abort();
+        self.active = false;
+        self.close_requested = true;
+        self.expect_deadline = None;
+    }
+    pub fn fail(&mut self, error: Error) {
+        self.lifecycle.finish(Completion::Error(error));
+        self.active = false;
+        self.close_requested = true;
+        self.expect_deadline = None;
+    }
+    pub fn poll_completion(&mut self) -> Option<Completion> {
+        self.lifecycle.poll()
+    }
+    pub fn reusable(&self) -> bool {
+        !self.active && !self.close_requested && self.lifecycle.delivered && self.decoder.reusable()
+    }
+}
