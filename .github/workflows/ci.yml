@@ -1,0 +1,351 @@
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions: {}
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  queue: ${{ github.event_name == 'pull_request' && 'single' || 'max' }}
+defaults:
+  run:
+    shell: bash
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: '1'
+jobs:
+  workflow-lint:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14'
+      - name: Install checksum-pinned linters
+        run: python3 scripts/ci/install-tools.py actionlint zizmor shellcheck
+      - name: Lint automation and exercise gate failures
+        run: |
+          python3 scripts/ci/lint-workflows.py
+          python3 -m unittest discover -s scripts/ci -p 'test_*.py' -v
+  lint-native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, windows-2025]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust
+        run: rustup toolchain install nightly-2026-08-20 --profile minimal --component rustfmt,clippy
+      - name: Formatting and unsafe-aware Clippy
+        run: |
+          cargo +nightly-2026-08-20 fmt --all --check
+          cargo +nightly-2026-08-20 clippy --locked --workspace --all-targets -- -D warnings -D clippy::undocumented_unsafe_blocks
+          cargo +nightly-2026-08-20 clippy --locked --workspace --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks
+      - name: Documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo +nightly-2026-08-20 doc --locked --workspace --all-features --no-deps
+      - name: Resolve with the pinned soak policy, then check stable
+        run: |
+          cargo +nightly-2026-08-20 metadata --locked --all-features --format-version 1 > /dev/null
+          rustup toolchain install stable --profile minimal
+          cargo +stable check --locked --workspace --all-targets --all-features
+  lint-wasm:
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [wasm32-wasip2, wasm32-unknown-unknown]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 30
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust
+        run: rustup toolchain install nightly-2026-08-20 --profile minimal --component rustfmt,clippy
+      - name: Cross-target Clippy and stable
+        run: |
+          rustup target add --toolchain nightly-2026-08-20 "$TARGET"
+          cargo +nightly-2026-08-20 clippy --locked --workspace --all-targets --target "$TARGET" --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks
+          rustup toolchain install stable --profile minimal --target "$TARGET"
+          cargo +stable check --locked --workspace --all-targets --all-features --target "$TARGET"
+  test-native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, windows-2025]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14'
+      - name: Install pinned Rust
+        run: rustup toolchain install nightly-2026-08-20 --profile minimal --component rustfmt,clippy
+      - name: Workspace and single-threaded contracts, default and all features
+        run: python3 scripts/ci/run-tests.py native
+  self-hosted-windows:
+    if: vars.SELF_HOSTED_WINDOWS == 'true'
+    # zizmor: ignore[self-hosted-runner] -- Owner-enabled, ephemeral isolated Windows runner required by the platform contract.
+    runs-on: [self-hosted, Windows, X64, turnloop-windows]
+    permissions:
+      contents: read
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14'
+      - name: Install pinned Rust
+        run: rustup toolchain install nightly-2026-08-20 --profile minimal --component rustfmt,clippy
+      - name: Native Windows lint and contracts
+        run: |
+          cargo +nightly-2026-08-20 clippy --locked --workspace --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks
+          python3 scripts/ci/run-tests.py native
+  wasi:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: wasm32-wasip2
+            toolchain: nightly-2026-08-20
+          - target: wasm32-wasip3
+            toolchain: nightly-2026-09-07
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 40
+    env:
+      TARGET: ${{ matrix.target }}
+      TOOLCHAIN: ${{ matrix.toolchain }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14'
+      - name: Install the backend's pinned toolchain and Wasmtime 46
+        run: |
+          rustup toolchain install "$TOOLCHAIN" --profile minimal --component clippy --target "$TARGET"
+          bash scripts/ci/install-wasmtime.sh
+      - name: Lint and run actual WASI contracts
+        run: |
+          cargo +"$TOOLCHAIN" clippy --locked --workspace --all-targets --all-features --target "$TARGET" -- -D warnings -D clippy::undocumented_unsafe_blocks
+          python3 scripts/ci/run-tests.py wasi --target "$TARGET"
+  web:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14'
+      - name: Install pinned Rust
+        run: rustup toolchain install nightly-2026-08-20 --profile minimal --component rustfmt,clippy
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '26.5.1'
+          package-manager-cache: false
+      - name: Prepare browser test tools
+        run: |
+          rustup target add --toolchain nightly-2026-08-20 wasm32-unknown-unknown
+          python3 scripts/ci/install-tools.py wasm-pack
+          google-chrome --version
+          firefox --version
+      - name: Chrome and Firefox contracts
+        run: python3 scripts/ci/run-tests.py web
+      - name: Node subset
+        run: python3 scripts/ci/run-tests.py node
+  protocol:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: turnloop
+          POSTGRES_USER: turnloop
+          POSTGRES_PASSWORD: turnloop # zizmor: ignore[hardcoded-container-credentials] -- Disposable CI database credential, never a repository secret.
+          POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U turnloop -d turnloop"
+          --health-interval 5s --health-timeout 5s --health-retries 30
+      mysql:
+        image: mysql:9
+        env:
+          MYSQL_DATABASE: turnloop
+          MYSQL_USER: turnloop
+          MYSQL_PASSWORD: turnloop # zizmor: ignore[hardcoded-container-credentials] -- Disposable CI database credential.
+          MYSQL_ROOT_PASSWORD: turnloop-root # zizmor: ignore[hardcoded-container-credentials] -- Disposable CI database credential.
+        ports: ['3306:3306']
+        options: >-
+          --health-cmd "mysql --host=127.0.0.1 --user=turnloop --password=turnloop --execute 'SELECT 1'"
+          --health-interval 5s --health-timeout 5s --health-retries 60
+      redis:
+        image: redis:8
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 30
+      mongo:
+        image: mongo:8
+        env:
+          MONGO_INITDB_ROOT_USERNAME: turnloop
+          MONGO_INITDB_ROOT_PASSWORD: turnloop # zizmor: ignore[hardcoded-container-credentials] -- Disposable CI database credential.
+        ports: ['27017:27017']
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'quit(db.adminCommand({ping:1}).ok ? 0 : 1)'"
+          --health-interval 5s --health-timeout 5s --health-retries 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14'
+      - name: Install pinned Rust
+        run: rustup toolchain install nightly-2026-08-20 --profile minimal --component rustfmt,clippy
+      - name: Bootstrap TLS, Redis cluster, Mongo replica set and test environment
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+          MYSQL_CONTAINER: ${{ job.services.mysql.id }}
+          REDIS_CONTAINER: ${{ job.services.redis.id }}
+          MONGO_CONTAINER: ${{ job.services.mongo.id }}
+        run: bash scripts/ci/bootstrap-services.sh
+      - name: Required real-server protocol suites
+        run: python3 scripts/ci/run-tests.py protocol
+      - name: Fixture logs and cleanup
+        if: always()
+        run: bash scripts/ci/cleanup-services.sh
+  dependencies:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14'
+      - name: Install pinned Rust
+        run: rustup toolchain install nightly-2026-08-20 --profile minimal --component rustfmt,clippy
+      - name: Install audit tools and p3 compiler
+        run: |
+          python3 scripts/ci/install-tools.py cargo-deny
+          rustup toolchain install nightly-2026-09-07 --profile minimal
+      - name: Seven-day dependency soak (including already locked versions)
+        run: python3 scripts/ci/soak.py
+      - name: Zero tokio or other async runtime on every target
+        run: bash scripts/ci/no-tokio.sh
+      - name: Advisories, bans, licenses and sources
+        run: cargo +nightly-2026-08-20 deny --locked check advisories bans licenses sources
+  loom:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 30
+    env:
+      RUSTFLAGS: --cfg loom
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14'
+      - name: Install pinned Rust
+        run: rustup toolchain install nightly-2026-08-20 --profile minimal --component rustfmt,clippy
+      - name: Model-check production notifier, queue and pool paths
+        run: python3 scripts/ci/run-tests.py loom
+  miri:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14'
+      - name: Install pinned Miri
+        run: |
+          rustup toolchain install nightly-2026-08-20 --profile minimal --component miri,rust-src
+          cargo +nightly-2026-08-20 miri setup
+      - name: Check core's explicitly marked pure-Rust tests
+        run: python3 scripts/ci/run-tests.py miri
+  instructions:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14'
+      - name: Install pinned Rust
+        run: rustup toolchain install nightly-2026-08-20 --profile minimal --component rustfmt,clippy
+      - name: Install Valgrind and matching iai-callgrind runner
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes valgrind
+          python3 scripts/ci/install-tools.py iai-callgrind-runner
+      - name: Three fresh-process instruction counts against reviewed baselines
+        run: python3 scripts/ci/instructions.py
+  ci-gate:
+    name: ci-gate
+    if: always()
+    needs: [workflow-lint, lint-native, lint-wasm, test-native, self-hosted-windows, wasi, web, protocol, dependencies, loom, miri, instructions]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14'
+      - name: Reject failures, cancellations and unexpected skips
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          SELF_HOSTED_WINDOWS: ${{ vars.SELF_HOSTED_WINDOWS }}
+        run: python3 scripts/ci/ci-gate.py

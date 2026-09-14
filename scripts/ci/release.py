@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""Workspace release planning and Cargo's atomic preflight, without a crate-name list.
+
+release-plz authors version/changelog PRs. Cargo's workspace publisher stages all
+sibling packages before publishing in dependency order, keeping the soak active.
+Only the publish subcommand writes to crates.io/GitHub; it is CI-only.
+"""
+import argparse
+import hashlib
+import io
+import json
+import os
+from pathlib import Path
+import tarfile
+import time
+import urllib.error
+import urllib.request
+from common import PIN, ROOT, cargo, entrypoint, fail, get_json, metadata, publish_order, run
+
+
+def registry(name):
+    try:
+        return get_json(f'https://crates.io/api/v1/crates/{name}')
+    except urllib.error.HTTPError as error:
+        if error.code == 404:
+            return None
+        raise
+
+
+def current_commit():
+    return run(['git', 'rev-parse', 'HEAD'], capture=True).strip()
+
+
+def verify_existing(package, version, sha):
+    """Retry only publications from this exact source commit, never relabel older code."""
+    name, number = package['name'], package['version']
+    if version['yanked']:
+        fail(f'{name}@{number} is yanked; create a new version')
+    url = f'https://static.crates.io/crates/{name}/{name}-{number}.crate'
+    with urllib.request.urlopen(url, timeout=60) as response:
+        blob = response.read()
+    if hashlib.sha256(blob).hexdigest() != version['checksum']:
+        fail(f'{name}@{number}: published archive checksum mismatch')
+    with tarfile.open(fileobj=io.BytesIO(blob), mode='r:gz') as archive:
+        record = archive.extractfile(f'{name}-{number}/.cargo_vcs_info.json')
+        if record is None or json.load(record)['git']['sha1'] != sha:
+            fail(f'{name}@{number} is already published from a different commit')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('command', choices=['order', 'preflight', 'publish'])
+    parser.add_argument('--manifest-path', default='Cargo.toml')
+    args = parser.parse_args()
+    data = metadata(args.manifest_path)
+    packages = publish_order(data)
+    if args.command == 'order':
+        for package in packages:
+            print(f'{package["name"]}\t{package["version"]}\t{package["manifest_path"]}')
+        return
+    sha = current_commit()
+    if sha != os.environ.get('RELEASE_SHA'):
+        fail('Checkout differs from the CI-verified release SHA')
+    plan_path = ROOT / '.tools/release-plan.json'
+    if args.command == 'preflight':
+        pending, recovery = [], []
+        for package in packages:
+            record = registry(package['name'])
+            if record is None:
+                fail(f'{package["name"]}: first publish must be performed manually; see RELEASING.md')
+            versions = record['versions']
+            existing = next((v for v in versions if v['num'] == package['version']), None)
+            if existing:
+                # Fully released older packages need no new release/tag.
+                tag = package['name'] + '-v' + package['version']
+                tags = run(['git', 'tag', '--list', tag], capture=True).strip()
+                if tags:
+                    print(f'Already released: {tag}')
+                    continue
+                verify_existing(package, existing, sha)
+                recovery.append(package['name'])
+            else:
+                pending.append(package['name'])
+            baseline = record['crate']['max_stable_version']
+            if not baseline:
+                fail(f'{package["name"]}: no stable registry baseline for semver-checks')
+            run(cargo(PIN) + ['semver-checks', '--manifest-path', package['manifest_path'],
+                '--baseline-version', baseline, '--all-features'], cwd=data['workspace_root'])
+        # One invocation checks EACH crate and stages unpublished siblings in a
+        # temporary registry. Separate invocations fail for new dependency versions.
+        command = cargo(PIN) + ['publish', '--registry', 'crates-io', '--locked', '--dry-run', '--manifest-path', str(Path(args.manifest_path).resolve())]
+        for package in packages:
+            command += ['-p', package['name']]
+        run(command, cwd=data['workspace_root'])
+        plan_path.parent.mkdir(parents=True, exist_ok=True)
+        plan_path.write_text(json.dumps({'sha': sha, 'pending': pending, 'recovery': recovery,
+            'versions': {p['name']: p['version'] for p in packages}}, indent=2) + '\n')
+        return
+    if os.environ.get('GITHUB_ACTIONS') != 'true' or os.environ.get('GITHUB_EVENT_NAME') != 'workflow_run':
+        fail('Publishing is only supported by the protected release.yml workflow')
+    plan = json.loads(plan_path.read_text())
+    if plan['sha'] != sha or plan['versions'] != {p['name']: p['version'] for p in packages}:
+        fail('Release plan no longer matches the checkout')
+    if plan['pending']:
+        command = cargo(PIN) + ['publish', '--registry', 'crates-io', '--locked', '--manifest-path', str(Path(args.manifest_path).resolve())]
+        for name in plan['pending']:
+            command += ['-p', name]
+        run(command, cwd=data['workspace_root'])
+    for package in packages:
+        if package['name'] not in plan['pending'] + plan['recovery']:
+            continue
+        version = None
+        for attempt in range(24):
+            record = registry(package['name'])
+            version = next((v for v in record['versions'] if v['num'] == package['version']), None) if record else None
+            if version is not None:
+                break
+            if attempt < 23:
+                time.sleep(5)
+        if version is None:
+            fail(f'{package["name"]}: uploaded version is not visible in the crates.io API after 120s')
+        verify_existing(package, version, sha)
+        tag = package['name'] + '-v' + package['version']
+        changelog = Path(package['manifest_path']).parent / 'CHANGELOG.md'
+        if not changelog.is_file():
+            fail(f'Missing release-plz changelog for {tag}')
+        # Release notes are the first version section, without unreleased history.
+        lines = changelog.read_text().splitlines(keepends=True)
+        start = next((i for i, line in enumerate(lines) if line.startswith('## ') and package['version'] in line), None)
+        if start is None:
+            fail(f'No changelog entry for {tag}')
+        end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith('## ')), len(lines))
+        notes = ROOT / '.tools/release-notes.md'
+        notes.write_text(''.join(lines[start:end]))
+        run(['gh', 'release', 'create', tag, '--repo', 'PerryTS/turnloop', '--target', sha,
+             '--title', tag, '--notes-file', str(notes)])
+
+
+if __name__ == '__main__':
+    entrypoint(main)
