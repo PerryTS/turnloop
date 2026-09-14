@@ -13,6 +13,7 @@ struct State {
     wake: std::sync::Arc<dyn Wake>,
 }
 #[derive(Clone)]
+/// Thread-safe, cloneable wake endpoint using the loop parking handshake.
 pub struct Notifier {
     state: Arc<State>,
 }
@@ -42,9 +43,11 @@ impl Notifier {
         }
         Ok(())
     }
+    /// Return native wake syscall attempts for instrumentation.
     pub fn wake_syscalls(&self) -> u64 {
         self.state.wake.syscall_count()
     }
+    /// Observe whether this loop is currently prepared to receive a native wake.
     pub fn is_parked(&self) -> bool {
         self.state.bits.load(Ordering::Acquire) & PARKED != 0
     }
@@ -82,13 +85,18 @@ pub(crate) struct Post {
     pub payload: Payload,
 }
 #[derive(Clone)]
+/// Bounded thread-safe payload queue routed to exactly one owning loop.
 pub struct Poster {
     inner: Arc<Postbox>,
 }
 #[derive(Debug)]
+/// Posting failure with ownership returned only when the payload was not accepted.
 pub struct PostError {
+    /// The queue or wake failure.
     pub error: Error,
+    /// Opaque host routing token preserved from submission.
     pub token: Token,
+    /// Returned payload if rejected; None means accepted despite a wake error, so do not retry.
     pub payload: Option<Payload>,
 }
 impl Poster {

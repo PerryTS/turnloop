@@ -1,0 +1,90 @@
+# core2 verification commands
+
+Cross-compilation is not runtime execution. Raw outputs: `.tools/core2/`.
+
+- **PASS** `cargo check -p turnloop` (exit 0; log 1789402872-060718).
+- **FAIL** `cargo test -p turnloop-contract --test native_surface -- --test-threads=1` (exit 101; log 1789402922-508323).
+- **FAIL** `cargo check -p turnloop` (exit 101; log 1789403313-560113).
+- **PASS** `cargo test -p turnloop-contract --test native_surface -- --test-threads=1` (exit 0; log 1789403340-731985).
+- **FAIL** `cargo test -p turnloop-contract --test native_surface -- --test-threads=1` (exit 101; log 1789403454-694022).
+- **PASS** `cargo check -p turnloop` (exit 0; log 1789403548-662864).
+- **PASS** `cargo test -p turnloop-contract --test native_surface -- --test-threads=1` (exit 0; log 1789403604-260402).
+- **FAIL** `cargo clippy -p turnloop -p turnloop-contract --all-targets -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 101; log 1789403650-349026).
+- **FAIL** `cargo check -p turnloop` (exit 101; log 1789403784-513664).
+- **PASS** `cargo check -p turnloop` (exit 0; log 1789403838-759359).
+- **PASS** `cargo check -p turnloop --features executor` (exit 0; log 1789404051-297516).
+- **PASS** `cargo clippy -p turnloop -p turnloop-contract --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 0; log 1789404080-249518).
+- **FAIL** `cargo test -p turnloop-contract --features executor --test executor -- --test-threads=1` (exit 101; log 1789404153-917636).
+- **PASS** `cargo clippy -p turnloop -p turnloop-contract --all-targets --all-features --target x86_64-unknown-linux-gnu -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 0; log 1789404161-645415).
+- **FAIL** `cargo test -p turnloop-contract --all-features --test native_surface --test executor -- --test-threads=1` (exit 101; log 1789404275-238389).
+- **FAIL** `cargo test -p turnloop-contract --all-features --test native_surface --test executor -- --test-threads=1` (exit 101; log 1789404297-032008).
+- **FAIL** `cargo test -p turnloop-contract --all-features --test native_surface --test executor -- --test-threads=1` (exit 101; log 1789404381-516986).
+- **FAIL** `cargo test -p turnloop-contract --all-features --test native_surface file_backed_stdio_runs_in_the_child -- --test-threads=1 --nocapture` (exit 101; log 1789404434-847488).
+- **PASS** `cargo test -p turnloop-contract --all-features --test native_surface --test executor -- --test-threads=1` (exit 0; log 1789404456-296511).
+- **FAIL** `cargo test -p turnloop -p turnloop-contract --all-features -- --test-threads=1` (exit 101; log 1789404534-233569).
+- **PASS** `cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 0; log 1789404543-528808).
+- **PASS** `cargo test -p turnloop-contract --test allocations --all-features -- --test-threads=1` (exit 0; log 1789404636-981771).
+- **PASS** `cargo test -p turnloop-contract --all-features --test native_surface descriptor_roundtrip_through_a_spawned_process -- --test-threads=1` (exit 0; log 1789404652-878283).
+- **FAIL** `env RUSTFLAGS=-Dmissing_docs cargo check -p turnloop --all-features` (exit 101; log 1789404669-142275).
+- **FAIL** `cargo rustc -p turnloop --lib --all-features -- -Dmissing_docs` (exit 101; log 1789404677-734806).
+- **PASS** `cargo rustc -p turnloop --lib --all-features -- -Dmissing_docs` (exit 0; log 1789404822-899085).
+- **PASS** `cargo +stable check --workspace --all-targets --all-features --locked` (exit 0; log 1789404837-9402).
+- **FAIL** `cargo clippy -p turnloop -p turnloop-contract -p turnloop-bench --all-targets --all-features --target x86_64-pc-windows-msvc -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 101; log 1789404837-933909).
+- **FAIL** `cargo clippy --workspace --all-targets --all-features --target wasm32-wasip2 -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 101; log 1789404837-928928).
+- **PASS** `cargo test -p turnloop -p turnloop-contract --all-features -- --test-threads=1` (exit 0; log 1789404940-217297).
+- **PASS** `cargo test -p turnloop-contract --all-features --test executor -- --test-threads=1` (exit 0; log 1789405001-509178).
+- **FAIL** `cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 101; log 1789405096-46428).
+- **PASS** `cargo clippy -p turnloop -p turnloop-contract -p turnloop-bench --all-targets --all-features --target x86_64-pc-windows-msvc -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 0; log 1789405115-382627).
+- **PASS** `cargo clippy --workspace --all-targets --all-features --target wasm32-wasip2 -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 0; log 1789405115-375308).
+- **FAIL** `cargo clippy --workspace --all-targets --all-features --target wasm32-unknown-unknown -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 101; log 1789405115-369443).
+- **FAIL** `cargo clippy --workspace --all-targets --all-features --target x86_64-unknown-linux-gnu -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 101; log 1789405115-364116).
+- **FAIL** `env RUSTDOCFLAGS=-Dwarnings cargo doc --workspace --all-features --no-deps` (exit 101; log 1789405170-199334).
+- **FAIL** `cargo clippy -p turnloop -p turnloop-contract --all-targets --all-features --target aarch64-linux-android -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 101; log 1789405191-636336).
+- **FAIL** `cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 101; log 1789405443-553617).
+- **FAIL** `cargo clippy -p turnloop -p turnloop-contract --all-targets --all-features --target aarch64-linux-android -- -D warnings` (exit 101; log 1789405443-570123).
+- **PASS** `cargo clippy --workspace --all-targets --all-features --target wasm32-unknown-unknown -- -D warnings` (exit 0; log 1789405443-578259).
+- **FAIL** `cargo clippy --workspace --all-targets --all-features --target x86_64-unknown-linux-gnu -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 101; log 1789405443-565386).
+- **PASS** `env RUSTDOCFLAGS=-Dwarnings cargo doc --workspace --all-features --no-deps` (exit 0; log 1789405443-588294).
+- **PASS** `cargo test -p turnloop -p turnloop-contract --all-features -- --test-threads=1` (exit 0; log 1789405482-900884).
+- **PASS** `cargo test -p turnloop-contract --all-features --test allocations -- --test-threads=1` (exit 0; log 1789405533-327561).
+- **PASS** `cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 0; log 1789405585-297931).
+- **PASS** `cargo +nightly-2026-09-07 clippy -p turnloop -p turnloop-contract -p turnloop-bench --all-targets --all-features --target wasm32-wasip3 -- -D warnings` (exit 0; log 1789405585-353678).
+- **PASS** `bash scripts/ci/no-tokio.sh` (exit 0; log 1789405585-433882).
+- **PASS** `cargo clippy -p turnloop -p turnloop-contract --all-targets --all-features --target aarch64-apple-ios -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 0; log 1789405585-400132).
+- **PASS** `cargo clippy -p turnloop -p turnloop-contract --lib --all-features --target aarch64-linux-android -- -D warnings` (exit 0; log 1789405585-357625).
+- **PASS** `cargo clippy --workspace --all-targets --all-features --target x86_64-unknown-linux-gnu -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 0; log 1789405585-351105).
+- **PASS** `python3 scripts/ci/soak.py` (exit 0; log 1789405585-466433).
+- **PASS** `python3 scripts/ci/run-tests.py native` (exit 0; log 1789405661-106325).
+- **PASS** `cargo test -p turnloop-contract --all-features --test executor --test allocations -- --test-threads=1` (exit 0; log 1789405799-407619).
+- **PASS** `python3 scripts/ci/run-tests.py loom` (exit 0; log 1789405800-585026).
+- **PASS** `cargo test -p turnloop -p turnloop-contract --all-features -- --test-threads=1` (exit 0; log 1789406042-125853).
+- **PASS** `rustup target add x86_64-unknown-freebsd` (exit 0; log 1789406043-321989).
+- **PASS** `cargo fmt --check` (exit 0; log 1789406095-215961).
+- **PASS** `cargo +stable check --locked --workspace --all-targets --all-features` (exit 0; log 1789406095-233768).
+- **PASS** `cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 0; log 1789406095-226727).
+- **PASS** `cargo clippy --workspace --all-targets -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 0; log 1789406095-222039).
+- **FAIL** `cargo clippy -p turnloop -p turnloop-contract --all-targets --all-features --target x86_64-unknown-freebsd -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 101; log 1789406095-244102).
+- **PASS** `cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 0; log 1789406095-251867).
+- **PASS** `cargo clippy --workspace --all-targets --all-features --target x86_64-unknown-linux-gnu -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 0; log 1789406095-260297).
+- **PASS** `cargo clippy -p turnloop -p turnloop-contract --all-targets --all-features --target x86_64-unknown-freebsd -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 0; log 1789406136-26634).
+- **PASS** `cargo clippy -p turnloop -p turnloop-contract -p turnloop-bench --all-targets --all-features --target x86_64-pc-windows-msvc -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 0; log 1789406136-28412).
+- **PASS** `cargo clippy --workspace --all-targets --all-features --target wasm32-unknown-unknown -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 0; log 1789406136-270299).
+- **PASS** `cargo clippy --workspace --all-targets --all-features --target wasm32-wasip2 -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 0; log 1789406136-275452).
+- **PASS** `python3 scripts/ci/install-tools.py cargo-deny actionlint zizmor shellcheck` (exit 0; log 1789406136-297937).
+- **PASS** `cargo +nightly-2026-09-07 clippy -p turnloop -p turnloop-contract -p turnloop-bench --all-targets --all-features --target wasm32-wasip3 -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 0; log 1789406136-290282).
+- **PASS** `cargo test --workspace -- --test-threads=1` (exit 0; log 1789406162-000888).
+- **PASS** `env RUSTDOCFLAGS=-Dwarnings cargo doc --locked --workspace --all-features --no-deps` (exit 0; log 1789406190-164954).
+- **FAIL** `env PATH=/Users/amlug/projects/perry/windlass-lanes/core2/.tools/bin:/Users/amlug/.cargo/bin:/opt/homebrew/bin:/usr/bin:/bin cargo +nightly-2026-08-20 deny --locked check` (exit 1; log 1789406190-147771).
+- **FAIL** `python3 scripts/ci/run-tests.py miri` (exit 1; log 1789406191-323086).
+- **PASS** `python3 -m unittest discover -s scripts/ci -p test_*.py -v` (exit 0; log 1789406190-158446).
+- **PASS** `env PATH=/Users/amlug/projects/perry/windlass-lanes/core2/.tools/bin:/Users/amlug/.cargo/bin:/opt/homebrew/bin:/usr/bin:/bin python3 scripts/ci/lint-workflows.py` (exit 0; log 1789406190-152554).
+- **PASS** `env MIRI_SYSROOT=/Users/amlug/projects/perry/windlass-lanes/core2/.tools/miri-sysroot cargo miri setup` (exit 0; log 1789406225-115319).
+- **PASS** `cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 0; log 1789406249-330447).
+- **PASS** `python3 scripts/ci/run-tests.py native` (exit 0; log 1789406250-003411).
+- **PASS** `env MIRI_SYSROOT=/Users/amlug/projects/perry/windlass-lanes/core2/.tools/miri-sysroot python3 scripts/ci/run-tests.py miri` (exit 0; log 1789406292-414816).
+- **PASS** `cargo test -p turnloop-contract --all-features --test allocations -- --test-threads=1` (exit 0; log 1789406404-531363).
+- **FAIL** `cargo clippy -p turnloop -p turnloop-contract --all-targets --all-features --target aarch64-linux-android -- -D warnings` (exit 101; log 1789406454-017972).
+- **PASS** `cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 0; log 1789406455-173108).
+- **PASS** `git diff --check` (exit 0; log 1789406455-634031).
+- **PASS** `cargo fmt --check` (exit 0; log 1789406455-732299).
+- **PASS** `git diff --check` (exit 0; log 1789406517-615215).

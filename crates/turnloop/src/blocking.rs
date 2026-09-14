@@ -9,8 +9,11 @@ use std::{
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Configuration fixed by the first process-wide blocking-pool submission.
 pub struct PoolConfig {
+    /// Number of lazily started process-wide blocking workers.
     pub threads: usize,
+    /// Maximum queued blocking jobs before ResourceLimit is returned.
     pub queue_capacity: usize,
 }
 impl Default for PoolConfig {
@@ -22,11 +25,16 @@ impl Default for PoolConfig {
     }
 }
 #[derive(Debug)]
+/// Owned hostname and port for a pool-backed native address lookup.
 pub struct DnsRequest {
+    /// Hostname resolved by the native resolver.
     pub host: String,
+    /// Port included in each resolved socket address.
     pub port: u16,
 }
 pub(crate) enum WorkOutput {
+    #[cfg(not(target_arch = "wasm32"))]
+    ExternalWait(crate::WaitResult),
     Blocking(Payload),
     Resolved(Vec<SocketAddr>),
 }
@@ -61,7 +69,7 @@ impl WorkPort {
         self.closed.store(true, Ordering::Release);
     }
     #[cfg(not(target_arch = "wasm32"))]
-    fn complete(&self, result: WorkResult) {
+    pub(crate) fn complete(&self, result: WorkResult) {
         if self.closed.load(Ordering::Acquire) {
             return;
         }
@@ -73,6 +81,10 @@ impl WorkPort {
         );
         let _ = self.notifier.notify();
     }
+}
+#[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
+pub(crate) trait ReusableWork: Send + Sync {
+    fn run(&self);
 }
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
@@ -89,8 +101,13 @@ mod native {
         port: Arc<WorkPort>,
         f: Box<dyn FnOnce() -> Result<WorkOutput> + Send>,
     }
+    enum Task {
+        Boxed(Job),
+        #[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
+        Reusable(Arc<dyn ReusableWork>),
+    }
     struct State {
-        jobs: Mutex<VecDeque<Job>>,
+        jobs: Mutex<VecDeque<Task>>,
         ready: Condvar,
         stopping: AtomicBool,
     }
@@ -127,6 +144,17 @@ mod native {
                                 return;
                             }
                             jobs.pop_front().expect("nonempty job queue")
+                        };
+                        #[cfg(not(any(turnloop_backend = "kqueue", turnloop_backend = "epoll")))]
+                        let Task::Boxed(job) = job;
+                        #[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
+                        let job = match job {
+                            Task::Boxed(job) => job,
+                            #[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
+                            Task::Reusable(work) => {
+                                work.run();
+                                continue;
+                            }
                         };
                         let result = if job.cancel.load(Ordering::Acquire) {
                             Err(Error::new(ErrorKind::Cancelled))
@@ -177,13 +205,37 @@ mod native {
         if jobs.len() == pool.config.queue_capacity {
             return Err(Error::new(ErrorKind::ResourceLimit));
         }
-        jobs.push_back(Job {
+        jobs.push_back(Task::Boxed(Job {
             op,
             cancel,
             port,
             f,
-        });
+        }));
         drop(jobs);
+        pool.state.ready.notify_one();
+        Ok(())
+    }
+    #[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
+    pub(crate) fn reusable(config: PoolConfig, work: Arc<dyn ReusableWork>) -> Result<()> {
+        if config.threads == 0 || config.queue_capacity == 0 {
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
+        let pool = POOL
+            .get_or_init(|| start(config))
+            .as_ref()
+            .map_err(|&e| e)?;
+        if pool.config != config {
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
+        let mut jobs = pool
+            .state
+            .jobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if jobs.len() == pool.config.queue_capacity {
+            return Err(Error::new(ErrorKind::ResourceLimit));
+        }
+        jobs.push_back(Task::Reusable(work));
         pool.state.ready.notify_one();
         Ok(())
     }
@@ -276,3 +328,6 @@ mod models {
         });
     }
 }
+
+#[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
+pub(crate) use native::reusable;
