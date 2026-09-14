@@ -25,3 +25,6 @@ impl std::error::Error for Error {}
 pub type Result<T> = std::result::Result<T, Error>;
 
 mod recycling;
+
+#[cfg(feature = "turnloop")]
+pub mod asynchronous;

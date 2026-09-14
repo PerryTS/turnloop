@@ -12,9 +12,13 @@ categories = ["network-programming"]
 documentation = "https://docs.rs/turnloop-http"
 
 [features]
+turnloop = ["dep:turnloop-io", "turnloop-tls/turnloop"]
+
 pure-rust-zstd = ["dep:turnloop-zstd-decoder"]
 
 [dependencies]
+turnloop-io = { workspace = true, optional = true }
+
 turnloop-zstd-decoder = { workspace = true, optional = true }
 bytes.workspace = true
 http.workspace = true
@@ -47,3 +51,15 @@ wasi-tests = ["codecs", "allocations"]
 [[test]]
 name = "allocations"
 harness = false
+
+[[example]]
+name = "h2spec_server"
+required-features = ["turnloop"]
+
+[[example]]
+name = "https_get"
+required-features = ["turnloop"]
+
+[[example]]
+name = "tls_echo"
+required-features = ["turnloop"]

@@ -316,3 +316,8 @@ pub fn node_error_code(error: &Error) -> &'static str {
         _ => "WS_ERR_SOCKET",
     }
 }
+
+#[cfg(feature = "turnloop")]
+pub mod asynchronous;
+#[cfg(feature = "turnloop")]
+pub use asynchronous::WebSocketStream;

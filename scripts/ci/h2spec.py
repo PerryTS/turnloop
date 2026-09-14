@@ -82,7 +82,7 @@ def check_report(path):
 def main():
     binary = install()
     data = metadata()
-    run(cargo() + ['build', '--locked', '-p', 'turnloop-http', '--example', 'h2spec_server'], cwd=ROOT)
+    run(cargo() + ['build', '--locked', '-p', 'turnloop-http', '--example', 'h2spec_server', '--features', 'turnloop'], cwd=ROOT)
     server_binary = Path(data['target_directory']) / 'debug/examples/h2spec_server'
     if os.name == 'nt':
         server_binary = server_binary.with_suffix('.exe')

@@ -277,3 +277,8 @@ impl ServerCertVerifier for Unverified {
             .supported_schemes()
     }
 }
+
+#[cfg(feature = "turnloop")]
+pub mod asynchronous;
+#[cfg(feature = "turnloop")]
+pub use asynchronous::TlsStream;

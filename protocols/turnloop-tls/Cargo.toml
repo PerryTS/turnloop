@@ -11,7 +11,12 @@ keywords = ["networking", "sans-io", "tls"]
 categories = ["network-programming"]
 documentation = "https://docs.rs/turnloop-tls"
 
+[features]
+turnloop = ["dep:turnloop-io"]
+
 [dependencies]
+turnloop-io = { workspace = true, optional = true }
+
 rustls.workspace = true
 webpki-roots.workspace = true
 

@@ -357,6 +357,40 @@ impl<B: Backend> Clone for ExecutorHandle<B> {
     }
 }
 impl<B: Backend> ExecutorHandle<B> {
+    /// Borrow the driver for resource configuration. Release before awaiting.
+    /// Tokens with the top bit set belong to the executor.
+    pub fn driver(&self) -> RefMut<'_, Driver<B>> {
+        self.shared.driver.borrow_mut()
+    }
+    /// Current monotonic time in this backend's clock domain.
+    pub fn now(&self) -> Instant {
+        self.shared.driver.borrow().now()
+    }
+    /// Resolve through the driver's native pool or host DNS capability.
+    pub fn resolve(&self, request: DnsRequest) -> Resolve<B> {
+        Resolve {
+            executor: self.clone(),
+            request: Some(request),
+            key: None,
+        }
+    }
+    /// Connect TCP without blocking the host. Dropping closes the pending socket.
+    pub fn connect(&self, addr: SocketAddr, opts: TcpOpts) -> Connect<B> {
+        Connect {
+            executor: self.clone(),
+            address: addr,
+            opts,
+            key: None,
+            handle: None,
+        }
+    }
+    /// Apply an absolute deadline without resetting it between I/O operations.
+    pub fn timeout_at<F: Future>(&self, deadline: Instant, future: F) -> Timeout<B, F> {
+        Timeout {
+            future,
+            sleep: self.sleep_until(deadline),
+        }
+    }
     /// Adopt a loop-owned TCP/local/stdio stream. Drop cancels I/O and closes it.
     pub fn io(&self, handle: Handle) -> AsyncIo<B> {
         AsyncIo {
@@ -842,6 +876,128 @@ pub struct Accept<B: Backend> {
     shared: Rc<Shared<B>>,
     listener: Handle,
     key: Option<Key>,
+}
+
+/// A TCP connection attempt owned until its terminal completion is delivered.
+pub struct Connect<B: Backend> {
+    executor: ExecutorHandle<B>,
+    address: SocketAddr,
+    opts: TcpOpts,
+    key: Option<Key>,
+    handle: Option<Handle>,
+}
+
+/// A cancellable asynchronous name lookup.
+pub struct Resolve<B: Backend> {
+    executor: ExecutorHandle<B>,
+    request: Option<DnsRequest>,
+    key: Option<Key>,
+}
+impl<B: Backend> Unpin for Resolve<B> {}
+impl<B: Backend> Future for Resolve<B> {
+    type Output = Result<Vec<SocketAddr>>;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let shared = &this.executor.shared;
+        let key = match this.key {
+            Some(key) => key,
+            None => {
+                let key = shared.reserve(cx)?;
+                let request = this
+                    .request
+                    .take()
+                    .ok_or(Error::new(ErrorKind::InvalidInput))?;
+                let result = shared.driver.borrow_mut().resolve(request, key.token());
+                match result {
+                    Ok(op) => {
+                        shared.slots.borrow_mut()[key.index].op = Some(op);
+                        this.key = Some(key);
+                        key
+                    }
+                    Err(e) => {
+                        shared.free(key);
+                        return Poll::Ready(Err(e));
+                    }
+                }
+            }
+        };
+        let Some(result) = shared.result(key, cx) else {
+            return Poll::Pending;
+        };
+        shared.free(key);
+        this.key = None;
+        Poll::Ready(match result {
+            OpResult::Resolved(addresses) => Ok(addresses),
+            OpResult::Err(e) => Err(e),
+            _ => Err(Error::new(ErrorKind::Cancelled)),
+        })
+    }
+}
+impl<B: Backend> Drop for Resolve<B> {
+    fn drop(&mut self) {
+        if let Some(key) = self.key.take() {
+            self.executor.shared.abandon(key);
+        }
+    }
+}
+impl<B: Backend> Unpin for Connect<B> {}
+impl<B: Backend> Future for Connect<B> {
+    type Output = Result<AsyncIo<B>>;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let shared = &this.executor.shared;
+        let key = match this.key {
+            Some(key) => key,
+            None => {
+                let key = shared.reserve(cx)?;
+                let result =
+                    shared
+                        .driver
+                        .borrow_mut()
+                        .tcp_connect(this.address, &this.opts, key.token());
+                match result {
+                    Ok(handle) => {
+                        this.handle = Some(handle);
+                        this.key = Some(key);
+                        key
+                    }
+                    Err(error) => {
+                        shared.free(key);
+                        return Poll::Ready(Err(error));
+                    }
+                }
+            }
+        };
+        let Some(result) = shared.result(key, cx) else {
+            return Poll::Pending;
+        };
+        shared.free(key);
+        this.key = None;
+        Poll::Ready(match result {
+            OpResult::Connected => Ok(this
+                .executor
+                .io(this.handle.take().expect("connected handle"))),
+            OpResult::Err(error) => Err(error),
+            _ => Err(Error::new(ErrorKind::Cancelled)),
+        })
+    }
+}
+impl<B: Backend> Drop for Connect<B> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            let _ = self
+                .executor
+                .shared
+                .driver
+                .borrow_mut()
+                .close(handle, Token(0));
+        }
+        if let Some(key) = self.key.take() {
+            // Connect has no borrowed buffer. Generation tags reject its later
+            // cancelled completion after the reservation has been released.
+            self.executor.shared.abandon(key);
+        }
+    }
 }
 impl<B: Backend> Unpin for Accept<B> {}
 impl<B: Backend> Future for Accept<B> {

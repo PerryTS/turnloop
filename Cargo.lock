@@ -1812,10 +1812,19 @@ dependencies = [
  "httparse",
  "percent-encoding",
  "rcgen",
+ "turnloop-io",
  "turnloop-tls",
  "turnloop-zstd-decoder",
  "url",
  "zstd",
+]
+
+[[package]]
+name = "turnloop-io"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "futures-io",
+ "turnloop",
 ]
 
 [[package]]
@@ -1885,6 +1894,7 @@ dependencies = [
  "ring",
  "rustls",
  "rustls-pki-types",
+ "turnloop-io",
  "webpki-roots",
 ]
 
@@ -1906,6 +1916,7 @@ dependencies = [
  "http",
  "tungstenite",
  "turnloop-http",
+ "turnloop-io",
 ]
 
 [[package]]

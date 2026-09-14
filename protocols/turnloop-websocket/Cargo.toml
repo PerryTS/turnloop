@@ -11,7 +11,12 @@ keywords = ["networking", "sans-io", "websocket"]
 categories = ["network-programming"]
 documentation = "https://docs.rs/turnloop-websocket"
 
+[features]
+turnloop = ["dep:turnloop-io", "turnloop-http/turnloop"]
+
 [dependencies]
+turnloop-io = { workspace = true, optional = true }
+
 tungstenite.workspace = true
 bytes.workspace = true
 http.workspace = true
@@ -28,3 +33,14 @@ workspace = true
 role = "protocol"
 service-group = "http"
 integration-tests = ["websocket"]
+
+[[example]]
+name = "echo_server"
+required-features = ["turnloop"]
+
+[[example]]
+name = "echo_client"
+required-features = ["turnloop"]
+
+[dev-dependencies]
+getrandom.workspace = true
