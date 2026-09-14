@@ -57,3 +57,12 @@ Cross-compilation is not runtime execution. Raw outputs: `.tools/core2/`.
 - **PASS** `python3 scripts/ci/run-tests.py native` (exit 0; log 1789405661-106325).
 - **PASS** `cargo test -p turnloop-contract --all-features --test executor --test allocations -- --test-threads=1` (exit 0; log 1789405799-407619).
 - **PASS** `python3 scripts/ci/run-tests.py loom` (exit 0; log 1789405800-585026).
+- **PASS** `cargo test -p turnloop -p turnloop-contract --all-features -- --test-threads=1` (exit 0; log 1789406042-125853).
+- **PASS** `rustup target add x86_64-unknown-freebsd` (exit 0; log 1789406043-321989).
+- **PASS** `cargo fmt --check` (exit 0; log 1789406095-215961).
+- **PASS** `cargo +stable check --locked --workspace --all-targets --all-features` (exit 0; log 1789406095-233768).
+- **PASS** `cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 0; log 1789406095-226727).
+- **PASS** `cargo clippy --workspace --all-targets -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 0; log 1789406095-222039).
+- **FAIL** `cargo clippy -p turnloop -p turnloop-contract --all-targets --all-features --target x86_64-unknown-freebsd -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 101; log 1789406095-244102).
+- **PASS** `cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 0; log 1789406095-251867).
+- **PASS** `cargo clippy --workspace --all-targets --all-features --target x86_64-unknown-linux-gnu -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 0; log 1789406095-260297).

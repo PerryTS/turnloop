@@ -268,6 +268,9 @@ unsafe impl Backend for Unix {
     fn signal(&mut self, h: Handle, signal: Signal) -> Result<()> {
         self.services.signal(h, signal)
     }
+    fn prepare_close(&mut self, h: Handle) -> Result<()> {
+        self.services.prepare_close(h)
+    }
     fn kill(&mut self, h: Handle, signal: Signal, group: bool) -> Result<()> {
         self.services.kill(h, signal, group)
     }

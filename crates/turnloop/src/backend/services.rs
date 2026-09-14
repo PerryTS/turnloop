@@ -177,6 +177,9 @@ impl Services {
         for e in self.entries.iter_mut().flatten() {
             if e.op == Some(op) {
                 e.cancelled = true;
+                if let Kind::Child(c) = &mut e.kind {
+                    c.ready = true;
+                }
                 return true;
             }
         }
@@ -198,15 +201,12 @@ impl Services {
     }
     fn runnable(e: &Entry) -> bool {
         e.op.is_some()
-            && (e.cancelled
-                || match &e.kind {
-                    Kind::Child(c) => {
-                        c.ready
-                            || c.status.is_some()
-                            || c.fallback.as_ref().is_some_and(|s| s.ready())
-                    }
-                    Kind::Signal(_, ticket) => ticket.ready(),
-                })
+            && match &e.kind {
+                Kind::Child(c) => {
+                    c.ready || c.status.is_some() || c.fallback.as_ref().is_some_and(|s| s.ready())
+                }
+                Kind::Signal(_, ticket) => e.cancelled || ticket.ready(),
+            }
     }
     pub fn has_work(&self) -> bool {
         self.entries.iter().flatten().any(Self::runnable)
@@ -219,26 +219,33 @@ impl Services {
             if !Self::runnable(e) {
                 continue;
             }
-            let (result, terminal) = if e.cancelled {
-                (Ok(Outcome::Cancelled), true)
-            } else {
-                match &mut e.kind {
-                    Kind::Signal(signal, ticket) => {
+            let (result, terminal) = match &mut e.kind {
+                Kind::Signal(signal, ticket) => {
+                    if e.cancelled {
+                        (Ok(Outcome::Cancelled), true)
+                    } else {
                         if !ticket.take() {
                             continue;
                         }
                         (Ok(Outcome::Signal(*signal)), false)
                     }
-                    Kind::Child(c) => {
-                        c.ready = false;
-                        if let Some(ticket) = &c.fallback {
-                            ticket.take();
-                        }
-                        match c.reap() {
-                            Ok(Some(status)) => (Ok(Outcome::Exited(status)), true),
-                            Ok(None) => continue,
-                            Err(e) => (Err(e), true),
-                        }
+                }
+                Kind::Child(c) => {
+                    c.ready = false;
+                    if let Some(ticket) = &c.fallback {
+                        ticket.take();
+                    }
+                    match c.reap() {
+                        Ok(Some(status)) => (
+                            Ok(if e.cancelled {
+                                Outcome::Cancelled
+                            } else {
+                                Outcome::Exited(status)
+                            }),
+                            true,
+                        ),
+                        Ok(None) => continue,
+                        Err(error) => (Err(error), true),
                     }
                 }
             };
@@ -252,6 +259,21 @@ impl Services {
                 result,
             });
         }
+    }
+    pub fn prepare_close(&mut self, h: Handle) -> Result<()> {
+        if let Some(e) = self
+            .entries
+            .get_mut(h.index())
+            .and_then(Option::as_mut)
+            .filter(|e| e.handle == h)
+            && let Kind::Child(c) = &mut e.kind
+        {
+            if c.reap()?.is_none() {
+                c.kill(Signal::Kill, c.group)?;
+            }
+            c.ready = true;
+        }
+        Ok(())
     }
     pub fn kill(&mut self, h: Handle, signal: Signal, group: bool) -> Result<()> {
         let e = self

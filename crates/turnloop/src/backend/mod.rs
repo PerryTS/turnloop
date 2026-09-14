@@ -22,6 +22,9 @@
 //! * `cancel` initiates cancellation, never frees native buffers prematurely. It
 //!   must eventually emit a terminal event even when cancel races with success.
 //!   The core arbitrates the result and emits Cancelled if cancellation won.
+//! * `prepare_close` starts nonblocking teardown before cancellation. Process
+//!   backends terminate the owned child and retain its exit operation until reaped,
+//!   including when cancellation is already pending. Other resources need no hook.
 //! * The core calls `release` only after every associated operation terminated
 //!   and the Closed completion was appended to host output. Drop must synchronously
 //!   quiesce any remaining I/O before freeing buffers (native completion draining
@@ -220,6 +223,13 @@ pub unsafe trait Backend: Sized + 'static {
         _spec: &crate::ProcessSpec,
     ) -> Result<u32> {
         Err(Error::new(crate::ErrorKind::Unsupported))
+    }
+    /// Begin nonblocking resource teardown before the core cancels its operations.
+    /// Process backends terminate the owned child/tree here and defer its terminal
+    /// acknowledgement until exit/reaping, so release never blocks a normal turn.
+    /// Other resources need no action. An error leaves the core handle open.
+    fn prepare_close(&mut self, _handle: Handle) -> Result<()> {
+        Ok(())
     }
     /// Signal an owned child, or its explicitly isolated process group.
     fn kill(&mut self, _handle: Handle, _signal: crate::Signal, _group: bool) -> Result<()> {

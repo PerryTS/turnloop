@@ -25,12 +25,13 @@ notifier parking and the single-wait/no-spin rules are unchanged.
 | `Outcome::HandleSent` | Confirm successful handle transfer. |
 | `Backend::set_notifier(Notifier)` | Called once after construction, before registration. Gives services the loop's parking-aware notification endpoint. Default is a no-op. |
 | `Backend::spawn(handle, pipes, &ProcessSpec) -> Result<u32>` | Bind the owned process and requested parent stdio handles atomically. The core reserves handles and the exit operation before calling this method. On error release partial state and reap any created child. |
+| `Backend::prepare_close(handle)` | Begin nonblocking teardown before core cancellation. A process backend terminates the child/tree and retains its exit registration until reaped; terminal acknowledgement and Closed then follow. Default is a no-op returning success for other resources. |
 | `Backend::kill(handle, Signal, group)` | Signal the owned child or its explicitly created process group/tree. Never signal a reused process identity. |
 | `Backend::signal(handle, Signal)` | Install a per-loop subscription to the process-wide dispatcher, then accept `WatchSignal`. |
 | `Backend::tty_set_mode` / `tty_window_size` | Set/restore terminal mode and query character dimensions. Save original state for final release/drop. |
 
 The five optional native capability methods default to `Unsupported`; no native
-success is synthesized. `set_notifier` has a separate no-op default. Backend
+success is synthesized. `set_notifier` and `prepare_close` have separate no-op defaults. Backend
 implementations with exhaustive `Open`, `Operation` or `Outcome` matches must add
 these variants, using explicit capability errors where appropriate. The generic
 host test checks failed setup leaves no handles/operations alive.
@@ -75,8 +76,11 @@ an independent signal handle; stop it explicitly when finished with the TTY.
   the interval where NOTE_EXIT is visible before wait status becomes reapable.
   Already-exited children are checked before treating registration failure as an
   error. Only owned child PIDs are reaped; never `waitpid(-1)`.
-- Closing/dropping a live child kills it (and its group when requested) and reaps
-  it. Teardown may synchronously wait for OS termination; ordinary process/signal
+- Closing a live child starts termination (including its group when requested),
+  then retains the native exit registration until reaping. Cancelled precedes
+  Closed, and release performs no blocking reap. Cancelling an exit registration
+  alone retains it until the child is reapable; close also initiates termination.
+  Dropping the loop may synchronously wait for OS teardown. Ordinary process/signal
   polling uses readiness and never polls on a fixed interval. Kill after the
   leader's exit was reaped returns `NotFound`, avoiding a reused PID/PGID. Hosts
   must request group termination while the leader is still owned and unreaped.
@@ -163,9 +167,9 @@ nonzero tests after those adapters land.
 No changes were made to authoritative `DESIGN.md`.
 
 1. Specify local control-stream framing and independent send ownership explicitly.
-2. Specify kill/reap-on-close and potentially blocking destruction. An asynchronous
-   process-release barrier would require a further trait/lifecycle addition if
-   destruction must also honor a turn's deadline; current close guarantees no zombie.
+2. Specify nonblocking kill/reap-on-close via `prepare_close`, delayed cancellation
+   of exit registrations until reapable, and potentially blocking loop destruction.
+   Both close and destruction guarantee no owned child is left as a zombie.
 3. Define the subscribed-signal disposition ownership contract and coalescing;
    include SIGCHLD as an internal subscription while children exist.
 4. Record `Raw` versus `Io`, resize subscription lifetime, and restoration ownership

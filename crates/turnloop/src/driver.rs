@@ -454,7 +454,8 @@ impl<B: Backend> Driver<B> {
         self.submit(pipe, Operation::RecvHandle, token)
     }
     /// Spawn a child and submit its exactly-once exit operation. Closing a live
-    /// child terminates and reaps it; a new process group enables `kill_group`.
+    /// child initiates termination, then waits through ordinary turns for reaping
+    /// before Cancelled and Closed; a new process group enables `kill_group`.
     pub fn spawn(&mut self, spec: &ProcessSpec, token: Token) -> Result<Process> {
         let h = self.new_handle(Kind::Socket)?;
         let mut pipes = [None; 3];
@@ -707,6 +708,7 @@ impl<B: Backend> Driver<B> {
         if r.closing.is_some() {
             return Err(Error::new(ErrorKind::InvalidInput));
         }
+        self.backend.prepare_close(h)?;
         let r = self.handles.get_mut(h.key).expect("validated");
         r.closing = Some(token);
         // Socket handles already carry a reference. Inactive timer handles do
