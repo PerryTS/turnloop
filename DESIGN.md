@@ -45,7 +45,9 @@ Tokio is designed to own the thread. Deno fits that model because JS runs *insid
 | Our PoC (macOS, compiled TS, `poc/custom-reactor`) | A main-thread mio reactor behind the same hooks. Single-connection TCP echo 2.6× faster; setTimeout lateness 2.1 → 1.1 ms with a socket open. Binary −0.9 %, RSS −1.5 %. The echo gap traced to writes waiting for the next 1 ms tick. |
 | Codex, isolated HTTP transport (macOS) | Moving fetch dispatch off the blocking pool: **−36.8 % instructions, −33.6 % peak RSS**. Hyper on a custom reactor vs lean tokio: a tie in steady state. |
 | Codex, Perry-runtime harness (macOS, cgu=16) | Native deadlines −10…−21 % instructions, timer abort −18 %, serial HTTP −6.7 % (inside cgu=16 layout noise), executable −92 KiB. |
-| Linux runs (shared x86_64 host, cgu=1) | In progress: instruction attribution of today's tokio bridge, replacement A/B, real `fetch()` dispatch patch. §10 budgets get filled from these. |
+| Linux attribution (x86_64, cgu=1) | tokio + Perry's bridge = 5–14 % of user instructions in tokio-backed workloads. The irreducible embedding cost is about 2.5k user instructions per `block_on` turn (no bounded-turn API in tokio 1.53.1). Making turns cheaper alone *raised* user instructions 13.5 %, because Perry's per-turn pump and keep-alive scan (~5.9k) then ran more often. |
+| Linux A/B (x86_64, cgu=1, controls ±0.2 %) | Custom reactor vs lean tokio (Codex harness): HTTP paths −4…−7 % user instructions; native timers −3.9 % (c32) / +6.1 % (c4096); abort +15 %; executable −60 KiB. Our compiled-TS PoC: TCP echo at 4 connections −37 % user instructions, 1 connection +11 %. **With a socket open, JS timers cost ~70× more in the PoC reactor: it busy-polled.** Perry truncates sub-ms deadlines to 0, and the reactor's fast hook then made zero-timeout epoll calls in a loop (37,607 turns for 50 timers). The macOS "timer lateness" win was this spin. |
+| Real `fetch()` dispatch patch (Perry, tokio kept) | Moving `perry-ext-fetch` off the blocking pool: −11…−21 % instructions per 1 KiB request (almost all kernel), −30…−63 % peak RSS, threads 33/129 → 1. |
 
 The conclusion both experiments share is that steady-state socket I/O costs about the same on tokio or a custom reactor. The waste is in the *embedding*: per-turn setup, 1 ms floors, blocking-pool handoffs, cross-thread wakes, and a timer wheel used where a deadline would do.
 
@@ -483,6 +485,7 @@ No other Perry change is needed for P0.
 2. **Wake:** zero syscalls on `notify()` while the loop is running (checked with a syscall-counting harness: `strace -c` / `ktrace` / ETW in CI smoke tests).
 3. **OS waits:** at most one per `turn`, and none when completions are already queued.
 4. **Ticks:** no fixed-interval ticks and no minimum wait floor.
+4a. **No spin.** A turn with nothing ready and a future deadline blocks until that deadline, at the precision in §7.6. It never returns immediately and never degrades into a zero-timeout poll loop. Hosts must pass exact deadlines (`Instant`, not truncated milliseconds). The Linux A/B measured what happens otherwise: 37,607 turns for 50 timers, ~70× user instructions. **Contract test:** with an idle registered socket and a 0.5 ms / 2 ms / 10 ms timer, turns per expiry ≤ 2 and zero-event OS waits ≤ 1 per expiry, on every backend.
 5. **Instruction budgets per operation** (Linux, cgu=1, `perf stat -e instructions:u,instructions:k`): TCP read / write / accept, timer start + cancel, notify + turn round trip, blocking job round trip, idle turn. **Values to be set from the attribution run of today's tokio bridge**, with a target below the tokio-bridge cost and within X % of a hand-written epoll loop. The CI gate compares against a committed baseline, with a control probe that must not move.
 
 **Methodology** (lessons already paid for):
@@ -519,7 +522,7 @@ Each phase must pass all of these before it lands:
 
 | Phase | Change | Removes |
 |---|---|---|
-| **P0** | turnloop behind the existing `js_register_wait_driver` hooks; timers stay in Perry | `block_on` + `Notify` + timeout per turn, 1 ms floors |
+| **P0** | turnloop behind the existing `js_register_wait_driver` hooks; timers stay in Perry, **but** Perry's deadline computation moves to `Instant` precision in the same change (today `as_millis()` truncation turns sub-ms waits into zero-budget spins), and the per-turn keep-alive scan becomes O(1) counters (the attribution run showed ~5.9k user instructions per turn there) | `block_on` + `Notify` + timeout per turn, 1 ms floors, spin on sub-ms deadlines |
 | **P1** | net (bundled stdlib and perry-ext-net, including Windows named-pipe IPC) on turnloop handles | tokio net tasks, mpsc-per-write |
 | **P2** | child_process, pty, stdin, dgram and signals on turnloop | per-pipe reader threads and polling readers (`os_process_streams.rs:361`, `dgram_reactor.rs:73`) on Unix; Windows keeps reader threads only where the OS requires them |
 | **P3** | JS timers into the turnloop heap; Node phase order | Vec scans, ms truncation, spin-until-throttle |
