@@ -3,6 +3,7 @@
 //! retryable-writes/retryable-writes.md § Executing Retryable Write Commands.
 //! The adapter performs the action returned by `action` and reports its outcome.
 //! Input BSON and wire templates are copied into retained buffers once per command.
+use crate::Instant;
 use crate::{
     retry::{Retry, RetryKind},
     uri::ReadPreference,
@@ -10,7 +11,7 @@ use crate::{
     Connection, Error, ErrorKind, Result,
 };
 use bson::raw::{RawBsonRef, RawDocument};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OperationKind {
     Read,
@@ -430,7 +431,7 @@ impl Operation {
     pub fn handle_timeout(&mut self, now: Instant) {
         if self.deadline.is_some_and(|d| d <= now) {
             self.finish_error(Error::new(
-                ErrorKind::Timeout,
+                ErrorKind::OperationTimeout,
                 "MongoDB operation timed out",
             ));
         }

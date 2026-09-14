@@ -1,6 +1,7 @@
 //! mongodb-handshake/handshake.md §§ Connection Handshake, Speculative Authentication.
 //! Events are pull-based. A token is accepted only on successful `command`, and
 //! yields exactly one Reply, Failed, or Unacknowledged event before reuse.
+use crate::Instant;
 use crate::{
     auth::{Mechanism, Scram},
     uri::Options,
@@ -8,7 +9,7 @@ use crate::{
     Error, ErrorKind, Result,
 };
 use bson::{doc, raw::RawDocument, Document};
-use std::{collections::VecDeque, time::Instant};
+use std::collections::VecDeque;
 #[derive(Debug)]
 pub enum ConnectionEvent {
     UpgradeTls,

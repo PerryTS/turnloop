@@ -1,11 +1,9 @@
 //! connection-monitoring-and-pooling/connection-monitoring-and-pooling.md
 //! §§ Connection Pool, Connection Pool Clearing, Wait Queue, Connection Checkout.
 //! Host performs Connect/Close actions and reports authentication-ready connections.
+use crate::Instant;
 use crate::{Error, ErrorKind, Result};
-use std::{
-    collections::VecDeque,
-    time::{Duration, Instant},
-};
+use std::{collections::VecDeque, time::Duration};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Lease {
     pub id: u64,
@@ -255,7 +253,7 @@ impl Pool {
                 self.events.push_back(PoolEvent::CheckoutFailed {
                     token: w.token,
                     error: Error::new(
-                        ErrorKind::Timeout,
+                        ErrorKind::WaitQueueTimeout,
                         "Timed out while checking out a connection from connection pool",
                     ),
                 });
@@ -318,6 +316,18 @@ impl Pool {
             });
             self.events.push_back(PoolEvent::Connect(lease));
             connecting += 1;
+        }
+    }
+}
+
+impl From<&crate::uri::Options> for PoolOptions {
+    fn from(options: &crate::uri::Options) -> Self {
+        Self {
+            min_size: options.min_pool_size,
+            max_size: options.max_pool_size,
+            max_connecting: options.max_connecting,
+            wait_timeout: options.wait_queue_timeout,
+            max_idle: options.max_idle_time,
         }
     }
 }

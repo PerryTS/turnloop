@@ -9,17 +9,111 @@ use bson::{
 #[derive(Debug, Default)]
 pub struct Command {
     writer: BsonWriter,
+    scratch: BsonWriter,
 }
 impl Command {
     pub fn new() -> Self {
         Self {
             writer: BsonWriter::new(),
+            scratch: BsonWriter::new(),
         }
     }
     pub fn raw(&self) -> &RawDocument {
         self.writer
             .as_raw()
             .expect("Command builder must finish successfully")
+    }
+    /// Applies URI-level defaults only when the command has no explicit override.
+    /// Call before sizing BulkBatcher; no owned BSON documents are constructed.
+    pub fn apply_client_options(
+        &mut self,
+        options: &crate::uri::Options,
+        write: bool,
+    ) -> Result<()> {
+        self.scratch.clear();
+        self.scratch.append_fields(self.writer.as_raw()?, &[])?;
+        if write
+            && self
+                .writer
+                .as_raw()?
+                .get("writeConcern")
+                .ok()
+                .flatten()
+                .is_none()
+            && ["w", "journal", "wtimeoutms"]
+                .iter()
+                .any(|k| options.raw.contains_key(*k))
+        {
+            let wc = self.scratch.start_document("writeConcern", false)?;
+            if let Some(w) = options.raw.get("w") {
+                if let Ok(n) = w.parse::<i32>() {
+                    self.scratch.int32("w", n)?;
+                } else {
+                    self.scratch.string("w", w)?;
+                }
+            }
+            if let Some(j) = options.raw.get("journal") {
+                self.scratch.boolean("j", j == "true")?;
+            }
+            if let Some(n) = options.raw.get("wtimeoutms") {
+                self.scratch.int64(
+                    "wtimeout",
+                    n.parse::<i64>().map_err(|_| {
+                        Error::new(ErrorKind::InvalidArgument, "wtimeoutMS out of range")
+                    })?,
+                )?;
+            }
+            self.scratch.end_document(wc)?;
+        }
+        if !write {
+            if let Some(level) = options.raw.get("readconcernlevel") {
+                if self
+                    .writer
+                    .as_raw()?
+                    .get("readConcern")
+                    .ok()
+                    .flatten()
+                    .is_none()
+                {
+                    let rc = self.scratch.start_document("readConcern", false)?;
+                    self.scratch.string("level", level)?;
+                    self.scratch.end_document(rc)?;
+                }
+            }
+            if options.read_preference != crate::uri::ReadPreference::Primary
+                && self
+                    .writer
+                    .as_raw()?
+                    .get("$readPreference")
+                    .ok()
+                    .flatten()
+                    .is_none()
+            {
+                let rp = self.scratch.start_document("$readPreference", false)?;
+                self.scratch
+                    .string("mode", options.read_preference.as_str())?;
+                if !options.read_preference_tags.is_empty() {
+                    let tags = self.scratch.start_document("tags", true)?;
+                    for (i, set) in options.read_preference_tags.iter().enumerate() {
+                        let mut b = [0; 20];
+                        let tag = self.scratch.start_document(index(i, &mut b), false)?;
+                        for (k, v) in set {
+                            self.scratch.string(k, v)?;
+                        }
+                        self.scratch.end_document(tag)?;
+                    }
+                    self.scratch.end_document(tags)?;
+                }
+                if let Some(max) = options.max_staleness {
+                    self.scratch
+                        .int64("maxStalenessSeconds", max.as_secs() as i64)?;
+                }
+                self.scratch.end_document(rp)?;
+            }
+        }
+        self.scratch.finish()?;
+        std::mem::swap(&mut self.writer, &mut self.scratch);
+        Ok(())
     }
     fn begin(&mut self, name: &str, collection: Option<&str>) -> Result<()> {
         self.writer.clear();

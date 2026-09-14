@@ -1,6 +1,7 @@
 //! server-discovery-and-monitoring/server-discovery-and-monitoring.md §§ Parsing
 //! hello, TopologyType table, updateRSFromPrimary, Error Handling; server-selection/
 //! server-selection.md §§ Read Preference, Latency Window, max-staleness.
+use crate::Instant;
 use crate::{
     uri::{Options, ReadPreference},
     Error, ErrorKind, Result,
@@ -8,7 +9,7 @@ use crate::{
 use bson::{oid::ObjectId, Document};
 use std::{
     collections::{BTreeMap, VecDeque},
-    time::{Duration, Instant},
+    time::Duration,
 };
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ServerType {

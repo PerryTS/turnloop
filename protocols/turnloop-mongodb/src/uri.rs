@@ -324,7 +324,11 @@ impl Options {
                 "authmechanism" => {
                     Mechanism::parse(v)?;
                 }
-                "w" => {}
+                "w" => {
+                    if v.is_empty() || v.starts_with('-') {
+                        return Err(parse_error("Invalid write concern w"));
+                    }
+                }
                 "journal" => {
                     boolean(v)?;
                 }
@@ -352,6 +356,11 @@ impl Options {
             return Err(parse_error(
                 "directConnection requires exactly one non-SRV host",
             ));
+        }
+        if self.raw.get("w").is_some_and(|v| v == "0")
+            && self.raw.get("journal").is_some_and(|v| v == "true")
+        {
+            return Err(parse_error("w=0 cannot be combined with journal=true"));
         }
         if self.heartbeat < Duration::from_millis(500)
             || self.max_connecting == 0

@@ -423,3 +423,207 @@ fn bulk_batch_limits_object_ids_and_unacknowledged_send() {
     ));
     assert!(c.is_ready());
 }
+
+#[test]
+fn sessions_causal_pool_recovery_and_end_retry() {
+    use turnloop_mongodb::{
+        bson::Timestamp,
+        session::{EndAction, EndKind, SessionPool, TransactionEnd},
+        time::HostInstant,
+    };
+    let now = Instant::now();
+    let mut s = Session::new([33; 16]);
+    s.next_retryable_write().unwrap();
+    s.observe(&doc!{"operationTime":Timestamp{time:5,increment:2},"$clusterTime":{"clusterTime":Timestamp{time:5,increment:2},"signature":{"hash":0}}});
+    let mut w = BsonWriter::new();
+    w.clear();
+    w.string("find", "items").unwrap();
+    s.decorate_causal_read(&mut w, Some("majority")).unwrap();
+    let raw = w.finish().unwrap();
+    assert_eq!(
+        raw.get_document("readConcern")
+            .unwrap()
+            .get_timestamp("afterClusterTime")
+            .unwrap(),
+        Timestamp {
+            time: 5,
+            increment: 2
+        }
+    );
+    assert!(raw.get_document("$clusterTime").is_ok());
+    let mut pool = SessionPool::new(Duration::from_secs(120));
+    assert!(pool.checkin(s, now));
+    assert_eq!(pool.next_timeout(), Some(now + Duration::from_secs(60)));
+    let mut s = pool.checkout(now).unwrap();
+    assert_eq!(s.txn_number, 1);
+    assert!(s.operation_time.is_none());
+    s.start_transaction().unwrap();
+    assert!(!s.commit(&mut w, false).unwrap());
+    assert!(!s.commit(&mut w, false).unwrap());
+    s.start_transaction().unwrap();
+    w.clear();
+    s.decorate(&mut w, false).unwrap();
+    w.finish().unwrap();
+    s.observe_recovery_token(&raw_recovery()).unwrap();
+    s.transaction_write_concern = Some(raw_wc());
+    s.commit(&mut w, false).unwrap();
+    assert_eq!(
+        w.as_raw()
+            .unwrap()
+            .get_document("recoveryToken")
+            .unwrap()
+            .get_i32("id")
+            .unwrap(),
+        4
+    );
+    let mut end = TransactionEnd::new(EndKind::Commit);
+    assert!(matches!(
+        end.failed(&mut s, Error::new(ErrorKind::Network, "reset"), 27, &mut w)
+            .unwrap(),
+        EndAction::Retry
+    ));
+    assert_eq!(
+        w.as_raw()
+            .unwrap()
+            .get_document("writeConcern")
+            .unwrap()
+            .get_i32("wtimeout")
+            .unwrap(),
+        123
+    );
+    assert!(
+        matches!(end.failed(&mut s,Error::new(ErrorKind::Network,"reset"),27,&mut w).unwrap(),EndAction::Failed(e)if e.has_label("UnknownTransactionCommitResult"))
+    );
+    s.start_transaction().unwrap();
+    w.clear();
+    s.decorate(&mut w, false).unwrap();
+    w.finish().unwrap();
+    s.abort(&mut w).unwrap();
+    let mut end = TransactionEnd::new(EndKind::Abort);
+    assert!(matches!(
+        end.failed(&mut s, Error::new(ErrorKind::Network, "reset"), 27, &mut w)
+            .unwrap(),
+        EndAction::Retry
+    ));
+    assert_eq!(w.as_raw().unwrap().get_i32("abortTransaction").unwrap(), 1);
+    assert!(matches!(
+        end.failed(&mut s, Error::new(ErrorKind::Network, "reset"), 27, &mut w)
+            .unwrap(),
+        EndAction::Complete
+    ));
+    assert!(pool.checkin(s, now));
+    pool.handle_timeout(now + Duration::from_secs(60));
+    assert!(pool.is_empty());
+    let start = HostInstant::from_duration(Duration::from_millis(42));
+    assert_eq!(
+        (start + Duration::from_millis(5)).duration_since(start),
+        Duration::from_millis(5)
+    );
+}
+fn raw_recovery() -> RawDocumentBuf {
+    raw(&doc! {"ok":1,"recoveryToken":{"id":4}})
+}
+fn raw_wc() -> RawDocumentBuf {
+    raw(&doc! {"w":1,"wtimeout":123})
+}
+#[test]
+fn close_preserves_received_reply_and_response_mismatch_completes_once() {
+    let mut c = ready();
+    let body = raw(&doc! {"ping":1,"$db":"admin"});
+    c.command(80, &body, &[], Instant::now()).unwrap();
+    let req = wire::i32_at(c.transmit(), 4).unwrap();
+    let n = c.transmit().len();
+    c.consume_transmit(n).unwrap();
+    let mut reply = Vec::new();
+    wire::encode(&mut reply, 1, req, 0, &raw(&doc! {"ok":1}), &[], 1000).unwrap();
+    feed(&mut c, &reply);
+    c.close();
+    assert!(matches!(
+        c.poll_event(),
+        Some(ConnectionEvent::Reply { token: 80 })
+    ));
+    assert_eq!(c.reply().unwrap().get_i32("ok").unwrap(), 1);
+    assert!(matches!(c.poll_event(), Some(ConnectionEvent::Closed)));
+    c.release_reply().unwrap();
+    assert!(!c.is_ready());
+    assert!(c.poll_event().is_none());
+    let mut c = ready();
+    c.command(81, &body, &[], Instant::now()).unwrap();
+    let n = c.transmit().len();
+    c.consume_transmit(n).unwrap();
+    wire::encode(&mut reply, 1, 10000, 0, &raw(&doc! {"ok":1}), &[], 1000).unwrap();
+    let mut at = 0;
+    let mut failed = false;
+    while at < reply.len() {
+        match c.receive(&reply[at..]) {
+            Ok(n) => {
+                assert!(n > 0);
+                at += n;
+            }
+            Err(_) => {
+                failed = true;
+                break;
+            }
+        }
+    }
+    assert!(failed);
+    assert!(matches!(
+        c.poll_event(),
+        Some(ConnectionEvent::Failed {
+            token: Some(81),
+            ..
+        })
+    ));
+    assert!(matches!(c.poll_event(), Some(ConnectionEvent::Closed)));
+    c.close();
+    assert!(c.poll_event().is_none());
+}
+
+#[test]
+fn client_option_inheritance_keeps_explicit_command_fields() {
+    let options=Options::parse("mongodb://a/?w=majority&journal=true&wtimeoutMS=30&readPreference=secondary&readPreferenceTags=region:west&maxStalenessSeconds=100&readConcernLevel=majority").unwrap();
+    let mut c = Command::new();
+    c.insert("db", "items", true, None).unwrap();
+    c.apply_client_options(&options, true).unwrap();
+    let wc = c.raw().get_document("writeConcern").unwrap();
+    assert_eq!(wc.get_str("w").unwrap(), "majority");
+    assert_eq!(wc.get_i64("wtimeout").unwrap(), 30);
+    assert!(wc.get_bool("j").unwrap());
+    c.insert(
+        "db",
+        "items",
+        true,
+        Some(&raw(&doc! {"writeConcern":{"w":1}})),
+    )
+    .unwrap();
+    c.apply_client_options(&options, true).unwrap();
+    assert_eq!(
+        c.raw()
+            .get_document("writeConcern")
+            .unwrap()
+            .get_i32("w")
+            .unwrap(),
+        1
+    );
+    c.find("db", "items", &raw(&doc! {}), None).unwrap();
+    c.apply_client_options(&options, false).unwrap();
+    let p = c.raw().get_document("$readPreference").unwrap();
+    assert_eq!(p.get_str("mode").unwrap(), "secondary");
+    assert_eq!(
+        p.get_array("tags")
+            .unwrap()
+            .get_document(0)
+            .unwrap()
+            .get_str("region")
+            .unwrap(),
+        "west"
+    );
+    assert_eq!(
+        c.raw()
+            .get_document("readConcern")
+            .unwrap()
+            .get_str("level")
+            .unwrap(),
+        "majority"
+    );
+}

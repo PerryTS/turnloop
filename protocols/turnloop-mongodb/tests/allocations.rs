@@ -39,10 +39,12 @@ static ALLOCATOR: Counter = Counter;
 #[test]
 fn warmed_command_and_borrowed_reply_allocate_zero() {
     for compressed in [false, true] {
-        measure(compressed);
+        for coordinator in [false, true] {
+            measure(compressed, coordinator);
+        }
     }
 }
-fn measure(compressed: bool) {
+fn measure(compressed: bool, coordinator: bool) {
     let now = Instant::now();
     let mut c = Connection::new(
         Options::parse(if compressed {
@@ -84,6 +86,8 @@ fn measure(compressed: bool) {
         compressed_reply[..4].copy_from_slice(&n.to_le_bytes());
     }
     let mut cmd = Command::new();
+    use turnloop_mongodb::operation::*;
+    let mut operation = Operation::new();
     let mut rows = 0;
     for round in 0..1002 {
         if round == 2 {
@@ -91,7 +95,40 @@ fn measure(compressed: bool) {
             TRACK.store(true, Ordering::SeqCst);
         }
         cmd.find("db", "items", &filter, None).unwrap();
-        c.command(round, cmd.raw(), &[], now).unwrap();
+        if coordinator {
+            operation
+                .begin(
+                    cmd.raw(),
+                    &[],
+                    OperationOptions {
+                        token: round,
+                        kind: OperationKind::Read,
+                        retry: true,
+                        session: Some(RetrySession {
+                            id: [12; 16],
+                            txn_number: 0,
+                        }),
+                        ..OperationOptions::default()
+                    },
+                    now,
+                )
+                .unwrap();
+            operation
+                .selected(
+                    "local",
+                    ServerCapabilities {
+                        wire_version: 27,
+                        sessions: true,
+                        standalone: false,
+                        direct: false,
+                    },
+                )
+                .unwrap();
+            operation.checked_out().unwrap();
+            operation.send(&mut c, now).unwrap();
+        } else {
+            c.command(round, cmd.raw(), &[], now).unwrap();
+        }
         let req = wire::i32_at(c.transmit(), 4).unwrap();
         let n = c.transmit().len();
         c.consume_transmit(n).unwrap();
@@ -104,6 +141,9 @@ fn measure(compressed: bool) {
         }
         assert!(matches!(c.poll_event(),Some(ConnectionEvent::Reply{token})if token==round));
         let body = c.reply().unwrap();
+        if coordinator {
+            assert!(operation.response(body).unwrap());
+        }
         turnloop_mongodb::Error::from_response(body).unwrap();
         let batch = turnloop_mongodb::command::CursorBatch::parse(body).unwrap();
         for row in batch.rows() {
@@ -116,7 +156,7 @@ fn measure(compressed: bool) {
     assert_eq!(rows, 2004);
     assert_eq!(
         allocations, 0,
-        "1000 warmed commands/2000 rows allocated {allocations} times (zlib={compressed})"
+        "1000 warmed commands/2000 rows allocated {allocations} times (zlib={compressed}, operation={coordinator})"
     );
 }
 fn feed(c: &mut Connection, b: &[u8]) {
