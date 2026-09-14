@@ -189,3 +189,56 @@ be explicitly marked UNRUN because there is no Linux host.
   process (32 connected loops, including stale Notifier/Poster use after drop).
 - FAIL: first final verification attempt found Clippy suspicious_map in fd_count;
   replaced map+count with inspect+count, preserving the per-entry success assertion.
+
+### Final validation refinements
+
+- PASS: `sh scripts/verify-core.sh`, including all native tests, five loom models,
+  both timer comparison configurations, Linux all-feature cross-Clippy and locked
+  stable checking. Final native count is 24 tests: 3 pure core, 19 shared scenarios,
+  1 allocation gate, 1 fd-lifetime gate.
+- PASS: Clippy `--workspace --all-targets` for wasm32-unknown-unknown,
+  wasm32-wasip2 and x86_64-pc-windows-msvc, both ordinary and all-feature builds.
+  These check the common core/contract/benchmark code, NOT the other lanes' adapters.
+- PASS: `RUSTFLAGS='--cfg loom' cargo +nightly-2026-08-20 clippy -p windlass --all-targets -- -D warnings`.
+- PASS: `cargo +1.98.0 check --workspace --locked` (same expected Cargo soak warning).
+- PASS: `cargo +nightly-2026-08-20 run --release -p windlass-bench -- --portable --timers`:
+  all nine workloads ran, explicitly reported in nanoseconds rather than instructions.
+- PASS: `rustup component add miri --toolchain nightly-2026-08-20`;
+  `MIRI_SYSROOT="$PWD/target/miri-sysroot" cargo +nightly-2026-08-20 miri setup`;
+  `MIRI_SYSROOT="$PWD/target/miri-sysroot" cargo +nightly-2026-08-20 miri test -p windlass --lib`
+  (3 tests). Sysroot cache stayed under this clone; toolchain/cache writes used the
+  explicitly writable Rust directories. No Homebrew or other lane files changed.
+- PASS: workflow YAML parsing with Ruby YAML.load_file and two-job assertion;
+  Python Cargo.lock audit found no tokio/tokio-* package; source inspection found no
+  unwrap() in library I/O and checked SAFETY comments at the unsafe operations.
+- Timer precision gate strengthened: 20 additional 250-us timers, median lateness
+  below 500 us, plus the existing no-early-fire and individual scheduler bounds.
+  `cargo +nightly-2026-08-20 test -p windlass-contract native::timer_bounds -- --nocapture`
+  PASS, and the subsequent complete suite PASS.
+- Close ordering test permits arbitrary order among cancellation IDs, while still
+  asserting both unique IDs precede Closed. This is required for native completion
+  backends, which need not preserve cancellation order.
+- The initial allocation gate also PASSed with BTreeMap (one timer reuses its root).
+  Strengthening the unchanged zero-allocation assertion to ten warmed batches of
+  1,000 timers exposed the actual allocation cost:
+  **FAIL:** `cargo +nightly-2026-08-20 test -p windlass-contract --test allocations --features windlass/timer-btree`:
+  `steady batches of 1000 timers allocate nothing`, `left: 1660`, `right: 0`.
+  This disqualifies BTreeMap as the production driver timer structure.
+- Final implementation always uses the indexed heap in Driver. `timer-btree` selects
+  the separate benchmark queue alias and its real conformance test, so both timer
+  candidates remain measurable without changing production semantics. The widened
+  allocation assertion remains in place. **PASS:** `cargo +nightly-2026-08-20 test
+  --workspace --all-features` and `cargo +nightly-2026-08-20 test --workspace`, both
+  including 10,000 batched timers, 128,000 bytes and 100 accepts with zero allocations.
+- FAIL then PASS during timer extraction: all-feature Clippy found unused heap len/
+  is_empty methods when the benchmark alias selected BTreeMap; exported the concrete
+  heap alongside the comparison alias. No lint suppression.
+- PASS: `python3 scripts/benchmark-core.py --rounds 5`. This builds two cgu=1 binaries
+  with `cargo +nightly-2026-08-20 build --release -p windlass-bench --target-dir
+  target/bench-{heap,btree}` (BTree adds `--features timer-btree`) and runs 15 fresh
+  processes in rotated order. Final source fingerprint is in the raw JSONL metadata.
+- Earlier 10k-iteration control showed noise ([9.59, 11.86] instructions/iteration).
+  Preserved those results in `benchmarks/core-macos-arm64-initial.jsonl`. The final
+  control does 1,000,000 actual iterations to amortize counter/page-fault overhead;
+  it is stable at 9.01 instructions/iteration at the reported precision. No samples
+  were discarded or thresholds loosened. Other operation ranges remain visible.
