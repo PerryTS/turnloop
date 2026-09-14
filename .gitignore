@@ -6,3 +6,5 @@
 **/node_modules
 **/pkg
 __pycache__/
+**/pkg/
+**/node_modules/
