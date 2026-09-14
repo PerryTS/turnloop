@@ -1,0 +1,3 @@
+[workspace]
+members = ["protocols/turnloop-mongodb"]
+resolver = "2"
