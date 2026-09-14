@@ -130,6 +130,38 @@ class Gates(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 bench.read_counts(directory)
 
+    def test_installer_verifies_digest_before_extracting(self):
+        import hashlib
+        import io
+        import tarfile
+        installer = module('install-tools')
+        stream = io.BytesIO()
+        with tarfile.open(fileobj=stream, mode='w:gz') as bundle:
+            contents = b'#!/bin/sh\nexit 0\n'
+            info = tarfile.TarInfo('nested/tool')
+            info.size = len(contents)
+            bundle.addfile(info, io.BytesIO(contents))
+        blob = stream.getvalue()
+        pin = {'version': 'test', 'url': 'https://example.invalid/tool.tar.gz',
+               'sha256': hashlib.sha256(blob).hexdigest(), 'executables': ['tool']}
+        with tempfile.TemporaryDirectory() as folder:
+            directory = Path(folder)
+            with patch.object(installer.json, 'loads', return_value={'test': {'Linux-x86_64': pin}}), \
+                 patch.object(installer.platform, 'system', return_value='Linux'), \
+                 patch.object(installer.platform, 'machine', return_value='x86_64'), \
+                 patch.object(installer.urllib.request, 'urlopen', return_value=io.BytesIO(blob)):
+                installer.install('test', directory)
+            self.assertEqual((directory/'tool').read_bytes(), contents)
+            (directory/'tool').unlink()
+            pin['sha256'] = '0'*64
+            with patch.object(installer.json, 'loads', return_value={'test': {'Linux-x86_64': pin}}), \
+                 patch.object(installer.platform, 'system', return_value='Linux'), \
+                 patch.object(installer.platform, 'machine', return_value='x86_64'), \
+                 patch.object(installer.urllib.request, 'urlopen', return_value=io.BytesIO(blob)):
+                with self.assertRaisesRegex(RuntimeError, 'SHA-256 mismatch'):
+                    installer.install('test', directory)
+            self.assertFalse((directory/'tool').exists())
+
     def test_queue_is_never_silently_weakened(self):
         lint = module('lint-workflows')
         source = (ROOT/'.github/workflows/ci.yml').read_text()
