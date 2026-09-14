@@ -5,22 +5,17 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
-[features]
-default = []
-h2 = ["hyper/http2"]
-
 [dependencies]
-hyper = { path = "vendor/hyper", default-features = false, features = ["client", "http1"] }
 bytes.workspace = true
 http.workspace = true
-http-body = "1"
-http-body-util = "0.1"
 url = "2"
 httparse = "1"
 flate2 = "1"
 brotli = "8"
-zstd = { version = "0.13", default-features = false }
 turnloop-tls = { path = "../turnloop-tls" }
 
 [dev-dependencies]
 rcgen.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+zstd = { version = "0.13", default-features = false }
