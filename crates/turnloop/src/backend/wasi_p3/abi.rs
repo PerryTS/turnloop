@@ -8,11 +8,11 @@ unsafe extern "C" {
 #[link(wasm_import_module = "wasi:sockets/types@0.3.0")]
 unsafe extern "C" {
     #[link_name = "[async-lower][method]tcp-socket.connect"]
-    pub(super) fn connect(params: *mut u32, result: *mut u32) -> u32;
+    fn raw_connect(params: *mut u32, result: *mut u32) -> u32;
     #[link_name = "[async-lower][method]udp-socket.send"]
-    pub(super) fn send(params: *mut u32, result: *mut u32) -> u32;
+    fn raw_send(params: *mut u32, result: *mut u32) -> u32;
     #[link_name = "[async-lower][method]udp-socket.receive"]
-    pub(super) fn receive(socket: u32, result: *mut u32) -> u32;
+    fn raw_receive(socket: u32, result: *mut u32) -> u32;
 }
 pub fn encode_addr(storage: &mut [u32], addr: SocketAddr) {
     storage.fill(0);
@@ -46,4 +46,36 @@ pub fn decode_addr(storage: &[u32]) -> SocketAddr {
             u32::from_le_bytes(b[28..32].try_into().expect("scope")),
         ))
     }
+}
+
+// Rust's wasm32-wasip3 shadow stack lives in canonical context slot 0.
+// Synchronous completion of an async-lowered call may reset that slot. Preserve
+// the caller's stack before subsequent Rust code touches a stack frame.
+#[link(wasm_import_module = "env")]
+unsafe extern "C" {
+    fn __wasm_get_stack_pointer() -> u32;
+    fn __wasm_set_stack_pointer(pointer: u32);
+}
+pub(super) fn preserving_stack<T>(f: impl FnOnce() -> T) -> T {
+    // SAFETY: pinned wasm32-wasip3 toolchain's shadow-stack accessors; the saved
+    // value identifies this still-live caller frame, never another task's stack.
+    let stack = unsafe { __wasm_get_stack_pointer() };
+    let result = f();
+    // SAFETY: f has returned synchronously; restore this caller's live stack.
+    unsafe {
+        __wasm_set_stack_pointer(stack);
+    }
+    result
+}
+pub(super) unsafe fn connect(params: *mut u32, result: *mut u32) -> u32 {
+    // SAFETY: caller owns pinned canonical parameters/return area until acknowledgement.
+    preserving_stack(|| unsafe { raw_connect(params, result) })
+}
+pub(super) unsafe fn send(params: *mut u32, result: *mut u32) -> u32 {
+    // SAFETY: caller owns pinned canonical parameters/return area until acknowledgement.
+    preserving_stack(|| unsafe { raw_send(params, result) })
+}
+pub(super) unsafe fn receive(socket: u32, result: *mut u32) -> u32 {
+    // SAFETY: caller owns socket and pinned return area until acknowledgement.
+    preserving_stack(|| unsafe { raw_receive(socket, result) })
 }

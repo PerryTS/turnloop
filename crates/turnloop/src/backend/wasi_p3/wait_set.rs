@@ -7,15 +7,15 @@ unsafe extern "C" {
     #[link_name = "[waitable-set-drop]"]
     fn set_drop(set: u32);
     #[link_name = "[waitable-join]"]
-    fn join(waitable: u32, set: u32);
+    fn raw_join(waitable: u32, set: u32);
     #[link_name = "[waitable-set-wait]"]
     fn wait(set: u32, payload: *mut [u32; 2]) -> u32;
     #[link_name = "[waitable-set-poll]"]
     fn poll(set: u32, payload: *mut [u32; 2]) -> u32;
     #[link_name = "[subtask-cancel]"]
-    pub(super) fn subtask_cancel(task: u32) -> u32;
+    pub(super) fn raw_subtask_cancel(task: u32) -> u32;
     #[link_name = "[subtask-drop]"]
-    pub(super) fn subtask_drop(task: u32);
+    pub(super) fn raw_subtask_drop(task: u32);
 }
 pub struct WaitSet(u32);
 impl WaitSet {
@@ -26,25 +26,25 @@ impl WaitSet {
     pub fn join(&self, waitable: u32) {
         // SAFETY: caller owns the live waitable until removing its membership.
         unsafe {
-            join(waitable, self.0);
+            super::abi::preserving_stack(|| raw_join(waitable, self.0));
         }
     }
     pub fn remove(&self, waitable: u32) {
         // SAFETY: caller still owns this waitable; zero removes all membership.
         unsafe {
-            join(waitable, 0);
+            super::abi::preserving_stack(|| raw_join(waitable, 0));
         }
     }
     pub fn step(&self, blocking: bool) -> (u32, u32, u32) {
         let mut payload = [0; 2];
         // SAFETY: live wait-set and writable aligned event payload.
-        let kind = unsafe {
+        let kind = super::abi::preserving_stack(|| unsafe {
             if blocking {
                 wait(self.0, &mut payload)
             } else {
                 poll(self.0, &mut payload)
             }
-        };
+        });
         (kind, payload[0], payload[1])
     }
 }
@@ -55,4 +55,13 @@ impl Drop for WaitSet {
             set_drop(self.0);
         }
     }
+}
+
+pub(super) unsafe fn subtask_cancel(task: u32) -> u32 {
+    // SAFETY: caller owns the live task and its pinned return area until cancellation.
+    super::abi::preserving_stack(|| unsafe { raw_subtask_cancel(task) })
+}
+pub(super) unsafe fn subtask_drop(task: u32) {
+    // SAFETY: caller removed membership and observed return/cancellation.
+    super::abi::preserving_stack(|| unsafe { raw_subtask_drop(task) })
 }

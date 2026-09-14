@@ -347,3 +347,72 @@ async fn steady_rust_websocket_posts_and_timers_allocate_nothing() {
     }
     assert_eq!(total, 6400);
 }
+
+#[wasm_bindgen_test(async)]
+async fn capability_errors_and_oversize_response_are_terminal() {
+    let mut l = Loop::new(Config {
+        pooled_buffer_size: 16,
+        ..Config::default()
+    })
+    .expect("loop");
+    let h = websocket(&mut l).await;
+    assert_eq!(
+        l.read_start(h, Token(1)).expect_err("multishot").kind,
+        ErrorKind::Unsupported
+    );
+    assert_eq!(
+        l.writev(h, WriteVectored::new([]).expect("vector"), Token(2))
+            .expect_err("writev")
+            .kind,
+        ErrorKind::Unsupported
+    );
+    assert_eq!(
+        l.detach(h).expect_err("transfer").kind,
+        ErrorKind::Unsupported
+    );
+    let read = l.read(h, ReadBuf::Pooled, Token(3)).expect("read");
+    assert_eq!(
+        l.read(h, ReadBuf::Pooled, Token(4))
+            .expect_err("second read")
+            .kind,
+        ErrorKind::WouldBlock
+    );
+    assert!(l.cancel(read));
+    let mut out = Completions::default();
+    l.turn(Timeout::Now, &mut out).expect("cancel ack");
+    assert_eq!(out.len(), 1);
+    assert!(matches!(out[0].result, OpResult::Cancelled));
+    l.close(h, Token(5)).expect("close");
+    l.turn(Timeout::Now, &mut out).expect("closed");
+    let (h, op) = l
+        .fetch(&(base().to_owned() + "/bytes"), ReadBuf::Pooled, Token(6))
+        .expect("fetch");
+    scheduled(&mut l, &mut out).await;
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].op, Some(op));
+    assert!(matches!(
+        out[0].result,
+        OpResult::Err(Error {
+            kind: ErrorKind::ResourceLimit,
+            ..
+        })
+    ));
+    assert!(!l.cancel(op), "oversize read retired exactly once");
+    l.close(h, Token(7)).expect("close");
+    l.turn(Timeout::Now, &mut out).expect("closed");
+    assert_eq!(out.len(), 1);
+    assert!(matches!(out[0].result, OpResult::Closed));
+    let timer = l
+        .timer(l.now() + Duration::from_millis(5), None, Token(8))
+        .expect("timer");
+    l.close(timer, Token(9)).expect("cancel timer");
+    l.turn(Timeout::Now, &mut out).expect("timer close");
+    assert_eq!(out.len(), 2);
+    let before = l.schedule_count();
+    JsFuture::from(sleep(20.0))
+        .await
+        .expect("past cancelled deadline");
+    l.turn(Timeout::Now, &mut out).expect("late timer");
+    assert!(out.is_empty());
+    assert_eq!(l.schedule_count(), before, "cancelled deadline disarmed");
+}
