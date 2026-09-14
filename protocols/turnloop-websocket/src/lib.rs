@@ -1,6 +1,12 @@
 //! WebSocket protocol over in-memory Read/Write views, never sockets. HTTP upgrade
 //! heads come from turnloop-http; pass unconsumed upgrade bytes to `receive`.
 //! permessage-deflate is deliberately not negotiated (tungstenite has no support).
+//!
+//! # Getting started on turnloop
+//! Enable the `turnloop` feature for the `asynchronous` module. The embedding
+//! host owns `LocalExecutor` and calls `turn`; adapters await its streams and
+//! deadline futures. See the crate README and turnloop-io for ownership, streaming
+//! and cancellation examples. Default features retain the sans-I/O API.
 #![deny(unsafe_op_in_unsafe_fn)]
 use base64::{Engine, engine::general_purpose::STANDARD};
 use std::{

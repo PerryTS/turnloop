@@ -40,6 +40,7 @@ role = "protocol"
 integration-tests = ["real_mongodb"]
 
 [target.'cfg(all(target_os = "wasi", target_env = "p3"))'.dependencies]
+turnloop-io = { workspace = true, optional = true, features = ["wasi-p3-experimental"] }
 turnloop-wasi-random.workspace = true
 
 [features]

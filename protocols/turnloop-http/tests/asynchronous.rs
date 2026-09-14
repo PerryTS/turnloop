@@ -380,3 +380,184 @@ fn node_async_client_redirect_decompression_and_h2() {
     }
     assert_eq!(finish(&mut task), 100);
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn node_https_and_http2_against_async_tls_server() {
+    use std::process::Command;
+    use turnloop_tls::{ServerConfig, TlsStream, rustls::pki_types::PrivatePkcs8KeyDer};
+    for h2 in [false, true] {
+        let cert =
+            rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("certificate");
+        let ca = cert.cert.pem();
+        let tls = ServerConfig::new(
+            vec![cert.cert.der().clone()],
+            PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()).into(),
+            vec![if h2 {
+                b"h2".to_vec()
+            } else {
+                b"http/1.1".to_vec()
+            }],
+            1_789_344_000,
+        )
+        .expect("TLS config");
+        let mut executor = LocalExecutor::<Platform>::new(Config::default()).expect("executor");
+        let h = executor.handle();
+        let listener = Listener::bind(&h, "127.0.0.1:0".parse().expect("address")).expect("listen");
+        let address = listener.local_addr().expect("address");
+        let end = h.now() + Duration::from_secs(10);
+        let mut task = executor
+            .spawn_local(async move {
+                let stream = listener.accept().await.expect("accept");
+                let stream = TlsStream::accept(stream, &tls, &h, end, 1_789_344_000)
+                    .await
+                    .expect("TLS handshake");
+                assert_eq!(
+                    stream.alpn_protocol(),
+                    Some(if h2 {
+                        b"h2".as_slice()
+                    } else {
+                        b"http/1.1".as_slice()
+                    })
+                );
+                let signal = server::Shutdown::default();
+                let stop = signal.clone();
+                let mut count = 0;
+                if h2 {
+                    server::http2(stream, signal, |core, event| {
+                        if let http2::Event::Headers {
+                            stream, end_stream, ..
+                        } = event
+                        {
+                            assert!(end_stream);
+                            core.send_headers(
+                                stream,
+                                &[
+                                    Header::new(":status", "200"),
+                                    Header::new("content-length", "4"),
+                                ],
+                                false,
+                            )
+                            .map_err(std::io::Error::other)?;
+                            assert_eq!(
+                                core.send_data(stream, b"node", true)
+                                    .map_err(std::io::Error::other)?,
+                                4
+                            );
+                            count += 1;
+                            stop.stop();
+                        }
+                        Ok(())
+                    })
+                    .await
+                    .expect("h2 drain");
+                } else {
+                    server::http1(stream, signal, |event, out| {
+                        match event {
+                            Event::Head(head) => {
+                                assert_eq!(head.method, "GET");
+                                out.start(&response(), BodyLength::Known(4))?;
+                                out.body(b"node")?;
+                            }
+                            Event::End => {
+                                out.finish(&[])?;
+                                count += 1;
+                                stop.stop();
+                            }
+                            _ => {}
+                        }
+                        Ok(())
+                    })
+                    .await
+                    .expect("h1 drain");
+                }
+                count
+            })
+            .expect("spawn");
+        let script = if h2 {
+            format!(
+                "const c=require('node:http2').connect('https://{address}',{{ca:process.env.TURNLOOP_CA,servername:'localhost'}});c.on('error',()=>process.exit(2));const r=c.request({{':path':'/'}});let body='';r.on('data',b=>body+=b);r.on('end',()=>{{if(body!=='node')process.exit(3);c.close()}});r.end();"
+            )
+        } else {
+            format!(
+                "require('node:https').get('https://{address}/',{{ca:process.env.TURNLOOP_CA,servername:'localhost',ALPNProtocols:['http/1.1']}},r=>{{let body='';r.on('data',b=>body+=b);r.on('end',()=>{{if(r.statusCode!==200||body!=='node')process.exit(3)}})}}).on('error',()=>process.exit(2));"
+            )
+        };
+        let mut child = Command::new("node")
+            .args(["-e", &script])
+            .env("TURNLOOP_CA", ca)
+            .spawn()
+            .expect("Node required");
+        while !task.is_finished() {
+            assert!(executor.driver().now() < end);
+            executor.turn(Timeout::Until(end)).expect("turn");
+        }
+        assert_eq!(finish(&mut task), 1);
+        executor.turn(Timeout::Now).expect("close delivery");
+        assert!(child.wait().expect("Node exit").success());
+    }
+}
+
+#[test]
+fn drop_server_cancels_inflight_request_once() {
+    use std::{cell::Cell, rc::Rc};
+    use turnloop_http::asynchronous::Http1;
+    let mut executor = LocalExecutor::<Platform>::new(Config::default()).expect("executor");
+    let h = executor.handle();
+    let mut server =
+        Server::bind(h.clone(), "127.0.0.1:0".parse().expect("address")).expect("server");
+    let address = server.local_addr().expect("address");
+    let seen = Rc::new(Cell::new(0));
+    let received = seen.clone();
+    let mut service = executor
+        .spawn_local(async move {
+            server
+                .run(move |stream, signal| {
+                    let received = received.clone();
+                    async move {
+                        server::http1(stream, signal, |event, _| {
+                            if let Event::Body(bytes) = event {
+                                assert_eq!(bytes, b"partial");
+                                received.set(received.get() + bytes.len());
+                            }
+                            Ok(())
+                        })
+                        .await
+                    }
+                })
+                .await
+        })
+        .expect("spawn");
+    let mut client = executor
+        .spawn_local(async move {
+            let stream = h
+                .connect(address, Default::default())
+                .await
+                .expect("connect");
+            let mut http = Http1::new(stream, turnloop_http::http1::Mode::Response);
+            let request = Request::new(&format!("http://{address}/"), "POST").expect("request");
+            http.send_head(&request.head(false), BodyLength::Known(100))
+                .await
+                .expect("head");
+            http.send_body(b"partial").await.expect("partial body");
+            assert!(http.head().await.is_err());
+            1
+        })
+        .expect("spawn");
+    let end = executor.driver().now() + Duration::from_secs(5);
+    while seen.get() == 0 {
+        assert!(executor.driver().now() < end);
+        executor.turn(Timeout::Until(end)).expect("turn");
+    }
+    assert_eq!(seen.get(), 7);
+    service.cancel();
+    while !client.is_finished() {
+        assert!(executor.driver().now() < end);
+        executor.turn(Timeout::Until(end)).expect("turn");
+    }
+    assert_eq!(finish(&mut client), 1);
+    assert!(matches!(
+        Pin::new(&mut service).poll(&mut Context::from_waker(Waker::noop())),
+        Poll::Ready(Err(turnloop::JoinError::Cancelled))
+    ));
+}

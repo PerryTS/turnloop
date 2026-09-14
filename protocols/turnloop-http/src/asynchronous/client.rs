@@ -87,7 +87,7 @@ impl<B: Backend> AsyncWrite for Transport<B> {
     }
 }
 enum Connection<B: Backend> {
-    H1(Http1<Transport<B>>),
+    H1(Box<Http1<Transport<B>>>),
     H2(Box<Http2<Transport<B>>>),
 }
 /// A client used by a local task. Repeated requests reuse per-origin connections
@@ -290,7 +290,9 @@ impl<B: Backend> Client<B> {
                     .connected(id, protocol, 1)
                     .map_err(io::Error::other)?;
                 lease.connection = Some(match protocol {
-                    Protocol::Http1 => Connection::H1(Http1::new(transport, Mode::Response)),
+                    Protocol::Http1 => {
+                        Connection::H1(Box::new(Http1::new(transport, Mode::Response)))
+                    }
                     Protocol::Http2 => {
                         Connection::H2(Box::new(Http2::new(transport, http2::Role::Client)?))
                     }

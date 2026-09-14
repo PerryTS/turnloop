@@ -1,4 +1,11 @@
 #![deny(unsafe_op_in_unsafe_fn)]
+//!
+//! # Getting started on turnloop
+//! Enable the `turnloop` feature for the `asynchronous` module. The embedding
+//! host owns `LocalExecutor` and calls `turn`; adapters await its streams and
+//! deadline futures. See the crate README and turnloop-io for ownership, streaming
+//! and cancellation examples. Default features retain the sans-I/O API.
+
 //! Pull-driven SMTP with explicit TLS transitions. Socket, DNS, certificate
 //! policy and clock ownership remain in the host. `Ready` also completes verify.
 pub mod message;

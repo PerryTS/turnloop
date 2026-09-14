@@ -16,3 +16,8 @@
 | 2026-09-14T19:50:58.345200+00:00 | PASS | `cargo test -p turnloop-io --test allocations -- --test-threads=1` | `.tools/adapters-net/tcp-allocations-fixed.log` |
 | 2026-09-14T19:51:24.520027+00:00 | PASS | `python3 scripts/ci/install-wasm-toolchain.py` | `.tools/adapters-net/wasm-sdk.log` |
 | 2026-09-14T19:51:56.201704+00:00 | FAIL | `cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks` | `.tools/adapters-net/clippy-native.log` |
+| 2026-09-14T19:53:05.820201+00:00 | PASS | `cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks` | `.tools/adapters-net/clippy-native-fixed.log` |
+| 2026-09-14T19:53:55.992366+00:00 | PASS | `cargo test -p turnloop-http --features turnloop --test asynchronous node_https_and_http2 -- --nocapture` | `.tools/adapters-net/node-tls.log` |
+| 2026-09-14T19:54:12.441094+00:00 | FAIL | `bash scripts/ci/install-wasmtime.sh` | `.tools/adapters-net/wasmtime.log` |
+| 2026-09-14T19:56:16.401692+00:00 | PASS | `cargo test --workspace --all-features -- --test-threads=1` | `.tools/adapters-net/workspace-test.log` |
+| 2026-09-14T19:56:21.062107+00:00 | PASS | `python3 scripts/ci/install-tools.py wasmtime --destination .tools/adapters-net/bin` | `.tools/adapters-net/wasmtime-owned.log` |

@@ -1,4 +1,11 @@
 #![deny(unsafe_op_in_unsafe_fn)]
+//!
+//! # Getting started on turnloop
+//! Enable the `turnloop` feature for the `asynchronous` module. The embedding
+//! host owns `LocalExecutor` and calls `turn`; adapters await its streams and
+//! deadline futures. See the crate README and turnloop-io for ownership, streaming
+//! and cancellation examples. Default features retain the sans-I/O API.
+
 #![forbid(unsafe_code)]
 //! Pull-driven MySQL protocol. The host owns transport, entropy, time and JS conversion.
 #[cfg(all(target_os = "wasi", target_env = "p3"))]

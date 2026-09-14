@@ -43,3 +43,6 @@ harness = false
 [[test]]
 name = "asynchronous"
 required-features = ["turnloop"]
+
+[target.'cfg(all(target_os = "wasi", target_env = "p3"))'.dependencies]
+turnloop-io = { workspace = true, optional = true, features = ["wasi-p3-experimental"] }

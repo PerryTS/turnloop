@@ -1,4 +1,11 @@
 #![deny(unsafe_op_in_unsafe_fn)]
+//!
+//! # Getting started on turnloop
+//! Enable the `turnloop` feature for the `asynchronous` module. The embedding
+//! host owns `LocalExecutor` and calls `turn`; adapters await its streams and
+//! deadline futures. See the crate README and turnloop-io for ownership, streaming
+//! and cancellation examples. Default features retain the sans-I/O API.
+
 //! Sans-I/O Redis connection. The host drains `output`, acknowledges writes with
 //! `consume_output`, supplies bytes/time, and polls events. Never reads a clock.
 //! Tokens are unique among outstanding commands. A timeout leaves a wire-order

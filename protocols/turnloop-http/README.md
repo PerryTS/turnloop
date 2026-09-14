@@ -14,3 +14,44 @@ No engine samples a clock. The host passes `Instant` deadlines and invokes timeo
 WASM uses the published `turnloop-zstd-decoder` fork of ruzstd 0.8.3 with retained sequence tables. Consumers need no workspace patch. Native builds use the reference zstd decoder by default; `pure-rust-zstd` selects the same decoder as WASM, including its allocation gates. See the decoder crate’s `UPSTREAM.md`.
 
 Tests use private ephemeral loopback servers, Node 26, curl, generated TLS certificates, RFC vectors and a vendored HPACK corpus. `examples/h2spec_server.rs` is a blocking conformance driver, not the future turnloop adapter. Exact commands and limitations are in the root `LANE_REPORT.md`.
+
+## Getting started on turnloop
+
+Enable the `turnloop` feature. Create `LocalExecutor<Platform>`, clone its handle,
+and spawn a task using `asynchronous::client::Client`. `request(&mut Request,
+|bytes| ...)` delivers borrowed response chunks and returns the response head.
+It retains per-origin connections, follows the existing redirect policy, applies
+proxy CONNECT before TLS, and reuses incremental decompression state. `stream`
+accepts an AsyncRead upload and a body length; the caller handles redirects for
+non-replayable sources. One absolute deadline covers the whole request. The host
+must call `expire()` at `next_deadline()` for idle pool eviction. Dropping a
+pending request closes its lease; incomplete connections never re-enter the pool.
+
+For explicit protocol control, `asynchronous::{Http1,Http2}` expose streaming
+events, writes and HTTP upgrade handoff. HTTP/2 callbacks release receive capacity
+after consuming DATA and retain unsent application data while send windows stall.
+The pooled facade serializes each client's requests; multiplexing is available
+through the lower-level HTTP/2 driver. `Expect: 100-continue` currently requires
+explicit HTTP/1 event handling in that facade.
+
+`asynchronous::server::Server` owns the TCP accept loop and local service tasks.
+Use `server::http1` or `server::http2` inside a service (optionally after TLS/ALPN).
+The HTTP/1 callback streams request events into a reusable Response encoder.
+`server.shutdown().stop()` stops accepts, closes idle HTTP/1 connections and sends
+HTTP/2 GOAWAY while existing streams drain. Wrap drain in an application deadline;
+dropping Server cancels its remaining service tasks.
+
+```sh
+cargo run -p turnloop-http --features turnloop --example https_get -- https://example.com/
+cargo run -p turnloop-http --features turnloop --example tls_echo -- cert.pem key.pem 127.0.0.1:8443
+cargo run -p turnloop-http --features turnloop --example https_get -- https://localhost:8443/ cert.pem
+```
+
+The TLS echo example negotiates HTTP/1.1 or HTTP/2 through ALPN. Certificates and
+private keys are supplied by the host; certificate verification stays enabled.
+WASI 0.2/0.3 use wasi:sockets and this same TLS/HTTP path (p3 remains experimental).
+On browsers, `asynchronous::web::get` maps to the existing host fetch operation:
+bounded GET response bodies, abort and deadlines. The current host interface does
+not expose status/headers, custom methods, body streaming, proxy CONNECT or ALPN;
+redirects, decompression and TLS are controlled by the browser. Servers/raw sockets
+are Unsupported there. See `turnloop-io` for the shared ownership pattern.

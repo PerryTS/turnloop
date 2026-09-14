@@ -11,3 +11,23 @@ building block, not a complete npm ws or JavaScript object-model replacement.
 Native Node interop runs through the shared `scripts/test-servers.py` runner;
 no Node package installation is required. Browser wasm uses host entropy for
 upstream masking and the same sans-I/O protocol implementation.
+
+## Getting started on turnloop
+
+Enable the `turnloop` feature. `WebSocketStream::connect` performs and validates
+an HTTP upgrade on a connected TCP, pipe or TLS stream; supply a fresh random
+nonce, subprotocol list, executor handle and absolute deadline. `accept` performs
+the server upgrade. Both preserve coalesced first-frame bytes. Await `send` and
+`receive`; ping/pong and close replies flush before received messages are returned.
+`close` waits for the peer under a deadline. Dropping a pending frame operation
+closes the stream. The host keeps turning its LocalExecutor.
+
+```sh
+cargo run -p turnloop-websocket --features turnloop --example echo_server -- 127.0.0.1:8080
+cargo run -p turnloop-websocket --features turnloop --example echo_client -- 127.0.0.1:8080
+```
+
+The same framed adapter works on native and WASI streams. Browsers use the web
+backend's host WebSocket capability instead of raw HTTP upgrades; browser APIs
+control TLS, headers, masking and extension negotiation. permessage-deflate remains
+unsupported by the sans-I/O core. See `turnloop-io` for shared transport glue.

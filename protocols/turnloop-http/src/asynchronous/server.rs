@@ -223,6 +223,9 @@ pub async fn http1<S: turnloop_io::Stream>(
             return Err(io::Error::other("service did not finish response"));
         }
         if shutdown.is_stopped() || !conn.reusable() {
+            if let Some(stream) = conn.stream.as_mut() {
+                turnloop_io::close(stream).await?;
+            }
             return Ok(());
         }
         conn.reset()?;
@@ -242,6 +245,9 @@ pub async fn http2<S: turnloop_io::Stream>(
     conn.shutdown = Some(shutdown);
     loop {
         if conn.core.is_drained() {
+            if let Some(stream) = conn.stream.as_mut() {
+                turnloop_io::close(stream).await?;
+            }
             return Ok(());
         }
         if !conn.event(&mut service).await? {
