@@ -136,3 +136,8 @@ Next work: thin turnloop adapter and Perry FFI wiring once the executor lands; c
 - [Undici errors](https://github.com/nodejs/undici/blob/main/docs/docs/api/Errors.md)
 - [ws API](https://github.com/websockets/ws/blob/master/doc/ws.md)
 - [Axios request configuration](https://axios-http.com/docs/req_config)
+
+## Integrator verification
+
+- 2026-09-14, integrator, outside the Codex sandbox (macOS arm64): `cargo test --workspace --locked` — **PASS, 34 tests, 0 failed**; `python3 scripts/run-h2spec.py` (strict) — **147 tests, 146 passed, 1 skipped, 0 failed**; `cargo tree -i` for tokio, tokio-util, hyper and h2 — none present.
+- **Publishing blocker to resolve at integration:** the root `[patch.crates-io] ruzstd = { path = "protocols/turnloop-http/vendor/ruzstd" }` only applies inside this workspace. Crates.io consumers of `turnloop-http` would get upstream ruzstd without the patch. Upstream the fix, publish the fork under its own name, or drop the dependency before publishing `turnloop-http`.
