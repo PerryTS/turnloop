@@ -56,8 +56,8 @@ fn registered_processes_and_signals_do_not_spin() {
 fn terminal_modes_resize_and_restore_on_close_and_drop() {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     let (mut master, mut slave) = (-1, -1);
-    // SAFETY: valid writable descriptor slots; null name/termios/winsize use defaults.
     assert_eq!(
+        // SAFETY: valid writable descriptor slots; null name/termios/winsize use defaults.
         unsafe {
             libc::openpty(
                 &mut master,
@@ -73,10 +73,10 @@ fn terminal_modes_resize_and_restore_on_close_and_drop() {
     let (_master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
     let get = || {
         let mut available = 0;
-        // SAFETY: query pending input on the owned PTY. On XNU, FIONREAD applies
-        // the pending canonical-mode transition (PENDIN) without consuming bytes,
-        // so the subsequent full termios equality compares settled terminal state.
         assert_eq!(
+            // SAFETY: query pending input on the owned PTY. On XNU, FIONREAD applies
+            // the pending canonical-mode transition (PENDIN) without consuming bytes,
+            // so the subsequent full termios equality compares settled terminal state.
             unsafe { libc::ioctl(slave.as_raw_fd(), libc::FIONREAD, &mut available) },
             0
         );
@@ -111,8 +111,8 @@ fn terminal_modes_resize_and_restore_on_close_and_drop() {
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
-        // SAFETY: live PTY and initialized window size. This fixture has no controlling session.
         assert_eq!(
+            // SAFETY: live PTY and initialized window size. This fixture has no controlling session.
             unsafe { libc::ioctl(slave.as_raw_fd(), libc::TIOCSWINSZ, &size) },
             0
         );
@@ -297,9 +297,9 @@ fn spawn_options_kill_and_close_reap_owned_children() {
             if close { (0, 1, 1) } else { (1, 0, 0) }
         );
         let mut status = 0;
-        // SAFETY: WNOHANG query of this fixture child only. ECHILD proves the
-        // library already reaped it, rather than leaving a zombie behind.
         assert_eq!(
+            // SAFETY: WNOHANG query of this fixture child only. ECHILD proves the
+            // library already reaped it, rather than leaving a zombie behind.
             unsafe { libc::waitpid(child.pid as i32, &mut status, libc::WNOHANG) },
             -1
         );
@@ -308,4 +308,106 @@ fn spawn_options_kill_and_close_reap_owned_children() {
             Some(libc::ECHILD)
         );
     }
+}
+
+#[test]
+fn process_drop_reaps_and_signal_drop_restores_disposition() {
+    let child = {
+        let mut l = Loop::new(Config::default()).expect("loop");
+        let mut spec = ProcessSpec::new(env!("CARGO_BIN_EXE_native_child"));
+        spec.args.push("sleep".into());
+        l.spawn(&spec, Token(1)).expect("owned child")
+    };
+    let mut code = 0;
+    assert_eq!(
+        // SAFETY: this fixture owns the child identity, and WNOHANG never blocks.
+        unsafe { libc::waitpid(child.pid as i32, &mut code, libc::WNOHANG) },
+        -1
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ECHILD)
+    );
+    let action = || {
+        // SAFETY: sigaction is plain C output storage.
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            // SAFETY: query only, leaving the process disposition unchanged.
+            unsafe { libc::sigaction(libc::SIGHUP, std::ptr::null(), &mut action) },
+            0
+        );
+        action
+    };
+    let before = action();
+    {
+        let mut l = Loop::new(Config::default()).expect("signal loop");
+        l.signal_start(Signal::Hup, Token(2))
+            .expect("subscribe HUP");
+        assert_ne!(
+            action().sa_sigaction,
+            before.sa_sigaction,
+            "dispatcher handler installed"
+        );
+    }
+    let after = action();
+    assert_eq!(after.sa_sigaction, before.sa_sigaction);
+    // Linux may synthesize SA_RESTORER; compare the documented handler flags.
+    let mask = libc::SA_RESTART | libc::SA_NOCLDSTOP | libc::SA_NOCLDWAIT | libc::SA_SIGINFO;
+    assert_eq!(after.sa_flags & mask, before.sa_flags & mask);
+}
+
+#[test]
+fn queued_file_writes_preserve_order_and_close_quiesces_buffers() {
+    use std::{
+        io::{Read, Seek, SeekFrom},
+        os::fd::OwnedFd,
+    };
+    let path = std::env::temp_dir().join(format!("tl-file-order-{}", std::process::id()));
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .expect("file");
+    let mut l = Loop::new(Config::default()).expect("loop");
+    let fd: OwnedFd = file.try_clone().expect("dup file").into();
+    let h = l
+        .attach(Detached::from_fd(fd).expect("file transport"), Token(1))
+        .expect("attach");
+    for i in 0..64 {
+        l.write(h, WriteBuf::Owned(vec![i; 32]), Token(i as u64))
+            .expect("queued write");
+    }
+    let mut writes = 0;
+    let mut out = Completions::with_capacity(3);
+    let until = l.now() + std::time::Duration::from_secs(5);
+    while writes != 64 {
+        assert!(l.now() < until);
+        l.turn(Timeout::Until(until), &mut out).expect("file turn");
+        for c in out.drain() {
+            assert_eq!(c.token, Token(writes));
+            assert!(matches!(c.result, OpResult::Wrote(32)));
+            writes += 1;
+        }
+    }
+    file.seek(SeekFrom::Start(0)).expect("seek");
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).expect("read bytes");
+    assert_eq!(bytes.len(), 2048);
+    for (i, chunk) in bytes.as_chunks::<32>().0.iter().enumerate() {
+        assert_eq!(*chunk, [i as u8; 32]);
+    }
+    file.seek(SeekFrom::Start(0))
+        .expect("rewind for provided read");
+    let mut provided = vec![0; 4096];
+    // SAFETY: storage stays fixed through loop destruction, which must quiesce
+    // pending or running pool-backed I/O before returning.
+    let buf = unsafe { IoBufMut::from_raw_parts(provided.as_mut_ptr(), provided.len()) };
+    l.read(h, ReadBuf::Provided(buf), Token(100))
+        .expect("provided file read");
+    l.turn(Timeout::Now, &mut out).expect("start worker");
+    drop(l);
+    provided.fill(37);
+    assert!(provided.iter().all(|&b| b == 37));
+    std::fs::remove_file(path).expect("remove file");
 }

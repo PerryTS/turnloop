@@ -75,9 +75,9 @@ pub fn executor_echoes_64_real_connections<B: backend::Backend>() {
             }
         })
         .expect("spawn server");
-    let until = Instant::now() + Duration::from_secs(10);
+    let until = ex.driver().now() + Duration::from_secs(10);
     while !server.is_finished() {
-        assert!(Instant::now() < until, "server timeout");
+        assert!(ex.driver().now() < until, "server timeout");
         ex.turn(Timeout::Until(until)).expect("executor turn");
     }
     assert_eq!(completed.get(), 64);
@@ -118,9 +118,9 @@ pub fn sleep_timeout_and_drop_cancel_pending_io<B: backend::Backend>() {
         .read(a, ReadBuf::Pooled, Token(50))
         .expect("peer EOF read");
     let mut out = Completions::default();
-    let until = Instant::now() + Duration::from_secs(2);
+    let until = ex.driver().now() + Duration::from_secs(2);
     loop {
-        assert!(Instant::now() < until);
+        assert!(ex.driver().now() < until);
         ex.driver()
             .turn(Timeout::Until(until), &mut out)
             .expect("peer turn");
@@ -150,9 +150,9 @@ pub fn sleep_timeout_and_drop_cancel_pending_io<B: backend::Backend>() {
             count.set(count.get() + 1);
         })
         .expect("timer task");
-    let until = Instant::now() + Duration::from_secs(3);
+    let until = ex.driver().now() + Duration::from_secs(3);
     while !timers.is_finished() {
-        assert!(Instant::now() < until);
+        assert!(ex.driver().now() < until);
         ex.turn(Timeout::Until(until)).expect("turn");
     }
     assert_eq!(samples.get(), 4);
@@ -232,9 +232,9 @@ pub fn udp_stdio_and_join_cancel<B: backend::Backend>(program: &std::ffi::OsStr)
                 .expect("mixed UDP timer");
         })
         .expect("UDP task");
-    let until = Instant::now() + Duration::from_secs(3);
+    let until = ex.driver().now() + Duration::from_secs(3);
     while !job.is_finished() {
-        assert!(Instant::now() < until);
+        assert!(ex.driver().now() < until);
         ex.turn(Timeout::Until(until)).expect("UDP turn");
     }
     let mut spec = ProcessSpec::new(program);
@@ -268,7 +268,7 @@ pub fn udp_stdio_and_join_cancel<B: backend::Backend>(program: &std::ffi::OsStr)
         })
         .expect("stdio task");
     while !job.is_finished() {
-        assert!(Instant::now() < until);
+        assert!(ex.driver().now() < until);
         ex.turn(Timeout::Until(until)).expect("stdio turn");
     }
     let mut cancelled = ex

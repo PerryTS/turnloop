@@ -323,10 +323,15 @@ pub(super) unsafe fn errno() -> *mut i32 {
     unsafe {
         libc::__error()
     }
-    #[cfg(turnloop_backend = "epoll")]
+    #[cfg(all(turnloop_backend = "epoll", not(target_os = "android")))]
     // SAFETY: libc returns this thread's live errno storage.
     unsafe {
         libc::__errno_location()
+    }
+    #[cfg(target_os = "android")]
+    // SAFETY: Bionic returns this thread's live errno storage.
+    unsafe {
+        libc::__errno()
     }
 }
 pub(super) unsafe fn write(fd: RawFd, ptr: *const libc::c_void, len: usize) -> isize {

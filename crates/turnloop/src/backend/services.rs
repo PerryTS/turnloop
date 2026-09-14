@@ -134,8 +134,8 @@ impl Services {
                 if state.reap()?.is_none() {
                     #[cfg(turnloop_backend = "epoll")]
                     if matches!(e.os, Some(libc::ENOSYS | libc::EINVAL | libc::EPERM)) {
-                        state.fallback = Some(signals::subscribe(Signal::Chld, self.notifier()?)?);
-                        // Subscription-before-second-check closes the SIGCHLD race.
+                        // The subscription above already covers the SIGCHLD
+                        // fallback; recheck after the failed pidfd registration.
                         state.reap()?;
                     } else {
                         return Err(e);

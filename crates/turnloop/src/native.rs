@@ -32,13 +32,13 @@ pub enum ProcessStdio {
     Handle(Handle),
 }
 
-/// Child launch options. Arguments exclude argv[0], which is the program name.
+/// Child launch options. Arguments exclude `argv[0]`, which is the program name.
 /// Environment entries override inherited values unless `env_clear` is true.
 #[derive(Clone, Debug)]
 pub struct ProcessSpec {
     /// Executable path or name resolved using PATH.
     pub program: OsString,
-    /// Arguments after argv[0].
+    /// Arguments after `argv[0]`.
     pub args: Vec<OsString>,
     /// Environment additions or overrides.
     pub env: Vec<(OsString, OsString)>,

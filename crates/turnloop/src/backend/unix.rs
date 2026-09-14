@@ -896,8 +896,8 @@ mod process_races {
         // SAFETY: initialized siginfo output and an owned child PID. WNOWAIT
         // proves exit occurred while deliberately preserving status for turnloop.
         let mut status: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        // SAFETY: valid child identity and writable output; wait only for its exit.
         assert_eq!(
+            // SAFETY: valid child identity and writable output; wait only for its exit.
             unsafe { libc::waitid(libc::P_PID, pid, &mut status, libc::WEXITED | libc::WNOWAIT) },
             0
         );
@@ -938,8 +938,8 @@ mod process_races {
             .expect("duplicate check");
         assert!(events.is_empty());
         let mut code = 0;
-        // SAFETY: query only the fixture child's wait status, without blocking.
         assert_eq!(
+            // SAFETY: query only the fixture child's wait status, without blocking.
             unsafe { libc::waitpid(pid as i32, &mut code, libc::WNOHANG) },
             -1
         );
