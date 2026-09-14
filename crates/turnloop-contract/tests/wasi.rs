@@ -103,14 +103,12 @@ fn repeated_eof_shutdown_and_empty_datagram() {
     let addr = "127.0.0.1:0".parse().expect("address");
     let a = l.udp_bind(addr, &UdpOpts::default()).expect("UDP");
     let b = l.udp_bind(addr, &UdpOpts::default()).expect("UDP");
+    let from = l.local_addr(a).expect("source address");
+    let to = l.local_addr(b).expect("destination address");
+    assert_ne!(from, to, "default UDP endpoints must be distinct");
     l.recv(b, ReadBuf::Pooled, Token(3)).expect("receive");
-    l.send_to(
-        a,
-        WriteBuf::Owned(Vec::new()),
-        l.local_addr(b).expect("address"),
-        Token(4),
-    )
-    .expect("send empty");
+    l.send_to(a, WriteBuf::Owned(Vec::new()), to, Token(4))
+        .expect("send empty");
     let until = l.now() + Duration::from_secs(2);
     let mut received = 0;
     let mut written = 0;
@@ -120,10 +118,12 @@ fn repeated_eof_shutdown_and_empty_datagram() {
         for c in out.drain() {
             match c.result {
                 OpResult::RecvFrom {
-                    n: 0,
+                    n,
+                    from: actual,
                     lease: Some(b),
-                    ..
                 } => {
+                    assert_eq!(actual, from, "unexpected UDP sender");
+                    assert_eq!(n, 0);
                     assert!(b.as_slice().is_empty());
                     received += 1;
                 }

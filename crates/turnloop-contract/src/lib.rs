@@ -522,6 +522,7 @@ pub fn udp_round_trip<B: Backend>() {
         .expect("bind b");
     let aa = l.local_addr(a).expect("addr");
     let ba = l.local_addr(b).expect("addr");
+    assert_ne!(aa, ba, "default UDP endpoints must be distinct");
     let bytes = b"datagram checked byte for byte";
     l.recv(b, ReadBuf::Pooled, Token(1)).expect("recv");
     l.send_to(a, WriteBuf::Owned(bytes.to_vec()), ba, Token(2))
@@ -540,16 +541,22 @@ pub fn udp_round_trip<B: Backend>() {
                     from,
                     lease: Some(data),
                 } => {
+                    assert!(
+                        matches!(c.token, Token(1) | Token(3)),
+                        "unexpected UDP receive token"
+                    );
+                    assert_eq!(
+                        from,
+                        if c.token == Token(1) { aa } else { ba },
+                        "unexpected UDP sender"
+                    );
                     assert_eq!(n, bytes.len());
                     assert_eq!(data.as_slice(), bytes);
                     received += 1;
                     if c.token == Token(1) {
-                        assert_eq!(from, aa);
                         l.recv(a, ReadBuf::Pooled, Token(3)).expect("recv return");
                         l.send_to(b, WriteBuf::Owned(data.as_slice().to_vec()), from, Token(4))
                             .expect("return send");
-                    } else {
-                        assert_eq!(from, ba);
                     }
                 }
                 OpResult::Wrote(n) => {
