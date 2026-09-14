@@ -218,3 +218,66 @@ fn steady_read_write_timer_and_accept_allocate_nothing() {
     }
     assert_eq!(accepted, 100);
 }
+
+#[test]
+fn cancellation_reserves_survive_a_full_event_backlog() {
+    let mut l = Loop::new(Config {
+        max_handles: 16,
+        max_operations: 16,
+        events_per_turn: 4,
+        post_capacity: 128,
+        ..Config::default()
+    })
+    .expect("loop");
+    let mut handles = [None; 16];
+    for h in &mut handles {
+        *h = Some(
+            l.timer(l.now(), Some(Duration::from_nanos(1)), Token(1))
+                .expect("repeating timer"),
+        );
+    }
+    let poster = l.poster();
+    let mut out = Completions::with_capacity(1);
+    let mut timers = 0;
+    let mut posts = 0;
+    for _ in 0..20 {
+        for _ in 0..4 {
+            poster.post(Token(2), Payload::U64(42)).expect("post");
+        }
+        l.turn(Timeout::Now, &mut out).expect("build backlog");
+        for c in out.drain() {
+            match c.result {
+                OpResult::Timer => timers += 1,
+                OpResult::Posted(Payload::U64(42)) => posts += 1,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+    ALLOCS.with(|v| v.set(0));
+    ACTIVE.with(|v| v.set(true));
+    for h in handles.into_iter().flatten() {
+        l.close(h, Token(3)).expect("cancel and close");
+    }
+    let mut cancelled = 0;
+    let mut closed = 0;
+    for _ in 0..1024 {
+        if cancelled == 16 && closed == 16 && posts == 80 {
+            break;
+        }
+        l.turn(Timeout::Now, &mut out).expect("drain backlog");
+        for c in out.drain() {
+            match c.result {
+                OpResult::Timer => timers += 1,
+                OpResult::Posted(Payload::U64(42)) => posts += 1,
+                OpResult::Cancelled => cancelled += 1,
+                OpResult::Closed => closed += 1,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+    ACTIVE.with(|v| v.set(false));
+    let allocations = ALLOCS.with(Cell::get);
+    assert!(timers > 0);
+    assert_eq!((cancelled, closed, posts), (16, 16, 80));
+    assert_eq!(allocations, 0, "cancel/close reserves under backpressure");
+}

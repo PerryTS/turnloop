@@ -14,6 +14,9 @@ use std::{
     time::Duration,
 };
 static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
+const NATIVE_EVENTS: usize = 0;
+const TIMER_EVENTS: usize = 1;
+const POST_EVENTS: usize = 2;
 #[derive(Clone, Copy)]
 enum Kind {
     Socket,
@@ -45,6 +48,7 @@ struct Op {
 struct Queued {
     completion: Completion,
     referenced: bool,
+    event_class: Option<usize>,
 }
 impl std::ops::Deref for Queued {
     type Target = Completion;
@@ -67,6 +71,7 @@ pub struct Driver<B: Backend> {
     ops: Table<Op>,
     timers: TimerQueue,
     queued: VecDeque<Queued>,
+    buffered: [usize; 3],
     events: Vec<Event<B::Detached>>,
     refs: usize,
     outstanding: usize,
@@ -85,6 +90,12 @@ impl<B: Backend> Driver<B> {
         {
             return Err(Error::new(ErrorKind::InvalidInput));
         }
+        let completion_capacity = config
+            .events_per_turn
+            .checked_mul(3)
+            .and_then(|n| n.checked_add(config.max_operations))
+            .and_then(|n| n.checked_add(config.max_handles))
+            .ok_or(Error::new(ErrorKind::InvalidInput))?;
         let backend = B::new(
             &config,
             BufferPool::new(config.pooled_buffers, config.pooled_buffer_size),
@@ -115,9 +126,12 @@ impl<B: Backend> Driver<B> {
             handles: Table::new(config.max_handles),
             ops: Table::new(config.max_operations),
             timers: TimerQueue::new(config.max_handles),
-            queued: VecDeque::with_capacity(
-                config.max_operations + config.max_handles + config.events_per_turn,
-            ),
+            // Terminal operation and Closed credits live until delivery. Native
+            // multishot events, repeating timers and posts each have their own
+            // bounded reserve, so no source can consume cancellation capacity or
+            // prevent another source from making progress with small host output.
+            queued: VecDeque::with_capacity(completion_capacity),
+            buffered: [0; 3],
             events: Vec::with_capacity(config.events_per_turn),
             refs: 0,
             outstanding: 0,
@@ -253,10 +267,22 @@ impl<B: Backend> Driver<B> {
         }
     }
     fn enqueue(&mut self, completion: Completion, referenced: bool) {
+        let event_class = match completion.result {
+            OpResult::Posted(_) => Some(POST_EVENTS),
+            OpResult::Timer if !completion.terminal => Some(TIMER_EVENTS),
+            _ if !completion.terminal => Some(NATIVE_EVENTS),
+            _ => None,
+        };
+        if let Some(class) = event_class {
+            debug_assert!(self.buffered[class] < self.config.events_per_turn);
+            self.buffered[class] += 1;
+        }
+        debug_assert!(self.queued.len() < self.queued.capacity());
         self.refs += usize::from(referenced);
         self.queued.push_back(Queued {
             completion,
             referenced,
+            event_class,
         });
     }
     fn finish(&mut self, id: OpId, result: OpResult, terminal: bool) {
@@ -602,6 +628,7 @@ impl<B: Backend> Driver<B> {
             let Some(Queued {
                 completion: c,
                 referenced,
+                event_class,
             }) = self.queued.pop_front()
             else {
                 break;
@@ -610,6 +637,9 @@ impl<B: Backend> Driver<B> {
                 .then_some(c.handle)
                 .flatten();
             self.refs -= usize::from(referenced);
+            if let Some(class) = event_class {
+                self.buffered[class] -= 1;
+            }
             if c.terminal && c.op.is_some() {
                 self.outstanding -= 1;
             }
@@ -673,9 +703,10 @@ impl<B: Backend> Driver<B> {
         let queued =
             !self.queued.is_empty() || !self.poster.is_empty() || !self.work_port.is_empty();
         let mut waits = 0;
-        if !queued {
+        if self.buffered[NATIVE_EVENTS] == 0 {
             let mut timeout = deadline.map(|d| d.saturating_duration_since(start));
             if timeout == Some(Duration::ZERO)
+                || queued
                 || notified
                 || self.backend.has_work()
                 || !self.notifier.park()
@@ -695,7 +726,7 @@ impl<B: Backend> Driver<B> {
         }
         let now = self.backend.now();
         for _ in 0..self.config.events_per_turn {
-            if self.queued.len() >= self.config.max_operations + self.config.max_handles {
+            if self.buffered[TIMER_EVENTS] == self.config.events_per_turn {
                 break;
             }
             let Some((key, _at)) = self.timers.pop_expired(now) else {
@@ -727,9 +758,6 @@ impl<B: Backend> Driver<B> {
         }
         self.backend.deadline_changed(self.timers.next_deadline());
         for _ in 0..self.config.events_per_turn {
-            if self.queued.len() >= self.config.max_operations + self.config.max_handles {
-                break;
-            }
             let Some(work) = self.work_port.pop() else {
                 break;
             };
@@ -751,11 +779,10 @@ impl<B: Backend> Driver<B> {
             };
             self.finish(work.op, result, true);
         }
-        // Queue posts before output delivery so a persistent timer/I/O backlog
-        // cannot indefinitely overtake an accepted post. Capacity reserves this
-        // stage's event budget; no queue growth is permitted here.
+        // The independent post reserve guarantees progress through a persistent
+        // timer/I/O backlog without consuming terminal operation/Closed credits.
         for _ in 0..self.config.events_per_turn {
-            if self.queued.len() == self.queued.capacity() {
+            if self.buffered[POST_EVENTS] == self.config.events_per_turn {
                 break;
             }
             let Some(p) = self.poster.pop() else {
