@@ -21,21 +21,25 @@ use std::{
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Kind {
+pub(super) enum Kind {
     Tcp,
+    Pipe,
+    PipeListener,
+    Stream,
+    File,
     Listener,
     Udp,
 }
 /// Owns an unregistered socket and can be sent to another loop/thread.
 #[derive(Debug)]
 pub struct Detached {
-    fd: OwnedFd,
-    kind: Kind,
+    pub(super) fd: OwnedFd,
+    pub(super) kind: Kind,
 }
 struct Resource {
     handle: Handle,
     transport: Detached,
-    connect: Option<SocketAddr>,
+    connect: Option<Addr>,
     connecting: bool,
     ready: [bool; 2],
     heads: [Option<usize>; 2],
@@ -46,6 +50,7 @@ struct Pending {
     request: Request,
     next: Option<usize>,
     offset: usize,
+    passed: Option<Detached>,
 }
 pub struct Unix {
     poller: SystemPoller,
@@ -59,7 +64,7 @@ pub struct Unix {
 fn direction(op: &Operation) -> usize {
     usize::from(!matches!(
         op,
-        Operation::Accept { .. } | Operation::Read { .. } | Operation::RecvFrom(_)
+        Operation::Accept { .. } | Operation::Read { .. } | Operation::RecvFrom(_) | Operation::RecvHandle
     ))
 }
 impl Unix {
@@ -74,12 +79,14 @@ impl Unix {
         &mut self,
         h: Handle,
         transport: Detached,
-        connect: Option<SocketAddr>,
+        connect: Option<Addr>,
     ) -> Result<()> {
         if self.resources.get(h.index()).is_none_or(Option::is_some) {
             return Err(Error::new(ErrorKind::InvalidInput));
         }
-        self.poller.register(transport.fd.as_raw_fd(), h.key())?;
+        if transport.kind != Kind::File {
+            self.poller.register(transport.fd.as_raw_fd(), h.key())?;
+        }
         self.resources[h.index()] = Some(Resource {
             handle: h,
             transport,
@@ -212,12 +219,29 @@ unsafe impl Backend for Unix {
         self.poller.waker()
     }
     fn open(&mut self, h: Handle, spec: Open) -> Result<()> {
+        let spec = match spec {
+            Open::Pipe(name) => {
+                let (transport, addr) = super::ipc::open(&name, None)?;
+                return self.install(h, transport, Some(addr));
+            }
+            Open::PipeListener { name, opts } => {
+                let (transport, _) = super::ipc::open(&name, Some(opts))?;
+                return self.install(h, transport, None);
+            }
+            Open::Stdio(which) => {
+                let fd = match which { Stdio::Stdin => 0, Stdio::Stdout => 1, Stdio::Stderr => 2 };
+                let transport = super::ipc::stdio(fd)?;
+                return self.install(h, transport, None);
+            }
+            other => other,
+        };
         let (addr, kind, reuse, backlog, nodelay) = match spec {
             Open::Tcp { addr, opts } => (addr, Kind::Tcp, false, 0, opts.nodelay),
             Open::Listener { addr, opts } => {
                 (addr, Kind::Listener, opts.reuse_port, opts.backlog, false)
             }
             Open::Udp { addr, opts } => (addr, Kind::Udp, opts.reuse_port, 0, false),
+            _ => unreachable!("native open handled above"),
         };
         if backlog > i32::MAX as u32 {
             return Err(Error::new(ErrorKind::InvalidInput));
@@ -246,7 +270,7 @@ unsafe impl Backend for Unix {
         self.install(
             h,
             Detached { fd, kind },
-            (kind == Kind::Tcp).then_some(addr),
+            (kind == Kind::Tcp).then(|| Addr::new(addr)),
         )
     }
     fn local_addr(&self, h: Handle) -> Result<SocketAddr> {
@@ -256,10 +280,11 @@ unsafe impl Backend for Unix {
         let h = request.handle;
         let r = self.get(h)?;
         let valid = match &request.operation {
-            Operation::Accept { .. } => r.transport.kind == Kind::Listener,
+            Operation::Accept { .. } => matches!(r.transport.kind, Kind::Listener | Kind::PipeListener),
+            Operation::SendHandle(_) | Operation::RecvHandle => r.transport.kind == Kind::Pipe,
             Operation::RecvFrom(_) | Operation::SendTo { .. } => r.transport.kind == Kind::Udp,
-            Operation::Connect => r.transport.kind == Kind::Tcp && r.connect.is_some(),
-            _ => r.transport.kind == Kind::Tcp,
+            Operation::Connect => matches!(r.transport.kind, Kind::Tcp | Kind::Pipe) && r.connect.is_some(),
+            _ => matches!(r.transport.kind, Kind::Tcp | Kind::Pipe | Kind::Stream | Kind::File),
         };
         if !valid || self.ops.get(request.op.index()).is_none_or(Option::is_some) {
             return Err(Error::new(ErrorKind::InvalidInput));
@@ -268,6 +293,13 @@ unsafe impl Backend for Unix {
         {
             return Err(Error::new(ErrorKind::InvalidInput));
         }
+        let passed = if let Operation::SendHandle(source) = request.operation {
+            let source = self.get(source)?;
+            if !matches!(source.transport.kind, Kind::Tcp | Kind::Listener | Kind::Udp | Kind::Pipe | Kind::PipeListener) {
+                return Err(Error::new(ErrorKind::Unsupported));
+            }
+            Some(Detached { fd: source.transport.fd.try_clone().map_err(Error::from)?, kind: source.transport.kind })
+        } else { None };
         let d = direction(&request.operation);
         let i = request.op.index();
         let r = self.resources[h.index()].as_mut().expect("validated");
@@ -281,6 +313,7 @@ unsafe impl Backend for Unix {
             request,
             next: None,
             offset: 0,
+            passed,
         });
         self.schedule(h);
         Ok(())
@@ -348,7 +381,11 @@ unsafe impl Backend for Unix {
         Ok(info)
     }
     fn release(&mut self, h: Handle) {
-        if self.get(h).is_ok() {
+        if let Ok(r) = self.get(h) {
+            if r.transport.kind != Kind::File {
+                let fd = r.transport.fd.as_raw_fd();
+                let _ = self.poller.deregister(fd);
+            }
             self.ready.retain(|&at| at != h);
             self.resources[h.index()] = None;
         }
@@ -359,7 +396,9 @@ unsafe impl Backend for Unix {
         if r.heads.iter().any(Option::is_some) {
             return Err(Error::new(ErrorKind::WouldBlock));
         }
-        self.poller.deregister(r.transport.fd.as_raw_fd())?;
+        if r.transport.kind != Kind::File {
+            self.poller.deregister(r.transport.fd.as_raw_fd())?;
+        }
         // Remove a stale scheduling entry before the slot can be reused.
         self.ready.retain(|&at| at != h);
         Ok(self.resources[h.index()]
@@ -384,7 +423,7 @@ fn execute(
     match &mut p.request.operation {
         Operation::Connect => {
             if !r.connecting {
-                let a = Addr::new(r.connect.ok_or(Error::new(ErrorKind::InvalidInput))?);
+                let a = r.connect.as_ref().ok_or(Error::new(ErrorKind::InvalidInput))?;
                 // SAFETY: nonblocking socket and live initialized sockaddr.
                 let n = unsafe { libc::connect(fd, a.ptr(), a.len) };
                 if n < 0 {
@@ -419,7 +458,15 @@ fn execute(
             r.connect = None;
             Ok(Some((Outcome::Connected, true)))
         }
+        Operation::SendHandle(_) => {
+            super::ipc::send(fd, p.passed.as_ref().ok_or(Error::new(ErrorKind::InvalidInput))?.fd.as_raw_fd())?;
+            Ok(Some((Outcome::HandleSent, true)))
+        }
+        Operation::RecvHandle => Ok(Some((Outcome::HandleReceived(super::ipc::receive(fd)?), true))),
         Operation::Accept { multishot } => {
+            if r.transport.kind == Kind::PipeListener {
+                return Ok(Some((Outcome::PipeAccepted(super::ipc::accept(fd)?), !*multishot)));
+            }
             let (fd, peer) = socket::accept(fd)?;
             Ok(Some((
                 Outcome::Accepted {
@@ -441,12 +488,11 @@ fn execute(
             }
             // SAFETY: WriteBuf guarantees stable initialized bytes until completion.
             let n = unsafe {
-                libc::send(
-                    fd,
-                    bytes[p.offset..].as_ptr().cast(),
-                    bytes.len() - p.offset,
-                    send_flags(),
-                )
+                if matches!(r.transport.kind, Kind::Stream | Kind::File) {
+                    super::ipc::write(fd, bytes[p.offset..].as_ptr().cast(), bytes.len() - p.offset)
+                } else {
+                    libc::send(fd, bytes[p.offset..].as_ptr().cast(), bytes.len() - p.offset, send_flags())
+                }
             };
             if n < 0 {
                 return Err(last_error());
@@ -485,7 +531,11 @@ fn execute(
             msg.msg_iov = iov.as_mut_ptr();
             msg.msg_iovlen = count as _;
             // SAFETY: msghdr references initialized iovecs and stable buffer regions.
-            let n = unsafe { libc::sendmsg(fd, &msg, send_flags()) };
+            let n = unsafe {
+                if matches!(r.transport.kind, Kind::Stream | Kind::File) {
+                    super::ipc::writev(fd, iov.as_ptr(), count as i32)
+                } else { libc::sendmsg(fd, &msg, send_flags()) }
+            };
             if n < 0 {
                 return Err(last_error());
             }
@@ -560,7 +610,7 @@ fn receive(
         if udp {
             libc::recvfrom(fd, ptr.cast(), len, 0, a.mut_ptr(), &mut a.len)
         } else {
-            libc::recv(fd, ptr.cast(), len, 0)
+            libc::read(fd, ptr.cast(), len)
         }
     };
     if n < 0 {

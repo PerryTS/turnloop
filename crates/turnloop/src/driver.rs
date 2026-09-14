@@ -97,11 +97,12 @@ impl<B: Backend> Driver<B> {
             .and_then(|n| n.checked_add(config.max_operations))
             .and_then(|n| n.checked_add(config.max_handles))
             .ok_or(Error::new(ErrorKind::InvalidInput))?;
-        let backend = B::new(
+        let mut backend = B::new(
             &config,
             BufferPool::new(config.pooled_buffers, config.pooled_buffer_size),
         )?;
         let notifier = Notifier::new(backend.waker());
+        backend.set_notifier(notifier.clone());
         let poster = Poster::new(config.post_capacity, notifier.clone());
         let work_port = crate::blocking::WorkPort::new(config.max_operations, notifier.clone());
         let owner = loop {
@@ -407,6 +408,113 @@ impl<B: Backend> Driver<B> {
     pub fn tcp_listen(&mut self, addr: SocketAddr, opts: &ListenOpts) -> Result<Handle> {
         self.open(Open::Listener { addr, opts: *opts })
     }
+    /// Listen for local IPC streams. Unix socket path removal belongs to the host.
+    pub fn pipe_listen(&mut self, name: &PipeName, opts: &ListenOpts) -> Result<Handle> {
+        self.open(Open::PipeListener { name: name.clone(), opts: *opts })
+    }
+    /// Connect a local stream, completing with Connected or an error.
+    pub fn pipe_connect(&mut self, name: &PipeName, token: Token) -> Result<Handle> {
+        let h = self.open(Open::Pipe(name.clone()))?;
+        if let Err(e) = self.submit(h, Operation::Connect, token) {
+            self.backend.release(h);
+            self.handles.remove(h.key);
+            self.refs -= 1;
+            return Err(e);
+        }
+        Ok(h)
+    }
+    /// Duplicate standard input, output or error, classifying pipe/file/terminal.
+    pub fn open_stdio(&mut self, which: Stdio) -> Result<Handle> {
+        self.open(Open::Stdio(which))
+    }
+    /// Pass an independent reference to a socket over local IPC. The source stays
+    /// owned by this loop; close or detach it explicitly when migration is desired.
+    pub fn send_handle(&mut self, pipe: Handle, h: Handle, token: Token) -> Result<OpId> {
+        if self.resource(h)?.closing.is_some() {
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
+        self.submit(pipe, Operation::SendHandle(h), token)
+    }
+    /// Receive and attach one passed socket. Use a dedicated IPC control stream;
+    /// ordinary reads must not consume the handle-transfer framing byte.
+    pub fn recv_handle(&mut self, pipe: Handle, token: Token) -> Result<OpId> {
+        self.submit(pipe, Operation::RecvHandle, token)
+    }
+    /// Spawn a child and submit its exactly-once exit operation. Closing a live
+    /// child terminates and reaps it; a new process group enables `kill_group`.
+    pub fn spawn(&mut self, spec: &ProcessSpec, token: Token) -> Result<Process> {
+        let h = self.new_handle(Kind::Socket)?;
+        let mut pipes = [None; 3];
+        let result = (|| {
+            for (i, stdio) in spec.stdio.iter().enumerate() {
+                if let ProcessStdio::Handle(source) = stdio { self.resource(*source)?; }
+                if *stdio == ProcessStdio::Pipe { pipes[i] = Some(self.new_handle(Kind::Socket)?); }
+            }
+            // Reserve the terminal completion before creating an OS child.
+            let op = self.new_op(Some(h), token)?;
+            let result = self.backend.spawn(h, pipes, spec).and_then(|pid| {
+                self.backend.submit(Request { op, handle: h, operation: Operation::ProcessExit })?;
+                Ok(pid)
+            });
+            if result.is_err() { self.retire(op); self.outstanding -= 1; }
+            result
+        })();
+        match result {
+            Ok(pid) => Ok(Process { handle: h, pid, stdin: pipes[0], stdout: pipes[1], stderr: pipes[2] }),
+            Err(e) => {
+                for handle in std::iter::once(h).chain(pipes.into_iter().flatten()) {
+                    self.backend.release(handle);
+                    if self.handles.remove(handle.key).is_some() { self.refs -= 1; }
+                }
+                Err(e)
+            }
+        }
+    }
+    /// Signal a child still owned by this loop.
+    pub fn kill(&mut self, process: Handle, signal: Signal) -> Result<()> {
+        self.resource(process)?;
+        self.backend.kill(process, signal, false)
+    }
+    /// Signal an isolated process group, including grandchildren.
+    pub fn kill_group(&mut self, process: Handle, signal: Signal) -> Result<()> {
+        self.resource(process)?;
+        self.backend.kill(process, signal, true)
+    }
+    /// Subscribe this loop to a process-wide signal. Repeated deliveries may
+    /// coalesce; every subscribed loop gets its own completion.
+    pub fn signal_start(&mut self, signal: Signal, token: Token) -> Result<Handle> {
+        let h = self.new_handle(Kind::Socket)?;
+        if let Err(e) = self.backend.signal(h, signal).and_then(|()| self.submit(h, Operation::WatchSignal, token).map(|_| ())) {
+            self.backend.release(h); self.handles.remove(h.key); self.refs -= 1;
+            return Err(e);
+        }
+        Ok(h)
+    }
+    /// Stop a signal subscription, delivering Stopped before the final Closed.
+    pub fn signal_stop(&mut self, h: Handle, token: Token) -> Result<()> {
+        let mut next = self.resource(h)?.head;
+        while let Some(op) = next {
+            next = self.ops.get(op.key).and_then(|op| op.next);
+            self.stop(op);
+        }
+        self.close(h, token)
+    }
+    /// Set terminal mode; its original settings are restored on close or drop.
+    pub fn tty_set_mode(&mut self, h: Handle, mode: TtyMode) -> Result<()> {
+        self.resource(h)?;
+        self.backend.tty_set_mode(h, mode)
+    }
+    /// Query terminal rows and columns.
+    pub fn tty_window_size(&self, h: Handle) -> Result<WindowSize> {
+        self.resource(h)?;
+        self.backend.tty_window_size(h)
+    }
+    /// Subscribe to resize notifications after validating the terminal. On a
+    /// Signal(WinCh) completion, query `tty_window_size` for its current size.
+    pub fn tty_resize_start(&mut self, h: Handle, token: Token) -> Result<Handle> {
+        self.tty_window_size(h)?;
+        self.signal_start(Signal::WinCh, token)
+    }
     pub fn udp_bind(&mut self, addr: SocketAddr, opts: &UdpOpts) -> Result<Handle> {
         self.open(Open::Udp { addr, opts: *opts })
     }
@@ -688,6 +796,17 @@ impl<B: Backend> Driver<B> {
             }
         } else {
             match e.result {
+                Ok(Outcome::Exited(status)) => OpResult::Exited(status),
+                Ok(Outcome::Signal(signal)) => OpResult::Signal(signal),
+                Ok(Outcome::PipeAccepted(d)) => match self.attach(d, op.token) {
+                    Ok(conn) => OpResult::PipeAccepted { conn },
+                    Err(e) => OpResult::Err(e),
+                },
+                Ok(Outcome::HandleReceived(d)) => match self.attach(d, op.token) {
+                    Ok(handle) => OpResult::HandleReceived { handle },
+                    Err(e) => OpResult::Err(e),
+                },
+                Ok(Outcome::HandleSent) => OpResult::HandleSent,
                 Err(e) => OpResult::Err(e),
                 Ok(Outcome::Connected) => OpResult::Connected,
                 Ok(Outcome::Accepted { transport, peer }) => match self.attach(transport, op.token)

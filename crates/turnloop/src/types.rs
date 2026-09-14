@@ -164,6 +164,12 @@ pub enum Integration {
 
 #[derive(Debug)]
 pub enum Open {
+    /// Unconnected local stream.
+    Pipe(crate::PipeName),
+    /// Local stream listener.
+    PipeListener { name: crate::PipeName, opts: ListenOpts },
+    /// Duplicate and classify a host standard stream.
+    Stdio(crate::Stdio),
     Tcp { addr: SocketAddr, opts: TcpOpts },
     Listener { addr: SocketAddr, opts: ListenOpts },
     Udp { addr: SocketAddr, opts: UdpOpts },

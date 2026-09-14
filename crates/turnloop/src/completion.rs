@@ -22,6 +22,16 @@ pub struct Completion {
 }
 #[derive(Debug)]
 pub enum OpResult {
+    /// Child exit, after reaping; produced exactly once per accepted spawn.
+    Exited(crate::ExitStatus),
+    /// Process-wide signal delivered to this subscribed loop.
+    Signal(crate::Signal),
+    /// Accepted local stream, already attached to this loop.
+    PipeAccepted { conn: Handle },
+    /// Received transport, already attached to this loop.
+    HandleReceived { handle: Handle },
+    /// One transport was passed to the receiving process.
+    HandleSent,
     Connected,
     Accepted {
         conn: Handle,

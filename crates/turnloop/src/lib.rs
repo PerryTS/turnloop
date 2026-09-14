@@ -9,6 +9,8 @@ mod buffer;
 mod types;
 pub use buffer::*;
 pub use types::*;
+mod native;
+pub use native::*;
 mod completion;
 mod driver;
 mod table;

@@ -1,36 +1,32 @@
-# Integration lane report
+# core2 lane report
 
-Updated 2026-09-14. Wave-1 integration and local verification are complete; external
-release prerequisites remain explicitly pending. The integrator makes commits because Git metadata is read-only.
+Updated 2026-09-14. Implementation in progress; no completion claim yet.
+Wave-1 history remains in docs/INTEGRATION_REPORT.md and docs/lanes/.
 
-Implemented: full turnloop rename; eight-member workspace (six publishable crates,
-two private helpers); stable 1.97.1 metadata; shared soaked dependencies; private
-start/stop/run server runner and common TURNLOOP_TEST_* ports; consolidated CI with
-explicit pending platform/baseline gates; native and cross-target test fixes;
-no-spin contract and the cached-readiness/EAGAIN core fix.
+Read completely: DESIGN.md, CONTRIBUTING.md, integration report, core/Windows/WASM
+lane reports. No applicable AGENTS.md. Git metadata remains read-only.
 
-PASS: default workspace tests, strict native/Linux/WASI/web Clippy, stable
-1.97.1, rustdoc, five loom models, two Miri suites, no-tokio on all eight target
-graphs, seven-day soak, cargo-deny, workflow lint wrapper and 15 automation tests. All six
-publishable crates passed fully verified cargo publish dry runs; no --no-verify
-was needed and nothing was uploaded. Redis (single/ACL/TLS/cluster/Sentinel), MongoDB
-(standalone/replicas/auth/TLS), and SMTP real-server subset passed.
+## Scope and implementation
 
-UNRUN: SQL test bodies (PostgreSQL shmget denied; MySQL initializer crashes in this
-sandbox), Linux/Windows runtime suites, full Windows test-target Clippy (ring needs
-Windows SDK headers), Docker CI fixture path, Windows/WASI/web production contracts,
-and Linux instruction measurements. Their gates have not been weakened or skipped.
+Remaining native surface: local IPC/stdio/SCM_RIGHTS, processes, process-wide
+signals, TTY, external waits, optional local executor, shared contracts and rustdoc.
+The starting tree already uses Backend revision 2 for empty-wait instrumentation.
+Preserve all no-spin, exactly-once, allocation and dependency gates.
 
-Audit changes: removed unmaintained rustls-pemfile; updated the iai-callgrind gate
-to its maintained Gungraun 0.19.4 successor to remove proc-macro-error2; kept all
-thresholds and v6 summary checks. Pinned email-encoding 0.4.1 to share base64 0.22.1.
-Added permissive 0BSD for quoted_printable, with no advisory/runtime exceptions.
+## Verification
 
-The detailed command history, earlier failures and remaining lane questions are in
-[docs/INTEGRATION_REPORT.md](docs/INTEGRATION_REPORT.md) and its linked command log.
-Next: integrator reruns SQL and hosted CI, integrates
-wave-2 backends/HTTP, obtains the Linux baseline and handles first publications.
+Implementation checks are pending. Linux/Windows runtime tests are UNRUN (no hosts).
+WASI/web native-only operations must explicitly return Unsupported; their common
+core and executor will be cross-checked. The seven-day dependency soak remains on.
+Exact verification invocations and outcomes will be in docs/core2-commands.md.
 
-Earlier failures, including a loaded timer-precision run, remain in the report.
-The unchanged full native gate passed afterward. Raw actionlint still rejects
-GitHub concurrency.queue; the strict validated compatibility wrapper passes.
+## Decisions / questions
+
+Portable API additions will use shared types and optional backend methods. Process
+groups map to Windows Job Objects; received transports use existing attach semantics.
+No DESIGN.md change has been made. Native close must reap owned children.
+
+## Next steps
+
+Implement and verify each surface, extend allocation/contract gates, document API
+and platform limitations, then run the full requested verification matrix.

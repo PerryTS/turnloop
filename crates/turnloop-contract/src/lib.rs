@@ -974,3 +974,5 @@ pub fn no_spin<B: Backend>() {
         "idle socket read remained pending throughout"
     );
 }
+
+pub mod native_surface;

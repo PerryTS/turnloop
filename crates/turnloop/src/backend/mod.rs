@@ -86,6 +86,15 @@ pub struct Request {
 }
 #[derive(Debug)]
 pub enum Operation {
+    /// Observe this process until its exit has been reaped.
+    ProcessExit,
+    /// Multishot subscription to this signal resource.
+    WatchSignal,
+    /// Duplicate a transport into the receiving process. The backend retains an
+    /// independent native reference until its send completes or is cancelled.
+    SendHandle(Handle),
+    /// Receive one transport over a local IPC stream.
+    RecvHandle,
     Connect,
     Accept { multishot: bool },
     Read { buf: ReadBuf, multishot: bool },
@@ -103,6 +112,16 @@ pub struct Event<D> {
 }
 #[derive(Debug)]
 pub enum Outcome<D> {
+    /// Reaped child termination.
+    Exited(crate::ExitStatus),
+    /// Coalesced signal delivery.
+    Signal(crate::Signal),
+    /// Accepted local connection (has no IP peer address).
+    PipeAccepted(D),
+    /// Received independent transport ownership.
+    HandleReceived(D),
+    /// One transport was passed successfully.
+    HandleSent,
     Connected,
     Accepted {
         transport: D,
@@ -137,6 +156,29 @@ pub unsafe trait Backend: Sized + 'static {
     type Wake: Wake;
     type Detached: Send + 'static;
     fn new(config: &Config, pool: BufferPool) -> Result<Self>;
+    /// Give process-wide services this loop's parking-aware notification endpoint.
+    fn set_notifier(&mut self, _notifier: crate::Notifier) {}
+    /// Spawn and bind the child and requested parent pipe handles atomically.
+    /// Failure must release all supplied handles and reap any created child.
+    fn spawn(&mut self, _handle: Handle, _pipes: [Option<Handle>; 3], _spec: &crate::ProcessSpec) -> Result<u32> {
+        Err(Error::new(crate::ErrorKind::Unsupported))
+    }
+    /// Signal an owned child, or its explicitly isolated process group.
+    fn kill(&mut self, _handle: Handle, _signal: crate::Signal, _group: bool) -> Result<()> {
+        Err(Error::new(crate::ErrorKind::Unsupported))
+    }
+    /// Bind a process-wide signal subscription to a new core handle.
+    fn signal(&mut self, _handle: Handle, _signal: crate::Signal) -> Result<()> {
+        Err(Error::new(crate::ErrorKind::Unsupported))
+    }
+    /// Set a terminal mode, retaining the original settings until release/drop.
+    fn tty_set_mode(&mut self, _handle: Handle, _mode: crate::TtyMode) -> Result<()> {
+        Err(Error::new(crate::ErrorKind::Unsupported))
+    }
+    /// Query current terminal dimensions.
+    fn tty_window_size(&self, _handle: Handle) -> Result<crate::WindowSize> {
+        Err(Error::new(crate::ErrorKind::Unsupported))
+    }
     /// Monotonic, nondecreasing time in a consistent domain across calls. Native
     /// adapters return std::time::Instant::now(). Web adapters construct
     /// crate::Instant::from_duration from their monotonic host clock. This method
@@ -183,3 +225,6 @@ mod socket;
 pub mod unix;
 #[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
 pub use unix::Unix as Platform;
+
+#[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
+mod ipc;
