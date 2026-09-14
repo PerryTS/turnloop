@@ -90,7 +90,7 @@ no new I/O unwraps or production operation allocations were introduced.
 | `cargo +stable check --locked --workspace --all-targets --all-features` | **PASS**, stable 1.97.1 |
 | `cargo test --workspace` | **PASS**, 92 tests; 10 real-server tests ignored and not counted |
 | `python3 scripts/ci/run-tests.py native` | **PASS**, 92 tests per workspace feature configuration plus independently checked core/protocol/contract suites; 368 total executions including repeats, 25 Unix contracts per configuration |
-| `cargo +nightly-2026-08-20 run --release -p turnloop-bench --locked -- --portable --timers` | **PENDING** at report write; portable timing smoke, never Linux instruction counts |
+| `cargo +nightly-2026-08-20 run --release -p turnloop-bench --locked -- --portable --timers` | **PASS**, nine workloads × 100,000 operations; nanoseconds only, never Linux instruction counts |
 | `scripts/test-servers.py --services mysql run cargo test -p turnloop-mysql --test server -- --include-ignored --test-threads=1` | Command **FAIL** at mysqld initialization, fatal signal in Aligned_atomic/Shared_spin_lock/delegates_init; all MySQL test bodies **UNRUN (sandbox)** |
 | `python3 scripts/ci/instructions.py` | Expected precondition **FAIL** on macOS; actual Linux measurements/regression comparison **UNRUN** |
 | `git diff --check` | **PASS** |
