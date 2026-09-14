@@ -236,12 +236,21 @@ jobs:
           python-version: '3.14'
       - name: Install pinned Rust
         run: rustup toolchain install nightly-2026-08-20 --profile minimal --component rustfmt,clippy
-      - name: Install SMTP sink for private fixture
+      - name: Install private fixture build dependencies and SMTP sink
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
           sudo apt-get update
-          sudo --preserve-env=DEBIAN_FRONTEND apt-get install --yes postfix
+          sudo --preserve-env=DEBIAN_FRONTEND apt-get install --yes postfix build-essential libssl-dev pkg-config
+      - name: Cache pinned Redis TLS build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .tools/redis-build
+          key: redis-tls-ubuntu-24.04-${{ runner.arch }}-${{ hashFiles('scripts/ci/install-redis.py') }}
+      - name: Install and verify Redis 8.4.0 with TLS
+        run: python3 scripts/ci/install-redis.py
+      - name: Pull MongoDB before the bounded fixture startup wait
+        run: docker pull mongo:8
       - name: Required real-server protocol suites with the shared fixture contract
         env:
           POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
@@ -250,6 +259,15 @@ jobs:
       - name: Fixture logs and cleanup
         if: always()
         run: scripts/test-servers.py --ci-services stop
+      - name: Preserve private server diagnostics
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: protocol-server-logs
+          path: .tools/**/*.log
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
 
   dependencies:
     runs-on: ubuntu-24.04
