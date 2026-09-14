@@ -1,0 +1,5 @@
+# Same pinned nightly as Perry, so cargo's min-publish-age soak applies. The crate itself must also build on stable.
+[toolchain]
+channel = "nightly-2026-08-20"
+components = ["rustfmt", "clippy"]
+targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "wasm32-wasip2", "wasm32-unknown-unknown", "wasm32-wasip1-threads"]

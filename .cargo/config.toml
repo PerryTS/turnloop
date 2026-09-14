@@ -1,0 +1,7 @@
+# Supply-chain soak, same window as Perry (SOAK_DAYS = 7). Crates published less than 7 days ago are not resolved
+# unless already in Cargo.lock.
+[unstable]
+min-publish-age = true
+
+[registry]
+global-min-publish-age = "7 days"
