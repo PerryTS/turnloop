@@ -99,9 +99,11 @@ python3 scripts/ci/run-tests.py loom
 python3 scripts/ci/run-tests.py miri
 ```
 
-Install the appropriate Rust targets and Miri component first. Both browsers must
-be installed; GitHub's Ubuntu image supplies Chrome and Firefox. wasm-pack locates
-or downloads the matching WebDriver and wasm-bindgen test runner. WASI gets network
+Install the appropriate Rust targets and Miri component first. Linux browser CI installs the checksum-pinned Chrome for Testing/matching driver
+and Firefox/geckodriver with `python3 scripts/ci/install-browsers.py`. The runner
+uses explicit binary paths and prints persistent driver logs on failure; zero
+browser tests is a failure. wasm-pack runs in no-install mode after the matching
+wasm-bindgen CLI is built by `install-web-tools.py`. WASI gets network
 access only inside the disposable test runner; each component has a 120-second
 runtime timeout. A standalone spike is not a substitute for the shared contracts.
 

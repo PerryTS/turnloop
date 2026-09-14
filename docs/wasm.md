@@ -94,39 +94,111 @@ stack access trapped. The release UDP and full I/O regressions now pass with
 restoration; debug-only tests had failed to expose this. This is part of the
 experimental ABI surface, not a portable assumption about future toolchains.
 
-There are still promotion blockers:
+Strict host-progress/cancellation boundedness and ABI portability remain
+unproven. See [the precise upstream requirements](upstream/wasi-p3-wait.md).
+The backend remains opt-in; passing no-spin does not remove that feature gate.
 
-1. `waitable-set.poll` alone does not schedule host socket subtasks when the owner
-   repeatedly calls `turn(Now)`. One cooperative `thread-yield` before one poll
-   allows I/O to progress under repeating-timer/post backlog. No guest wait loop
-   or fresh `block_on` is used, and the no-spin contract passes. However the host
-   yield has no demonstrated wall-time budget. A host primitive that advances
-   ready subtasks with an explicit work/time bound, or a documented bound for
-   this yield, is required before claiming strict D7 boundedness.
-2. UDP receive returns an owned canonical `list<u8>`. It currently allocates once
-   per successful nonempty datagram: the strict gate measures **100 allocations
-   for 100 receives**, then fails against zero. Correct reuse needs an allocator
-   for asynchronous returns that preserves per-task context and owns returned
-   storage until completion/cancel; p2's synchronous scratch scope cannot simply
-   be copied. Results can arrive on a later turn and multiple requests can be in
-   flight. Error variants can also own strings. No unsafe scratch ownership
-   shortcut or relaxed allocation threshold is used.
-3. On the pinned p3 compiler, a debug custom GlobalAlloc makes the harness's
-   `wasi:cli/environment.get-arguments` canonical realloc access a zero shadow
-   stack before tests start. Release allocation tests do start and exercise their
-   subjects. Debug allocator-entry context/stack initialization needs an upstream
-   fix or an audited canonical allocator trampoline. Backend context restoration
-   does not fix this pre-backend startup path.
-4. Workspace p3 Clippy reaches MongoDB -> BSON -> rand 0.9 -> getrandom 0.3.4,
-   which rejects p3. Core/contract p3 Clippy passes. The protocol dependency needs
-   a soaked p3-capable implementation; no insecure RNG substitute is enabled.
+### Canonical UDP storage and debug allocation harness
 
-On this macOS/Wasmtime combination, p2 and p3 also fail the existing shared
-`timer_precision` median-lateness ceiling of 500 microseconds (approximately
-1.03 ms and 2.35 ms in debug; p3 release still measured 1.08 ms). Nanosecond deadlines are passed without a
-backend-added millisecond floor. The tests stay enabled and the gate stays red;
-a host/runtime timing investigation is necessary. Separate filtered coverage
-runs are reported as such and never used as CI gate passes.
+The allocation source was host canonical lowering of each received `list<u8>`,
+not address conversion or the provided/pool output buffer. In release, scoped
+`cabi_realloc` redirects raw async socket/wait-set return lists into retained
+64 KiB slots. There is one reservation per live UDP socket (one receive head per
+socket), retained to the high-water mark until the last backend drops. All loops
+on the agent share the arena because host progress can return another loop's
+subtask. Busy slots are never reset at turn boundaries. Returned bytes are
+copied to the requested output and the slot is released only on consumption or
+acknowledged cancellation; error text is also consumed without generated String
+destruction. Unrelated imports and oversized exceptional error strings use the
+ordinary allocator. The measured steady path remains strictly zero allocations.
+
+Regression subjects cover the original 100 datagrams/6,400 bytes, 320 concurrent
+IPv6 datagrams with provided/pooled outputs (0 through 8,192 bytes), 320 real
+cancellations, output capacity one, two loops, pending drop and surviving-loop
+reuse. A direct canonical test initializes two full 65,536-byte lists, verifies
+both contents survive scope/owner changes, and asserts reuse only after release.
+The wire maximum is 8 KiB because a direct host socket probe accepts 8 KiB but
+rejects 16/60 KiB with EMSGSIZE on this Mac; canonical capacity is tested directly.
+
+**p3 allocation gates are release-only.** The pinned compiler lowers the custom
+GlobalAlloc harness's unoptimized allocator entry using context-slot-0 stack
+storage. The `get-arguments` canonical realloc enters with that slot zero before
+Rust's harness starts; unoptimized stack access traps. Release inlining avoids
+that startup path. Backend stack restoration cannot repair a pre-main entry.
+The custom canonical allocator is likewise release-only; debug uses std's default
+owned lists. There is no debug zero-allocation claim. The required WASI CI job
+runs debug semantic/no-spin contracts, release semantic/precision contracts,
+release canonical-storage unit tests, and release allocation gates, requiring
+positive counts for every binary. The zero threshold is unchanged.
+
+### p3 entropy and the complete workspace
+
+BSON 3.1.0 requires rand 0.9; its newest compatible release 0.9.5 (2026-07-11)
+still uses rand_core 0.9/getrandom 0.3.4. getrandom 0.3.4 (2025-10-14) is the last
+0.3 release and has no p3 backend. Soak-eligible getrandom 0.4.3 (2026-06-17) has
+p3 support, but cannot satisfy that dependency's 0.3 requirement. Registry API
+and the exact locked manifests were checked on 2026-09-14; no dependency was
+updated and no soak exception was used.
+
+`.cargo/config.toml` sets `--cfg getrandom_backend="custom"` **only for
+wasm32-wasip3**. The explicit `turnloop-wasi-random` linkage crate supplies the
+[documented custom-backend symbol](https://github.com/rust-random/getrandom/blob/v0.3.4/README.md#custom-backend),
+`__getrandom_v03_custom`, which both locked getrandom 0.3.4 and 0.4.3 declare.
+The scalar `wasi:random/random@0.3.0.get-random-u64` import initializes every
+requested byte, including unaligned tails, with no list allocation. The shim is
+linked by the three protocol consumers and shared once in a final binary;
+MongoDB remains in the full p3 workspace. It introduces no event-loop dependency
+into the sans-IO crates. Other targets are unaffected.
+
+Downstream p3 applications must set that target rustflag themselves (Cargo does
+not inherit dependency config), link the shim, and avoid a second custom symbol.
+Missing WASI random support is a link/host capability failure, never a predictable
+fallback. Tests generate 754 bytes through both getrandom generations, reject
+zero/constant long samples, generate two distinct BSON ObjectIds, and measure
+200 additional real entropy fills at zero allocations.
+
+## WASI timer measurements
+
+Wasmtime **46.0.0** on macOS arm64, release, twenty 250 µs waits per process.
+`crates/turnloop-contract/examples/wasi_timer_baseline.rs` deliberately uses no
+turnloop types or calls: p2 subscribes/polls the monotonic-clock pollable; p3 uses
+the same async-lowered monotonic-clock wait with a single raw waitable set (p3
+removed pollables). Every wait checks it did not return early.
+
+| Measurement | Median lateness |
+| --- | ---: |
+| Bare p2 | 919,416 ns |
+| Bare p3 | 907,125 ns |
+| turnloop p2, same runtime | 1,062,667 ns |
+| turnloop p3, same runtime | 973,666 ns |
+
+Raw bare p2 lateness, nanoseconds:
+`[2389375, 911375, 924542, 920625, 2046875, 936792, 925125, 903625, 904000, 2030958, 906833, 920250, 919416, 909917, 2046125, 915625, 902208, 894500, 894583, 908292]`.
+
+Raw bare p3 lateness, nanoseconds:
+`[262291, 1293542, 2020166, 894375, 892167, 897875, 909250, 2049500, 906917, 907125, 918042, 906875, 906125, 2039958, 920167, 956666, 903917, 891667, 2027125, 895166]`.
+
+Raw turnloop p2 lateness, nanoseconds:
+`[2075125, 1068625, 1051083, 1047375, 1062625, 1073708, 1047333, 2286833, 1030083, 2289292, 1048167, 1076417, 2353792, 1025292, 2239583, 1039500, 1062667, 1069916, 1038333, 1040375]`.
+
+Raw turnloop p3 lateness, nanoseconds:
+`[910750, 906208, 919292, 2067416, 973666, 990000, 918333, 2066166, 925791, 918583, 930125, 921000, 2062833, 959958, 924458, 1121584, 2050917, 979083, 1042708, 1023542]`.
+
+The bare programs reproduce the ~1 ms host lateness; the observed additional
+turnloop p3 median is ~67 µs, not a millisecond floor. Per the integrator's decision,
+DESIGN §7.4/§7.6 now describe host-dependent wake precision (Wasmtime ≈1 ms).
+The WASI release gate uses median ≤2 ms, giving measured host scheduling headroom;
+native's <500 µs gate is unchanged. Debug excludes precision sampling but still
+runs timer semantics and **turns per expiry ≤2, zero-event waits ≤1**. CI prints
+both baseline and driver raw samples to make host changes visible. Deadline
+representation remains nanoseconds; no backend floors or spins were introduced.
+
+Reproduce each baseline with the target's pin and runner, for example:
+
+```sh
+CARGO_TARGET_WASM32_WASIP3_RUNNER=scripts/ci/wasmtime-runner.sh cargo +nightly-2026-09-07 run --locked -p turnloop-contract --release --all-features --target wasm32-wasip3 --example wasi_timer_baseline
+python3 scripts/ci/run-tests.py wasi --target wasm32-wasip3
+```
 
 ## Web host integration
 
@@ -196,8 +268,8 @@ checks 2,000 unique full-width messages from two real workers and no idle wakes.
 
 ## Explicit contract exclusions
 
-These are platform exclusions, not successful tests. Required WASI timer/UDP
-and allocation failures are **not excluded**.
+These are platform exclusions, not successful tests. WASI UDP, release precision
+and release allocation subjects remain mandatory.
 
 | Contract family | WASI p2/p3 | Web/Node |
 | --- | --- | --- |
@@ -205,7 +277,7 @@ and allocation failures are **not excluded**.
 | Blocking pool / native cross-thread wake and 8-peer posting | Excluded: these single-agent targets cannot spawn OS threads; Running-notify/post behavior exercised | Native threads/pool excluded and Unsupported tested; two actual JS Workers exercise SAB posting |
 | Native detach/attach transfer | Excluded: WASI resource transfer Unsupported (accept attaches owned transport internally) | Excluded: browser transport transfer Unsupported, tested |
 | Integration fd/event, POSIX signal EINTR, kqueue/epoll/IOCP specifics | Excluded: runtime-owned integration, no native fd | Excluded: HostCallback and zero OS waits |
-| Native sub-ms timer ceiling | Required unchanged, currently FAIL on this host | Native ceiling excluded: browser timers are clamped. Host-clock tests require no early firing, bounded lateness, 60 actual expiries and one scheduled turn each |
+| Native sub-ms timer ceiling | Release uses measured host bound ≤2 ms; debug semantics/no-spin remain required | Native ceiling excluded: browser timers are clamped. Host-clock tests require no early firing, bounded lateness, 60 actual expiries and one scheduled turn each |
 | Real Postgres/MySQL/Redis/SMTP/MongoDB server integration | Outside backend contract scope; existing native protocol fixtures remain separate | Raw-socket protocol integration excluded by platform capability; sans-IO protocol crates still cross-check |
 
 For browser reruns outside the sandbox, use the setup/PATH above and:
@@ -214,3 +286,34 @@ For browser reruns outside the sandbox, use the setup/PATH above and:
 python3 scripts/ci/run-tests.py web --browser chrome
 python3 scripts/ci/run-tests.py web --browser firefox
 ```
+
+## Pinned browser CI and diagnostics
+
+Linux x86_64 CI installs Chrome for Testing **153.0.8010.36** and exactly matching
+chromedriver, Firefox **155.0.1** and geckodriver **0.37.1**. URLs and SHA-256 pins
+are committed in `scripts/ci/browsers.json`. `install-browsers.py` verifies each
+archive before extracting, checks executable versions on Linux and writes
+absolute binary paths. Firefox's SHA256SUMS and geckodriver's GitHub release
+asset digest were independently matched; Chrome/driver digests were computed
+from the official Chrome for Testing HTTPS archives.
+
+```sh
+python3 scripts/ci/install-browsers.py               # Linux x86_64
+python3 scripts/ci/install-browsers.py --verify-only # verify/extract without execution on other hosts
+```
+
+`BrowserDriver` starts and owns each pinned driver, polls its `/status` with a
+15-second bound, supplies an explicit browser binary in capabilities, and points
+wasm-bindgen-test at that driver. It does not treat normal driver stderr as a
+startup failure. `wasm-pack --mode no-install` receives the exact driver path.
+Driver stdout/stderr (Chrome verbose, Gecko trace) stay in `.tools/browser-logs/`
+and are printed on any test/fixture/startup failure. Cleanup terminates the
+owned process group, including browser children. Chrome and Firefox are each
+attempted, and zero executed browser tests cause failure even if compilation or
+Node tests passed. Node remains a separately executed seven-contract suite.
+
+The integrator reproduced ChromeDriver SIGKILL on this Mac **outside the
+sandbox**, with matching 153.0.8010.36 versions: this is a host restriction,
+not a sandbox diagnosis. Real browser execution remains UNRUN here and required
+on GitHub's Linux runner. Linux binary checksum/extraction verification and mock
+WebDriver lifecycle tests do not count as browser test execution.
