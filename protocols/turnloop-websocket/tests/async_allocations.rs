@@ -259,6 +259,80 @@ fn websocket() {
         "WebSocket: 100 reads, {reference} core-owned message allocations, 0 adapter allocations; 100 writes, 0 allocations"
     );
 }
+fn http2_data_flow() {
+    use turnloop_http::{
+        asynchronous::Http2,
+        http1::Header,
+        http2::{Event, Role},
+    };
+    // A real open stream and peer settings precede the measured DATA frames.
+    let mut conn = Http2::new(
+        Wire::new(b"\x00\x00\x04\x00\x00\x00\x00\x00\x01body"),
+        Role::Client,
+    )
+    .expect("h2");
+    assert_eq!(
+        conn.core
+            .open(
+                &[
+                    Header::new(":method", "POST"),
+                    Header::new(":scheme", "http"),
+                    Header::new(":authority", "example.test"),
+                    Header::new(":path", "/"),
+                ],
+                false
+            )
+            .expect("stream"),
+        1
+    );
+    assert_eq!(
+        conn.core
+            .receive(b"\x00\x00\x00\x04\x00\x00\x00\x00\x00")
+            .expect("settings")
+            .consumed,
+        9
+    );
+    let head = conn
+        .core
+        .receive(b"\x00\x00\x01\x01\x04\x00\x00\x00\x01\x88")
+        .expect("response headers");
+    assert!(matches!(head.event, Some(Event::Headers { stream: 1, .. })));
+    let mut bytes_seen = 0;
+    let mut round = || {
+        assert!(
+            run(conn.event(|core, event| {
+                let Event::Data {
+                    stream,
+                    bytes,
+                    end_stream,
+                } = event
+                else {
+                    panic!("DATA required")
+                };
+                assert_eq!(stream, 1);
+                assert!(!end_stream);
+                assert_eq!(bytes, b"body");
+                bytes_seen += bytes.len();
+                core.release_capacity(stream, bytes.len() as u32)
+                    .map_err(io::Error::other)
+            }))
+            .expect("DATA and flow credit")
+        );
+    };
+    round();
+    assert_eq!(
+        measure(|| {
+            for _ in 0..100 {
+                round();
+            }
+        }),
+        0,
+        "HTTP/2 DATA/credit adapter allocates"
+    );
+    assert_eq!(bytes_seen, 404);
+    println!("HTTP/2: 100 DATA deliveries and flow-credit writes, zero allocations");
+}
+
 fn main() {
     assert!(
         measure(|| {
@@ -267,6 +341,7 @@ fn main() {
         "allocator must observe allocation"
     );
     http();
+    http2_data_flow();
     websocket();
-    println!("test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;");
+    println!("test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;");
 }

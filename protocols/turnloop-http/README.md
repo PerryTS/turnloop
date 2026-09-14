@@ -13,7 +13,7 @@ No engine samples a clock. The host passes `Instant` deadlines and invokes timeo
 
 WASM uses the published `turnloop-zstd-decoder` fork of ruzstd 0.8.3 with retained sequence tables. Consumers need no workspace patch. Native builds use the reference zstd decoder by default; `pure-rust-zstd` selects the same decoder as WASM, including its allocation gates. See the decoder crate’s `UPSTREAM.md`.
 
-Tests use private ephemeral loopback servers, Node 26, curl, generated TLS certificates, RFC vectors and a vendored HPACK corpus. `examples/h2spec_server.rs` is a blocking conformance driver, not the future turnloop adapter. Exact commands and limitations are in the root `LANE_REPORT.md`.
+Tests use private ephemeral loopback servers, Node 26, curl, generated TLS certificates, RFC vectors and a vendored HPACK corpus. `examples/h2spec_server.rs` drives the async server on turnloop; the required h2spec gate checks all 147 strict cases. Exact commands and limitations are in the root `LANE_REPORT.md`.
 
 ## Getting started on turnloop
 

@@ -54,3 +54,42 @@
 | 2026-09-14T20:17:52.009366+00:00 | FAIL | `cargo test -p turnloop-io --target wasm32-wasip2 --test streams resolve_and_cancel -- --nocapture --test-threads=1` | `.tools/adapters-net/io-wasi-dns.log` |
 | 2026-09-14T20:17:55.173968+00:00 | PASS | `python3 -m unittest discover -s scripts/ci -p 'test_*.py' -v` | `.tools/adapters-net/python-gates-final.log` |
 | 2026-09-14T20:19:16.550532+00:00 | PASS | `python3 scripts/ci/run-tests.py protocol-wasi --target wasm32-wasip2` | `.tools/adapters-net/protocol-wasip2-complete.log` |
+| 2026-09-14T20:19:58.854281+00:00 | FAIL | `python3 scripts/ci/run-tests.py protocol-wasi --target wasm32-wasip3` | `.tools/adapters-net/protocol-wasip3-complete.log` |
+| 2026-09-14T20:21:50.253847+00:00 | PASS | `python3 scripts/ci/run-tests.py protocol-wasi --target wasm32-wasip3` | `.tools/adapters-net/protocol-wasip3-harness.log` |
+| 2026-09-14T20:22:00.692110+00:00 | PASS | `cargo fmt --all --check` | `.tools/adapters-net/fmt.log` |
+| 2026-09-14T20:22:03.110308+00:00 | PASS | `cargo clippy --locked --workspace --all-targets -- -D warnings -D clippy::undocumented_unsafe_blocks` | `.tools/adapters-net/clippy-default.log` |
+| 2026-09-14T20:22:05.120818+00:00 | PASS | `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks` | `.tools/adapters-net/clippy-final.log` |
+| 2026-09-14T20:22:07.043148+00:00 | PASS | `cargo +stable check --locked --workspace --all-targets --all-features` | `.tools/adapters-net/stable-final.log` |
+| 2026-09-14T20:22:08.520490+00:00 | PASS | `env 'RUSTDOCFLAGS=-D warnings' cargo doc --locked --workspace --all-features --no-deps` | `.tools/adapters-net/rustdoc.log` |
+| 2026-09-14T20:25:20.002254+00:00 | PASS | `python3 scripts/ci/run-tests.py native` | `.tools/adapters-net/native-modes.log` |
+| 2026-09-14T20:25:22.364698+00:00 | PASS | `python3 scripts/test-servers.py --services http run python3 scripts/ci/run-tests.py interop --mode all-features` | `.tools/adapters-net/interop-final.log` |
+| 2026-09-14T20:25:25.776765+00:00 | PASS | `python3 scripts/ci/h2spec.py` | `.tools/adapters-net/h2spec-final.log` |
+| 2026-09-14T20:25:29.423567+00:00 | PASS | `cargo publish --dry-run --locked --allow-dirty -p turnloop -p turnloop-io` | `.tools/adapters-net/io-publish-dry-run.log` |
+| 2026-09-14T20:25:56.875862+00:00 | FAIL | `cargo test -p turnloop-http -p turnloop-io -p turnloop-websocket --all-features --test asynchronous --test streams --test async_allocations -- --test-threads=1` | `.tools/adapters-net/http-final-drain.log` |
+| 2026-09-14T20:27:57.206420+00:00 | FAIL | `cargo test -p turnloop-http -p turnloop-io -p turnloop-websocket --all-features --test asynchronous --test streams --test async_allocations -- --test-threads=1` | `.tools/adapters-net/http-final-drain-fixed.log` |
+| 2026-09-14T20:28:56.789734+00:00 | PASS | `cargo test -p turnloop-http -p turnloop-io -p turnloop-websocket --all-features --test asynchronous --test streams --test async_allocations -- --test-threads=1` | `.tools/adapters-net/http-final-drain-complete.log` |
+| 2026-09-14T20:29:30.287669+00:00 | PASS | `python3 scripts/ci/run-tests.py wasi --target wasm32-wasip2` | `.tools/adapters-net/wasi-core-p2.log` |
+| 2026-09-14T20:29:57.655493+00:00 | PASS | `python3 scripts/ci/run-tests.py wasi --target wasm32-wasip3` | `.tools/adapters-net/wasi-core-p3.log` |
+| 2026-09-14T20:30:02.447581+00:00 | PASS | `python3 scripts/ci/release.py order` | `.tools/adapters-net/release-order.log` |
+| 2026-09-14T20:30:03.764994+00:00 | PASS | `python3 scripts/ci/check-paths.py` | `.tools/adapters-net/paths-final.log` |
+| 2026-09-14T20:30:20.937753+00:00 | PASS | `python3 scripts/ci/run-tests.py protocol-wasi --target wasm32-wasip2` | `.tools/adapters-net/protocol-p2-last.log` |
+| 2026-09-14T20:30:45.826850+00:00 | PASS | `python3 scripts/ci/run-tests.py protocol-wasi --target wasm32-wasip3` | `.tools/adapters-net/protocol-p3-last.log` |
+| 2026-09-14T20:30:46.688691+00:00 | PASS | `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks` | `.tools/adapters-net/clippy-last.log` |
+| 2026-09-14T20:30:58.062220+00:00 | PASS | `cargo clippy --locked --workspace --all-targets --all-features --target wasm32-wasip2 -- -D warnings -D clippy::undocumented_unsafe_blocks` | `.tools/adapters-net/clippy-p2-last.log` |
+| 2026-09-14T20:31:10.208163+00:00 | PASS | `cargo +nightly-2026-09-07 clippy --locked --workspace --all-targets --all-features --target wasm32-wasip3 -- -D warnings -D clippy::undocumented_unsafe_blocks` | `.tools/adapters-net/clippy-p3-last.log` |
+| 2026-09-14T20:31:23.750087+00:00 | PASS | `cargo clippy --locked --workspace --all-targets --all-features --target wasm32-unknown-unknown -- -D warnings -D clippy::undocumented_unsafe_blocks` | `.tools/adapters-net/clippy-web-last.log` |
+| 2026-09-14T20:31:24.556579+00:00 | PASS | `cargo +stable check --locked --workspace --all-targets --all-features` | `.tools/adapters-net/stable-last.log` |
+| 2026-09-14T20:31:25.092939+00:00 | PASS | `cargo fmt --all --check` | `.tools/adapters-net/fmt-last.log` |
+| 2026-09-14T20:32:09.118344+00:00 | PASS | `cargo clippy --locked --workspace --lib --all-features --target x86_64-pc-windows-msvc -- -D warnings -D clippy::undocumented_unsafe_blocks` | `.tools/adapters-net/clippy-windows-libs.log` |
+| 2026-09-14T20:32:20.306389+00:00 | PASS | `cargo clippy --locked --workspace --all-targets --all-features --target x86_64-unknown-linux-gnu -- -D warnings -D clippy::undocumented_unsafe_blocks` | `.tools/adapters-net/clippy-linux-last.log` |
+| 2026-09-14T20:32:36.709222+00:00 | PASS | `cargo +stable check --locked --workspace --all-targets --all-features --target wasm32-wasip2` | `.tools/adapters-net/stable-p2.log` |
+| 2026-09-14T20:32:55.111931+00:00 | PASS | `cargo +stable check --locked --workspace --all-targets --all-features --target wasm32-unknown-unknown` | `.tools/adapters-net/stable-web.log` |
+| 2026-09-14T20:33:05.034905+00:00 | PASS | `python3 scripts/test-servers.py --services http run python3 scripts/ci/run-tests.py interop --mode all-features` | `.tools/adapters-net/interop-last.log` |
+| 2026-09-14T20:33:09.893439+00:00 | PASS | `python3 scripts/ci/run-tests.py loom` | `.tools/adapters-net/loom.log` |
+| 2026-09-14T20:33:10.263757+00:00 | FAIL | `python3 scripts/ci/run-tests.py miri` | `.tools/adapters-net/miri.log` |
+| 2026-09-14T20:34:50.599677+00:00 | PASS | `cargo test --workspace --all-features -- --test-threads=1` | `.tools/adapters-net/workspace-final.log` |
+| 2026-09-14T20:37:30.197824+00:00 | PASS | `cargo miri setup` | `.tools/adapters-net/miri-setup.log` |
+| 2026-09-14T20:37:48.755027+00:00 | PASS | `env MIRI_SYSROOT=/Users/amlug/projects/perry/windlass-lanes/adapters-net/.tools/adapters-net/miri-sysroot python3 scripts/ci/run-tests.py miri` | `.tools/adapters-net/miri-local.log` |
+| 2026-09-14T20:38:44.978587+00:00 | PASS | `bash scripts/ci/no-tokio.sh` | `.tools/adapters-net/no-tokio-last.log` |
+| 2026-09-14T20:39:06.326604+00:00 | PASS | `python3 scripts/ci/soak.py` | `.tools/adapters-net/soak-last.log` |
+| 2026-09-14T20:39:07.554706+00:00 | PASS | `cargo deny --locked check advisories bans licenses sources` | `.tools/adapters-net/deny-last.log` |

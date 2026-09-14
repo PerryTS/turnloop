@@ -24,3 +24,7 @@ wasi-tests = ["streams", "allocations"]
 
 [features]
 wasi-p3-experimental = ["turnloop/wasi-p3-experimental"]
+
+[[test]]
+name = "allocations"
+harness = false

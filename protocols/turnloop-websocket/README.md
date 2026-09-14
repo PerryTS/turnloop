@@ -31,3 +31,19 @@ The same framed adapter works on native and WASI streams. Browsers use the web
 backend's host WebSocket capability instead of raw HTTP upgrades; browser APIs
 control TLS, headers, masking and extension negotiation. permessage-deflate remains
 unsupported by the sans-I/O core. See `turnloop-io` for shared transport glue.
+
+For browser-hosted payload I/O, adopt a host WebSocket directly (its handshake and
+framing belong to the browser), then await the same shared stream helpers:
+
+```rust,ignore
+let socket = handle.driver().websocket(url, turnloop_io::turnloop::Token(0))?;
+let mut payloads = handle.io(socket);
+turnloop_io::write_all(&mut payloads, b"hello").await?;
+let count = turnloop_io::read(&mut payloads, &mut buffer).await?;
+```
+
+Do not wrap that payload stream in `WebSocketStream`, which expects raw framed
+wire bytes. Host payload I/O does not expose raw ping/pong frames, custom upgrade
+headers, application-controlled masking, or a server listener. Wrap operations
+in `turnloop_io::deadline` for abortable waits; the web executor contract tests
+exercise this host path with real WebSocket traffic.

@@ -65,3 +65,12 @@ Complete remaining interoperability/allocation checks, run final serial native/c
 - New TLS real-TCP allocation gate PASS: 100 warmed bidirectional exchanges, 400 existing rustls record allocations, zero adapter overhead. This gate also runs in required WASI/interop jobs. WebSocket and shared-I/O WASI suites added to metadata.
 - no-tokio PASS across every policy target/default/all-feature graph. Soak PASS with the base branch's existing rustls security exception (unchanged); cargo-deny advisories/bans/licenses/sources PASS. No new dependency exception.
 - Workflow lint PASS (actionlint/zizmor/shellcheck). Python gate tests PASS 91 after fixing an inherited feature-coverage mismatch: WASI/web features now require their actual target jobs, explicit forwarding/runtime commands and ci-gate dependencies, with negative controls. Every existing native matrix row and unknown-feature rejection remains mandatory.
+
+
+## Checkpoint 3 verification
+
+- Native default, executor and all-features modes PASS through `run-tests.py native`, including independent positive crate counts. Formatting, native default/all-feature Clippy, stable and rustdoc PASS.
+- Interop PASS all eight declared suites. h2spec PASS again: all 147 strict cases, zero skipped/failed. `cargo publish --dry-run --locked --allow-dirty -p turnloop -p turnloop-io` PASS, including extraction/rebuild of the packaged shared crate; no upload occurred.
+- Added explicit pooled HTTP/1+2 cancellation/reconnection tests, HTTP/2 idle keepalive no-spin, HTTP/2 DATA/flow-credit zero-allocation measurement, and graceful GOAWAY response drain. The drain test found/fixed incorrect rejection of an accepted in-flight response and unsafe reuse of a draining connection. Final targeted native tests PASS 12 HTTP + 2 shared streams + 3 allocation + 2 WebSocket; one Node fixture test runs separately in required interop.
+- Shared-I/O p3 allocation test initially hit the pinned compiler/libtest argument-allocation trap before any test ran. Converted it to the existing standalone allocator-gate pattern; the same 1,000-round subject, calibration and absolute-zero assertion are unchanged. Expanded protocol suites now PASS on both WASI versions, including WebSocket/TLS/shared-I/O allocations.
+- Full core WASI debug/release semantic and release allocation gates PASS on p2 and p3. Final cross-target lint and remaining integration checks continue; exact command ledger retains failures and fixes.

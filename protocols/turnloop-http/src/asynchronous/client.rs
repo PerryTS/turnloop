@@ -390,6 +390,7 @@ impl<B: Backend> Client<B> {
                     let mut response = None;
                     let mut ended = false;
                     let mut deliver = true;
+                    let mut peer_draining = false;
                     let mut receive = |core: &mut http2::Connection,
                                        event: http2::Event<'_>|
                      -> io::Result<()> {
@@ -434,15 +435,20 @@ impl<B: Backend> Client<B> {
                                 if deliver {
                                     decoders.feed(bytes, false, body)?;
                                 }
-                                core.release_capacity(stream, bytes.len() as u32)
-                                    .map_err(io::Error::other)?;
+                                if !end_stream || !peer_draining {
+                                    core.release_capacity(stream, bytes.len() as u32)
+                                        .map_err(io::Error::other)?;
+                                }
                                 ended |= end_stream;
                             }
                             http2::Event::Reset { stream, .. } if stream == id => {
                                 return Err(io::Error::other("HTTP/2 stream reset"));
                             }
-                            http2::Event::Goaway { .. } => {
-                                return Err(io::Error::other("HTTP/2 GOAWAY"));
+                            http2::Event::Goaway { last_stream, code } => {
+                                peer_draining = true;
+                                if code != 0 || last_stream < id {
+                                    return Err(io::Error::other("HTTP/2 GOAWAY rejected request"));
+                                }
                             }
                             _ => {}
                         }
@@ -523,15 +529,22 @@ impl<B: Backend> Client<B> {
                                         if deliver {
                                             decoders.feed(bytes, false, body)?;
                                         }
-                                        core.release_capacity(stream, bytes.len() as u32)
-                                            .map_err(io::Error::other)?;
+                                        if !end_stream || !peer_draining {
+                                            core.release_capacity(stream, bytes.len() as u32)
+                                                .map_err(io::Error::other)?;
+                                        }
                                         ended |= end_stream;
                                     }
                                     http2::Event::Reset { stream, .. } if stream == id => {
                                         return Err(io::Error::other("HTTP/2 stream reset"));
                                     }
-                                    http2::Event::Goaway { .. } => {
-                                        return Err(io::Error::other("HTTP/2 GOAWAY"));
+                                    http2::Event::Goaway { last_stream, code } => {
+                                        peer_draining = true;
+                                        if code != 0 || last_stream < id {
+                                            return Err(io::Error::other(
+                                                "HTTP/2 GOAWAY rejected request",
+                                            ));
+                                        }
                                     }
                                     _ => {}
                                 }
@@ -545,7 +558,7 @@ impl<B: Backend> Client<B> {
                     if deliver {
                         decoders.feed(&[], true, body)?;
                     }
-                    lease.reusable = true;
+                    lease.reusable = !peer_draining;
                     response.ok_or_else(|| io::Error::other("missing response"))?
                 }
             };

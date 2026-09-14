@@ -1,6 +1,29 @@
 # Integration report
 
-Updated 2026-09-14. HTTP integration produces a twelve-member workspace with ten
+## Wave 3 adapters-net update (2026-09-14)
+
+The workspace now has fourteen members and twelve publishable crates. The new
+`turnloop-io` crate supplies shared stream ownership, sans-I/O driving and deadline
+helpers. Optional `turnloop` features add executor-backed TLS, HTTP, WebSocket and
+database/mail adapters. HTTP includes pooled streaming clients, a draining server,
+and the browser's existing bounded GET capability. The HTTPS/TLS echo/WebSocket
+examples are checked in required CI; h2spec runs against the async server.
+
+Native verification, strict cross-target Clippy for Linux/WASI/web, stable checks,
+real WASI 0.2/0.3 socket suites, Node web contracts, Node/curl interop and all 147
+h2spec cases pass. Windows generic libraries pass cross-Clippy; full Windows
+all-target checking fails because this clone still lacks the IOCP `Platform`
+provider. Chrome runtime is UNRUN after sandbox startup failure; Linux/Windows
+runtime and instruction comparisons require their hosts. The seven-day soak and
+all existing required gates remain enabled. See [the lane report](../LANE_REPORT.md)
+and [exact verification commands](adapters-net-commands.md) for allocation
+baselines, WASI DNS/browser capability limits and the remaining integration work.
+The publish order below includes `turnloop-io` before its protocol consumers.
+
+The following merge narrative records the earlier integration checkpoint; its
+WASI, Node and cross-compilation status is superseded by this update.
+
+HTTP integration produced a twelve-member workspace with ten
 publishable crates. The current main merge retains HTTP/TLS/WebSocket and h2spec,
 main's service diagnostics/cleanup, deterministic MySQL authentication and portable
 Windows test gates. rustls 0.23.45 passes the security audit and the seven-day soak

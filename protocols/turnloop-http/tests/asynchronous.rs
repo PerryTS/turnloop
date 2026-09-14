@@ -148,6 +148,13 @@ fn http2_streaming_pool_and_shutdown() {
 
 #[test]
 fn idle_http_keepalive_obeys_no_spin() {
+    idle_keepalive(false);
+}
+#[test]
+fn idle_http2_keepalive_obeys_no_spin() {
+    idle_keepalive(true);
+}
+fn idle_keepalive(h2: bool) {
     use std::{cell::Cell, rc::Rc};
     let mut executor = LocalExecutor::<Platform>::new(Config::default()).expect("executor");
     let h = executor.handle();
@@ -158,15 +165,27 @@ fn idle_http_keepalive_obeys_no_spin() {
     let service = executor
         .spawn_local(async move {
             server
-                .run(|stream, signal| {
-                    server::http1(stream, signal, |event, out| {
-                        match event {
-                            Event::Head(_) => out.start(&response(), BodyLength::Empty)?,
-                            Event::End => out.finish(&[])?,
-                            _ => {}
-                        }
-                        Ok(())
-                    })
+                .run(move |stream, signal| async move {
+                    if h2 {
+                        server::http2(stream, signal, |core, event| {
+                            if let http2::Event::Headers { stream, .. } = event {
+                                core.send_headers(stream, &[Header::new(":status", "200")], true)
+                                    .map_err(std::io::Error::other)?;
+                            }
+                            Ok(())
+                        })
+                        .await
+                    } else {
+                        server::http1(stream, signal, |event, out| {
+                            match event {
+                                Event::Head(_) => out.start(&response(), BodyLength::Empty)?,
+                                Event::End => out.finish(&[])?,
+                                _ => {}
+                            }
+                            Ok(())
+                        })
+                        .await
+                    }
                 })
                 .await
         })
@@ -175,7 +194,15 @@ fn idle_http_keepalive_obeys_no_spin() {
         .spawn_local(async move {
             let tls = turnloop_tls::ClientConfig::new(Default::default(), 1_789_344_000)
                 .expect("TLS config");
-            let mut client = Client::new(h, tls, 1_789_344_000, Options::default());
+            let mut client = Client::new(
+                h,
+                tls,
+                1_789_344_000,
+                Options {
+                    http2_prior_knowledge: h2,
+                    ..Default::default()
+                },
+            );
             let mut request = Request::new(&format!("http://{address}/"), "GET").expect("request");
             assert_eq!(
                 client
@@ -370,7 +397,25 @@ fn node_async_client_redirect_decompression_and_h2() {
                 assert_eq!(received, b"POST /echo async node h2");
                 count += 1;
             }
-            count
+            let mut request = Request::new(&format!("http://127.0.0.1:{port2}/echo"), "POST")
+                .expect("large request");
+            request.body = vec![b'x'; 262144];
+            let mut received = Vec::new();
+            assert_eq!(
+                client
+                    .request(&mut request, |bytes| {
+                        received.extend_from_slice(bytes);
+                        Ok(())
+                    })
+                    .await
+                    .expect("flow-controlled upload and response")
+                    .status,
+                200
+            );
+            assert_eq!(received.len(), 262144 + b"POST /echo ".len());
+            assert!(received.starts_with(b"POST /echo "));
+            assert!(received[b"POST /echo ".len()..].iter().all(|&b| b == b'x'));
+            count + 1
         })
         .expect("spawn");
     let end = executor.driver().now() + Duration::from_secs(15);
@@ -378,7 +423,7 @@ fn node_async_client_redirect_decompression_and_h2() {
         assert!(executor.driver().now() < end);
         executor.turn(Timeout::Until(end)).expect("turn");
     }
-    assert_eq!(finish(&mut task), 100);
+    assert_eq!(finish(&mut task), 101);
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -860,4 +905,237 @@ origin.listen(0, '127.0.0.1', () => proxy.listen(0, '127.0.0.1', () => {
     assert_eq!(finish(&mut task), 21);
     executor.turn(Timeout::Now).expect("close delivery");
     assert!(node.0.wait().expect("Node exit").success());
+}
+
+#[test]
+fn cancelled_pooled_request_never_reuses_partial_response() {
+    use std::cell::Cell;
+    use turnloop_http::{
+        asynchronous::{Http1, Http2},
+        http1::Mode,
+    };
+    for h2 in [false, true] {
+        let mut executor = LocalExecutor::<Platform>::new(Config::default()).expect("executor");
+        let h = executor.handle();
+        let listener = Listener::bind(&h, "127.0.0.1:0".parse().expect("address")).expect("listen");
+        let address = listener.local_addr().expect("address");
+        let mut server = executor
+            .spawn_local(async move {
+                for request in 0..2 {
+                    let stream = listener.accept().await.expect("fresh accept");
+                    if h2 {
+                        let mut conn = Http2::new(stream, http2::Role::Server).expect("h2");
+                        let mut heads = 0;
+                        while conn
+                            .event(|core, event| {
+                                if let http2::Event::Headers { stream, .. } = event {
+                                    heads += 1;
+                                    core.send_headers(
+                                        stream,
+                                        &[Header::new(":status", "200")],
+                                        request == 1,
+                                    )
+                                    .map_err(std::io::Error::other)?;
+                                    if request == 0 {
+                                        assert_eq!(
+                                            core.send_data(stream, b"partial", false)
+                                                .map_err(std::io::Error::other)?,
+                                            7
+                                        );
+                                    }
+                                }
+                                Ok(())
+                            })
+                            .await
+                            .expect("receive and peer EOF")
+                        {}
+                        assert_eq!(heads, 1);
+                    } else {
+                        let mut conn = Http1::new(stream, Mode::Request);
+                        assert_eq!(conn.head().await.expect("head").method, "GET");
+                        conn.event(|e| {
+                            assert!(matches!(e, Event::End));
+                            Ok(())
+                        })
+                        .await
+                        .expect("request end");
+                        conn.send_head(
+                            &response(),
+                            BodyLength::Known(if request == 0 { 100 } else { 0 }),
+                        )
+                        .await
+                        .expect("response head");
+                        if request == 0 {
+                            conn.send_body(b"partial").await.expect("partial response");
+                        } else {
+                            conn.finish_body(&[]).await.expect("complete response");
+                        }
+                        let mut stream = conn.into_inner().expect("transport");
+                        assert_eq!(read(&mut stream, &mut [0; 1]).await.expect("peer EOF"), 0);
+                    }
+                }
+                2
+            })
+            .expect("spawn");
+        let mut client = executor
+            .spawn_local(async move {
+                let tls = turnloop_tls::ClientConfig::new(Default::default(), 1_789_344_000)
+                    .expect("TLS config");
+                let mut client = Client::new(
+                    h,
+                    tls,
+                    1_789_344_000,
+                    Options {
+                        http2_prior_knowledge: h2,
+                        ..Default::default()
+                    },
+                );
+                let mut request =
+                    Request::new(&format!("http://{address}/"), "GET").expect("request");
+                let bytes_seen = Cell::new(0);
+                {
+                    let mut pending = std::pin::pin!(client.request(&mut request, |bytes| {
+                        assert_eq!(bytes, b"partial");
+                        bytes_seen.set(bytes_seen.get() + bytes.len());
+                        Ok(())
+                    }));
+                    std::future::poll_fn(|cx| {
+                        assert!(
+                            pending.as_mut().poll(cx).is_pending(),
+                            "first response is deliberately unfinished"
+                        );
+                        if bytes_seen.get() == 7 {
+                            Poll::Ready(())
+                        } else {
+                            Poll::Pending
+                        }
+                    })
+                    .await;
+                }
+                assert_eq!(bytes_seen.get(), 7);
+                assert!(
+                    client.next_deadline().is_none(),
+                    "cancelled lease must leave the pool"
+                );
+                assert_eq!(
+                    client
+                        .request(&mut request, |_| panic!("empty second body"))
+                        .await
+                        .expect("fresh connection")
+                        .status,
+                    200
+                );
+                1
+            })
+            .expect("spawn");
+        let end = executor.driver().now() + Duration::from_secs(5);
+        while !server.is_finished() || !client.is_finished() {
+            assert!(executor.driver().now() < end);
+            executor.turn(Timeout::Until(end)).expect("turn");
+        }
+        assert_eq!(finish(&mut client), 1);
+        assert_eq!(finish(&mut server), 2);
+    }
+}
+
+#[test]
+fn graceful_goaway_drains_existing_pooled_request() {
+    use turnloop_http::asynchronous::Http2;
+    let mut executor = LocalExecutor::<Platform>::new(Config::default()).expect("executor");
+    let h = executor.handle();
+    let sh = h.clone();
+    let listener = Listener::bind(&h, "127.0.0.1:0".parse().expect("address")).expect("listen");
+    let address = listener.local_addr().expect("address");
+    let mut server = executor
+        .spawn_local(async move {
+            let mut conn = Http2::new(
+                listener.accept().await.expect("accept"),
+                http2::Role::Server,
+            )
+            .expect("h2");
+            let mut stream = None;
+            while stream.is_none() {
+                assert!(
+                    conn.event(|_, event| {
+                        if let http2::Event::Headers { stream: id, .. } = event {
+                            stream = Some(id);
+                        }
+                        Ok(())
+                    })
+                    .await
+                    .expect("headers")
+                );
+            }
+            let stream = stream.expect("request stream");
+            conn.core
+                .send_headers(stream, &[Header::new(":status", "200")], false)
+                .expect("response headers");
+            assert_eq!(
+                conn.core
+                    .send_data(stream, b"before", false)
+                    .expect("partial"),
+                6
+            );
+            conn.shutdown().await.expect("GOAWAY flush");
+            sh.sleep(Duration::from_millis(2))
+                .await
+                .expect("in-flight response delay");
+            assert_eq!(
+                conn.core
+                    .send_data(stream, b"after", true)
+                    .expect("finish existing stream"),
+                5
+            );
+            conn.flush().await.expect("response flush");
+            while !conn.core.is_drained() {
+                assert!(
+                    conn.event(|_, _| Ok(()))
+                        .await
+                        .expect("drain request END_STREAM")
+                );
+            }
+            11
+        })
+        .expect("spawn");
+    let mut client = executor
+        .spawn_local(async move {
+            let tls = turnloop_tls::ClientConfig::new(Default::default(), 1_789_344_000)
+                .expect("TLS config");
+            let mut client = Client::new(
+                h,
+                tls,
+                1_789_344_000,
+                Options {
+                    http2_prior_knowledge: true,
+                    ..Default::default()
+                },
+            );
+            let mut request = Request::new(&format!("http://{address}/"), "GET").expect("request");
+            let mut bytes = Vec::new();
+            assert_eq!(
+                client
+                    .request(&mut request, |chunk| {
+                        bytes.extend_from_slice(chunk);
+                        Ok(())
+                    })
+                    .await
+                    .expect("response survives GOAWAY")
+                    .status,
+                200
+            );
+            assert_eq!(bytes, b"beforeafter");
+            assert!(
+                client.next_deadline().is_none(),
+                "drained connection cannot be reused"
+            );
+            bytes.len()
+        })
+        .expect("spawn");
+    let end = executor.driver().now() + Duration::from_secs(5);
+    while !server.is_finished() || !client.is_finished() {
+        assert!(executor.driver().now() < end);
+        executor.turn(Timeout::Until(end)).expect("turn");
+    }
+    assert_eq!(finish(&mut server), 11);
+    assert_eq!(finish(&mut client), 11);
 }
