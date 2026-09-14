@@ -246,3 +246,15 @@ Cross-compilation is not runtime execution. Raw output is in `.tools/core3/`.
   run, zero failures. Combined final campaigns: **4,970 test passes**, 61,440 churn
   signal deliveries and 15,360 concurrent-contract child exits. Ignored external
   server tests are not counted as executed.
+
+- **PASS** `env RUST_TEST_THREADS=1 cargo test --workspace`; workspace-default 1/1, exit 0, 222 test passes, log `.tools/core3/workspace-default-01.log`.
+
+- **PASS** `env RUSTDOCFLAGS=-Dwarnings cargo doc --locked --workspace --all-features --no-deps`; rustdoc 1/1, exit 0, 0 test passes, log `.tools/core3/rustdoc-01.log`.
+
+- **PASS** `python3 .tools/core3/measure.py`: five rotated fresh-process rounds of all three revision binaries, steady and `--instruction-boundaries`; 390 positive ri_instructions measurements, identical extended harness, cgu=1. Raw committed artifact: `benchmarks/core3-macos-arm64.jsonl`; metadata includes source and binary SHA-256s.
+
+- **PASS** `cargo fmt --check`; final-fmt 1/1, exit 0, 0 test passes, log `.tools/core3/final-fmt-01.log`.
+
+- **PASS** `python3 scripts/ci/check-paths.py`; final-paths 1/1, exit 0, 0 test passes, log `.tools/core3/final-paths-01.log`.
+
+- **PASS** `git diff --check`; final-diff 1/1, exit 0, 0 test passes, log `.tools/core3/final-diff-01.log`.
