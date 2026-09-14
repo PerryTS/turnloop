@@ -1,0 +1,15 @@
+# DESIGN.md §5b remains undecided. Enabling this needs an explicit spec decision
+# and a reason in review. It only permits h2's io-util trait dependency; all other
+# tokio features (including default, rt, net, time, sync) remain errors.
+[h2_exception]
+enabled = false
+reason = ""
+
+# Target coverage, not a crate list. Keep in step with backend support.
+[targets]
+triples = [
+  "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu",
+  "aarch64-apple-darwin", "x86_64-pc-windows-msvc",
+  "wasm32-wasip2", "wasm32-wasip3", "wasm32-unknown-unknown",
+  "wasm32-wasip1-threads",
+]

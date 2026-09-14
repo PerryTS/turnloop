@@ -1,0 +1,156 @@
+{
+  "actionlint": {
+    "Darwin-aarch64": {
+      "version": "v1.7.12",
+      "url": "https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_darwin_arm64.tar.gz",
+      "sha256": "aba9ced2dee8d27fecca3dc7feb1a7f9a52caefa1eb46f3271ea66b6e0e6953f",
+      "executables": [
+        "actionlint"
+      ]
+    },
+    "Linux-x86_64": {
+      "version": "v1.7.12",
+      "url": "https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz",
+      "sha256": "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8",
+      "executables": [
+        "actionlint"
+      ]
+    }
+  },
+  "zizmor": {
+    "Darwin-aarch64": {
+      "version": "v1.30.1",
+      "url": "https://github.com/zizmorcore/zizmor/releases/download/v1.30.1/zizmor-aarch64-apple-darwin.tar.gz",
+      "sha256": "e28d22b087f9ebb8d99da6e740d348c930f559961c7c3f12badda54f882195a2",
+      "executables": [
+        "zizmor"
+      ]
+    },
+    "Linux-x86_64": {
+      "version": "v1.30.1",
+      "url": "https://github.com/zizmorcore/zizmor/releases/download/v1.30.1/zizmor-x86_64-unknown-linux-gnu.tar.gz",
+      "sha256": "e65324f4430c2717591937edcec90ccbefaf14c174f8ec9415e03ca875b46e1a",
+      "executables": [
+        "zizmor"
+      ]
+    }
+  },
+  "shellcheck": {
+    "Darwin-aarch64": {
+      "version": "v0.11.0",
+      "url": "https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.darwin.aarch64.tar.gz",
+      "sha256": "339b930feb1ea764467013cc1f72d09cd6b869ebf1013296ba9055ab2ffbd26f",
+      "executables": [
+        "shellcheck"
+      ]
+    },
+    "Linux-x86_64": {
+      "version": "v0.11.0",
+      "url": "https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.gz",
+      "sha256": "b7af85e41cc99489dcc21d66c6d5f3685138f06d34651e6d34b42ec6d54fe6f6",
+      "executables": [
+        "shellcheck"
+      ]
+    }
+  },
+  "wasmtime": {
+    "Darwin-aarch64": {
+      "version": "v46.0.0",
+      "url": "https://github.com/bytecodealliance/wasmtime/releases/download/v46.0.0/wasmtime-v46.0.0-aarch64-macos.tar.xz",
+      "sha256": "ab4bdab6ea42a3245cda91cdc6e0430491c4b78ecd643406fc1764ccddbdcd25",
+      "executables": [
+        "wasmtime"
+      ]
+    },
+    "Linux-x86_64": {
+      "version": "v46.0.0",
+      "url": "https://github.com/bytecodealliance/wasmtime/releases/download/v46.0.0/wasmtime-v46.0.0-x86_64-linux.tar.xz",
+      "sha256": "2acc86341edd9ad8b6b8d0cbcea2bd0b1928b0b363c0a76f41ba56f33d9fd7bf",
+      "executables": [
+        "wasmtime"
+      ]
+    }
+  },
+  "release-plz": {
+    "Darwin-aarch64": {
+      "version": "release-plz-v0.3.167",
+      "url": "https://github.com/release-plz/release-plz/releases/download/release-plz-v0.3.167/release-plz-aarch64-apple-darwin.tar.gz",
+      "sha256": "e9dc21a6a79ee59e6e9c5dc6d8fed54380e0d2a4f768c2950cbd8cf99f5f9fba",
+      "executables": [
+        "release-plz"
+      ]
+    },
+    "Linux-x86_64": {
+      "version": "release-plz-v0.3.167",
+      "url": "https://github.com/release-plz/release-plz/releases/download/release-plz-v0.3.167/release-plz-x86_64-unknown-linux-gnu.tar.gz",
+      "sha256": "eebaca8d608e7863f3098bb75a84075b9af79b8b175a55c914b26c39036d99ac",
+      "executables": [
+        "release-plz"
+      ]
+    }
+  },
+  "cargo-deny": {
+    "Darwin-aarch64": {
+      "version": "0.20.2",
+      "url": "https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-aarch64-apple-darwin.tar.gz",
+      "sha256": "fe67d82a10d8597a3549364cb733a3f9cc1bfff9031b7ae46384a9f2a72090c3",
+      "executables": [
+        "cargo-deny"
+      ]
+    },
+    "Linux-x86_64": {
+      "version": "0.20.2",
+      "url": "https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz",
+      "sha256": "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f",
+      "executables": [
+        "cargo-deny"
+      ]
+    }
+  },
+  "cargo-semver-checks": {
+    "Darwin-aarch64": {
+      "version": "v0.50.0",
+      "url": "https://github.com/obi1kenobi/cargo-semver-checks/releases/download/v0.50.0/cargo-semver-checks-aarch64-apple-darwin.tar.gz",
+      "sha256": "f99f928d67501c29e8410026f27a54cf799fb13611c3b4a6a58f2772cf7e3799",
+      "executables": [
+        "cargo-semver-checks"
+      ]
+    },
+    "Linux-x86_64": {
+      "version": "v0.50.0",
+      "url": "https://github.com/obi1kenobi/cargo-semver-checks/releases/download/v0.50.0/cargo-semver-checks-x86_64-unknown-linux-gnu.tar.gz",
+      "sha256": "52a65dc88dc53fa8b57d6087954eb52cda149ca03bcfca78ce3fdecd23f893c4",
+      "executables": [
+        "cargo-semver-checks"
+      ]
+    }
+  },
+  "wasm-pack": {
+    "Darwin-aarch64": {
+      "version": "v0.15.0",
+      "url": "https://github.com/wasm-bindgen/wasm-pack/releases/download/v0.15.0/wasm-pack-v0.15.0-aarch64-apple-darwin.tar.gz",
+      "sha256": "0abff4a03d670b6c00ea31d0e1608a72407e355f3d3765e9c30eb45cd5b7e318",
+      "executables": [
+        "wasm-pack"
+      ]
+    },
+    "Linux-x86_64": {
+      "version": "v0.15.0",
+      "url": "https://github.com/wasm-bindgen/wasm-pack/releases/download/v0.15.0/wasm-pack-v0.15.0-x86_64-unknown-linux-musl.tar.gz",
+      "sha256": "c09f971ecaed9a2efc80fdcea7a00ef6b53c7fadc8c57d1f61b53a6aa66b668a",
+      "executables": [
+        "wasm-pack"
+      ]
+    }
+  },
+  "iai-callgrind-runner": {
+    "Linux-x86_64": {
+      "version": "v0.16.1",
+      "url": "https://github.com/gungraun/gungraun/releases/download/v0.16.1/iai-callgrind-runner-v0.16.1-x86_64-unknown-linux-gnu.tar.gz",
+      "sha256": "436feddb83ec916ddaf401dd1cea45aa329745067e8136a774b2fc581de6b448",
+      "executables": [
+        "iai-callgrind-runner"
+      ]
+    }
+  }
+}
