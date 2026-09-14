@@ -518,7 +518,12 @@ impl IocpBackend {
                 info.waits = 1;
                 // High-resolution waitable timers reject APC callbacks on Windows
                 // 11 build 26200. NT packets also avoid executing host APCs here.
-                let result = self.port.wait(timeout, false, &mut entries);
+                let wait_timeout = if timeout.is_some_and(|d| !d.is_zero()) {
+                    None
+                } else {
+                    timeout
+                };
+                let result = self.port.wait(wait_timeout, false, &mut entries);
                 let notified = self.wake.state.swap(RUNNING, Ordering::AcqRel) == NOTIFIED;
                 info.notified |= notified;
                 self.timer.cancel()?;
