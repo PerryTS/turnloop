@@ -2,7 +2,7 @@
 """Private protocol fixtures. start/stop/run; only instances under .tools are touched.
 
 Default: all services, fail on missing capability. Select a subset explicitly with
---services postgres,mysql,redis,mongodb,smtp; never silently bypass unavailable tests.
+--services postgres,mysql,redis,mongodb,smtp,http; never silently bypass unavailable tests.
 """
 import argparse
 from contextlib import contextmanager
@@ -17,6 +17,7 @@ import signal
 import socket
 import time
 import secrets
+import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOLS = ROOT / '.tools'
@@ -79,10 +80,10 @@ def startup_logs(name, *paths):
         raise
 
 
-def private_process(args, log_path):
+def private_process(args, log_path, *, env=None):
     with Path(log_path).open('wb') as log:
         return subprocess.Popen([str(x) for x in args], stdout=log, stderr=log,
-                                start_new_session=True)
+                                start_new_session=True, env=env)
 
 
 def cleanup_after_failure(error, cleanup):
@@ -550,9 +551,79 @@ def smtp_stop():
         SMTP_CHILD.wait(timeout=15)
     (directory / 'control.json').unlink(missing_ok=True)
 
+HTTP_CHILD = None
+
+
+def http_start():
+    global HTTP_CHILD
+    directory = TOOLS / 'http'
+    directory.mkdir(parents=True, exist_ok=True)
+    state_path = directory / 'state.json'
+    if state_path.exists():
+        raise RuntimeError('Private HTTP state exists; stop it first')
+    token = secrets.token_hex(24)
+    log_path = directory / 'server.log'
+    with startup_logs('HTTP', log_path):
+        HTTP_CHILD = private_process([find_binary('node'), ROOT / 'scripts/fixtures/http-server.mjs'],
+            log_path, env={**os.environ, 'TURNLOOP_TEST_HTTP_TOKEN': token})
+        def stop_failed_child():
+            if HTTP_CHILD.poll() is None:
+                HTTP_CHILD.terminate()
+            HTTP_CHILD.wait(timeout=10)
+        try:
+            deadline = time.monotonic() + 10
+            while True:
+                if HTTP_CHILD.poll() is not None:
+                    raise RuntimeError(f'HTTP fixture exited with status {HTTP_CHILD.returncode} before readiness')
+                lines = log_path.read_text().splitlines()
+                if lines:
+                    ports = json.loads(lines[0])
+                    if set(ports) != {'h1', 'h2'} or any(type(p) is not int or not 1024 < p < 65536 for p in ports.values()):
+                        raise RuntimeError('Invalid HTTP fixture ports')
+                    state_path.write_text(json.dumps({'ports': ports, 'token': token}))
+                    return {'TURNLOOP_TEST_HTTP_PORT': str(ports['h1']),
+                            'TURNLOOP_TEST_HTTP2_PORT': str(ports['h2'])}
+                if time.monotonic() >= deadline:
+                    raise RuntimeError('HTTP fixture startup timed out')
+                time.sleep(.02)
+        except BaseException as error:
+            cleanup_after_failure(error, stop_failed_child)
+            raise
+
+
+def http_stop():
+    state_path = TOOLS / 'http/state.json'
+    if not state_path.exists():
+        return
+    state = json.loads(state_path.read_text())
+    ports = state['ports']
+    if any(type(p) is not int or not 1024 < p < 65536 for p in ports.values()):
+        raise RuntimeError('Invalid private HTTP state')
+    request = urllib.request.Request(f'http://127.0.0.1:{ports["h1"]}/__turnloop_shutdown',
+        method='POST', headers={'x-turnloop-test-token': state['token']})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(request, timeout=5) as response:
+        if response.read() != b'stopping':
+            raise RuntimeError('Private HTTP identity was not verified')
+    deadline = time.monotonic() + 10
+    for port in ports.values():
+        while True:
+            try:
+                with socket.create_connection(('127.0.0.1', port), timeout=.1):
+                    pass
+            except OSError:
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError('Private HTTP listener did not close')
+            time.sleep(.02)
+    if HTTP_CHILD is not None:
+        HTTP_CHILD.wait(timeout=10)
+    state_path.unlink()
+
+
 def stop_all():
     errors = []
-    for stop in (smtp_stop, mongo_stop, redis_stop, sql_stop, docker_cleanup):
+    for stop in (http_stop, smtp_stop, mongo_stop, redis_stop, sql_stop, docker_cleanup):
         try:
             stop()
         except Exception as error:
@@ -578,6 +649,8 @@ def start_all():
         if 'smtp' in SELECTED:
             env.update(smtp_start())
             state['smtp_pid'] = SMTP_CHILD.pid
+        if 'http' in SELECTED:
+            env.update(http_start())
         STATE.write_text(json.dumps(state))
         return env
     except BaseException as error:
@@ -588,7 +661,7 @@ def main():
     global SELECTED, CI_SERVICES
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--ci-services', action='store_true', help='Linux CI: provision PostgreSQL/MySQL service containers; run native Redis and private Mongo containers')
-    parser.add_argument('--services', default='postgres,mysql,redis,mongodb,smtp')
+    parser.add_argument('--services', default='postgres,mysql,redis,mongodb,smtp,http')
     parser.add_argument('action', choices=['start', 'stop', 'run'])
     parser.add_argument('command', nargs=argparse.REMAINDER)
     args = parser.parse_args()
@@ -596,7 +669,7 @@ def main():
     CI_SERVICES = args.ci_services
     if CI_SERVICES:
         prepare_docker_wrappers()
-    if SELECTED - {'postgres', 'mysql', 'redis', 'mongodb', 'smtp'}:
+    if SELECTED - {'postgres', 'mysql', 'redis', 'mongodb', 'smtp', 'http'}:
         parser.error('unknown service')
     os.chdir(ROOT)
     if args.action == 'stop':

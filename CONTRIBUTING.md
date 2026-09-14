@@ -85,7 +85,9 @@ cannot be published. `publish = false` excludes helpers from releases. All local
 path dependencies of publishable crates need explicit registry version requirements.
 
 Optional `[package.metadata.turnloop-ci]` describes test capabilities. The role
-may be `core`, `contract`, `protocol` or `bench`. During integration, `*-contract`,
+may be `core`, `contract`, `protocol`, `codec` or `bench`.
+`codec` marks the portable Zstandard library, which needs corpus/allocation coverage
+instead of external-service metadata. During integration, `*-contract`,
 `*-bench` suffixes and direct `protocols/` members are recognized from metadata;
 other crates default to core.
 Use explicit roles for layouts that differ.
@@ -164,6 +166,8 @@ port is loopback-only; there is no fallback to a default port or system instance
 | `TURNLOOP_TEST_MONGODB_REPLICA_PORTS` | Three comma-separated ports; set `turnloop_test`, keyfile auth |
 | `TURNLOOP_TEST_MONGODB_TLS_PORT` | Fresh TLS standalone; same authentication tests |
 | `TURNLOOP_TEST_MONGODB_TOOLS` | Directory containing MongoDB `cert.pem` |
+| `TURNLOOP_TEST_HTTP_PORT` | Private Node HTTP/1.1 fixture (redirects, gzip, trailers and connection reuse) |
+| `TURNLOOP_TEST_HTTP2_PORT` | Private Node HTTP/2 fixture (100 multiplexed streams) |
 | `TURNLOOP_TEST_SMTP_PORT` | Postfix smtp-sink loopback port |
 | `TURNLOOP_TEST_SMTP_TOOLS` | Directory containing sink message dumps for byte assertions |
 
@@ -195,7 +199,51 @@ runner; in-process TLS/auth SMTP peers remain normal tests.
 
 In the managed macOS sandbox PostgreSQL initialization fails at `shmget` and
 MySQL initialization crashes. Those real-server tests are **UNRUN (sandbox)**;
-run the full command outside the sandbox. Do not remove their ignored test bodies
+run the full command outside the sandbox.
+
+HTTP fixture servers use the same lifecycle and authenticated private-instance
+shutdown. Node **26.5.1** is pinned with setup-node on native and protocol CI.
+The `service-group = "http"` metadata selects HTTP/TLS/WebSocket interop targets:
+
+```bash
+scripts/test-servers.py --services http run python3 scripts/ci/run-tests.py interop
+python3 scripts/ci/h2spec.py
+python3 scripts/ci/run-tests.py protocol-wasi --target wasm32-wasip2
+```
+
+`h2spec.py` downloads the pinned source commit in `scripts/ci/tools.json`, verifies
+its SHA-256 before extraction, verifies Go modules, builds locally, and runs strict
+conformance. Its JUnit gate requires 147 distinct successful tests, no failures,
+errors or skips, and consistent suite counters. A 16-KiB response ensures the
+negative-window test executes. Go and a native compiler must be installed.
+
+`wasi-tests` metadata names portable test targets; HTTP declares codecs/allocations,
+and the decoder declares its allocation regression. Allocation targets use standalone,
+unconditionally executed harnesses with positive allocator calibration, preserving
+every test and the zero-allocation thresholds. This avoids pinned WASI 0.3
+libtest CLI-argument lowering calling the generated allocator shim without a
+valid stack; these targets always run their full list, regardless of test filters. Both WASI 0.2 and 0.3 have a
+required protocol job, independent of the pending production backend contracts.
+For ring on macOS, set `CC_wasm32_wasip2` and `CC_wasm32_unknown_unknown` to
+`/opt/homebrew/opt/llvm/bin/clang`, and the corresponding `AR_*` values to
+`/opt/homebrew/opt/llvm/bin/llvm-ar`; Linux CI uses clang/llvm-ar. Protocol library
+and all-test-target Clippy covers browser wasm, while browser runtime contracts
+remain pending with the backend lane.
+
+The shared rustls configuration disables defaults and selects ring/std/tls12.
+SQL/Redis/SMTP/Mongo test transports and the TLS library use the same version and
+provider. ring supports the native targets and builds on wasm32; browser entropy
+uses its JS feature, WASI uses host randomness. The adapter still takes host time.
+No aws-lc provider, FIPS or post-quantum guarantee is selected. Mozilla trust-anchor
+data uses CDLA-Permissive-2.0; its redistribution text ships in turnloop-tls.
+
+`turnloop-zstd-decoder` is an MIT fork of ruzstd 0.8.3. HTTP's versioned dependency
+works for crates.io consumers without `[patch]`. Native `pure-rust-zstd` tests and
+WASI tests exercise the same decoder. See `docs/upstream/ruzstd.md` for the exact
+maintainer submission and reproduction; source/license/corpus provenance ships
+with the decoder. `cargo publish --dry-run --locked --allow-dirty --workspace`
+stages unpublished siblings together and verifies every packaged library. Never
+use `--no-verify` to bypass this dependency chain. Do not remove their ignored test bodies
 or treat a failed initializer as a test pass.
 
 CI's PostgreSQL 16/MySQL **9.6.0** service containers are provisioned by
@@ -218,8 +266,8 @@ path is **UNRUN locally** because the development sandbox has no Docker.
 Private server stdout and stderr are captured together under `.tools/`: Redis
 `redis/<instance>/server.log`, MongoDB `mongodb/<instance>/process.log` plus
 `mongod.log`, SQL `sql/*init*.log`, `postgres.log`, `mysqld-console.log` and
-`mysql.log`, and SMTP `smtp/server.log`. Startup failures print the relevant last
-40 lines (at most 16 KiB per file), including errors before internal logging is
+`mysql.log`, SMTP `smtp/server.log`, and HTTP `http/server.log`. Startup failures
+print the relevant last 40 lines (at most 16 KiB per file), including errors before internal logging is
 initialized. CI preserves these files in the `protocol-server-logs` artifact.
 Cleanup reaps owned Redis children, removes state for crashed instances, and
 checks private config identity before a separate invocation sends SHUTDOWN.
@@ -228,8 +276,9 @@ are chained beneath the original startup/test error so both remain visible.
 
 ## Pending platform and measurement gates
 
-The `wasi`, `web`, and `instructions` jobs remain required and fail until their
-missing inputs land. The strict `ci-gate` fan-in is retained. Windows `test-native`
+The `wasi` and `web` jobs remain required and fail until their missing production
+backend inputs land. The instruction job compares against the committed Linux
+baseline. The strict `ci-gate` fan-in is retained. Windows `test-native`
 runs the workspace and independently requires positive counts for core and every
 protocol member, with default and all features. The existing sans-IO unit, wire,
 SCRAM, SDAM/selection fixture and allocation tests are portable. No unnecessary
@@ -249,8 +298,8 @@ contract zero counts always fail.
   Resolve the p3 bounded waitable-set API before claiming D7 compliance.
 - **Wave 2 web:** provide real browser and Node test targets, add `web-tests` and
   `node-tests` metadata, run Chrome, Firefox and Node via `run-tests.py`.
-- **Linux instruction baseline:** run the candidate command below on Ubuntu
-  24.04 x86_64, review three rounds and exact controls, commit the measured baseline.
+- **Linux instruction regression:** run against the committed baseline on Ubuntu
+  24.04 x86_64. Use the candidate command below only for a reviewed rebaseline;
   macOS timings must never substitute for Linux instruction counts.
 
 ## Instruction regression gate

@@ -80,12 +80,48 @@ class Gates(unittest.TestCase):
     def test_fan_in_declares_every_job(self):
         import re
         source = (ROOT / '.github/workflows/ci.yml').read_text()
-        jobs = set(re.findall(r'^  ([a-z][a-z-]+):$', source.split('jobs:\n')[1], re.MULTILINE))
+        jobs = set(re.findall(r'^  ([a-z][a-z0-9-]+):$', source.split('jobs:\n')[1], re.MULTILINE))
         declared = re.search(r'^    needs: \[(.+)\]$', source, re.MULTILINE)[1]
         self.assertEqual(set(declared.split(', ')), jobs - {'ci-gate'})
         for workflow in (ROOT / '.github/workflows').glob('*.yml'):
             for action in re.findall(r'uses: ([^\n]+)', workflow.read_text()):
                 self.assertRegex(action, r'^[^@]+@[0-9a-f]{40} # v')
+
+    def test_h2spec_rejects_partial_skipped_duplicate_and_failed_reports(self):
+        h2 = module('h2spec')
+        import xml.etree.ElementTree as ET
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'report.xml'
+            report = ET.Element('testsuites')
+            suite = ET.SubElement(report, 'testsuite', tests='147', failures='0', errors='0', skipped='0')
+            for index in range(147):
+                ET.SubElement(suite, 'testcase', package='http2', classname=str(index))
+            def check():
+                ET.ElementTree(report).write(path)
+                h2.check_report(path)
+            check()
+            for tag in ('failure', 'error', 'skipped'):
+                bad = ET.SubElement(suite[0], tag)
+                with self.subTest(tag=tag), self.assertRaises(RuntimeError):
+                    check()
+                suite[0].remove(bad)
+            suite[-1].set('classname', '0')
+            with self.assertRaises(RuntimeError):
+                check()
+            suite.remove(suite[-1])
+            with self.assertRaises(RuntimeError):
+                check()
+            report.remove(suite)
+            with self.assertRaises(RuntimeError):
+                check()
+
+    def test_h2spec_checksum_precedes_extraction(self):
+        h2 = module('h2spec')
+        with tempfile.TemporaryDirectory() as folder:
+            directory = Path(folder)
+            with self.assertRaisesRegex(RuntimeError, 'checksum mismatch'):
+                h2.extract_source(b'not trusted', {'sha256': '0' * 64}, directory)
+            self.assertEqual(list(directory.iterdir()), [])
 
     def test_exact_ci_sha_event_and_workflow(self):
         gate = module('check-ci')

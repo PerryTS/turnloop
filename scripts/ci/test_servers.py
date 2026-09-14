@@ -1,4 +1,4 @@
-"""Lifecycle regressions for the shared fixture runner; no external servers needed."""
+"""Private fixture lifecycle regressions; HTTP uses Node, database failures use fakes."""
 import importlib.util
 from contextlib import contextmanager, ExitStack, redirect_stderr
 import io
@@ -50,6 +50,57 @@ def crashing_binary(path):
 
 
 class Fixtures(unittest.TestCase):
+    def test_default_run_starts_http_and_preserves_the_test_exit_code(self):
+        with private_runner() as fixtures:
+            arguments = ['test-servers.py', 'run', sys.executable, '-c', 'raise SystemExit(19)']
+            env = {'TURNLOOP_TEST_HTTP_PORT': '32123', 'TURNLOOP_TEST_HTTP2_PORT': '32124'}
+            with patch.object(sys, 'argv', arguments), \
+                 patch.object(fixtures, 'sql_start', return_value={}) as sql, \
+                 patch.object(fixtures, 'redis_start', return_value={}) as redis, \
+                 patch.object(fixtures, 'mongo_start', return_value={}) as mongo, \
+                 patch.object(fixtures, 'smtp_start', return_value={}) as smtp, \
+                 patch.object(fixtures, 'SMTP_CHILD', Mock(pid=123)), \
+                 patch.object(fixtures, 'http_start', return_value=env) as http, \
+                 patch.object(fixtures, 'stop_all') as stop:
+                self.assertEqual(fixtures.main(), 19)
+            for start in (sql, redis, mongo, smtp, http):
+                start.assert_called_once()
+            stop.assert_called_once()
+            self.assertEqual(json.loads(fixtures.STATE.read_text())['env']['TURNLOOP_TEST_HTTP2_PORT'], '32124')
+
+    def test_http_failed_start_reports_tail_and_reaps_child(self):
+        with private_runner() as fixtures:
+            fixtures.SELECTED = {'http'}
+            executable = crashing_binary(fixtures.TOOLS / 'node')
+            errors = io.StringIO()
+            with patch.object(fixtures, 'find_binary', return_value=executable), \
+                 redirect_stderr(errors), self.assertRaises((RuntimeError, json.JSONDecodeError)):
+                fixtures.start_all()
+            self.assertIn('HTTP startup failed', errors.getvalue())
+            self.assertIn('stdout: fixture actually executed', errors.getvalue())
+            self.assertIn('stderr: rejected fixture option', errors.getvalue())
+            self.assertNotIn('old output outside the tail', errors.getvalue())
+            self.assertIn(str(fixtures.TOOLS / 'http/server.log'), errors.getvalue())
+            self.assertIsNotNone(fixtures.HTTP_CHILD.returncode)
+            self.assertFalse(fixtures.STATE.exists())
+            self.assertFalse((fixtures.TOOLS / 'http/state.json').exists())
+
+    def test_http_start_error_remains_primary_when_reaping_fails(self):
+        with private_runner() as fixtures:
+            child = Mock(returncode=23)
+            child.poll.return_value = 23
+            cleanup_error = subprocess.TimeoutExpired('node', 10)
+            child.wait.side_effect = cleanup_error
+            with patch.object(fixtures, 'private_process', return_value=child) as spawn, \
+                 redirect_stderr(io.StringIO()), \
+                 self.assertRaisesRegex(RuntimeError, 'HTTP fixture exited with status 23') as caught:
+                fixtures.http_start()
+            spawn.assert_called_once()
+            child.wait.assert_called_once_with(timeout=10)
+            child.terminate.assert_not_called()
+            self.assertIs(caught.exception.__cause__, cleanup_error)
+            self.assertFalse((fixtures.TOOLS / 'http/state.json').exists())
+
     def test_failed_first_initializer_cleans_partial_state(self):
         fixtures = runner()
         with tempfile.TemporaryDirectory() as directory:
@@ -70,6 +121,36 @@ class Fixtures(unittest.TestCase):
                 sql_stop.assert_called_once()
                 redis_stop.assert_called_once()
                 mongo_stop.assert_called_once()
+
+    def test_http_lifecycle_authenticates_and_closes_both_listeners(self):
+        import socket
+        import urllib.error
+        import urllib.request
+        fixtures = runner()
+        with tempfile.TemporaryDirectory() as folder, patch.object(fixtures, 'TOOLS', Path(folder)):
+            env = fixtures.http_start()
+            ports = [int(env[key]) for key in ('TURNLOOP_TEST_HTTP_PORT', 'TURNLOOP_TEST_HTTP2_PORT')]
+            try:
+                self.assertNotEqual(*ports)
+                for port in ports:
+                    with socket.create_connection(('127.0.0.1', port), timeout=2):
+                        pass
+                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                request = urllib.request.Request(f'http://127.0.0.1:{ports[0]}/__turnloop_shutdown',
+                    method='POST', headers={'x-turnloop-test-token': 'wrong'})
+                with self.assertRaises(urllib.error.HTTPError) as error:
+                    opener.open(request, timeout=2)
+                self.assertEqual(error.exception.code, 403)
+                error.exception.close()
+                with opener.open(f'http://127.0.0.1:{ports[0]}/alive', timeout=2) as response:
+                    self.assertEqual(response.read(), b'GET /alive ')
+            finally:
+                fixtures.http_stop()
+            self.assertFalse((Path(folder) / 'http/state.json').exists())
+            self.assertEqual(fixtures.HTTP_CHILD.returncode, 0)
+            for port in ports:
+                with self.assertRaises(OSError):
+                    socket.create_connection(('127.0.0.1', port), timeout=.2)
 
     def test_redis_crashed_start_reports_tail_and_cleans_all_state(self):
         with private_runner() as fixtures:
