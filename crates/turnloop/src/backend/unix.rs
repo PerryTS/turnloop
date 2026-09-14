@@ -901,7 +901,14 @@ mod process_races {
         let mut status: libc::siginfo_t = unsafe { std::mem::zeroed() };
         assert_eq!(
             // SAFETY: valid child identity and writable output; wait only for its exit.
-            unsafe { libc::waitid(libc::P_PID, pid, &mut status, libc::WEXITED | libc::WNOWAIT) },
+            unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as _,
+                    &mut status,
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            },
             0
         );
         let h = Handle {

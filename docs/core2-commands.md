@@ -66,3 +66,25 @@ Cross-compilation is not runtime execution. Raw outputs: `.tools/core2/`.
 - **FAIL** `cargo clippy -p turnloop -p turnloop-contract --all-targets --all-features --target x86_64-unknown-freebsd -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 101; log 1789406095-244102).
 - **PASS** `cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 0; log 1789406095-251867).
 - **PASS** `cargo clippy --workspace --all-targets --all-features --target x86_64-unknown-linux-gnu -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 0; log 1789406095-260297).
+- **PASS** `cargo clippy -p turnloop -p turnloop-contract --all-targets --all-features --target x86_64-unknown-freebsd -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 0; log 1789406136-26634).
+- **PASS** `cargo clippy -p turnloop -p turnloop-contract -p turnloop-bench --all-targets --all-features --target x86_64-pc-windows-msvc -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 0; log 1789406136-28412).
+- **PASS** `cargo clippy --workspace --all-targets --all-features --target wasm32-unknown-unknown -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 0; log 1789406136-270299).
+- **PASS** `cargo clippy --workspace --all-targets --all-features --target wasm32-wasip2 -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 0; log 1789406136-275452).
+- **PASS** `python3 scripts/ci/install-tools.py cargo-deny actionlint zizmor shellcheck` (exit 0; log 1789406136-297937).
+- **PASS** `cargo +nightly-2026-09-07 clippy -p turnloop -p turnloop-contract -p turnloop-bench --all-targets --all-features --target wasm32-wasip3 -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 0; log 1789406136-290282).
+- **PASS** `cargo test --workspace -- --test-threads=1` (exit 0; log 1789406162-000888).
+- **PASS** `env RUSTDOCFLAGS=-Dwarnings cargo doc --locked --workspace --all-features --no-deps` (exit 0; log 1789406190-164954).
+- **FAIL** `env PATH=/Users/amlug/projects/perry/windlass-lanes/core2/.tools/bin:/Users/amlug/.cargo/bin:/opt/homebrew/bin:/usr/bin:/bin cargo +nightly-2026-08-20 deny --locked check` (exit 1; log 1789406190-147771).
+- **FAIL** `python3 scripts/ci/run-tests.py miri` (exit 1; log 1789406191-323086).
+- **PASS** `python3 -m unittest discover -s scripts/ci -p test_*.py -v` (exit 0; log 1789406190-158446).
+- **PASS** `env PATH=/Users/amlug/projects/perry/windlass-lanes/core2/.tools/bin:/Users/amlug/.cargo/bin:/opt/homebrew/bin:/usr/bin:/bin python3 scripts/ci/lint-workflows.py` (exit 0; log 1789406190-152554).
+- **PASS** `env MIRI_SYSROOT=/Users/amlug/projects/perry/windlass-lanes/core2/.tools/miri-sysroot cargo miri setup` (exit 0; log 1789406225-115319).
+- **PASS** `cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 0; log 1789406249-330447).
+- **PASS** `python3 scripts/ci/run-tests.py native` (exit 0; log 1789406250-003411).
+- **PASS** `env MIRI_SYSROOT=/Users/amlug/projects/perry/windlass-lanes/core2/.tools/miri-sysroot python3 scripts/ci/run-tests.py miri` (exit 0; log 1789406292-414816).
+- **PASS** `cargo test -p turnloop-contract --all-features --test allocations -- --test-threads=1` (exit 0; log 1789406404-531363).
+- **FAIL** `cargo clippy -p turnloop -p turnloop-contract --all-targets --all-features --target aarch64-linux-android -- -D warnings` (exit 101; log 1789406454-017972).
+- **PASS** `cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 0; log 1789406455-173108).
+- **PASS** `git diff --check` (exit 0; log 1789406455-634031).
+- **PASS** `cargo fmt --check` (exit 0; log 1789406455-732299).
+- **PASS** `git diff --check` (exit 0; log 1789406517-615215).

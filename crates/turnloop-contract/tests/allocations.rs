@@ -376,6 +376,7 @@ fn regular_file_jobs_reuse_pool_storage() {
         .expect("file attach");
     let mut out = Completions::default();
     let mut count = 0;
+    let mut writes = 0;
     for i in 0..201 {
         file.seek(SeekFrom::Start(0))
             .expect("seek after completed read");
@@ -404,6 +405,24 @@ fn regular_file_jobs_reuse_pool_storage() {
                 break;
             }
         }
+        file.seek(SeekFrom::Start(0)).expect("rewind for write");
+        static OUTPUT: [u8; 64] = [9; 64];
+        // SAFETY: static immutable bytes remain valid through native acknowledgement.
+        let bytes = unsafe { IoBuf::from_raw_parts(OUTPUT.as_ptr(), OUTPUT.len()) };
+        l.write(h, WriteBuf::Provided(bytes), Token(3))
+            .expect("file write");
+        loop {
+            assert!(l.now() < deadline);
+            l.turn(Timeout::Until(deadline), &mut out)
+                .expect("file write turn");
+            if !out.is_empty() {
+                assert_eq!(out.len(), 1);
+                assert_eq!(out[0].token, Token(3));
+                assert!(matches!(out[0].result, OpResult::Wrote(64)));
+                writes += 1;
+                break;
+            }
+        }
     }
     ACTIVE.with(|v| v.set(false));
     assert_eq!(
@@ -411,7 +430,7 @@ fn regular_file_jobs_reuse_pool_storage() {
         0,
         "reusable file jobs allocate nothing"
     );
-    assert_eq!(count, 201);
+    assert_eq!((count, writes), (201, 201));
     std::fs::remove_file(path).expect("remove file");
 }
 
