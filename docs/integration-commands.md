@@ -91,3 +91,12 @@
 - FAIL (exit 2): `git diff --check` — log `.tools/verification/1789401599715648000.log`.
 - PASS (exit 0): `git diff --check` — log `.tools/verification/1789401647262787000.log`.
 - FAIL (exit 1): `.tools/bin/actionlint -color` — log `.tools/verification/1789401647327519000.log`.
+- PASS (exit 0): `python3 -c 'import subprocess; result=subprocess.run(["rg","--hidden","-i","win[d]lass","-g","!docs/lanes/**","-g","!.git/**","-g","!.tools/**","-g","!target/**"]); assert result.returncode == 1, "legacy name remains"'` — log `.tools/verification/1789401906837935000.log`.
+- FAIL (exit 1): `python3 -W error -m unittest discover -s scripts/ci -p 'test_*.py' -v` — log `.tools/verification/1789401906924909000.log`.
+- PASS (exit 0): `env PATH=.tools/bin:/opt/homebrew/bin:/usr/bin:/bin:/Users/amlug/.cargo/bin python3 scripts/ci/lint-workflows.py` — log `.tools/verification/1789401907124774000.log`.
+- PASS (exit 0): `python3 -m py_compile scripts/test-servers.py` — log `.tools/verification/1789401937662226000.log`.
+- PASS (exit 0): `python3 -W error -m unittest discover -s scripts/ci -p 'test_*.py' -v` — log `.tools/verification/1789401937747391000.log`.
+- PASS (exit 0): `git diff --check` — log `.tools/verification/1789401938501089000.log`.
+- PASS (exit 0): `scripts/test-servers.py --services smtp run cargo test -p turnloop-smtp --test smtp installed_postfix -- --include-ignored` — log `.tools/verification/1789401973676703000.log`.
+- PASS (exit 0): `cargo fmt --check` — log `.tools/verification/1789401974000419000.log`.
+- PASS (exit 0): `git diff --check` — log `.tools/verification/1789401974296599000.log`.

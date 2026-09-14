@@ -23,8 +23,24 @@ STATE = TOOLS / 'test-servers.json'
 SELECTED = set()
 CI_SERVICES = False
 POSTGRES_HBA = """local all all trust
+hostssl all tls_user 127.0.0.1/32 scram-sha-256
+hostnossl all tls_user 127.0.0.1/32 reject
+host all scram_user 127.0.0.1/32 scram-sha-256
+host all md5_user 127.0.0.1/32 md5
+host all clear_user 127.0.0.1/32 password
+host all postgres 127.0.0.1/32 trust
+"""
+
 MYSQL_USERS = """CREATE DATABASE IF NOT EXISTS turnloop_test;
-POSTGRES_USERS = """    DO $$ BEGIN
+CREATE USER IF NOT EXISTS 'auth_rsa_user'@'127.0.0.1' IDENTIFIED WITH caching_sha2_password BY 'fixture-password';
+GRANT ALL ON turnloop_test.* TO 'auth_rsa_user'@'127.0.0.1';
+CREATE USER IF NOT EXISTS 'sql_user'@'127.0.0.1' IDENTIFIED WITH caching_sha2_password BY 'fixture-password';
+CREATE USER IF NOT EXISTS 'tls_user'@'127.0.0.1' IDENTIFIED WITH caching_sha2_password BY 'fixture-password' REQUIRE SSL;
+GRANT ALL ON turnloop_test.* TO 'sql_user'@'127.0.0.1';
+GRANT ALL ON turnloop_test.* TO 'tls_user'@'127.0.0.1';
+"""
+
+POSTGRES_USERS = """DO $$ BEGIN
      IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='scram_user') THEN CREATE ROLE scram_user LOGIN; END IF;
      IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='tls_user') THEN CREATE ROLE tls_user LOGIN; END IF;
      IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='md5_user') THEN CREATE ROLE md5_user LOGIN; END IF;
@@ -38,19 +54,7 @@ POSTGRES_USERS = """    DO $$ BEGIN
     ALTER ROLE md5_user PASSWORD 'fixture-password';
 
 GRANT ALL ON SCHEMA public TO scram_user, tls_user, md5_user, clear_user;
-"""GRANT ALL ON turnloop_test.* TO 'auth_rsa_user'@'127.0.0.1';
-CREATE USER IF NOT EXISTS 'sql_user'@'127.0.0.1' IDENTIFIED WITH caching_sha2_password BY 'fixture-password';
-CREATE USER IF NOT EXISTS 'tls_user'@'127.0.0.1' IDENTIFIED WITH caching_sha2_password BY 'fixture-password' REQUIRE SSL;
-GRANT ALL ON turnloop_test.* TO 'sql_user'@'127.0.0.1';
-GRANT ALL ON turnloop_test.* TO 'tls_user'@'127.0.0.1';
-"""hostnossl all tls_user 127.0.0.1/32 reject
-host all scram_user 127.0.0.1/32 scram-sha-256
-host all md5_user 127.0.0.1/32 md5
-host all clear_user 127.0.0.1/32 password
-host all postgres 127.0.0.1/32 trust
 """
-MYSQL_USERS = "\nCREATE DATABASE IF NOT EXISTS turnloop_test;\nCREATE USER IF NOT EXISTS 'auth_rsa_user'@'127.0.0.1' IDENTIFIED WITH caching_sha2_password BY 'fixture-password';\nGRANT ALL ON turnloop_test.* TO 'auth_rsa_user'@'127.0.0.1';\nCREATE USER IF NOT EXISTS 'sql_user'@'127.0.0.1' IDENTIFIED WITH caching_sha2_password BY 'fixture-password';\nCREATE USER IF NOT EXISTS 'tls_user'@'127.0.0.1' IDENTIFIED WITH caching_sha2_password BY 'fixture-password' REQUIRE SSL;\nGRANT ALL ON turnloop_test.* TO 'sql_user'@'127.0.0.1';\nGRANT ALL ON turnloop_test.* TO 'tls_user'@'127.0.0.1';\n"
-POSTGRES_USERS = "\n    DO $$ BEGIN\n     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='scram_user') THEN CREATE ROLE scram_user LOGIN; END IF;\n     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='tls_user') THEN CREATE ROLE tls_user LOGIN; END IF;\n     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='md5_user') THEN CREATE ROLE md5_user LOGIN; END IF;\n     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='clear_user') THEN CREATE ROLE clear_user LOGIN; END IF;\n    END $$;\n    SET password_encryption='scram-sha-256';\n    ALTER ROLE scram_user PASSWORD 'fixture-password';\n    ALTER ROLE tls_user PASSWORD 'fixture-password';\n    ALTER ROLE clear_user PASSWORD 'fixture-password';\n    SET password_encryption='md5';\n    ALTER ROLE md5_user PASSWORD 'fixture-password';\n    \nGRANT ALL ON SCHEMA public TO scram_user, tls_user, md5_user, clear_user;\n"
 
 def find_binary(name):
     binary = shutil.which(name)

@@ -1,7 +1,7 @@
 # Integration lane report
 
-Updated 2026-09-14. Integration implementation is complete; final verification is
-being collected. The integrator makes commits because Git metadata is read-only.
+Updated 2026-09-14. Wave-1 integration and local verification are complete; external
+release prerequisites remain explicitly pending. The integrator makes commits because Git metadata is read-only.
 
 Implemented: full turnloop rename; eight-member workspace (six publishable crates,
 two private helpers); stable 1.97.1 metadata; shared soaked dependencies; private
@@ -9,9 +9,9 @@ start/stop/run server runner and common TURNLOOP_TEST_* ports; consolidated CI w
 explicit pending platform/baseline gates; native and cross-target test fixes;
 no-spin contract and the cached-readiness/EAGAIN core fix.
 
-PASS so far: default workspace tests, strict native/Linux/WASI/web Clippy, stable
+PASS: default workspace tests, strict native/Linux/WASI/web Clippy, stable
 1.97.1, rustdoc, five loom models, two Miri suites, no-tokio on all eight target
-graphs, seven-day soak, cargo-deny, workflow lint wrapper and 13 gate tests. All six
+graphs, seven-day soak, cargo-deny, workflow lint wrapper and 15 automation tests. All six
 publishable crates passed fully verified cargo publish dry runs; no --no-verify
 was needed and nothing was uploaded. Redis (single/ACL/TLS/cluster/Sentinel), MongoDB
 (standalone/replicas/auth/TLS), and SMTP real-server subset passed.
@@ -28,5 +28,9 @@ Added permissive 0BSD for quoted_printable, with no advisory/runtime exceptions.
 
 The detailed command history, earlier failures and remaining lane questions are in
 [docs/INTEGRATION_REPORT.md](docs/INTEGRATION_REPORT.md) and its linked command log.
-Next: finish final checks/report; integrator reruns SQL and hosted CI, integrates
+Next: integrator reruns SQL and hosted CI, integrates
 wave-2 backends/HTTP, obtains the Linux baseline and handles first publications.
+
+Earlier failures, including a loaded timer-precision run, remain in the report.
+The unchanged full native gate passed afterward. Raw actionlint still rejects
+GitHub concurrency.queue; the strict validated compatibility wrapper passes.

@@ -164,7 +164,8 @@ Other corrected intermediate failures: inherited safety-comment placement and
 Clippy style diagnostics under the unified edition/MSRV; RustCrypto API changes
 (`KeyInit`, MD5 formatting); an incorrect temporary assumption about PBKDF2's
 return type; portable test clock/TLS imports; the mock Docker test's macOS
-`/var` versus `/private/var` path alias; one trailing-whitespace edit. The ledger
+`/var` versus `/private/var` path alias; one trailing-whitespace edit and a final SQL-constant formatting syntax error
+(caught by the fixture tests, restored, and all 15 automation tests rerun PASS). The ledger
 keeps their original FAIL entries and later PASS commands.
 
 ## Dependencies chosen
