@@ -93,3 +93,6 @@
 | 2026-09-14T20:38:44.978587+00:00 | PASS | `bash scripts/ci/no-tokio.sh` | `.tools/adapters-net/no-tokio-last.log` |
 | 2026-09-14T20:39:06.326604+00:00 | PASS | `python3 scripts/ci/soak.py` | `.tools/adapters-net/soak-last.log` |
 | 2026-09-14T20:39:07.554706+00:00 | PASS | `cargo deny --locked check advisories bans licenses sources` | `.tools/adapters-net/deny-last.log` |
+| 2026-09-14T20:41:28.362239+00:00 | PASS | `git diff --check` | `.tools/adapters-net/diff-final.log` |
+| 2026-09-14T20:41:30.749533+00:00 | PASS | `python3 scripts/ci/check-paths.py` | `.tools/adapters-net/paths-handoff.log` |
+| 2026-09-14T20:41:31.274346+00:00 | PASS | `cargo fmt --all --check` | `.tools/adapters-net/fmt-handoff.log` |

@@ -1,76 +1,101 @@
 # adapters-net wave 3
 
-In progress from 67690e9 (0.1.0-alpha.1). The integrator owns Git commits; this lane makes working-tree edits only.
-Read DESIGN.md, CONTRIBUTING.md, integration report and relevant HTTP/core/Windows/WASM/CI and database lane reports. No applicable AGENTS.md.
+Implementation and local verification are complete for the providers present in this clone. Full Windows validation remains blocked by the missing production IOCP provider. Browser execution needs an outside-sandbox rerun. This is not an all-platform release-readiness claim.
+
+Started from 67690e9, version 0.1.0-alpha.1. Read DESIGN.md completely, CONTRIBUTING.md, the integration report and relevant HTTP/core/Windows/WASM/CI/database lane reports. No applicable AGENTS.md. The integrator owns commits; this lane changed the working tree only.
 
 ## Implemented
 
-- Publishable `crates/turnloop-io`: futures-io stream contract over AsyncIo/TCP/pipes, listener ownership, shared sans-I/O event/output driver, cancellation guards and executor-backed absolute deadlines. Added executor async connect, resolve, absolute timeout and browser fetch futures.
-- Optional `turnloop` features on TLS, HTTP, WebSocket, Postgres, MySQL, Redis, SMTP and MongoDB. Database/mail adapters implement the one shared driver contract and preserve borrowed core events and terminal-close semantics.
-- Generic async client/server `TlsStream<S>`: deadline handshake, ALPN, partial reads/writes and graceful close_notify. Native and WASI run the same rustls unbuffered cores.
-- HTTP/1 and HTTP/2 streaming drivers, per-origin pooled client, replayable redirects, proxy CONNECT, incremental decompression, streaming uploads, total request deadlines and cancellation. `100-continue` handles informational replies, timeout fallback and early rejection. Server accept loop owns local tasks, stops accepts and drains active connections; HTTP/2 sends GOAWAY.
-- Async WebSocket client/server handshake over HTTP upgrade, preserved unread bytes, frames, ping/pong and close handshake.
-- HTTPS GET, TLS HTTP/1+HTTP/2 echo, WebSocket echo client/server examples. README/rustdoc getting-started sections and shared adapter contract. Integration report publish order puts turnloop-io after turnloop and before protocols.
-- Required CI suites activate test target required-features; async protocol interop runs through existing required native/interop jobs. h2spec now tests the async server. WASI protocol jobs run real async HTTP/TLS socket tests. New browser fetch/abort contract is wired into existing web contracts. Examples are checked by all-targets/all-features Clippy.
+- Publishable `crates/turnloop-io`, with crates.io metadata: shared futures-io stream contract over AsyncIo/TCP/pipes, listener ownership, borrowed sans-I/O event/output driving, cancellation guards and absolute deadlines built on Timeout. Executor handles gained connect, resolve, absolute-timeout and web-fetch futures. Submitted buffers retain AsyncIo's cancellation-safe ownership.
+- Optional `turnloop` features on Postgres, MySQL, Redis, SMTP, MongoDB, TLS, HTTP and WebSocket. Database/mail adapters implement the same small shared driver contract; authentication and TLS-transition decisions remain explicit host-managed core events. No duplicate transport loops were added to those five crates.
+- Generic client/server `TlsStream<S>` with handshake deadlines, ALPN, retained bounded buffers, fragmented reads/writes and graceful close_notify. Native and WASI use the same rustls unbuffered cores.
+- HTTP/1.1 and HTTP/2 stream drivers; per-origin pooled client; replayable redirects; authenticated proxy CONNECT; incremental decompression; streamed uploads and borrowed response chunks; absolute request deadlines and cancellation. Expect/100-continue handles informational responses, timer fallback and early final rejection. Graceful GOAWAY drains an accepted response and prevents reuse of the draining connection.
+- Server listener/accept ownership and local service tasks, HTTP/1 keep-alive, HTTP/2, stop-accept/drain shutdown and drop cancellation. Idle HTTP/1 and HTTP/2 connections obey the no-spin contract.
+- Async WebSocket client/server over HTTP upgrade, preserving coalesced unread bytes; frame streaming, ping/pong and close handshake. Browser usage documents the existing host WebSocket payload path and bounded host-fetch GET capability.
+- Built examples: HTTPS GET; TLS echo with HTTP/1.1 + HTTP/2 ALPN; WebSocket echo client and server. Crate READMEs and rustdoc have getting-started sections. CONTRIBUTING documents the adapter/gate workflow; the integration report includes the current status and publish order with turnloop-io before consumers.
+- Required CI uses test-target required-features and positive execution counts. Native jobs independently execute the adapter crate. Existing interop jobs run the async suites; h2spec targets the async server; required protocol-WASI jobs include real socket/adapter/allocation suites; Node/browser contracts include executor fetch/abort. All-target/all-feature lint builds examples. No required job or skip policy was relaxed.
+- Corrected an inherited CI feature-coverage mismatch: six public features now map to their actual native/WASI/web jobs and forwarding/runtime commands. All eighteen native matrix arms remain mandatory. Negative-control Python tests reject missing jobs, forwarding, runtime commands and unknown features.
 
 ## Verification
 
-Every subsequent exact verification command, including failed attempts and fixes, is retained in [the command ledger](docs/adapters-net-commands.md). Logs are local under `.tools/adapters-net/`.
+[The exact command ledger](docs/adapters-net-commands.md) records PASS/FAIL for all instrumented commands, including intermediate failures and corrected reruns. Logs are retained in `.tools/adapters-net/`. Commands below summarize the final results; explicit UNRUN commands follow. `CARGO_BUILD_JOBS=4`; large builds ran serially.
 
-| Command | Result |
+| Command | Final result |
 | --- | --- |
-| `cargo check -p turnloop-io -p turnloop-tls --all-features` | PASS |
-| `cargo test -p turnloop-io -p turnloop-tls --all-features --test streams --test asynchronous -- --test-threads=1` | PASS, 3 real TCP/TLS tests |
-| `cargo check -p turnloop-http --features turnloop` | Initial FAIL borrow conflict; fixed, PASS |
-| `cargo check --workspace --all-features` | PASS |
-| `cargo test --workspace --all-features -- --test-threads=1` | PASS (latest subsequent HTTP additions tested separately; final rerun pending) |
-| `cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks` | PASS after fixing initial warnings; final rerun in progress |
-| `python3 scripts/ci/h2spec.py` | PASS all 147 strict tests, zero skips, against async server |
-| `python3 scripts/test-servers.py --services http run python3 scripts/ci/run-tests.py interop --mode all-features` | PASS; final added-test rerun pending |
-| `cargo test -p turnloop-http --features turnloop --test asynchronous -- --test-threads=1` | PASS 8, 1 fixture test ignored here (executed by interop): pooled HTTP/1+2, 60 no-spin timer expiries, request/server cancellation, Node HTTPS/H2, curl, 100-continue |
-| `cargo test -p turnloop-websocket --features turnloop --test asynchronous -- --test-threads=1` | PASS after fixing upgrade boundary and queued close delivery; real Node WebSocket and native async peers |
-| `cargo test -p turnloop-io --test allocations -- --test-threads=1` | PASS 1,000 warmed TCP request/reply rounds with zero allocations; initial failure exposed consume_output(0), fixed in shared driver |
-| `cargo test -p turnloop-websocket --features turnloop --test async_allocations` | PASS 100 HTTP exchanges, 300 inherent core-owned head allocations, zero added adapter allocations; 100 WebSocket reads and 100 writes with zero allocations |
-| `python3 scripts/ci/install-wasm-toolchain.py` | PASS verified WASI SDK 34 |
-| `bash scripts/ci/install-wasmtime.sh` | FAIL sandbox: inherited symlink pointed into another clone; no external writes made |
-| `python3 scripts/ci/install-tools.py wasmtime --destination .tools/adapters-net/bin` | PASS verified Wasmtime 46; local .tools/bin symlink now points to this owned install |
-| `source .tools/wasm-env.sh; python3 scripts/ci/run-tests.py protocol-wasi --target wasm32-wasip2` | PASS all declared suites; 5 async HTTP and 2 async TLS tests use real wasi:sockets |
-| `source .tools/wasm-env.sh; python3 scripts/ci/run-tests.py protocol-wasi --target wasm32-wasip3` | PASS all declared suites under pinned nightly-2026-09-07 and Wasmtime 46; 5 async HTTP and 2 TLS tests |
-| `cargo fmt --all` | PASS; final --check pending |
+| `cargo fmt --all --check` | PASS |
+| `cargo clippy --locked --workspace --all-targets -- -D warnings -D clippy::undocumented_unsafe_blocks` | PASS |
+| `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks` | PASS |
+| `cargo +stable check --locked --workspace --all-targets --all-features` | PASS, stable 1.97.1 |
+| `cargo test --workspace --all-features -- --test-threads=1` | PASS, final tree: 270 test passes, including doctests; service-dependent ignored tests run separately where available |
+| `python3 scripts/ci/run-tests.py native` | PASS, all three macOS feature modes, workspace and independently counted members; 1,257 passes across repeated mode/member runs. Later GOAWAY/cancellation additions also pass the final all-feature workspace and interop runs |
+| `env RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --all-features --no-deps` | PASS |
+| `python3 scripts/test-servers.py --services http run python3 scripts/ci/run-tests.py interop --mode all-features` | PASS, final run: all eight suites, 38 tests, zero ignored; real curl, Node HTTP/HTTPS/HTTP2/WebSocket and authenticated CONNECT |
+| `python3 scripts/ci/h2spec.py` | PASS, strict 147/147, zero skipped/failed, async server |
+| `python3 scripts/ci/run-tests.py protocol-wasi --target wasm32-wasip2` | PASS, 42 tests in 11 independently counted suites, including real async TLS/HTTP/WebSocket/shared-I/O sockets and allocation gates |
+| `python3 scripts/ci/run-tests.py protocol-wasi --target wasm32-wasip3` | PASS, same 42 tests/11 suites, pinned nightly-2026-09-07 and Wasmtime 46 |
+| `python3 scripts/ci/run-tests.py wasi --target wasm32-wasip2` | PASS, 59 passes: core release tests, debug/release contracts and release allocation gates |
+| `python3 scripts/ci/run-tests.py wasi --target wasm32-wasip3` | PASS, 64 passes across the same required profiles |
+| `cargo clippy --locked --workspace --all-targets --all-features --target x86_64-unknown-linux-gnu -- -D warnings -D clippy::undocumented_unsafe_blocks` | PASS, Zig cross C toolchain |
+| `cargo clippy --locked --workspace --all-targets --all-features --target wasm32-wasip2 -- -D warnings -D clippy::undocumented_unsafe_blocks` | PASS |
+| `cargo +nightly-2026-09-07 clippy --locked --workspace --all-targets --all-features --target wasm32-wasip3 -- -D warnings -D clippy::undocumented_unsafe_blocks` | PASS |
+| `cargo clippy --locked --workspace --all-targets --all-features --target wasm32-unknown-unknown -- -D warnings -D clippy::undocumented_unsafe_blocks` | PASS |
+| `cargo clippy --workspace --all-targets --all-features --target x86_64-pc-windows-msvc -- -D warnings -D clippy::undocumented_unsafe_blocks` | FAIL: this clone has no Windows `backend::Platform`; async executable/test targets need the IOCP provider merge. C dependencies were cross-compiled successfully after configuring Zig |
+| `cargo clippy --locked --workspace --lib --all-features --target x86_64-pc-windows-msvc -- -D warnings -D clippy::undocumented_unsafe_blocks` | PASS, generic libraries only; does not replace the failing full gate |
+| `cargo +stable check --locked --workspace --all-targets --all-features --target wasm32-wasip2` | PASS |
+| `cargo +stable check --locked --workspace --all-targets --all-features --target wasm32-unknown-unknown` | PASS |
+| `python3 scripts/ci/run-tests.py node` | PASS, 12 actual tests; fixture observed five fetches, two aborts and six WebSockets/7,937 echoed bytes |
+| `python3 scripts/ci/run-tests.py loom` | PASS, six models |
+| `env MIRI_SYSROOT="$PWD/.tools/adapters-net/miri-sysroot" cargo miri setup` | PASS; first default-cache attempt failed sandbox permissions, then setup used this writable path |
+| `env MIRI_SYSROOT="$PWD/.tools/adapters-net/miri-sysroot" python3 scripts/ci/run-tests.py miri` | PASS, both required pure-Rust test filters executed; isolation unchanged |
+| `bash scripts/ci/no-tokio.sh` | PASS, every policy target plus all-target graph, default and all features |
+| `python3 scripts/ci/soak.py` | PASS, 251 locked versions; seven-day policy retained; base branch's one rustls security exception unchanged |
+| `cargo deny --locked check advisories bans licenses sources` | PASS |
+| `python3 -m unittest discover -s scripts/ci -p 'test_*.py' -v` | PASS, 91 tests |
+| `python3 scripts/ci/feature_modes.py` | PASS, six public features and eighteen mandatory native arms |
+| `python3 scripts/ci/lint-workflows.py` | PASS, actionlint/zizmor/ShellCheck and strict existing compatibility validation |
+| `python3 scripts/ci/check-paths.py` | PASS |
+| `python3 scripts/ci/release.py order` | PASS, includes turnloop-io before consumers |
+| `cargo publish --dry-run --locked --allow-dirty -p turnloop -p turnloop-io` | PASS, including extracted packaged dependency rebuild; no upload |
 
-Cross-target Clippy, stable, final native modes, browser/Node runtime and supply-chain/automation checks are pending. Linux/Windows runtime and instruction-count comparisons are UNRUN (no hosts). SQL real-server runs are UNRUN (sandbox shmget/initialization restrictions supplied by user).
+Earlier bootstrap commands not captured by the command logger: `cargo check -p turnloop-io -p turnloop-tls --all-features` PASS; `cargo test -p turnloop-io -p turnloop-tls --all-features --test streams --test asynchronous -- --test-threads=1` PASS (three tests at that checkpoint); `cargo check -p turnloop-http --features turnloop` initially FAIL (borrow conflict), then PASS after correction; `cargo check --workspace --all-features` PASS; `cargo fmt --all` PASS. Subsequent strict checks supersede those snapshots.
 
-## Deviations / design questions
+### Subjects proved by new tests
 
-- Existing AsyncIo uses retained per-operation staging for safe cancellation. Adapters reuse transport storage and bounded protocol scratch; borrowed futures-io buffers never remain submitted after a dropped operation.
-- Existing HTTP cores own decoded heads and allocate for them. Allocation gates measure and retain that baseline while asserting zero additional adapter allocations; WebSocket frame and shared TCP driver gates assert absolute zero.
-- Upstream rustls 0.23.45 unbuffered decryption still owns/allocates plaintext records (already documented in CONTRIBUTING.md). TLS storage is retained by the adapter; no claim of whole-stack TLS allocation freedom.
-- The pooled facade serializes requests on each Client; the low-level HTTP/2 driver supports multiplexed streams. Independent Client instances can dispatch concurrently.
-- Existing browser fetch capability exposes only a bounded complete-body GET, without status/headers or request options. The browser facade exposes exactly that capability plus abort/deadline; streaming/custom methods, proxy CONNECT, explicit TLS/ALPN and listening servers are unavailable there. A richer web HTTP facade needs a backend capability extension.
-- Database authentication and TLS-transition policy remain explicit core events managed by the host; their transport/event driving is shared.
-- Windows runtime awaits the IOCP provider merge. No skip waiver or gate weakening added.
-- No DESIGN.md changes or dependency-soak exceptions introduced.
+- Shared driver: 1,000 warmed real TCP request/reply operations allocate zero times. Native DNS cancellation, slot reuse and completed-future repoll are exercised repeatedly; WASI explicitly verifies Unsupported DNS and slot release.
+- HTTP/1: 100 exchanges match the sans-I/O baseline of 300 core-owned decoded-head allocations, with zero adapter overhead. HTTP/2: 100 DATA deliveries plus flow-credit writes allocate zero times. The counters are calibrated with known allocations.
+- WebSocket: 100 received frames and 100 sent frames allocate zero times. Separate real TCP and Node peers exercise upgrade, frame payloads, ping/pong and close.
+- TLS: 100 warmed bidirectional real-TCP records incur exactly 400 existing rustls-owned allocations and zero adapter overhead. Separate tests verify ALPN, a 32,768-byte payload consumed one byte at a time, close_notify and silent-peer handshake timeout.
+- Idle keep-alive: HTTP/1 and HTTP/2 each undergo sixty actual timer expiries across 0.5/2/10-ms deadlines while a real connection remains idle; bounded turn/wait counters prove no spinning.
+- Cancellation: drop a body future, drop pooled HTTP/1 and HTTP/2 requests mid-body, and drop the server with an in-flight request. Tests verify single closure/task completion and fresh-connection recovery; poisoned leases never return to the pool.
+- Interop includes verified HTTPS, authenticated CONNECT, redirects/gzip, 100 HTTP/2 request/response rounds, a 262,144-byte HTTP/2 exchange crossing flow-control windows, and all 147 strict h2spec cases.
 
-## Next steps
+### Environment and UNRUN work
 
-Complete remaining interoperability/allocation checks, run final serial native/cross-target/WASI/web checks, update this report with every result and identify any environment-only UNRUN work for the integrator.
+| Command / runtime | Status and reason |
+| --- | --- |
+| `python3 scripts/ci/run-tests.py web --browser chrome` | UNRUN (sandbox): compilation and matching ChromeDriver startup succeeded, but Chrome exited during session creation. Wrapper command reports FAIL; zero browser tests executed |
+| `python3 scripts/ci/run-tests.py web --browser firefox` | UNRUN, Firefox not installed |
+| `python3 scripts/ci/run-tests.py native` on Linux and Windows | UNRUN, no hosts; cross-Clippy is recorded separately |
+| `python3 scripts/ci/instructions.py` | UNRUN, requires Linux x86_64/Gungraun/Valgrind; committed baseline unchanged |
+| Full `scripts/test-servers.py` SQL service run and Docker CI | UNRUN (sandbox/no Docker): PostgreSQL shmget denied and MySQL initialization crashes, as supplied in the task; async HTTP fixture runs succeeded |
+| GitHub required `ci-gate` on the integrated tree | UNRUN locally; workflow retains all prerequisites and Windows full-target failure must be resolved before claiming green |
 
-## Checkpoint 2 findings
+WASI commands source `.tools/wasm-env.sh` (verified WASI SDK 34), use the repository's pinned p3 toolchain and the verified local Wasmtime 46 install. Node/browser tools use the pinned wasm-bindgen CLI and clone-local `WASM_PACK_CACHE`/`XDG_CACHE_HOME`. Cross C builds use clone-local Zig wrappers/caches. An inherited Wasmtime symlink into another clone initially caused an install failure; it was replaced with a symlink to this clone's verified install, without external writes. Initial failures, including Windows, Chrome, allocator/upgrade/framing/GOAWAY regressions and their fixes, remain in the command ledger.
 
-- Native authenticated CONNECT → verified Node HTTPS succeeds. Curl HTTP/1, Node HTTPS/H2 and WebSocket interop pass. `100-continue` and response-close framing regressions are fixed and tested.
-- Strict full-workspace Clippy PASS on Linux x86_64 (Zig cross C toolchain), WASI p2/p3 and browser wasm. Full-workspace stable native check PASS.
-- Windows full all-targets Clippy FAIL: the base clone exports no `backend::Platform` for IOCP. This is a provider-merge prerequisite, not an adapter source error; generic-library-only cross-check pending. No mock provider, runtime waiver or skipped-success gate was introduced. Integrating IOCP is necessary before the complete Windows native job can pass.
-- The core's resolver uses the native blocking pool; it returns Unsupported on WASI. A first attempt to treat WASI DNS like native DNS failed. Native cancellation/slot-reuse assertions remain intact, and a separate WASI test explicitly proves Unsupported and slot release. WASI clients use IP URLs or a host-resolved stream with the original TLS server name. Native DNS and generic adapter semantics are unchanged.
-- Node web contracts PASS 12 tests, including new executor fetch/abort, with verified HTTP/WebSocket fixture traffic. wasm-pack's initial cache error was fixed by setting WASM_PACK_CACHE and XDG_CACHE_HOME inside the clone. Chrome browser runtime UNRUN (sandbox): matched ChromeDriver launched, but Chrome exited during session startup; zero browser tests ran. Firefox UNRUN (not installed).
-- New TLS real-TCP allocation gate PASS: 100 warmed bidirectional exchanges, 400 existing rustls record allocations, zero adapter overhead. This gate also runs in required WASI/interop jobs. WebSocket and shared-I/O WASI suites added to metadata.
-- no-tokio PASS across every policy target/default/all-feature graph. Soak PASS with the base branch's existing rustls security exception (unchanged); cargo-deny advisories/bans/licenses/sources PASS. No new dependency exception.
-- Workflow lint PASS (actionlint/zizmor/shellcheck). Python gate tests PASS 91 after fixing an inherited feature-coverage mismatch: WASI/web features now require their actual target jobs, explicit forwarding/runtime commands and ci-gate dependencies, with negative controls. Every existing native matrix row and unknown-feature rejection remains mandatory.
+## Deviations and proposed DESIGN clarifications
 
+- No DESIGN.md edits, dependency-soak exceptions, weakened test thresholds or skip waivers were introduced. The core trait remains unchanged.
+- Existing HTTP decoded heads and rustls plaintext records allocate. New gates assert their measured core baselines plus zero added adapter allocations; shared TCP, HTTP/2 DATA and WebSocket gates require absolute zero. Whole-stack HTTP/TLS allocation freedom is not achieved by this lane. Proposed clarification: explicitly distinguish adapter transport overhead from these already documented core/crypto allocations; eliminating the latter requires a separate core/crypto design change, not a gate waiver.
+- Bounded retained transport/TLS/protocol storage avoids allocation per adapter read/write after warm-up. AsyncIo still owns staging needed to keep submitted memory valid through cancellation. No future leaves a borrowed futures-io buffer submitted after drop.
+- The pooled facade serializes requests on each Client. Lower-level HTTP/2 supports multiple streams; separate Client instances can run concurrently. Response callbacks consume borrowed chunks synchronously; low-level events allow application-driven pauses between reads.
+- WASI 0.2/0.3 socket/TLS paths run, but the existing native-blocking-pool resolver returns Unsupported there. High-level WASI clients use IP URLs; host-resolved streams can retain the original DNS name for TLS verification/SNI through the lower-level drivers. Host DNS capability remains an open backend design item.
+- Browser host fetch currently supports only a bounded complete-body GET without response status/headers or request options. The facade exposes this capability plus abort/deadline. Browser-controlled redirects, decompression and TLS are available; explicit TLS/ALPN, proxy CONNECT, custom methods, streaming bodies and listening/raw sockets are unavailable. Richer browser HTTP needs a backend fetch capability revision. Host WebSocket carries payload bytes; framing/masking/control frames stay with the browser.
+- Windows library code is generic and cross-checks, but the missing IOCP provider prevents the full all-targets gate. No mock backend or cfg exclusion masks that prerequisite.
 
-## Checkpoint 3 verification
+## Open questions and next steps
 
-- Native default, executor and all-features modes PASS through `run-tests.py native`, including independent positive crate counts. Formatting, native default/all-feature Clippy, stable and rustdoc PASS.
-- Interop PASS all eight declared suites. h2spec PASS again: all 147 strict cases, zero skipped/failed. `cargo publish --dry-run --locked --allow-dirty -p turnloop -p turnloop-io` PASS, including extraction/rebuild of the packaged shared crate; no upload occurred.
-- Added explicit pooled HTTP/1+2 cancellation/reconnection tests, HTTP/2 idle keepalive no-spin, HTTP/2 DATA/flow-credit zero-allocation measurement, and graceful GOAWAY response drain. The drain test found/fixed incorrect rejection of an accepted in-flight response and unsafe reuse of a draining connection. Final targeted native tests PASS 12 HTTP + 2 shared streams + 3 allocation + 2 WebSocket; one Node fixture test runs separately in required interop.
-- Shared-I/O p3 allocation test initially hit the pinned compiler/libtest argument-allocation trap before any test ran. Converted it to the existing standalone allocator-gate pattern; the same 1,000-round subject, calibration and absolute-zero assertion are unchanged. Expanded protocol suites now PASS on both WASI versions, including WebSocket/TLS/shared-I/O allocations.
-- Full core WASI debug/release semantic and release allocation gates PASS on p2 and p3. Final cross-target lint and remaining integration checks continue; exact command ledger retains failures and fixes.
+1. Integrator: merge the IOCP provider, rerun full Windows Clippy/native modes and unchanged no-spin/allocation/cancellation contracts. Run Linux native/instruction gates and the complete required GitHub fan-in on the merged tree.
+2. Rerun Chrome/Firefox and SQL/Docker suites outside this sandbox. Node web traffic and both real WASI versions have already run here.
+3. Confirm the documented high-level client serialization and browser fetch/WASI DNS capability boundaries for Perry's facade. Extend backend capabilities if richer host HTTP/DNS is required.
+4. Decide whether a future owned-head/rustls core change must remove the measured inherent allocations; preserve the new calibrated allocation gates in the meantime.
+5. Integrator commits the coherent working tree and reviews the publish dry run/order. Nothing was uploaded or released by this lane.
