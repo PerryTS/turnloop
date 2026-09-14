@@ -1,36 +1,34 @@
-# Integration lane report
+# wasm2 lane report
 
-Updated 2026-09-14. Wave-1 integration and local verification are complete; external
-release prerequisites remain explicitly pending. The integrator makes commits because Git metadata is read-only.
+Work in progress, 2026-09-14. Read DESIGN.md draft 0.3, CONTRIBUTING.md,
+INTEGRATION_REPORT.md, and the wasm/core/CI reports. No AGENTS.md applies.
 
-Implemented: full turnloop rename; eight-member workspace (six publishable crates,
-two private helpers); stable 1.97.1 metadata; shared soaked dependencies; private
-start/stop/run server runner and common TURNLOOP_TEST_* ports; consolidated CI with
-explicit pending platform/baseline gates; native and cross-target test fixes;
-no-spin contract and the cached-readiness/EAGAIN core fix.
+The checked-in Backend has revision-1 hooks and revision-2 empty-wait counters;
+this lane preserves both. Implementing WASI 0.2, experimental WASI 0.3 and web,
+their shared contracts and required CI jobs. The seven-day soak and runtime bans
+remain unchanged. Git is read-only; the integrator commits.
 
-PASS: default workspace tests, strict native/Linux/WASI/web Clippy, stable
-1.97.1, rustdoc, five loom models, two Miri suites, no-tokio on all eight target
-graphs, seven-day soak, cargo-deny, workflow lint wrapper and 15 automation tests. All six
-publishable crates passed fully verified cargo publish dry runs; no --no-verify
-was needed and nothing was uploaded. Redis (single/ACL/TLS/cluster/Sentinel), MongoDB
-(standalone/replicas/auth/TLS), and SMTP real-server subset passed.
+## Implemented
 
-UNRUN: SQL test bodies (PostgreSQL shmget denied; MySQL initializer crashes in this
-sandbox), Linux/Windows runtime suites, full Windows test-target Clippy (ring needs
-Windows SDK headers), Docker CI fixture path, Windows/WASI/web production contracts,
-and Linux instruction measurements. Their gates have not been weakened or skipped.
+Initial inspection complete. Existing spikes are reference material, not evidence
+that production contracts passed. Verification ledger: `.tools/wasm2/commands.jsonl`;
+final commands and results will be copied here.
 
-Audit changes: removed unmaintained rustls-pemfile; updated the iai-callgrind gate
-to its maintained Gungraun 0.19.4 successor to remove proc-macro-error2; kept all
-thresholds and v6 summary checks. Pinned email-encoding 0.4.1 to share base64 0.22.1.
-Added permissive 0BSD for quoted_printable, with no advisory/runtime exceptions.
+## Verification
 
-The detailed command history, earlier failures and remaining lane questions are in
-[docs/INTEGRATION_REPORT.md](docs/INTEGRATION_REPORT.md) and its linked command log.
-Next: integrator reruns SQL and hosted CI, integrates
-wave-2 backends/HTTP, obtains the Linux baseline and handles first publications.
+- PASS: read-only inventory, clean initial git status, required document/source reads.
+- UNRUN: implementation gates, until the new backends and contracts exist.
+- UNRUN: Linux/Windows runtime, unavailable hosts.
 
-Earlier failures, including a loaded timer-precision run, remain in the report.
-The unchanged full native gate passed afterward. Raw actionlint still rejects
-GitHub concurrency.queue; the strict validated compatibility wrapper passes.
+## Deviations / questions
+
+- p2 requires scoped canonical ABI return storage in addition to reusable input
+  pollable lists; generated poll/read bindings allocate.
+- p3 needs an audited persistent wait-set provider; investigating the bindings'
+  task registration ABI before choosing the experimental implementation.
+- Web host JS allocations must be distinguished from Rust steady-state storage.
+
+## Next steps
+
+Implement and test all three adapters; replace pending wasm jobs; run strict
+quality gates and workflow lints; record platform skips with exact reasons.

@@ -22,7 +22,11 @@ mod queue;
 mod sync;
 pub use notifier::{Notifier, PostError, Poster};
 
-#[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
+#[cfg(any(
+    turnloop_backend = "kqueue",
+    turnloop_backend = "epoll",
+    turnloop_backend = "wasi_p2"
+))]
 pub type Loop = Driver<backend::Platform>;
 #[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
 pub use backend::unix::Detached;
