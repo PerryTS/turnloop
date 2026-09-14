@@ -199,12 +199,32 @@ run the full command outside the sandbox. Do not remove their ignored test bodie
 or treat a failed initializer as a test pass.
 
 CI's PostgreSQL 16/MySQL **9.6.0** service containers are provisioned by
-`scripts/test-servers.py --ci-services`. That mode launches the same six-node
-Redis topology and five MongoDB instances using private named Linux containers,
-with the same configurations, auth, certificates and environment variables as the
-native runner. It runs verified SQL TLS probes, then the metadata-selected Rust
-suites. Container identities/ownership labels are checked during cleanup. This
-Docker path is **UNRUN locally** because the development sandbox has no Docker.
+`scripts/test-servers.py --ci-services`. Redis runs natively at **8.4.0**, matching
+the local fixture. `python3 scripts/ci/install-redis.py` builds the official tarball
+after verifying its committed SHA-256 against Redis's published release digest,
+with TLS enabled for both server and CLI. CI caches only `.tools/redis-build`,
+keyed by Ubuntu version, architecture and the complete installer hash; there are
+no fallback cache keys. Cache hits still verify the binary versions and CLI TLS
+support, and real Redis TLS tests remain required. Add `.tools/redis-build/bin`
+to PATH when using this build locally; CI exports it through `GITHUB_PATH`.
+
+The six-node Redis cluster (three masters and three replicas), single/TLS instance
+and Sentinel use the native runner's configurations, auth and certificates. The
+five MongoDB instances use private named Linux containers; CI pulls their image
+before the bounded startup wait. SQL TLS probes precede the metadata-selected Rust
+suites. Mongo container ownership labels are checked during cleanup. The Docker
+path is **UNRUN locally** because the development sandbox has no Docker.
+
+Private server stdout and stderr are captured together under `.tools/`: Redis
+`redis/<instance>/server.log`, MongoDB `mongodb/<instance>/process.log` plus
+`mongod.log`, SQL `sql/*init*.log`, `postgres.log`, `mysqld-console.log` and
+`mysql.log`, and SMTP `smtp/server.log`. Startup failures print the relevant last
+40 lines (at most 16 KiB per file), including errors before internal logging is
+initialized. CI preserves these files in the `protocol-server-logs` artifact.
+Cleanup reaps owned Redis children, removes state for crashed instances, and
+checks private config identity before a separate invocation sends SHUTDOWN.
+An unresponsive or unidentified instance retains its record. Cleanup failures
+are chained beneath the original startup/test error so both remain visible.
 
 ## Pending platform and measurement gates
 
