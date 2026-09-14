@@ -13,6 +13,14 @@ use turnloop_http::{
 };
 #[path = "support/tls.rs"]
 mod tls_support;
+fn curl() -> Command {
+    let executable = std::env::var_os("TURNLOOP_TEST_CURL").unwrap_or_else(|| "curl".into());
+    let mut command = Command::new(executable);
+    // Explicit child PATH takes precedence over System32 on Windows. CI uses an
+    // absolute override because Git Bash can prepend its own curl to that PATH.
+    command.env("PATH", std::env::var_os("PATH").expect("PATH"));
+    command
+}
 // Probe the same executable used by the tests. Windows' bundled curl commonly
 // has HTTP/1 support but no HTTP2, regardless of its version number.
 fn curl_capability(version: &str, field: &str, capability: &str) -> bool {
@@ -22,12 +30,7 @@ fn curl_capability(version: &str, field: &str, capability: &str) -> bool {
     })
 }
 fn curl_supports(http2: bool) -> bool {
-    match Command::new("curl")
-        // Probe the same PATH-selected executable used by the transfer tests.
-        .env("PATH", std::env::var_os("PATH").expect("PATH"))
-        .arg("-V")
-        .output()
-    {
+    match curl().arg("-V").output() {
         Ok(output) => {
             assert!(
                 output.status.success(),
@@ -35,10 +38,22 @@ fn curl_supports(http2: bool) -> bool {
                 String::from_utf8_lossy(&output.stderr)
             );
             let version = String::from_utf8(output.stdout).expect("curl -V must emit UTF-8");
-            curl_capability(&version, "Protocols:", "http")
-                && (!http2 || curl_capability(&version, "Features:", "HTTP2"))
+            let supported = curl_capability(&version, "Protocols:", "http")
+                && (!http2 || curl_capability(&version, "Features:", "HTTP2"));
+            if std::env::var_os("TURNLOOP_TEST_CURL").is_some() {
+                assert!(
+                    supported,
+                    "explicit CI curl lacks required capabilities: {version}"
+                );
+            }
+            supported
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && std::env::var_os("TURNLOOP_TEST_CURL").is_none() =>
+        {
+            false
+        }
         Err(error) => panic!("cannot probe curl: {error}"),
     }
 }
@@ -214,9 +229,7 @@ fn curl_and_node_fetch_against_native_http1() {
         let output = if node {
             Command::new("node").args(["--input-type=module","-e","setTimeout(()=>process.exit(70),10000).unref();const r=await fetch(process.argv[1]);if(r.status!==200)process.exit(2);console.log(await r.text());",&url]).output().expect("Node fetch must run")
         } else {
-            Command::new("curl")
-                // Explicit child PATH takes precedence over System32 on Windows.
-                .env("PATH", std::env::var_os("PATH").expect("PATH"))
+            curl()
                 .args([
                     "--silent",
                     "--show-error",
@@ -373,9 +386,7 @@ fn run_h2_clients(curl_http2: impl Fn() -> bool) -> usize {
         let output = if node {
             Command::new("node").args(["--input-type=module","-e",r#"import h2 from 'node:http2'; setTimeout(()=>{console.error('client timeout');process.exit(70);},10000).unref(); const c=h2.connect(process.argv[1]); await Promise.all(Array.from({length:100},()=>new Promise((resolve,reject)=>{const s=c.request({':path':'/interop'});let b='';s.on('response',h=>{if(h[':status']!==200)reject(Error('status'));});s.on('data',x=>b+=x);s.on('end',()=>b==='native-h2'?resolve():reject(Error(b)));s.on('error',reject);s.on('aborted',()=>reject(Error('stream aborted')));s.end();})));c.close();console.log('100 verified');"#,&url]).output().unwrap()
         } else {
-            Command::new("curl")
-                // Explicit child PATH takes precedence over System32 on Windows.
-                .env("PATH", std::env::var_os("PATH").expect("PATH"))
+            curl()
                 .args([
                     "--http2-prior-knowledge",
                     "--silent",

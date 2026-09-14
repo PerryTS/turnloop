@@ -126,7 +126,9 @@ jobs:
         run: rustup toolchain install nightly-2026-08-20 --profile minimal --component rustfmt,clippy
       - name: Install checksum-pinned curl with HTTP/2 on Windows
         if: runner.os == 'Windows'
-        run: python3 scripts/ci/install-tools.py curl
+        run: |
+          python3 scripts/ci/install-tools.py curl
+          echo "TURNLOOP_TEST_CURL=$GITHUB_WORKSPACE/.tools/bin/curl.exe" >> "$GITHUB_ENV"
       - name: Workspace and single-threaded contracts, default and all features
         run: python3 scripts/ci/run-tests.py native
       - name: HTTP, TLS and WebSocket Node/curl interop
@@ -154,7 +156,9 @@ jobs:
       - name: Install pinned Rust
         run: rustup toolchain install nightly-2026-08-20 --profile minimal --component rustfmt,clippy
       - name: Install checksum-pinned curl with HTTP/2
-        run: python3 scripts/ci/install-tools.py curl
+        run: |
+          python3 scripts/ci/install-tools.py curl
+          echo "TURNLOOP_TEST_CURL=$GITHUB_WORKSPACE/.tools/bin/curl.exe" >> "$GITHUB_ENV"
       - name: Native Windows lint and contracts
         run: |
           cargo +nightly-2026-08-20 clippy --locked --workspace --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks

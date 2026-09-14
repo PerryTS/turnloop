@@ -144,7 +144,18 @@ Further local validation:
 
 GitHub CI results and links are tracked in PR #5; local results alone do not
 establish a CI pass. The initial run at `2eee4c8` failed the Windows HTTP/2 setup;
-the production run starts after the current-main merge at `833ebe0`.
+the production run starts after the current-main merge at `833ebe0`. At `228cc51`,
+GitHub's `windows-2025` test and lint jobs passed: workspace 215/230, contracts
+40/47, fixture interop 17, and the stable/MSRV/documentation checks. The final local
+native runner also passed 215/230 and 40/47 after merging main.
+
+Inspection of the hosted interop log found its curl HTTP/2 leg was UNRUN despite
+the green job: the runner still selected a curl without HTTP/2 from PATH. CI now
+sets `TURNLOOP_TEST_CURL` to the installed absolute path. Both capability probing
+and transfers use that path; a missing or incapable explicit binary fails instead
+of skipping. Local positive verification ran Node's 100 streams and curl's stream;
+a deliberately missing explicit path failed at capability probing as required.
+This final CI correction needs its own hosted result, linked from the PR.
 
 Unrun wider gates: ETW syscall traces, CPU-cycle A/B attribution, overnight soak,
 Windows 10 minimum-version coverage, and VM/power-state precision matrices.
