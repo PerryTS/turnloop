@@ -6,7 +6,8 @@ completions, makes at most one OS wait, and runs no user callbacks. There is no
 runtime thread and no tokio dependency.
 
 **Pre-alpha.** This workspace contains the Unix driver and runtime-independent
-PostgreSQL, MySQL, Redis, MongoDB and SMTP protocol engines. APIs can change.
+PostgreSQL, MySQL, Redis, MongoDB, SMTP, HTTP/1.1, HTTP/2, TLS and WebSocket
+protocol engines. APIs can change.
 Protocol engines consume bytes and produce actions; host transport and executor
 adapters are still being integrated. Perry is the first intended consumer.
 
@@ -21,8 +22,10 @@ adapters are still being integrated. Perry is the first intended consumer.
 
 Windows and WASM are required for the first release; standalone spikes are
 excluded from the publishable workspace. The platform table describes current
-code, not a completed support promise. HTTP, TLS and WebSocket crates are being
-worked on separately.
+code, not a completed support promise. HTTP/TLS/WebSocket native interop and
+strict h2spec are integrated; the portable HTTP/decoder suites execute on WASI.
+See the integration report for release blockers, including the shared rustls
+security fix awaiting the mandatory dependency soak.
 
 ```rust,no_run
 use std::time::Duration;

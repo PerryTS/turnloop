@@ -13,10 +13,15 @@ description = "An embeddable event-loop driver, turned by its host"
 
 [features]
 default = []
+executor = ["dep:futures-io"]
 timer-btree = []
 epoll-timerfd = []
 wasi-p3-experimental = ["dep:wasip3"]
 web-worker = []
+process-sigchld = []
+
+[dependencies]
+futures-io = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

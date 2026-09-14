@@ -416,3 +416,254 @@ async fn capability_errors_and_oversize_response_are_terminal() {
     assert!(out.is_empty());
     assert_eq!(l.schedule_count(), before, "cancelled deadline disarmed");
 }
+
+#[wasm_bindgen_test]
+fn revision_two_single_agent_contracts() {
+    turnloop_contract::single_agent::unsupported_native::<backend::Platform>();
+    turnloop_contract::single_agent::waits::<backend::Platform>();
+    let mut l = Loop::new(Config::default()).expect("loop");
+    for which in [Stdio::Stdin, Stdio::Stdout, Stdio::Stderr] {
+        assert_eq!(
+            l.open_stdio(which).expect_err("browser stdio").kind,
+            ErrorKind::Unsupported
+        );
+    }
+    let condition = WaitCondition::new(0).expect("condition");
+    let mut out = Completions::with_capacity(1);
+    let mut completions = 0;
+    allocations::measure(|| {
+        for kind in 0..800 {
+            let op = l
+                .external_wait(
+                    &condition,
+                    u64::from(kind % 4 == 0),
+                    Some(l.now()),
+                    Token(kind),
+                )
+                .expect("wait");
+            if kind % 4 == 1 {
+                condition.notify();
+            }
+            if kind % 4 == 2 {
+                assert!(l.cancel(op));
+            }
+            l.turn(Timeout::Now, &mut out).expect("completion");
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].op, Some(op));
+            assert!(match kind % 4 {
+                0 => matches!(out[0].result, OpResult::ExternalWait(WaitResult::NotEqual)),
+                1 => matches!(out[0].result, OpResult::ExternalWait(WaitResult::Notified)),
+                2 => matches!(out[0].result, OpResult::Cancelled),
+                _ => matches!(out[0].result, OpResult::ExternalWait(WaitResult::TimedOut)),
+            });
+            completions += 1;
+        }
+    });
+    assert_eq!(completions, 800);
+    assert!(!l.alive());
+}
+
+#[wasm_bindgen_test(async)]
+async fn external_wait_deadlines_schedule_without_spin() {
+    let mut l = Loop::new(Config::default()).expect("loop");
+    let socket = websocket(&mut l).await;
+    let idle = l
+        .read(socket, ReadBuf::Pooled, Token(90))
+        .expect("idle read");
+    let condition = WaitCondition::new(0).expect("condition");
+    let mut out = Completions::default();
+    let mut expiries = 0;
+    for micros in [500, 2000, 10000] {
+        for _ in 0..20 {
+            let at = l.now() + Duration::from_micros(micros);
+            let op = l
+                .external_wait(&condition, 0, Some(at), Token(1))
+                .expect("wait");
+            assert_eq!(l.next_deadline(), Some(at));
+            let mut turns = 0;
+            loop {
+                scheduled(&mut l, &mut out).await;
+                turns += 1;
+                assert!(turns <= 2);
+                if out.is_empty() {
+                    continue;
+                }
+                assert_eq!(out.len(), 1);
+                assert_eq!(out[0].op, Some(op));
+                assert!(matches!(
+                    out[0].result,
+                    OpResult::ExternalWait(WaitResult::TimedOut)
+                ));
+                assert!(l.now() >= at);
+                assert!(l.now() - at < Duration::from_millis(100));
+                expiries += 1;
+                break;
+            }
+        }
+    }
+    assert_eq!(expiries, 60);
+    assert!(l.cancel(idle));
+}
+
+#[cfg(feature = "executor")]
+async fn executor_scheduled(ex: &mut LocalExecutor<backend::Platform>) {
+    let mut resolve = None;
+    let promise = Promise::new(&mut |r, _| resolve = Some(r));
+    let resolve = resolve.expect("resolver");
+    let callback = Closure::wrap(Box::new(move || {
+        resolve.call0(&JsValue::UNDEFINED).expect("resolve");
+    }) as Box<dyn FnMut()>);
+    ex.driver()
+        .set_schedule_turn(callback.as_ref().unchecked_ref())
+        .expect("schedule");
+    JsFuture::from(guard(&promise))
+        .await
+        .expect("executor scheduled");
+    allocations::measure(|| ex.turn(Timeout::Now).expect("executor turn"));
+    ex.driver()
+        .set_schedule_turn(&Function::new_no_args(""))
+        .expect("clear callback");
+}
+
+#[cfg(feature = "executor")]
+#[wasm_bindgen_test(async)]
+async fn executor_websocket_sleep_and_cancel() {
+    use futures_io::{AsyncRead, AsyncWrite};
+    use std::{
+        future::{Future, poll_fn},
+        pin::Pin,
+        task::{Context, Poll, Waker},
+    };
+    let mut ex = LocalExecutor::<backend::Platform>::new(Config::default()).expect("executor");
+    let socket = ex
+        .driver()
+        .websocket(&(base().replace("http:", "ws:") + "/echo"), Token(1))
+        .expect("websocket");
+    executor_scheduled(&mut ex).await;
+    let mut stream = ex.handle().io(socket);
+    let count = Rc::new(Cell::new(0));
+    let completed = count.clone();
+    let h = ex.handle();
+    let task = ex
+        .spawn_local(async move {
+            for _ in 0..20 {
+                assert_eq!(
+                    poll_fn(|cx| Pin::new(&mut stream).poll_write(cx, &[37; 64]))
+                        .await
+                        .expect("write"),
+                    64
+                );
+                poll_fn(|cx| Pin::new(&mut stream).poll_flush(cx))
+                    .await
+                    .expect("flush");
+                let mut bytes = [0; 64];
+                let n = poll_fn(|cx| Pin::new(&mut stream).poll_read(cx, &mut bytes))
+                    .await
+                    .expect("read");
+                assert_eq!(n, 64);
+                assert_eq!(bytes, [37; 64]);
+                h.sleep(Duration::from_micros(500)).await.expect("sleep");
+                completed.set(completed.get() + 1);
+            }
+            let error = h
+                .timeout(Duration::from_millis(2), std::future::pending::<()>())
+                .await
+                .expect_err("timeout");
+            assert_eq!(error.kind, ErrorKind::TimedOut);
+        })
+        .expect("task");
+    assert_eq!(ex.run_ready(), 1, "task actually submitted a write");
+    while !task.is_finished() {
+        executor_scheduled(&mut ex).await;
+    }
+    assert_eq!(count.get(), 20);
+    let mut cancelled = ex
+        .spawn_local(std::future::pending::<()>())
+        .expect("pending task");
+    cancelled.cancel();
+    ex.run_ready();
+    assert_eq!(
+        Pin::new(&mut cancelled).poll(&mut Context::from_waker(Waker::noop())),
+        Poll::Ready(Err(JoinError::Cancelled))
+    );
+}
+
+#[cfg(feature = "web-worker")]
+#[wasm_bindgen(module = "/tests/web/helpers.js")]
+extern "C" {
+    #[wasm_bindgen(js_name=conditionWorker)]
+    fn condition_worker(descriptor: &JsValue) -> Promise;
+    #[wasm_bindgen(js_name=updateCondition)]
+    fn update_condition(worker: &JsValue, store: bool, value: u64) -> Promise;
+    #[wasm_bindgen(js_name=stopCondition)]
+    fn stop_condition(worker: &JsValue);
+    #[wasm_bindgen(js_name=conditionBackpressure)]
+    fn condition_backpressure(descriptor: &JsValue);
+    #[wasm_bindgen(js_name=conditionClosed)]
+    fn condition_closed(descriptor: &JsValue);
+}
+#[cfg(feature = "web-worker")]
+#[wasm_bindgen_test(async)]
+async fn worker_conditions_notify_waiting_loops_and_close() {
+    let mut a = Loop::new(Config::default()).expect("loop A");
+    let mut b = Loop::new(Config::default()).expect("loop B");
+    let condition = WaitCondition::new(0).expect("condition");
+    let descriptor = a
+        .worker_wait_condition(&condition, 2)
+        .expect("condition ring");
+    condition_backpressure(&descriptor);
+    let mut out = Completions::with_capacity(1);
+    a.turn(Timeout::Now, &mut out).expect("drain filled ring");
+    assert!(out.is_empty());
+    let worker = JsFuture::from(condition_worker(&descriptor))
+        .await
+        .expect("real worker started");
+    let mut completions = 0;
+    for round in 0..32 {
+        let expected = condition.load();
+        let one = a
+            .external_wait(&condition, expected, None, Token(1))
+            .expect("A wait");
+        let two = b
+            .external_wait(&condition, expected, None, Token(2))
+            .expect("B wait");
+        // Both loops enter externally parked state; the condition owner may differ
+        // from a waiting loop. A Worker uses the shared ring's Atomics wake path.
+        a.integration().expect("park A");
+        b.integration().expect("park B");
+        JsFuture::from(update_condition(
+            &worker,
+            round % 2 == 0,
+            0xf123456700000000 + round,
+        ))
+        .await
+        .expect("worker admitted update");
+        for (l, op) in [(&mut a, one), (&mut b, two)] {
+            scheduled(l, &mut out).await;
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].op, Some(op));
+            assert!(matches!(
+                out[0].result,
+                OpResult::ExternalWait(WaitResult::Notified)
+            ));
+            completions += 1;
+        }
+        if round % 2 == 0 {
+            assert_eq!(condition.load(), 0xf123456700000000 + round);
+        } else {
+            assert_eq!(condition.load(), expected, "same-value notification");
+        }
+    }
+    stop_condition(&worker);
+    assert_eq!(completions, 64);
+    drop(a);
+    condition_closed(&descriptor);
+    let op = b
+        .external_wait(&condition, condition.load(), None, Token(3))
+        .expect("survivor wait");
+    condition.notify();
+    scheduled(&mut b, &mut out).await;
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].op, Some(op));
+    assert!(!b.alive());
+}

@@ -209,3 +209,143 @@ fn wasi_random_fills_both_getrandom_generations_and_bson() {
     assert!(a.bytes()[4..9].iter().any(|&b| b != 0));
     println!("entropy subject: {generated} bytes, two getrandom generations, two BSON ObjectIds");
 }
+
+#[test]
+fn revision_two_unsupported_native_capabilities() {
+    contract::single_agent::unsupported_native::<Platform>();
+}
+#[test]
+fn external_wait_routing_cancellation_and_capacity() {
+    contract::single_agent::waits::<Platform>();
+}
+#[test]
+fn external_wait_deadlines_do_not_spin() {
+    use std::time::Duration;
+    use turnloop::*;
+    let mut l = Loop::new(Config::default()).expect("loop");
+    let (_, _a, b) = contract::pair(&mut l);
+    let idle = l.read(b, ReadBuf::Pooled, Token(1)).expect("idle read");
+    let condition = WaitCondition::new(0).expect("condition");
+    let mut out = Completions::default();
+    let mut expiries = 0;
+    for micros in [500, 2000, 10000] {
+        for _ in 0..20 {
+            let at = l.now() + Duration::from_micros(micros);
+            let op = l
+                .external_wait(&condition, 0, Some(at), Token(2))
+                .expect("wait");
+            assert_eq!(l.next_deadline(), Some(at));
+            let (mut turns, mut empty, mut waits) = (0, 0, 0);
+            loop {
+                let info = l
+                    .turn(Timeout::After(Duration::from_secs(1)), &mut out)
+                    .expect("wait turn");
+                turns += 1;
+                empty += info.zero_event_waits;
+                waits += info.os_waits;
+                assert!(
+                    turns <= 2 && empty <= 1,
+                    "external deadline spun: micros={micros}, expiry={expiries}, turns={turns}, empty={empty}, remaining={:?}",
+                    at.saturating_duration_since(l.now())
+                );
+                if !out.is_empty() {
+                    assert_eq!(out.len(), 1);
+                    assert_eq!(out[0].op, Some(op));
+                    assert!(matches!(
+                        out[0].result,
+                        OpResult::ExternalWait(WaitResult::TimedOut)
+                    ));
+                    assert!(l.now() >= at);
+                    assert!(l.now() - at < Duration::from_millis(100));
+                    assert!(waits > 0, "wait executed");
+                    expiries += 1;
+                    break;
+                }
+            }
+        }
+    }
+    assert_eq!(expiries, 60);
+    assert!(l.cancel(idle));
+}
+
+#[cfg(feature = "executor")]
+#[test]
+fn executor_on_one_wasi_agent() {
+    use contract::executor_contract as executor;
+    executor::sleep_timeout_and_drop_cancel_pending_io::<Platform>();
+    executor::pending_future_buffers_may_move_and_shrink::<Platform>();
+    executor::pending_writes_may_replace_the_caller_slice::<Platform>();
+}
+
+#[test]
+fn stdio_streams_preserve_host_ownership() {
+    use std::time::Duration;
+    use turnloop::*;
+    let mut l = Loop::new(Config::default()).expect("loop");
+    let stdin = l.open_stdio(Stdio::Stdin).expect("stdin");
+    let stdout = l.open_stdio(Stdio::Stdout).expect("stdout");
+    let stderr = l.open_stdio(Stdio::Stderr).expect("stderr");
+    let expected = b"turnloop revision two stdin fixture\n";
+    let mut actual = Vec::new();
+    let mut out = Completions::default();
+    let until = l.now() + Duration::from_secs(5);
+    while actual.len() < expected.len() {
+        l.read(stdin, ReadBuf::Pooled, Token(1))
+            .expect("stdin read");
+        loop {
+            assert!(l.now() < until);
+            l.turn(Timeout::Until(until), &mut out).expect("read turn");
+            if !out.is_empty() {
+                assert_eq!(out.len(), 1);
+                let OpResult::Read {
+                    n,
+                    lease: Some(ref bytes),
+                } = out[0].result
+                else {
+                    panic!("stdin fixture bytes missing")
+                };
+                assert!(n > 0);
+                actual.extend_from_slice(bytes.as_slice());
+                break;
+            }
+        }
+    }
+    assert_eq!(actual, expected);
+    for (h, bytes) in [
+        (stdout, b"turnloop stdio stdout verified\n".as_slice()),
+        (stderr, b"turnloop stdio stderr verified\n".as_slice()),
+    ] {
+        l.write(h, WriteBuf::Owned(bytes.to_vec()), Token(2))
+            .expect("stdio write");
+        loop {
+            assert!(l.now() < until);
+            l.turn(Timeout::Until(until), &mut out).expect("write turn");
+            if !out.is_empty() {
+                assert!(matches!(out[0].result, OpResult::Wrote(n) if n == bytes.len()));
+                break;
+            }
+        }
+        l.shutdown(h, Token(3)).expect("stdio shutdown");
+        loop {
+            assert!(l.now() < until);
+            l.turn(Timeout::Until(until), &mut out)
+                .expect("shutdown turn");
+            if !out.is_empty() {
+                assert!(matches!(out[0].result, OpResult::Shutdown));
+                break;
+            }
+        }
+    }
+    for h in [stdin, stdout, stderr] {
+        l.close(h, Token(4)).expect("close stdio");
+    }
+    l.turn(Timeout::Now, &mut out).expect("close turn");
+    assert_eq!(out.len(), 3);
+    assert!(out.iter().all(|c| matches!(c.result, OpResult::Closed)));
+    assert!(!l.alive());
+    // libtest still prints via the host stdout after the owned streams close.
+    println!(
+        "stdio subject: {} stdin bytes, two writes, three Closed",
+        actual.len()
+    );
+}

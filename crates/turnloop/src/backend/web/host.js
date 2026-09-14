@@ -6,7 +6,7 @@ const get = id => { const h=hosts.get(id); if(!h) throw new Error('closed turnlo
 export function createHost(capacity) {
   if(nextHost > 0xffffffff) throw new Error('host identity exhausted');
   const id=nextHost++;
-  hosts.set(id,{ops:new Array(capacity).fill(null),resources:new Map(),schedule:()=>{},scheduled:false,epoch:0,timer:null,deadline:null,schedules:0,worker:null});
+  hosts.set(id,{ops:new Array(capacity).fill(null),resources:new Map(),schedule:()=>{},scheduled:false,epoch:0,timer:null,deadline:null,schedules:0,worker:null,conditions:[]});
   return id;
 }
 export function now() { return performance.now(); }
@@ -17,7 +17,7 @@ export function wake(id) {
   const epoch=++h.epoch;
   queueMicrotask(()=>{if(hosts.get(id)===h && h.scheduled && h.epoch===epoch){h.scheduled=false;h.schedule();}});
 }
-export function beginTurn(id) {const h=get(id);h.scheduled=false;h.epoch++;h.worker?.pump();}
+export function beginTurn(id) {const h=get(id);h.scheduled=false;h.epoch++;h.worker?.pump();for(const c of h.conditions)c.pump();}
 export function deadlineChanged(id,deadline) {
   const h=get(id);if(h.deadline===deadline)return;
   clearTimeout(h.timer);h.timer=null;h.deadline=deadline;
@@ -94,7 +94,7 @@ export function release(id,key) {
   if(r.socket){r.socket.onopen=r.socket.onmessage=r.socket.onerror=r.socket.onclose=null;r.socket.close();}
   h.resources.delete(key);
 }
-export function dispose(id) {const h=get(id);clearTimeout(h.timer);h.worker?.stop();for(const key of h.resources.keys())release(id,key);hosts.delete(id);}
+export function dispose(id) {const h=get(id);clearTimeout(h.timer);h.worker?.stop();for(const c of h.conditions)c.stop();for(const key of h.resources.keys())release(id,key);hosts.delete(id);}
 export function schedules(id) {return get(id).schedules;}
 
 // Shared queue is available only through the web-worker Rust feature. No Rust
@@ -134,6 +134,10 @@ export function attachWorker(id,capacity,accept) {
   const h=get(id);
   if(!workerSupported() || h.worker)throw new Error('worker poster unavailable');
   if(!Number.isInteger(capacity) || capacity<=0 || capacity>1048576 || (capacity&(capacity-1)))throw new Error('invalid capacity');
+  h.worker=makeWorker(id,capacity,accept);
+  return h.worker.descriptor;
+}
+function makeWorker(id,capacity,accept) {
   const buffer=new SharedArrayBuffer((7+capacity*4)*4),w=new Int32Array(buffer);
   let waiting=false,stopped=false;
   const pump=()=>{
@@ -160,7 +164,22 @@ export function attachWorker(id,capacity,accept) {
       wait.value.then(()=>{waiting=false;Atomics.store(w,4,0);pump();});
     } else {Atomics.store(w,4,0);wake(id);}
   };
-  h.worker={words:w,pump,stop:()=>{stopped=true;Atomics.store(w,6,1);Atomics.add(w,3,1);Atomics.notify(w,3);}};
+  const worker={words:w,pump,stop:()=>{stopped=true;Atomics.store(w,6,1);Atomics.add(w,3,1);Atomics.notify(w,3);}};
   pump();
-  return {buffer,capacity,producerSource:SharedPoster.toString()};
+  worker.descriptor={buffer,capacity,producerSource:SharedPoster.toString()};
+  return worker;
+}
+
+// A condition uses its own bounded ring: notifications never consume unrelated
+// Poster capacity. Values become visible on the owner when this ring is drained.
+export function attachCondition(id,capacity,accept) {
+  const h=get(id);
+  if(!workerSupported() || h.conditions.length>=h.ops.length)throw new Error('worker condition unavailable');
+  const worker=makeWorker(id,capacity,accept);
+  h.conditions.push(worker);
+  worker.descriptor.producerSource=`class SharedCondition extends (${SharedPoster.toString()}) {
+    notify() { return this.post(0n,0n); }
+    store(value) { return this.post(1n,value); }
+  }`;
+  return worker.descriptor;
 }

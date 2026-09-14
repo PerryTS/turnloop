@@ -31,6 +31,14 @@ struct Driver {
 }
 impl Driver {
     fn connect(user: &str, ssl: SslMode) -> Self {
+        let port: u16 = std::env::var("TURNLOOP_TEST_POSTGRES_PORT")
+            .expect("private server port required")
+            .parse()
+            .expect("fixture operation must succeed");
+        Self::connect_to(port, user, ssl)
+    }
+    fn connect_to(port: u16, user: &str, ssl: SslMode) -> Self {
+        eprintln!("PostgreSQL connecting as {user}, SSL mode {ssl:?}");
         let password = b"fixture-password".to_vec();
         let config = Config {
             user: user.into(),
@@ -40,10 +48,6 @@ impl Driver {
             ..Config::default()
         };
         let core = Connection::new(config).expect("fixture operation must succeed");
-        let port: u16 = std::env::var("TURNLOOP_TEST_POSTGRES_PORT")
-            .expect("private server port required")
-            .parse()
-            .expect("fixture operation must succeed");
         let mut d = Self {
             core,
             io: Transport::connect(port),
@@ -151,7 +155,12 @@ impl Driver {
                 }
                 Event::CopyOut { .. } | Event::CopyDone { .. } => {}
                 Event::CopyData { data, .. } => results.copies.extend_from_slice(data),
-                Event::Closed { reason } => panic!("unexpected close: {reason}"),
+                Event::Closed { reason } => {
+                    panic!(
+                        "unexpected close: {reason}; server errors: {:?}",
+                        results.errors
+                    )
+                }
             }
         }
         self.flush();
@@ -180,6 +189,42 @@ impl Driver {
             .expect("fixture operation must succeed");
         self.drain(None)
     }
+}
+
+#[test]
+fn rejected_startup_reports_server_sqlstate_and_message() {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("private listener");
+    let port = listener.local_addr().expect("private address").port();
+    let server = std::thread::spawn(move || {
+        let (mut io, _) = listener.accept().expect("client connects");
+        io.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        let mut size = [0; 4];
+        io.read_exact(&mut size).expect("startup length");
+        let size = u32::from_be_bytes(size) as usize;
+        assert!((8..4096).contains(&size));
+        let mut startup = vec![0; size - 4];
+        io.read_exact(&mut startup).expect("startup body");
+        assert!(
+            startup
+                .windows(14)
+                .any(|value| value == b"user\0postgres\0")
+        );
+        let body = b"SFATAL\0VFATAL\0C28000\0Mrole \"postgres\" does not exist\0\0";
+        io.write_all(b"E").expect("ErrorResponse tag");
+        io.write_all(&((body.len() + 4) as u32).to_be_bytes())
+            .expect("ErrorResponse length");
+        io.write_all(body).expect("ErrorResponse body");
+    });
+    let error = std::panic::catch_unwind(|| Driver::connect_to(port, "postgres", SslMode::Disable))
+        .err()
+        .expect("missing role must fail startup");
+    server
+        .join()
+        .expect("server must receive and reject startup");
+    let message = error.downcast_ref::<String>().expect("diagnostic panic");
+    assert!(message.contains("28000"), "{message}");
+    assert!(message.contains("does not exist"), "{message}");
 }
 
 #[test]
@@ -285,31 +330,44 @@ fn authentication_queries_pipeline_copy_cancel() {
         .query(7, "SELECT pg_sleep(10)", None)
         .expect("fixture operation must succeed");
     d.flush();
-    // Separate query proves the backend started before sending CancelRequest.
-    let mut observer = Driver::connect("postgres", SslMode::Disable);
+    // The Docker image initializes the superuser as `turnloop`, so a `postgres`
+    // role need not exist. A same-role session can inspect its own backends.
+    let mut observer = Driver::connect("scram_user", SslMode::Disable);
+    let cancel = d.core.cancel_request().expect("BackendKeyData required");
+    let pid = i32::from_be_bytes(cancel[8..12].try_into().expect("four PID bytes"));
+    assert!(pid > 0);
+    let active = format!(
+        "SELECT count(*) FROM pg_stat_activity WHERE pid={pid} AND query='SELECT pg_sleep(10)' AND state='active'"
+    );
+    // Prove this exact backend started before sending the separate CancelRequest.
     let until = Instant::now() + Duration::from_secs(5);
     loop {
-        let r = observer.query("SELECT count(*) FROM pg_stat_activity WHERE query='SELECT pg_sleep(10)' AND state='active'");
+        let r = observer.query(&active);
+        assert!(r.errors.is_empty(), "observer errors: {:?}", r.errors);
         if r.rows[0][0].as_deref() == Some(b"1") {
             break;
         }
-        assert!(Instant::now() < until);
+        assert!(Instant::now() < until, "backend {pid} never became active");
+        std::thread::sleep(Duration::from_millis(10));
     }
     let port: u16 = std::env::var("TURNLOOP_TEST_POSTGRES_PORT")
         .expect("fixture operation must succeed")
         .parse()
         .expect("fixture operation must succeed");
-    TcpStream::connect(("127.0.0.1", port))
-        .expect("fixture operation must succeed")
-        .write_all(
-            &d.core
-                .cancel_request()
-                .expect("fixture operation must succeed"),
-        )
-        .expect("fixture operation must succeed");
+    let mut cancel_io = TcpStream::connect(("127.0.0.1", port)).expect("cancel connection");
+    cancel_io
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("cancel timeout");
+    cancel_io.write_all(&cancel).expect("send CancelRequest");
+    // PostgreSQL closes this connection without a response after processing it.
+    assert_eq!(cancel_io.read(&mut [0; 1]).expect("cancel EOF"), 0);
     let r = d.drain(None);
+    assert_eq!(r.errors.len(), 1);
     assert_eq!(r.errors[0].0, "57014");
-    assert_eq!(r.completed[0].1, Outcome::ServerError);
+    assert_eq!(
+        r.completed,
+        [(7, Outcome::ServerError, TransactionStatus::Idle)]
+    );
     assert_eq!(
         d.query("SELECT count(*) FROM items").rows[0][0],
         Some(b"4".to_vec())

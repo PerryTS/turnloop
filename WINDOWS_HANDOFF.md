@@ -9,7 +9,7 @@ The Windows parts of turnloop were written and cross-checked on macOS (`cargo ch
    ```powershell
    git clone https://github.com/PerryTS/turnloop.git
    cd turnloop
-   git checkout lane/windows
+   git checkout -b windows/iocp-backend   # everything (spikes and backend) is on main
    rustup show   # installs the pinned nightly-2026-08-20 from rust-toolchain.toml
    ```
 3. Record the environment in the results file:
@@ -20,7 +20,7 @@ The Windows parts of turnloop were written and cross-checked on macOS (`cargo ch
 
 ## Phase 1: run the IOCP spikes (nothing is known to pass yet)
 
-Everything lives in `spikes/iocp/`. See `spikes/iocp/README.md` for what each test binary proves, and `LANE_REPORT.md` at the root of the `lane/windows` branch for the full UNRUN list.
+Everything lives in `spikes/iocp/`. See `spikes/iocp/README.md` for what each test binary proves, and `docs/lanes/windows.md` for the full UNRUN list.
 
 ```powershell
 cargo clippy --manifest-path spikes/iocp/Cargo.toml --all-targets -- -D warnings
@@ -43,18 +43,18 @@ Rules:
 - **Console test:** it spawns a child with `CREATE_NEW_CONSOLE`. Run it from a normal interactive session, not over a non-interactive SSH session without a console.
 - **Write the results** to `spikes/iocp/WINDOWS_RESULTS.md`: one row per test with PASS / FAIL / fixed-in-commit, the timer precision numbers, the environment, and anything that contradicts DESIGN.md §7.3.
 
-## Phase 2: port the backend onto the core trait (after `trait-v0` is tagged on `main`)
+## Phase 2: port the backend onto the core trait (ready now)
 
-The integrator tags `trait-v0` on `main` once the core lane's Backend trait and contract tests are merged. Then:
+The core Backend trait is merged on `main` as **revision 2**, tag `trait-v2`, in `crates/turnloop/src/backend/mod.rs`. Revision 2 adds pipes/local IPC, stdio, handle passing, processes, signals, TTY and external waits on top of revision 1's host-clock and scheduling hooks; see `docs/BACKEND_REVISION_2.md` and `docs/lanes/core.md`. The Windows mechanisms for all of these are prototyped in `spikes/iocp` (named pipes, overlapped stdio or reader threads, Job Objects + RegisterWaitForSingleObject, SetConsoleCtrlHandler, console input).
 
-1. Merge `main` into a branch `lane/windows-host`.
-2. Port `spikes/iocp/backend_draft/` to `crates/turnloop/src/backend/iocp/` against the trait. The adaptation notes are in `LANE_REPORT.md`.
-3. Run the contract suite on Windows: `cargo test -p turnloop-contract -- --test-threads=1`, plus the Windows-specific variants listed in `spikes/iocp/CONTRACT_TEST_PLAN.md`.
-4. Record results in `WINDOWS_RESULTS.md`.
+2. Port `spikes/iocp/backend_draft/` to `crates/turnloop/src/backend/iocp/` against the trait. The adaptation notes are in `docs/lanes/windows.md`. Keep `spikes/iocp` as the mechanism reference.
+3. Run the contract suite on Windows: `cargo test -p turnloop-contract -- --test-threads=1`, including the no-spin contract (DESIGN.md §10 rule 4a), plus the Windows-specific variants listed in `spikes/iocp/CONTRACT_TEST_PLAN.md`.
+4. Record the results in `WINDOWS_RESULTS.md`.
+5. CI: `.github/workflows/ci.yml` also runs on GitHub's `windows-2025` runner. To run the same jobs on this machine, register it as a self-hosted runner with label `turnloop-windows` and set the repository variable `SELF_HOSTED_WINDOWS=true`.
 
 ## Rules (same as LANES.md)
 
-- **Branches:** push to `lane/windows-host` only; never to `main`. The integrator merges.
+- **Branches:** push to `windows/iocp-backend` only and open a **draft PR** against `main`; never push to `main`. CI runs on the PR, including GitHub's `windows-2025` runner.
 - **Commit messages:** plain, with no attribution, co-author or tool-signature lines.
 - **Dependencies:** only `windows-sys` (plus test-only dev-dependencies). No tokio, no compio.
 - **Honesty:** report any failing, skipped or unrun test as exactly that, with the command.

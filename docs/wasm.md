@@ -1,7 +1,7 @@
 # WASI and web backends
 
 The wasm adapters implement the checked-in Backend contract, including its
-revision-1 clock/deadline/timeout hooks and revision-2 empty-wait counters.
+revision-2 native capability methods, clock/deadline/timeout hooks and empty-wait counters.
 `Driver` remains the only completion/token arbiter. Backends never dispatch user
 callbacks from inside `turn`. The WASI 0.3 provider is **experimental**, with the
 remaining promotion blockers below. See the root lane report for actual results;
@@ -31,6 +31,8 @@ with `--locked`. This avoids a separate unsoaked `cargo install` resolution.
 CI places the resulting binaries on PATH. Local setup:
 
 ```sh
+python3 scripts/ci/install-wasm-toolchain.py
+source .tools/wasm-env.sh
 python3 scripts/ci/install-web-tools.py
 export PATH="$PWD/.tools/bin:$PWD/.tools/wasm-bindgen-source/target/release:$PATH"
 export WASM_PACK_CACHE="$PWD/.tools/wasm-pack-cache"
@@ -42,7 +44,9 @@ python3 scripts/ci/run-tests.py node
 
 The WASI runner grants loopback/network access and sets a 120-second execution
 limit. WASI contract and allocation binaries are checked independently for
-positive test counts; allocations use release builds with the same zero threshold.
+positive test counts with all features (including the executor); allocations use release builds with the same zero threshold.
+The semantic binaries receive an explicit 36-byte stdin fixture, and must read it
+through turnloop, write to both output streams and close all three handles.
 P3's debug custom allocator currently traps before the test harness starts (see
 below). Browser runs are attempted separately, so a Chrome failure cannot hide
 Firefox. Each run owns a fresh ephemeral-port HTTP/WebSocket fixture and asserts
@@ -266,6 +270,51 @@ isolation headers. Node's Worker test uses worker_threads without DOM APIs. The
 same test runs in isolated browsers, fills the ring to prove rejection, then
 checks 2,000 unique full-width messages from two real workers and no idle wakes.
 
+## Revision 2: stdio, external waits and executor
+
+WASI p2 and p3 implement `open_stdio` with owned `wasi:cli` stream endpoints.
+Reads, writes, writev, cancellation and shutdown use the same direction queues,
+provided/pooled buffers and bounded waits as sockets. P2 drops subscriptions
+before stream resources; p3 uses CLI-specific result futures and waits for stream
+shutdown acknowledgement. Closing owned endpoints leaves the host standard
+streams usable. Native AF_UNIX, handle passing, processes, signals and TTY
+mode/window operations explicitly return `Unsupported`; the WASI terminal API
+has detection but no portable mode/size query. Web stdio is also Unsupported.
+
+`WaitCondition` and `external_wait` work on the single owning WASI/web agent.
+A lazily initialized registry reserves 16,384 slots during condition construction,
+retains storage at its used high-water mark, and publishes into each waiting
+loop's reserved completion queue. No helper thread or per-wait allocation is
+created. Initial inequality, same-value notify, value changes, exact deadlines,
+cancel/stop, output backpressure and loop-drop cleanup have executable contracts.
+The earliest wait deadline participates in `next_deadline()` and web host timer
+scheduling. Expiry publication during a turn does not leave a spurious wake for
+the next turn. WASI cannot accept OS-thread producers; a host must return control
+to the guest agent to mutate/notify conditions.
+
+With `web-worker`, `loop.worker_wait_condition(&condition, capacity)` returns
+another bounded SharedArrayBuffer descriptor. Its `producerSource` class exposes
+`store(valueBigInt)` and `notify()`, each returning false on full/contended/closed.
+Accepted records apply in FIFO order when the owner drains the queue; admission
+is asynchronous and is not an acknowledgement that the owner applied the value.
+This is a host message bridge, not shared Rust linear memory. It uses the same
+Atomics publication/parking protocol as Worker Poster, with an independent ring
+per condition descriptor. Descriptor count is bounded by `max_operations`, and
+storage/closures live until the owning driver drops. A descriptor can notify a
+condition registered on several loops on the same agent. Cross-origin isolation
+requirements are identical to Worker Poster. Drop closes the ring before releasing
+the callback; delayed Worker messages cannot access released Rust state.
+
+The `executor` feature runs on each of these targets. WASI contracts exercise
+real TCP buffers, sleeps/timeouts and task cancellation without OS threads; the
+release allocation binary also runs the native shared executor I/O/sleep gate.
+Web tests run byte-verified WebSocket tasks, sleeps/timeouts and explicit join
+cancellation using only host-scheduled `turn(Now)`. Their synchronous Rust turn
+paths have a zero-allocation gate; JavaScript/runtime allocations remain outside
+that measurement. A separate Worker test delivers 64 condition completions to two
+loops, alternates changed/same values, and checks full-ring rejection and closure.
+Both external-wait and ordinary timer tests retain all sixty no-spin expiries.
+
 ## Explicit contract exclusions
 
 These are platform exclusions, not successful tests. WASI UDP, release precision
@@ -310,7 +359,7 @@ Driver stdout/stderr (Chrome verbose, Gecko trace) stay in `.tools/browser-logs/
 and are printed on any test/fixture/startup failure. Cleanup terminates the
 owned process group, including browser children. Chrome and Firefox are each
 attempted, and zero executed browser tests cause failure even if compilation or
-Node tests passed. Node remains a separately executed seven-contract suite.
+Node tests passed. Node remains a separately executed suite with positive subject counts.
 
 The integrator reproduced ChromeDriver SIGKILL on this Mac **outside the
 sandbox**, with matching 153.0.8010.36 versions: this is a host restriction,

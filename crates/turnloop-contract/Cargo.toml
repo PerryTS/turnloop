@@ -7,8 +7,14 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[features]
+executor = ["turnloop/executor", "dep:futures-io"]
+wasi-p3-experimental = ["turnloop/wasi-p3-experimental"]
+web-worker = ["turnloop/web-worker"]
+
 [dependencies]
 turnloop.workspace = true
+futures-io = { workspace = true, optional = true }
 
 [lints]
 workspace = true
@@ -18,10 +24,12 @@ libc.workspace = true
 
 [package.metadata.turnloop-ci]
 role = "contract"
+# Remove when the production IOCP provider instantiates the shared contracts.
+windows-contracts-pending = "WINDOWS_HANDOFF.md"
 web-tests = ["browser"]
 node-tests = ["node"]
-web-tests-features = ["web-worker"]
-node-tests-features = ["web-worker"]
+web-tests-features = ["web-worker", "executor"]
+node-tests-features = ["web-worker", "executor"]
 web-fixture = "tests/web/fixture.mjs"
 wasi-tests = ["wasi"]
 wasi-allocation-tests = ["allocations"]
@@ -40,9 +48,6 @@ path = "tests/web/browser.rs"
 name = "node"
 path = "tests/web/node.rs"
 
-[features]
-wasi-p3-experimental = ["turnloop/wasi-p3-experimental"]
-web-worker = ["turnloop/web-worker"]
 
 [target.'cfg(all(target_os = "wasi", target_env = "p2"))'.dev-dependencies]
 wasip2 = "=1.0.3"
@@ -50,3 +55,9 @@ wasip2 = "=1.0.3"
 [target.'cfg(all(target_os = "wasi", target_env = "p3"))'.dev-dependencies]
 turnloop-wasi-random.workspace = true
 bson.workspace = true
+
+[[bin]]
+name = "native_child"
+path = "src/bin/native_child.rs"
+test = false
+bench = false

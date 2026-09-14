@@ -558,3 +558,435 @@ fn wasi_random_scalar_imports_allocate_nothing() {
     ACTIVE.with(|v| v.set(false));
     assert_eq!(ALLOCS.with(|n| n.get()), 0, "200 real entropy fills");
 }
+
+#[cfg(not(target_os = "wasi"))]
+#[test]
+fn ipc_handle_transfer_and_external_waits_allocate_nothing_after_setup() {
+    let mut l = Loop::new(Config::default()).expect("loop");
+    let path = std::env::temp_dir().join(format!("tl-alloc-ipc-{}.sock", std::process::id()));
+    let (_, a, b) = turnloop_contract::native_surface::pipe_pair(&mut l, &PipeName(path.clone()));
+    let (_, source, _peer) = turnloop_contract::pair(&mut l);
+    let condition = WaitCondition::new(0).expect("wait condition");
+    // Start worker/helper infrastructure before steady state.
+    let wait = l
+        .external_wait(&condition, 0, None, Token(30))
+        .expect("warm wait");
+    assert!(l.cancel(wait));
+    let mut out = Completions::default();
+    while l
+        .turn(Timeout::Now, &mut out)
+        .expect("warm cancellation")
+        .completions
+        == 0
+    {}
+    let mut bytes = [0; 64];
+    for _ in 0..4 {
+        exchange(&mut l, a, b, &mut bytes, &mut out, true);
+    }
+    ALLOCS.with(|v| v.set(0));
+    ACTIVE.with(|v| v.set(true));
+    let mut transferred = 0;
+    let mut waits = 0;
+    for _ in 0..200 {
+        exchange(&mut l, a, b, &mut bytes, &mut out, true);
+        l.send_handle(a, source, Token(10))
+            .expect("send descriptor");
+        l.recv_handle(b, Token(11)).expect("receive descriptor");
+        let wait = l
+            .external_wait(&condition, 0, None, Token(12))
+            .expect("external wait");
+        assert!(l.cancel(wait));
+        let mut received = None;
+        let mut sent = false;
+        let mut cancelled = false;
+        let deadline = l.now() + Duration::from_secs(2);
+        while received.is_none() || !sent || !cancelled {
+            assert!(l.now() < deadline);
+            l.turn(Timeout::Until(deadline), &mut out)
+                .expect("transfer turn");
+            for c in out.drain() {
+                match c.result {
+                    OpResult::HandleSent => sent = true,
+                    OpResult::HandleReceived { handle } => received = Some(handle),
+                    OpResult::Cancelled => {
+                        assert_eq!(c.op, Some(wait));
+                        cancelled = true;
+                        waits += 1;
+                    }
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+        }
+        l.close(received.expect("received fd"), Token(13))
+            .expect("close received fd");
+        l.turn(Timeout::Now, &mut out).expect("close turn");
+        assert!(out.iter().any(|c| matches!(c.result, OpResult::Closed)));
+        transferred += 1;
+    }
+    ACTIVE.with(|v| v.set(false));
+    assert_eq!(
+        ALLOCS.with(|n| n.get()),
+        0,
+        "IPC and external waits steady allocations"
+    );
+    assert_eq!((transferred, waits), (200, 200));
+    std::fs::remove_file(path).expect("remove socket path");
+}
+
+#[cfg(not(target_os = "wasi"))]
+#[test]
+fn regular_file_jobs_reuse_pool_storage() {
+    use std::{
+        io::{Seek, SeekFrom, Write},
+        os::fd::OwnedFd,
+    };
+    let path = std::env::temp_dir().join(format!("tl-alloc-file-{}", std::process::id()));
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .expect("file");
+    file.write_all(&[9; 64]).expect("file bytes");
+    let mut l = Loop::new(Config::default()).expect("loop");
+    let fd: OwnedFd = file.try_clone().expect("clone file").into();
+    let h = l
+        .attach(Detached::from_fd(fd).expect("file transport"), Token(1))
+        .expect("file attach");
+    let mut out = Completions::default();
+    let mut count = 0;
+    let mut writes = 0;
+    for i in 0..201 {
+        file.seek(SeekFrom::Start(0))
+            .expect("seek after completed read");
+        if i == 1 {
+            ALLOCS.with(|v| v.set(0));
+            ACTIVE.with(|v| v.set(true));
+        }
+        l.read(h, ReadBuf::Pooled, Token(2)).expect("file read");
+        let deadline = l.now() + Duration::from_secs(2);
+        loop {
+            assert!(l.now() < deadline);
+            l.turn(Timeout::Until(deadline), &mut out)
+                .expect("file turn");
+            if !out.is_empty() {
+                assert_eq!(out.len(), 1);
+                let OpResult::Read {
+                    n,
+                    lease: Some(ref data),
+                } = out[0].result
+                else {
+                    panic!("missing file bytes");
+                };
+                assert_eq!(n, 64);
+                assert_eq!(data.as_slice(), [9; 64]);
+                count += 1;
+                break;
+            }
+        }
+        file.seek(SeekFrom::Start(0)).expect("rewind for write");
+        static OUTPUT: [u8; 64] = [9; 64];
+        // SAFETY: static immutable bytes remain valid through native acknowledgement.
+        let bytes = unsafe { IoBuf::from_raw_parts(OUTPUT.as_ptr(), OUTPUT.len()) };
+        l.write(h, WriteBuf::Provided(bytes), Token(3))
+            .expect("file write");
+        loop {
+            assert!(l.now() < deadline);
+            l.turn(Timeout::Until(deadline), &mut out)
+                .expect("file write turn");
+            if !out.is_empty() {
+                assert_eq!(out.len(), 1);
+                assert_eq!(out[0].token, Token(3));
+                assert!(matches!(out[0].result, OpResult::Wrote(64)));
+                writes += 1;
+                break;
+            }
+        }
+    }
+    ACTIVE.with(|v| v.set(false));
+    assert_eq!(
+        ALLOCS.with(|n| n.get()),
+        0,
+        "reusable file jobs allocate nothing"
+    );
+    assert_eq!((count, writes), (201, 201));
+    std::fs::remove_file(path).expect("remove file");
+}
+
+#[cfg(feature = "executor")]
+#[test]
+fn executor_steady_io_poll_and_sleep_allocate_nothing() {
+    use futures_io::{AsyncRead, AsyncWrite};
+    use std::{
+        future::Future,
+        pin::Pin,
+        task::{Context, Poll, Waker},
+    };
+    use turnloop::executor::LocalExecutor;
+    let mut ex = LocalExecutor::<backend::Platform>::new(Config::default()).expect("executor");
+    let (_, a, b) = turnloop_contract::pair(&mut ex.driver());
+    let mut a = ex.handle().io(a);
+    let mut b = ex.handle().io(b);
+    let waker = Waker::noop();
+    let mut cx = Context::from_waker(waker);
+    let mut count = 0;
+    for i in 0..1001 {
+        if i == 1 {
+            ALLOCS.with(|v| v.set(0));
+            ACTIVE.with(|v| v.set(true));
+        }
+        let mut input = [0; 64];
+        let output = [27; 64];
+        let Poll::Ready(wrote) = Pin::new(&mut a).poll_write(&mut cx, &output) else {
+            panic!("fresh write buffer")
+        };
+        assert_eq!(wrote.expect("buffer write"), 64);
+        assert!(Pin::new(&mut a).poll_flush(&mut cx).is_pending());
+        assert!(Pin::new(&mut b).poll_read(&mut cx, &mut input).is_pending());
+        let mut sleep = ex.handle().sleep(Duration::ZERO);
+        assert!(Pin::new(&mut sleep).poll(&mut cx).is_pending());
+        let mut wrote = false;
+        let mut read = false;
+        let mut slept = false;
+        let deadline = ex.driver().now() + Duration::from_secs(2);
+        while !wrote || !read || !slept {
+            assert!(ex.driver().now() < deadline);
+            ex.turn(Timeout::Until(deadline)).expect("executor turn");
+            if !wrote && let Poll::Ready(r) = Pin::new(&mut a).poll_flush(&mut cx) {
+                r.expect("write completion");
+                wrote = true;
+            }
+            if !read && let Poll::Ready(r) = Pin::new(&mut b).poll_read(&mut cx, &mut input) {
+                assert_eq!(r.expect("read"), 64);
+                assert_eq!(input, output);
+                read = true;
+            }
+            if !slept && let Poll::Ready(r) = Pin::new(&mut sleep).poll(&mut cx) {
+                r.expect("sleep");
+                slept = true;
+            }
+        }
+        count += 1;
+    }
+    ACTIVE.with(|v| v.set(false));
+    assert_eq!(
+        ALLOCS.with(|n| n.get()),
+        0,
+        "executor steady I/O and timer polls allocate nothing"
+    );
+    assert_eq!(count, 1001);
+}
+
+#[cfg(not(target_os = "wasi"))]
+#[test]
+fn signal_exit_and_external_notification_delivery_allocate_nothing() {
+    let mut l = Loop::new(Config::default()).expect("loop");
+    let signal = l.signal_start(Signal::Usr1, Token(1)).expect("signal");
+    let condition = WaitCondition::new(0).expect("condition");
+    let mut children = [None; 16];
+    for child in &mut children {
+        let mut spec = ProcessSpec::new(env!("CARGO_BIN_EXE_native_child"));
+        spec.args.push("sleep".into());
+        *child = Some(l.spawn(&spec, Token(2)).expect("child"));
+    }
+    let mut out = Completions::default();
+    // Warm notifier/TLS paths before measuring completion delivery, leaving the
+    // already registered children alive. Process creation is resource setup.
+    l.turn(Timeout::Now, &mut out).expect("warm services");
+    assert!(out.is_empty());
+    ALLOCS.with(|v| v.set(0));
+    ACTIVE.with(|v| v.set(true));
+    for child in children.iter().flatten() {
+        l.kill(child.handle, Signal::Kill).expect("kill child");
+    }
+    let mut exits = 0;
+    let until = l.now() + Duration::from_secs(5);
+    while exits != 16 {
+        assert!(l.now() < until);
+        l.turn(Timeout::Until(until), &mut out).expect("exit turn");
+        for c in out.drain() {
+            assert_eq!(c.token, Token(2));
+            let OpResult::Exited(status) = c.result else {
+                panic!("missing exit")
+            };
+            assert_eq!(status.signal, Some(libc::SIGKILL));
+            exits += 1;
+        }
+    }
+    let (mut signals, mut waits) = (0, 0);
+    for _ in 0..200 {
+        let op = l
+            .external_wait(&condition, 0, None, Token(3))
+            .expect("wait");
+        condition.notify();
+        // SAFETY: SIGUSR1 has a live subscription and getpid names this process.
+        assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGUSR1) }, 0);
+        let (mut signaled, mut notified) = (false, false);
+        let until = l.now() + Duration::from_secs(2);
+        while !signaled || !notified {
+            assert!(l.now() < until);
+            l.turn(Timeout::Until(until), &mut out)
+                .expect("service turn");
+            for c in out.drain() {
+                match c.result {
+                    OpResult::Signal(Signal::Usr1) => {
+                        assert_eq!(c.token, Token(1));
+                        assert!(!signaled);
+                        signaled = true;
+                        signals += 1;
+                    }
+                    OpResult::ExternalWait(WaitResult::Notified) => {
+                        assert_eq!(c.op, Some(op));
+                        assert!(!notified);
+                        notified = true;
+                        waits += 1;
+                    }
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+        }
+    }
+    ACTIVE.with(|v| v.set(false));
+    assert_eq!(
+        ALLOCS.with(|n| n.get()),
+        0,
+        "service completion allocations"
+    );
+    assert_eq!((exits, signals, waits), (16, 200, 200));
+    l.signal_stop(signal, Token(4)).expect("stop");
+}
+
+#[cfg(target_os = "wasi")]
+#[test]
+fn single_agent_external_waits_allocate_nothing() {
+    let mut l = Loop::new(Config::default()).expect("loop");
+    let condition = WaitCondition::new(0).expect("condition setup");
+    let mut out = Completions::with_capacity(1);
+    let mut results = 0;
+    ALLOCS.with(|n| n.set(0));
+    ACTIVE.with(|v| v.set(true));
+    for _ in 0..200 {
+        for kind in 0..4 {
+            let op = l
+                .external_wait(&condition, u64::from(kind == 0), Some(l.now()), Token(kind))
+                .expect("wait");
+            if kind == 1 {
+                condition.notify();
+            }
+            if kind == 2 {
+                assert!(l.cancel(op));
+            }
+            l.turn(Timeout::Now, &mut out).expect("completion");
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].op, Some(op));
+            assert!(match kind {
+                0 => matches!(out[0].result, OpResult::ExternalWait(WaitResult::NotEqual)),
+                1 => matches!(out[0].result, OpResult::ExternalWait(WaitResult::Notified)),
+                2 => matches!(out[0].result, OpResult::Cancelled),
+                _ => matches!(out[0].result, OpResult::ExternalWait(WaitResult::TimedOut)),
+            });
+            results += 1;
+        }
+    }
+    ACTIVE.with(|v| v.set(false));
+    assert_eq!(
+        ALLOCS.with(|n| n.get()),
+        0,
+        "single-agent external wait allocations"
+    );
+    assert_eq!(results, 800);
+    assert!(!l.alive());
+}
+
+#[cfg(target_os = "wasi")]
+#[test]
+fn stdio_writes_reuse_stream_storage() {
+    let mut l = Loop::new(Config::default()).expect("loop");
+    let h = l.open_stdio(Stdio::Stderr).expect("stderr setup");
+    let mut out = Completions::with_capacity(1);
+    let mut wrote = 0;
+    let mut allocations = 0;
+    for round in 0..101 {
+        ALLOCS.with(|n| n.set(0));
+        ACTIVE.with(|v| v.set(round != 0));
+        // SAFETY: static input lives until every completion and loop teardown.
+        let bytes = unsafe { IoBuf::from_raw_parts(b".".as_ptr(), 1) };
+        l.write(h, WriteBuf::Provided(bytes), Token(1))
+            .expect("stdio write");
+        let until = l.now() + Duration::from_secs(2);
+        loop {
+            assert!(l.now() < until);
+            l.turn(Timeout::Until(until), &mut out).expect("stdio turn");
+            if !out.is_empty() {
+                assert!(matches!(out[0].result, OpResult::Wrote(1)));
+                break;
+            }
+        }
+        ACTIVE.with(|v| v.set(false));
+        if round != 0 {
+            allocations += ALLOCS.with(|n| n.get());
+            wrote += 1;
+        }
+    }
+    assert_eq!(wrote, 100);
+    assert_eq!(allocations, 0, "steady stdio writes");
+}
+
+#[cfg(target_os = "wasi")]
+#[test]
+fn stdio_reads_reuse_caller_buffers_through_eof() {
+    let mut l = Loop::new(Config::default()).expect("loop");
+    let h = l.open_stdio(Stdio::Stdin).expect("stdin setup");
+    let expected = b"turnloop revision two stdin fixture\n";
+    let mut byte = [0u8; 1];
+    let mut out = Completions::with_capacity(1);
+    let mut allocations = 0;
+    let mut reads = 0;
+    for (i, &value) in expected.iter().enumerate() {
+        ALLOCS.with(|n| n.set(0));
+        ACTIVE.with(|v| v.set(i != 0));
+        // SAFETY: the one-byte caller region remains exclusive and fixed until
+        // the terminal read below; it is only inspected after acknowledgement.
+        let buf = unsafe { IoBufMut::from_raw_parts(byte.as_mut_ptr(), byte.len()) };
+        l.read(h, ReadBuf::Provided(buf), Token(1))
+            .expect("stdin read");
+        let until = l.now() + Duration::from_secs(2);
+        loop {
+            assert!(l.now() < until);
+            l.turn(Timeout::Until(until), &mut out).expect("stdin turn");
+            if !out.is_empty() {
+                assert!(matches!(
+                    out[0].result,
+                    OpResult::Read { n: 1, lease: None }
+                ));
+                break;
+            }
+        }
+        assert_eq!(byte[0], value);
+        ACTIVE.with(|v| v.set(false));
+        if i != 0 {
+            allocations += ALLOCS.with(|n| n.get());
+        }
+        reads += 1;
+    }
+    let mut eofs = 0;
+    ALLOCS.with(|n| n.set(0));
+    ACTIVE.with(|v| v.set(true));
+    for _ in 0..2 {
+        l.read(h, ReadBuf::Pooled, Token(2)).expect("EOF read");
+        let until = l.now() + Duration::from_secs(2);
+        loop {
+            assert!(l.now() < until);
+            l.turn(Timeout::Until(until), &mut out).expect("EOF turn");
+            if !out.is_empty() {
+                assert!(matches!(out[0].result, OpResult::Eof));
+                eofs += 1;
+                break;
+            }
+        }
+    }
+    ACTIVE.with(|v| v.set(false));
+    allocations += ALLOCS.with(|n| n.get());
+    assert_eq!((reads, eofs), (36, 2));
+    assert_eq!(allocations, 0, "stdio reads and repeated CLI EOF results");
+}

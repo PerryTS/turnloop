@@ -12,11 +12,19 @@ from web_fixture import WebFixture
 from common import PIN, P3_PIN, ROOT, cargo, entrypoint, fail, members, metadata, role, run, select, settings
 
 
-def checked_tests(command, *, cwd, env=None, minimum_groups=1):
+def checked_tests(command, *, cwd, env=None, minimum_groups=1, input_text=None):
     # Preserve the output and exit code; never turn ignored/filtered tests into passes.
     print('+ ' + ' '.join(map(str, command)), flush=True)
     process = subprocess.Popen(command, cwd=cwd, env=env, text=True,
-                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               stdin=subprocess.PIPE if input_text is not None else None)
+    if input_text is not None:
+        try:
+            process.stdin.write(input_text)
+        except BrokenPipeError:
+            pass # The exit code and positive subject counts below remain mandatory.
+        finally:
+            process.stdin.close()
     output = []
     for line in process.stdout:
         print(line, end='', flush=True)
@@ -29,11 +37,77 @@ def checked_tests(command, *, cwd, env=None, minimum_groups=1):
     if sum(count > 0 for count in groups) < minimum_groups:
         fail('Suite completed without a positive passed-test count. Add real executable tests.')
     print(f'PASS executed {passed} tests')
+    return passed
+
+
+def protocol_tests(packages, base, root, env):
+    """Finish every declared suite, then fail the job if any one failed."""
+    results = []
+    for package in packages:
+        name = package['name']
+        targets = settings(package).get('integration-tests', [])
+        if not targets:
+            results.append((name, 'FAIL', 'Missing integration-tests metadata'))
+            continue
+        available = {t['name'] for t in package['targets'] if 'test' in t['kind']}
+        for target in targets:
+            suite = f'{name}/{target}'
+            try:
+                if target not in available:
+                    fail(f'Unknown integration test target: {suite}')
+                count = checked_tests(base + ['-p', name, '--test', target,
+                    '--', '--include-ignored', '--test-threads=1', '--nocapture'], cwd=root, env=env)
+            except (RuntimeError, subprocess.CalledProcessError, OSError) as error:
+                print(f'FAIL {suite}: {error}', file=sys.stderr, flush=True)
+                results.append((suite, 'FAIL', str(error)))
+            else:
+                results.append((suite, 'PASS', f'{count} tests passed'))
+    if not results:
+        results.append(('protocol', 'FAIL', 'No executable suites selected'))
+    def cell(value):
+        return value.replace('|', '&#124;').replace('\n', ' ').replace('\r', ' ')
+    table = '\n'.join(['## Protocol suites', '', '| Suite | Result | Details |',
+                       '| --- | --- | --- |'] +
+                      ['| ' + ' | '.join(cell(value) for value in row) + ' |' for row in results]) + '\n'
+    print(table, flush=True)
+    if summary := os.environ.get('GITHUB_STEP_SUMMARY'):
+        with open(summary, 'a', encoding='utf-8') as output:
+            output.write(table + '\n')
+    if any(status == 'FAIL' for _, status, _ in results):
+        fail('Protocol suites failed; see the per-suite results above')
+    return results
+
+
+def native_tests(data, base, root, *, windows):
+    contracts = select(data, 'contract')
+    pending = []
+    for package in contracts:
+        handoff = settings(package).get('windows-contracts-pending')
+        if windows and handoff:
+            if handoff != 'WINDOWS_HANDOFF.md' or not (root / handoff).is_file():
+                fail(f'{package["name"]}: pending Windows contracts need WINDOWS_HANDOFF.md')
+            pending.append(package['name'])
+            message = (f'PENDING Windows backend contracts: {package["name"]}. '
+                       'IOCP bounded waits/no-spin, socket I/O, cancel/close ordering, '
+                       'wake/integration, allocation and lifetime tests await the production provider. '
+                       'See [WINDOWS_HANDOFF.md](https://github.com/PerryTS/turnloop/blob/main/WINDOWS_HANDOFF.md), phase 2. '
+                       'Remove windows-contracts-pending metadata when IOCP lands.\n')
+            print(message, flush=True)
+            if summary := os.environ.get('GITHUB_STEP_SUMMARY'):
+                with open(summary, 'a', encoding='utf-8') as output:
+                    output.write(message + '\n')
+    for features in ([], ['--all-features']):
+        checked_tests(base + ['--workspace'] + features + ['--', '--test-threads=1'], cwd=root)
+        # Every portable member must execute independently; another crate's tests
+        # cannot hide a cfg-excluded core, protocol codec or fixture suite.
+        for package in select(data, 'core') + select(data, 'protocol') + contracts:
+            if package['name'] not in pending:
+                checked_tests(base + ['-p', package['name']] + features + ['--', '--test-threads=1'], cwd=root)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('suite', choices=['native', 'wasi', 'web', 'node', 'loom', 'miri', 'protocol'])
+    parser.add_argument('suite', choices=['native', 'wasi', 'web', 'node', 'loom', 'miri', 'protocol', 'protocol-wasi', 'interop'])
     parser.add_argument('--manifest-path', default='Cargo.toml')
     parser.add_argument('--target')
     parser.add_argument('--browser', choices=['chrome', 'firefox'])
@@ -46,40 +120,50 @@ def main():
     if args.target:
         base += ['--target', args.target]
     if args.suite == 'native':
-        # Run all normal suites, then every contract member independently: zero
-        # platform contracts cannot be hidden by another member's passing tests.
-        for features in ([], ['--all-features']):
-            checked_tests(base + ['--workspace'] + features + ['--', '--test-threads=1'], cwd=root)
-            for package in select(data, 'contract'):
-                checked_tests(base + ['-p', package['name']] + features + ['--', '--test-threads=1'], cwd=root)
-    elif args.suite == 'wasi':
+        windows = 'windows' in args.target if args.target else sys.platform == 'win32'
+        native_tests(data, base, root, windows=windows)
+    elif args.suite in ('wasi', 'protocol-wasi'):
         if args.target not in ('wasm32-wasip2', 'wasm32-wasip3'):
             fail('wasi requires --target wasm32-wasip2 or wasm32-wasip3')
         env['CARGO_TARGET_' + args.target.upper().replace('-', '_') + '_RUNNER'] = str(ROOT / 'scripts/ci/wasmtime-runner.sh')
-        for package in select(data, 'core'):
-            if settings(package).get('wasi-lib-tests'):
-                features = ['--features', 'wasi-p3-experimental'] if args.target == 'wasm32-wasip3' else []
-                checked_tests(base + ['-p', package['name'], '--lib', '--release'] + features
-                              + ['--', '--nocapture', '--test-threads=1'], cwd=root, env=env)
-        for package in select(data, 'contract'):
-            features = ['--features', 'wasi-p3-experimental'] if args.target == 'wasm32-wasip3' else []
-            available = {t['name'] for t in package['targets'] if 'test' in t['kind']}
-            failures = []
-            for key, profile in [('wasi-tests', []), ('wasi-tests', ['--release']),
-                                 ('wasi-allocation-tests', ['--release'])]:
-                targets = settings(package).get(key, [])
-                if not targets:
-                    fail(f'{package["name"]}: declare {key}; each binary must execute real tests')
+        if args.suite == 'protocol-wasi':
+            selected = [(p, settings(p).get('wasi-tests', [])) for p in members(data)
+                        if role(p) in ('protocol', 'codec') and settings(p).get('wasi-tests')]
+            if not selected:
+                fail('No wasi-tests metadata: protocol runtime coverage is required')
+            for package, targets in selected:
+                available = {t['name'] for t in package['targets'] if 'test' in t['kind']}
                 for target in targets:
                     if target not in available:
-                        fail(f'{package["name"]}: missing {key} target {target}')
-                    try:
-                        checked_tests(base + ['-p', package['name'], '--test', target] + features + profile
-                                      + ['--', '--nocapture', '--test-threads=1'], cwd=root, env=env)
-                    except (subprocess.CalledProcessError, RuntimeError, OSError) as error:
-                        failures.append(str(error))
-            if failures:
-                fail('WASI gates failed: ' + '; '.join(failures))
+                        fail(f'Unknown WASI test target: {package["name"]}/{target}')
+                    checked_tests(base + ['-p', package['name'], '--test', target,
+                        '--', '--test-threads=1'], cwd=root, env=env)
+        else:
+            for package in select(data, 'core'):
+                if settings(package).get('wasi-lib-tests'):
+                    features = ['--all-features']
+                    checked_tests(base + ['-p', package['name'], '--lib', '--release'] + features
+                                  + ['--', '--nocapture', '--test-threads=1'], cwd=root, env=env)
+            for package in select(data, 'contract'):
+                features = ['--all-features']
+                available = {t['name'] for t in package['targets'] if 'test' in t['kind']}
+                failures = []
+                for key, profile in [('wasi-tests', []), ('wasi-tests', ['--release']),
+                                     ('wasi-allocation-tests', ['--release'])]:
+                    targets = settings(package).get(key, [])
+                    if not targets:
+                        fail(f'{package["name"]}: declare {key}; each binary must execute real tests')
+                    for target in targets:
+                        if target not in available:
+                            fail(f'{package["name"]}: missing {key} target {target}')
+                        try:
+                            checked_tests(base + ['-p', package['name'], '--test', target] + features + profile
+                                          + ['--', '--nocapture', '--test-threads=1'], cwd=root, env=env,
+                                          input_text='turnloop revision two stdin fixture\n')
+                        except (subprocess.CalledProcessError, RuntimeError, OSError) as error:
+                            failures.append(str(error))
+                if failures:
+                    fail('WASI gates failed: ' + '; '.join(failures))
     elif args.suite in ('web', 'node'):
         env['RUSTUP_TOOLCHAIN'] = PIN
         for package in select(data, 'contract'):
@@ -136,16 +220,12 @@ def main():
             fail('Core must mark pure-Rust tests with package.metadata.turnloop-ci.miri-filters')
     else:
         env['TURNLOOP_TEST_REQUIRED'] = '1'
-        for package in select(data, 'protocol'):
-            targets = settings(package).get('integration-tests', [])
-            if not targets:
-                fail(f'{package["name"]}: integration-tests metadata must identify real-server test targets')
-            available = {t['name'] for t in package['targets'] if 'test' in t['kind']}
-            for target in targets:
-                if target not in available:
-                    fail(f'Unknown integration test target: {package["name"]}/{target}')
-                checked_tests(base + ['-p', package['name'], '--test', target,
-                    '--', '--include-ignored', '--test-threads=1', '--nocapture'], cwd=root, env=env)
+        packages = select(data, 'protocol')
+        if args.suite == 'interop':
+            packages = [p for p in packages if settings(p).get('service-group') == 'http']
+            if not packages:
+                fail('HTTP interop group must contain executable suites')
+        protocol_tests(packages, base, root, env)
 
 
 if __name__ == '__main__':

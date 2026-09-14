@@ -13,6 +13,7 @@ required, with no nightly language features in the library. WASI 0.3 alone uses
 `nightly-2026-09-07` and Wasmtime 46.0.0, based on the WASM lane's successful spike.
 
 ```bash
+python3 scripts/ci/check-paths.py
 cargo +nightly-2026-08-20 fmt --all --check
 cargo +nightly-2026-08-20 clippy --locked --workspace --all-targets --all-features -- \
   -D warnings -D clippy::undocumented_unsafe_blocks
@@ -27,6 +28,16 @@ cargo +nightly-2026-08-20 deny --locked check
 python3 scripts/ci/lint-workflows.py
 python3 -m unittest discover -s scripts/ci -p 'test_*.py' -v
 ```
+
+`check-paths.py` reads Git's index for exact path spellings and the working tree
+for file references, so it also catches unstaged source edits on case-insensitive
+disks. It rejects file/directory case collisions, Rust includes and module paths
+(including disabled cfg branches and inline modules), and Cargo readme/license-file
+paths. It understands literal/raw strings and literal `concat!` with
+`env!("CARGO_MANIFEST_DIR")`; other computed include paths fail for manual resolution.
+Comments and string contents are not scanned as Rust code. Stage new referenced
+files with their exact case before the final check. Run its synthetic Git regression
+with `python3 -m unittest discover -s scripts/ci -p test_paths.py -v`.
 
 Every unsafe block must explain its safety with `// SAFETY:` and crate roots deny
 `unsafe_op_in_unsafe_fn`. No `unwrap()` on I/O paths. Assert actual completions,
@@ -50,6 +61,33 @@ checks their index timestamps/checksums, because the resolver alone permits lock
 young versions. A too-young version fails with its publish and eligible timestamps;
 choose an older version. No soak override is accepted in CI.
 
+### Security fixes younger than the soak window
+
+For a reviewed security fix, add a `[[security-exceptions]]` entry to
+`scripts/ci/policy.toml` with `crate`, one exact `version`, a `RUSTSEC-YYYY-NNNN`
+`advisory`, a nonempty `reason`, and `expires` equal to the registry publish date
+plus seven days (UTC). See the rustls 0.23.45 entry for RUSTSEC-2026-0285.
+The gate still verifies the registry checksum and all other versions' ages,
+prints every active exception, and fails if an entry is expired, unused, or has
+the wrong expiry. Remove the entry when its exact seven-day timestamp is reached,
+or immediately if that crate/version leaves the lockfile.
+
+Scope the resolver override to the one precise update command. This environment
+form was verified on the pinned nightly; do not export it or edit `.cargo/config.toml`:
+
+```bash
+env CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE='0 days' \
+  cargo +nightly-2026-08-20 update -p rustls --precise 0.23.45
+python3 scripts/ci/soak.py
+cargo +nightly-2026-08-20 deny --locked check
+bash scripts/ci/no-tokio.sh
+```
+
+Review the lockfile diff and the advisory's patched range; commit the exception
+and lockfile together. Do not add a cargo-deny advisory ignore. rustls 0.23.45 was
+published at `2026-09-14T15:11:17Z`, so its exception is no longer usable at
+`2026-09-21T15:11:17Z`, even though the policy stores only the date `2026-09-21`.
+
 ## Workspace discovery and test metadata
 
 Scripts use `cargo metadata` and its `workspace_members`, never a crate list or
@@ -58,7 +96,9 @@ cannot be published. `publish = false` excludes helpers from releases. All local
 path dependencies of publishable crates need explicit registry version requirements.
 
 Optional `[package.metadata.turnloop-ci]` describes test capabilities. The role
-may be `core`, `contract`, `protocol` or `bench`. During integration, `*-contract`,
+may be `core`, `contract`, `protocol`, `codec` or `bench`.
+`codec` marks the portable Zstandard library, which needs corpus/allocation coverage
+instead of external-service metadata. During integration, `*-contract`,
 `*-bench` suffixes and direct `protocols/` members are recognized from metadata;
 other crates default to core.
 Use explicit roles for layouts that differ.
@@ -115,6 +155,9 @@ be real Cargo test targets, not names of ignored unit-test functions. CI runs ea
 with `--include-ignored --test-threads=1 --nocapture`; ignored real-server tests
 must actually execute. The protocol job fails if any protocol member lacks a
 declaration, or a selected suite runs zero tests.
+The runner attempts every declared suite even after failures, prints a per-suite
+PASS/FAIL table, and appends it to `GITHUB_STEP_SUMMARY` when set. Missing/invalid
+metadata, command failures and zero executed tests remain failures of the job.
 
 CI sets `TURNLOOP_TEST_REQUIRED=1`. A harness must **fail**, never return success,
 if a required connection/certificate variable is absent, a service is unavailable,
@@ -139,6 +182,8 @@ port is loopback-only; there is no fallback to a default port or system instance
 | `TURNLOOP_TEST_MONGODB_REPLICA_PORTS` | Three comma-separated ports; set `turnloop_test`, keyfile auth |
 | `TURNLOOP_TEST_MONGODB_TLS_PORT` | Fresh TLS standalone; same authentication tests |
 | `TURNLOOP_TEST_MONGODB_TOOLS` | Directory containing MongoDB `cert.pem` |
+| `TURNLOOP_TEST_HTTP_PORT` | Private Node HTTP/1.1 fixture (redirects, gzip, trailers and connection reuse) |
+| `TURNLOOP_TEST_HTTP2_PORT` | Private Node HTTP/2 fixture (100 multiplexed streams) |
 | `TURNLOOP_TEST_SMTP_PORT` | Postfix smtp-sink loopback port |
 | `TURNLOOP_TEST_SMTP_TOOLS` | Directory containing sink message dumps for byte assertions |
 
@@ -146,6 +191,9 @@ port is loopback-only; there is no fallback to a default port or system instance
 scripts/test-servers.py run cargo test --workspace -- --include-ignored
 scripts/test-servers.py start   # prints shell exports; explicitly source them to run tests
 scripts/test-servers.py stop
+# Reproduce PostgreSQL's CI configuration with separate proxied TCP connections:
+scripts/test-servers.py --services postgres --postgres-proxy run cargo test \
+  -p turnloop-postgres --test server -- --include-ignored --test-threads=1 --nocapture
 # Explicit subset for machines unable to run SQL; does not count as a full pass:
 scripts/test-servers.py --services redis,mongodb,smtp run cargo test \
   -p turnloop-redis -p turnloop-mongodb -p turnloop-smtp -- --include-ignored --test-threads=1
@@ -157,29 +205,166 @@ installed binaries on PATH (with macOS/PostgreSQL installation fallbacks); it do
 not install or upgrade system software. PostgreSQL supports cleartext, MD5,
 SCRAM and TLS/PLUS fixtures; MySQL covers caching-SHA2 fast/full/RSA and TLS, and
 records native-password plugin availability (MySQL 9 removed that plugin).
+The MySQL auth test deliberately warms its RSA and TLS accounts, then clears
+the server authentication cache with `FLUSH PRIVILEGES` through the private TLS
+`auth_admin` account (password `fixture-password`, RELOAD privilege). It asserts
+the reset's successful acknowledgement, full RSA auth, full TLS auth without RSA,
+and later fast hits on both accounts. This also covers repeated tests after CI's
+independent TLS probe. Run fixture suites serially; cache invalidation is global
+to the disposable server.
 MongoDB cleanup is an explicit example invoked only by `stop`, never a test that
 could shut down a concurrently running suite. SMTP's installed-sink test uses the
 runner; in-process TLS/auth SMTP peers remain normal tests.
 
 In the managed macOS sandbox PostgreSQL initialization fails at `shmget` and
 MySQL initialization crashes. Those real-server tests are **UNRUN (sandbox)**;
-run the full command outside the sandbox. Do not remove their ignored test bodies
+run the full command outside the sandbox.
+
+Local PostgreSQL initializes the administrator as `turnloop`, matching CI's
+`POSTGRES_USER`; a `postgres` database exists but a `postgres` role is not assumed.
+Both paths apply the same three SSL `ALTER SYSTEM` settings and reload, then check
+effective TLS settings and pending restarts and print versions, roles and timeout
+settings. The optional loopback TCP proxy preserves bytes and half-closes, opens
+one upstream connection per client, and reports forwarded bytes, connection counts
+and CancelRequests. The cancel test observes its exact backend PID using another
+`scram_user` session, requires SQLSTATE 57014 and checks subsequent session reuse.
+
+HTTP fixture servers use the same lifecycle and authenticated private-instance
+shutdown. Node **26.5.1** is pinned with setup-node on native and protocol CI.
+Node fetch and `node:http2` legs are mandatory on every native runner. curl legs
+use the installed executable's `curl -V` capabilities (`Protocols: http`, plus
+`Features: HTTP2` for h2); missing HTTP2 skips only that curl leg. Tests print each
+verified leg and run a real 100-stream Node regression with curl HTTP2 unavailable.
+All fixture network connections use explicit IPv4 loopback; `localhost` in TLS
+certificates/SNI or HTTP authority fields does not select the transport address.
+The `service-group = "http"` metadata selects HTTP/TLS/WebSocket interop targets:
+
+```bash
+scripts/test-servers.py --services http run python3 scripts/ci/run-tests.py interop
+python3 scripts/ci/h2spec.py
+python3 scripts/ci/run-tests.py protocol-wasi --target wasm32-wasip2
+```
+
+`h2spec.py` downloads the pinned source commit in `scripts/ci/tools.json`, verifies
+its SHA-256 before extraction, verifies Go modules, builds locally, and runs strict
+conformance. Its JUnit gate requires 147 distinct successful tests, no failures,
+errors or skips, and consistent suite counters. A 16-KiB response ensures the
+negative-window test executes. Go and a native compiler must be installed.
+
+`wasi-tests` metadata names portable test targets; HTTP declares codecs/allocations,
+and the decoder declares its allocation regression. Allocation targets use standalone,
+unconditionally executed harnesses with positive allocator calibration, preserving
+every test and the zero-allocation thresholds. This avoids pinned WASI 0.3
+libtest CLI-argument lowering calling the generated allocator shim without a
+valid stack; these targets always run their full list, regardless of test filters. Both WASI 0.2 and 0.3 have a
+required protocol job, independent of the pending production backend contracts.
+For ring, install the same pinned C toolchain used by CI on Linux x86_64 or
+macOS arm64 (no system installation required):
+
+```bash
+python3 scripts/ci/install-wasm-toolchain.py
+source .tools/wasm-env.sh
+cargo clippy --locked --workspace --all-targets --target wasm32-wasip2 -- -D warnings
+cargo clippy --locked --workspace --all-targets --target wasm32-unknown-unknown -- -D warnings
+bash scripts/ci/install-wasmtime.sh
+python3 scripts/ci/run-tests.py protocol-wasi --target wasm32-wasip2
+python3 scripts/ci/run-tests.py protocol-wasi --target wasm32-wasip3
+```
+
+The installer verifies [wasi-sdk 34.0's official release hashes](https://github.com/WebAssembly/wasi-sdk/releases/tag/wasi-sdk-34)
+against `scripts/ci/tools.json` before extraction into `.tools/`. It provides
+absolute target-specific `CC_*`/`AR_*` paths for p2, p3 and browser wasm; CI receives
+them through `GITHUB_ENV`. It compiles a wasm object and archives it for each target
+before reporting success. This fixes CI run 34874044440's missing `llvm-ar` and
+Apple clang's absent wasm backend. The SDK includes a WASI sysroot; Rust retains
+its own target linker/libc, and ring builds its freestanding C objects with clang.
+No extra browser libc or default rustls provider is enabled. Re-source the file
+in each local shell; do not set a global `CC` that would change native builds.
+
+`turnloop-tls` additionally declares `wasi-tests = ["portable"]`: its in-memory
+transport runs real ring-backed handshakes, encrypted records, ALPN, resumption,
+certificate rejection and injected deadlines without native sockets or threads.
+This establishes TLS correctness, not allocation freedom of upstream rustls records: a
+separate probe measured four allocations per bidirectional record exchange in
+rustls 0.23.45. Existing core/HTTP/decoder allocation gates remain mandatory.
+The HTTP/decoder codec and allocation suites continue to execute on p2 and p3.
+Database/SMTP real-server TLS suites still need their native fixture transports;
+compilation of those targets is not counted as WASI server execution. Protocol
+library and all-test-target Clippy covers browser wasm; browser runtime contracts
+remain owned by the backend lane.
+
+The shared rustls configuration disables defaults and selects ring/std/tls12.
+SQL/Redis/SMTP/Mongo test transports and the TLS library use the same version and
+provider. ring supports the native targets and builds on wasm32; browser entropy
+uses its JS feature, WASI uses host randomness. The adapter still takes host time.
+No aws-lc provider, FIPS or post-quantum guarantee is selected. Mozilla trust-anchor
+data uses CDLA-Permissive-2.0; its redistribution text ships in turnloop-tls.
+
+`turnloop-zstd-decoder` is an MIT fork of ruzstd 0.8.3. HTTP's versioned dependency
+works for crates.io consumers without `[patch]`. Native `pure-rust-zstd` tests and
+WASI tests exercise the same decoder. See `docs/upstream/ruzstd.md` for the exact
+maintainer submission and reproduction; source/license/corpus provenance ships
+with the decoder. `cargo publish --dry-run --locked --allow-dirty --workspace`
+stages unpublished siblings together and verifies every packaged library. Never
+use `--no-verify` to bypass this dependency chain. Do not remove their ignored test bodies
 or treat a failed initializer as a test pass.
 
-CI's PostgreSQL 16/MySQL 9 service containers are provisioned by
-`scripts/test-servers.py --ci-services`. That mode launches the same six-node
-Redis topology and five MongoDB instances using private named Linux containers,
-with the same configurations, auth, certificates and environment variables as the
-native runner. It runs verified SQL TLS probes, then the metadata-selected Rust
-suites. Container identities/ownership labels are checked during cleanup. This
-Docker path is **UNRUN locally** because the development sandbox has no Docker.
+CI's PostgreSQL **16.13**/MySQL **9.6.0** service containers are provisioned by
+`scripts/test-servers.py --ci-services`. Redis runs natively at **8.4.0**, matching
+the local fixture. `python3 scripts/ci/install-redis.py` builds the official tarball
+after verifying its committed SHA-256 against Redis's published release digest,
+with TLS enabled for both server and CLI. CI caches only `.tools/redis-build`,
+keyed by Ubuntu version, architecture and the complete installer hash; there are
+no fallback cache keys. Cache hits still verify the binary versions and CLI TLS
+support, and real Redis TLS tests remain required. Add `.tools/redis-build/bin`
+to PATH when using this build locally; CI exports it through `GITHUB_PATH`.
+
+The six-node Redis cluster (three masters and three replicas), single/TLS instance
+and Sentinel use the native runner's configurations, auth and certificates. The
+five MongoDB instances use private named Linux containers; CI pulls their image
+before the bounded startup wait. SQL TLS probes precede the metadata-selected Rust
+suites. Mongo containers run with the host UID/GID, and their ownership labels
+are checked during cleanup. The Docker
+path is **UNRUN locally** because the development sandbox has no Docker.
+
+Private server stdout and stderr are captured together under `.tools/`: Redis
+`redis/<instance>/server.log`, MongoDB `mongodb/<instance>/process.log` plus
+`mongod.log`, SQL `sql/*init*.log`, `postgres.log`, `mysqld-console.log` and
+`mysql.log`, SMTP `smtp/server.log`, and HTTP `http/server.log`. Startup failures
+print the relevant last 40 lines (at most 16 KiB per file), including errors before internal logging is
+initialized. `scripts/test-servers.py logs` prints bounded tails and copies only
+known log files to the flat `.tools/protocol-logs/` directory. CI uploads that
+directory as `protocol-server-logs`, without recursively scanning server data.
+On protocol job failure, CI also prints and preserves both SQL service container
+logs. The only fixture build cache is `.tools/redis-build`; it contains no data.
+Mongo cleanup stops/removes containers or stops native servers, reaps owned
+children and verifies closed ports before deleting recorded data directories.
+Private PostgreSQL/MySQL data is deleted after shutdown, including partial data
+from failed initialization. Logs and certificates are retained outside data roots.
+Cleanup reaps owned Redis children, removes state for crashed instances, and
+checks private config identity before a separate invocation sends SHUTDOWN.
+An unresponsive or unidentified instance retains its record. Cleanup failures
+are chained beneath the original startup/test error so both remain visible.
 
 ## Pending platform and measurement gates
 
-The `wasi`, `web`, Windows shared-contract portion of `test-native`, and
-`instructions` jobs intentionally remain required and failing until their missing
-inputs land. Their commands and the strict `ci-gate` fan-in are retained. No
-`continue-on-error`, empty-test success or expected skip is permitted for them.
+The `wasi` and `web` jobs run the production revision-2 providers and remain
+required. WASI 0.3 keeps its experimental feature; Linux must execute both pinned
+browsers. WASI runners enable the executor and independently require positive core,
+debug/release semantic and release allocation counts, supplying a real stdin
+fixture to the semantic tests. The instruction job compares against the committed Linux
+baseline. The strict `ci-gate` fan-in is retained. Windows `test-native`
+runs the workspace and independently requires positive counts for core and every
+protocol member, with default and all features. The existing sans-IO unit, wire,
+SCRAM, SDAM/selection fixture and allocation tests are portable. No unnecessary
+Unix test cfg exclusions were found.
+
+Production IOCP contracts are explicitly pending through the contract member's
+`windows-contracts-pending = "WINDOWS_HANDOFF.md"` metadata. The runner lists their
+scope and handoff in the Windows job summary. Remove this metadata when IOCP lands;
+the ordinary independent positive-count contract gate then applies on Windows too.
+This marker applies only to Windows contracts; core/protocol zero counts and Unix
+contract zero counts always fail.
 
 - **Wave 2 Windows:** adapt `spikes/iocp` to the production Backend, instantiate
   `turnloop-contract` on IOCP, run all contracts (including no-spin) on Windows.
@@ -191,8 +376,8 @@ inputs land. Their commands and the strict `ci-gate` fan-in are retained. No
   aborted fetch and WebSocket fixture traffic. See [docs/wasm.md](docs/wasm.md)
   for setup, explicit platform exclusions and outstanding p3 runtime limitations.
   These remain failing gates until the strict requirements pass.
-- **Linux instruction baseline:** run the candidate command below on Ubuntu
-  24.04 x86_64, review three rounds and exact controls, commit the measured baseline.
+- **Linux instruction regression:** run against the committed baseline on Ubuntu
+  24.04 x86_64. Use the candidate command below only for a reviewed rebaseline;
   macOS timings must never substitute for Linux instruction counts.
 
 ## Instruction regression gate
@@ -219,10 +404,38 @@ Ubuntu 24.04 x86_64, generate candidates with:
 python3 scripts/ci/instructions.py --record .tools/instruction-candidates.json
 ```
 
-Review all three fresh-process rounds, choose stable counts, identify controls,
-and commit the baseline in the bench crate. Candidate recording is **not** a gate
-pass and never overwrites a baseline. Standard CI runs
-`python3 scripts/ci/instructions.py`, never `--record`.
+Declare every expected summary key in `instruction-cases` and the exact control
+keys in `instruction-controls` in the bench package's CI metadata. Recording
+requires all declared cases in all three fresh-process rounds, positive counts,
+exact controls, and the same 3% ceiling. Candidate counts use the smallest measured
+count for each case; all three rounds must pass comparison against those counts.
+Candidate recording never overwrites the committed baseline.
+
+Standard CI runs `python3 scripts/ci/instructions.py`. If a baseline is missing,
+the job measures all benchmarks, uploads artifact **`instruction-baselines`**, and
+**fails** with commit instructions. The artifact contains ready-to-review baseline
+files at their repository-relative paths, `measurements.json` with all three rounds,
+and `README.txt` with the exact commands. It contains no invented Linux counts.
+
+To request a fresh baseline even when one exists, run the CI workflow manually
+with the boolean `record_baselines: true` (or `gh workflow run ci.yml -f record_baselines=true`).
+The instruction job then runs `instructions.py --record-baselines`, uploads the
+same artifact, and succeeds after valid measurement without claiming a regression
+comparison passed. All other required jobs still run normally.
+
+Review the rounds and control counts, then from the repository root:
+
+```bash
+gh run download <RUN_ID> --repo PerryTS/turnloop --name instruction-baselines --dir .tools/instruction-baselines
+mkdir -p crates/turnloop-bench/benchmarks
+cp .tools/instruction-baselines/crates/turnloop-bench/benchmarks/instructions.json crates/turnloop-bench/benchmarks/instructions.json
+git add crates/turnloop-bench/benchmarks/instructions.json
+git commit -m "Record Linux instruction baselines"
+```
+
+Push the reviewed baseline and rerun ordinary CI to execute the regression check.
+The first bootstrap cannot be verified by macOS execution; Linux runtime counts
+must come from the Ubuntu 24.04 x86_64 runner.
 
 The gate builds with one codegen unit, requires new v6 summaries and nonzero
 counts, rejects missing/extra benchmarks and fails above **3%** growth in any

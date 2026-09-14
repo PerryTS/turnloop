@@ -994,3 +994,192 @@ pub fn no_spin<B: Backend>() {
         "idle socket read remained pending throughout"
     );
 }
+
+pub mod native_surface;
+
+#[cfg(feature = "executor")]
+pub mod executor_contract;
+
+/// Revision-2 contracts for a single owning WASI/web agent.
+#[cfg(target_arch = "wasm32")]
+pub mod single_agent {
+    use std::{
+        sync::{Arc, atomic::AtomicU64},
+        time::Duration,
+    };
+    use turnloop::{
+        backend::{Backend, Operation, Request},
+        *,
+    };
+
+    pub fn unsupported_native<B: Backend>() {
+        let mut l = Driver::<B>::new(Config::default()).expect("loop");
+        let path = PipeName("unsupported.sock".into());
+        for _ in 0..16 {
+            assert_eq!(
+                l.pipe_connect(&path, Token(1)).expect_err("local IPC").kind,
+                ErrorKind::Unsupported
+            );
+            assert_eq!(
+                l.pipe_listen(&path, &ListenOpts::default())
+                    .expect_err("listener")
+                    .kind,
+                ErrorKind::Unsupported
+            );
+            let mut spec = ProcessSpec::new("unavailable");
+            spec.stdio = [ProcessStdio::Pipe; 3];
+            assert_eq!(
+                l.spawn(&spec, Token(2)).expect_err("process").kind,
+                ErrorKind::Unsupported
+            );
+            assert_eq!(
+                l.signal_start(Signal::Int, Token(3))
+                    .expect_err("signal")
+                    .kind,
+                ErrorKind::Unsupported
+            );
+            assert!(!l.alive(), "rejected setup leaked core credits");
+        }
+        let h = l
+            .timer(l.now() + Duration::from_secs(1), None, Token(4))
+            .expect("identity");
+        let op = l.timer_op(h).expect("operation identity");
+        assert_eq!(
+            l.kill(h, Signal::Kill).expect_err("kill").kind,
+            ErrorKind::Unsupported
+        );
+        assert_eq!(
+            l.kill_group(h, Signal::Kill).expect_err("group").kind,
+            ErrorKind::Unsupported
+        );
+        assert_eq!(
+            l.tty_set_mode(h, TtyMode::Raw).expect_err("TTY").kind,
+            ErrorKind::Unsupported
+        );
+        assert_eq!(
+            l.tty_window_size(h).expect_err("window size").kind,
+            ErrorKind::Unsupported
+        );
+        assert_eq!(
+            l.tty_resize_start(h, Token(5)).expect_err("resize").kind,
+            ErrorKind::Unsupported
+        );
+        let mut backend = B::new(&Config::default(), BufferPool::new(2, 64)).expect("backend");
+        for operation in [
+            Operation::ProcessExit,
+            Operation::WatchSignal,
+            Operation::SendHandle(h),
+            Operation::RecvHandle,
+        ] {
+            assert_eq!(
+                backend
+                    .submit(Request {
+                        op,
+                        handle: h,
+                        operation
+                    })
+                    .expect_err("native operation")
+                    .kind,
+                ErrorKind::Unsupported
+            );
+        }
+        assert!(!backend.has_work(), "unsupported requests retained no work");
+    }
+
+    pub fn waits<B: Backend>() {
+        let cfg = Config {
+            max_operations: 4,
+            ..Config::default()
+        };
+        let mut a = Driver::<B>::new(cfg).expect("first loop");
+        let mut b = Driver::<B>::new(cfg).expect("second loop");
+        let condition = WaitCondition::from_atomic(Arc::new(AtomicU64::new(7))).expect("condition");
+        let mut out = Completions::with_capacity(1);
+        let mut delivered = 0;
+        for round in 0..32 {
+            let mismatch = a
+                .external_wait(&condition, 8, None, Token(1))
+                .expect("mismatch");
+            a.turn(Timeout::Now, &mut out).expect("mismatch turn");
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].op, Some(mismatch));
+            assert!(matches!(
+                out[0].result,
+                OpResult::ExternalWait(WaitResult::NotEqual)
+            ));
+            let first = a
+                .external_wait(&condition, 7, None, Token(2))
+                .expect("wait A");
+            let second = b
+                .external_wait(&condition, 7, None, Token(3))
+                .expect("wait B");
+            assert!(!a.cancel(second), "foreign identity rejected");
+            assert!(a.alive() && b.alive());
+            condition.notify(); // Same-value notification must complete both registrations.
+            if round % 2 == 0 {
+                assert!(a.cancel(first));
+            }
+            for (driver, id, token) in [(&mut a, first, Token(2)), (&mut b, second, Token(3))] {
+                driver.turn(Timeout::Now, &mut out).expect("notify turn");
+                assert_eq!(out.len(), 1);
+                assert_eq!((out[0].op, out[0].token), (Some(id), token));
+                if token == Token(2) && round % 2 == 0 {
+                    assert!(matches!(out[0].result, OpResult::Cancelled));
+                } else {
+                    assert!(matches!(
+                        out[0].result,
+                        OpResult::ExternalWait(WaitResult::Notified)
+                    ));
+                }
+                assert!(!driver.cancel(id));
+                assert!(!driver.alive());
+            }
+            let stopped = a
+                .external_wait(&condition, 7, None, Token(4))
+                .expect("stop wait");
+            assert!(a.stop(stopped));
+            a.turn(Timeout::Now, &mut out).expect("stop turn");
+            assert_eq!(out.len(), 1);
+            assert!(matches!(out[0].result, OpResult::Stopped));
+            let expired = a
+                .external_wait(&condition, 7, Some(a.now()), Token(5))
+                .expect("deadline");
+            a.turn(Timeout::Now, &mut out).expect("expiry turn");
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].op, Some(expired));
+            assert!(matches!(
+                out[0].result,
+                OpResult::ExternalWait(WaitResult::TimedOut)
+            ));
+            assert_eq!(a.next_deadline(), None);
+            delivered += 5;
+        }
+        for _ in 0..4 {
+            a.external_wait(&condition, 7, None, Token(6))
+                .expect("drop wait");
+        }
+        assert_eq!(
+            a.external_wait(&condition, 7, None, Token(7))
+                .expect_err("bounded")
+                .kind,
+            ErrorKind::ResourceLimit
+        );
+        drop(a);
+        let live = b
+            .external_wait(&condition, 7, None, Token(8))
+            .expect("survivor");
+        condition.store(9);
+        b.turn(Timeout::Now, &mut out).expect("survivor turn");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].op, Some(live));
+        assert!(matches!(
+            out[0].result,
+            OpResult::ExternalWait(WaitResult::Notified)
+        ));
+        b.turn(Timeout::Now, &mut out).expect("no duplicate");
+        assert!(out.is_empty());
+        assert_eq!(condition.load(), 9);
+        assert_eq!(delivered, 160);
+        assert!(!b.alive());
+    }
+}

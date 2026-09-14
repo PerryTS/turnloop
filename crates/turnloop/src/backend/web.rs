@@ -50,12 +50,21 @@ extern "C" {
         capacity: u32,
         accept: &Function,
     ) -> std::result::Result<JsValue, JsValue>;
+    #[cfg(feature = "web-worker")]
+    #[wasm_bindgen(catch, js_name=attachCondition)]
+    fn attach_condition(
+        id: u32,
+        capacity: u32,
+        accept: &Function,
+    ) -> std::result::Result<JsValue, JsValue>;
 }
 fn error(_: JsValue) -> Error {
     Error::new(ErrorKind::Other)
 }
+/// Web resources cannot transfer through the native detached transport API.
 #[derive(Debug)]
 pub enum Detached {}
+/// Host scheduler endpoint for an owning web instance.
 pub struct WebWake {
     id: u32,
 }
@@ -75,6 +84,7 @@ struct Pending {
     request: Request,
     cancelled: bool,
 }
+/// Host callback driver for browser and Node agents.
 pub struct Web {
     id: u32,
     wake: Arc<WebWake>,
@@ -84,11 +94,14 @@ pub struct Web {
     failure: Option<Error>,
     #[cfg(feature = "web-worker")]
     worker: Option<Closure<dyn FnMut(u64, u64) -> bool>>,
+    #[cfg(feature = "web-worker")]
+    conditions: Vec<Closure<dyn FnMut(u64, u64) -> bool>>,
 }
 impl Web {
     pub(crate) fn configure(&mut self, schedule: &Function) -> Result<()> {
         configure(self.id, schedule).map_err(error)
     }
+    /// Number of coalesced host turn requests, for contract instrumentation.
     pub fn schedule_count(&self) -> u32 {
         schedules(self.id)
     }
@@ -110,6 +123,34 @@ impl Web {
         let descriptor =
             attach_worker(self.id, capacity, accept.as_ref().unchecked_ref()).map_err(error)?;
         self.worker = Some(accept);
+        Ok(descriptor)
+    }
+    #[cfg(feature = "web-worker")]
+    pub(crate) fn worker_condition(
+        &mut self,
+        condition: WaitCondition,
+        capacity: u32,
+    ) -> Result<JsValue> {
+        if !worker_supported() {
+            return Err(Error::new(ErrorKind::Unsupported));
+        }
+        if capacity == 0 || !capacity.is_power_of_two() || capacity > 1_048_576 {
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
+        if self.conditions.len() == self.ops.len() {
+            return Err(Error::new(ErrorKind::ResourceLimit));
+        }
+        let accept = Closure::wrap(Box::new(move |kind: u64, value: u64| {
+            if kind == 0 {
+                condition.notify();
+            } else {
+                condition.store(value);
+            }
+            true
+        }) as Box<dyn FnMut(u64, u64) -> bool>);
+        let descriptor =
+            attach_condition(self.id, capacity, accept.as_ref().unchecked_ref()).map_err(error)?;
+        self.conditions.push(accept);
         Ok(descriptor)
     }
     fn worker_has_work(&self) -> bool {
@@ -153,6 +194,8 @@ unsafe impl Backend for Web {
             failure: None,
             #[cfg(feature = "web-worker")]
             worker: None,
+            #[cfg(feature = "web-worker")]
+            conditions: Vec::new(),
         })
     }
     fn now(&self) -> Instant {
@@ -193,6 +236,15 @@ unsafe impl Backend for Web {
         Err(Error::new(ErrorKind::Unsupported))
     }
     fn submit(&mut self, request: Request) -> Result<()> {
+        if matches!(
+            request.operation,
+            Operation::ProcessExit
+                | Operation::WatchSignal
+                | Operation::SendHandle(_)
+                | Operation::RecvHandle
+        ) {
+            return Err(Error::new(ErrorKind::Unsupported));
+        }
         let r = self.resource(request.handle)?;
         if self.ops.get(request.op.index()).is_none_or(Option::is_some) {
             return Err(Error::new(ErrorKind::InvalidInput));

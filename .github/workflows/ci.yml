@@ -3,6 +3,12 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      record_baselines:
+        description: Record Linux instruction baselines for review
+        type: boolean
+        default: false
 permissions: {}
 concurrency:
   group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
@@ -27,10 +33,15 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.14'
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '26.5.1'
+          package-manager-cache: false
       - name: Install checksum-pinned linters
         run: python3 scripts/ci/install-tools.py actionlint zizmor shellcheck
       - name: Lint automation and exercise gate failures
         run: |
+          python3 scripts/ci/check-paths.py
           python3 scripts/ci/lint-workflows.py
           python3 -m unittest discover -s scripts/ci -p 'test_*.py' -v
   lint-native:
@@ -83,6 +94,8 @@ jobs:
           persist-credentials: false
       - name: Install pinned Rust
         run: rustup toolchain install nightly-2026-08-20 --profile minimal --component rustfmt,clippy
+      - name: Install checksum-pinned wasm C compiler and archiver
+        run: python3 scripts/ci/install-wasm-toolchain.py
       - name: Cross-target Clippy and stable
         run: |
           rustup target add --toolchain nightly-2026-08-20 "$TARGET"
@@ -106,10 +119,16 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.14'
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '26.5.1'
+          package-manager-cache: false
       - name: Install pinned Rust
         run: rustup toolchain install nightly-2026-08-20 --profile minimal --component rustfmt,clippy
       - name: Workspace and single-threaded contracts, default and all features
         run: python3 scripts/ci/run-tests.py native
+      - name: HTTP, TLS and WebSocket Node/curl interop
+        run: python3 scripts/test-servers.py --services http run python3 scripts/ci/run-tests.py interop
       - name: Portable timer benchmark with workload assertions
         run: cargo +nightly-2026-08-20 run --release -p turnloop-bench --locked -- --portable --timers
   self-hosted-windows:
@@ -126,6 +145,10 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.14'
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '26.5.1'
+          package-manager-cache: false
       - name: Install pinned Rust
         run: rustup toolchain install nightly-2026-08-20 --profile minimal --component rustfmt,clippy
       - name: Native Windows lint and contracts
@@ -159,6 +182,8 @@ jobs:
         run: |
           rustup toolchain install "$TOOLCHAIN" --profile minimal --component clippy --target "$TARGET"
           bash scripts/ci/install-wasmtime.sh
+      - name: Install checksum-pinned wasm C compiler and archiver
+        run: python3 scripts/ci/install-wasm-toolchain.py
       - name: Lint the complete WASI workspace
         run: |
           cargo +"$TOOLCHAIN" clippy --locked --workspace --all-targets --all-features --target "$TARGET" -- -D warnings -D clippy::undocumented_unsafe_blocks
@@ -193,6 +218,8 @@ jobs:
           python3 scripts/ci/install-tools.py wasm-pack
           python3 scripts/ci/install-web-tools.py
           python3 scripts/ci/install-browsers.py
+      - name: Install checksum-pinned wasm C compiler and archiver
+        run: python3 scripts/ci/install-wasm-toolchain.py
       - name: Chrome and Firefox contracts
         run: python3 scripts/ci/run-tests.py web
       - name: Node subset
@@ -205,7 +232,7 @@ jobs:
     timeout-minutes: 45
     services:
       postgres:
-        image: postgres:16
+        image: postgres:16.13
         env:
           POSTGRES_DB: turnloop
           POSTGRES_USER: turnloop
@@ -216,7 +243,7 @@ jobs:
           --health-cmd "pg_isready -h 127.0.0.1 -U turnloop -d turnloop"
           --health-interval 5s --health-timeout 5s --health-retries 30
       mysql:
-        image: mysql:9
+        image: mysql:9.6.0
         env:
           MYSQL_DATABASE: turnloop
           MYSQL_USER: turnloop
@@ -233,14 +260,27 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.14'
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '26.5.1'
+          package-manager-cache: false
       - name: Install pinned Rust
         run: rustup toolchain install nightly-2026-08-20 --profile minimal --component rustfmt,clippy
-      - name: Install SMTP sink for private fixture
+      - name: Install private fixture build dependencies and SMTP sink
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
           sudo apt-get update
-          sudo --preserve-env=DEBIAN_FRONTEND apt-get install --yes postfix
+          sudo --preserve-env=DEBIAN_FRONTEND apt-get install --yes postfix build-essential libssl-dev pkg-config
+      - name: Cache pinned Redis TLS build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .tools/redis-build
+          key: redis-tls-ubuntu-24.04-${{ runner.arch }}-${{ hashFiles('scripts/ci/install-redis.py') }}
+      - name: Install and verify Redis 8.4.0 with TLS
+        run: python3 scripts/ci/install-redis.py
+      - name: Pull MongoDB before the bounded fixture startup wait
+        run: docker pull mongo:8
       - name: Required real-server protocol suites with the shared fixture contract
         env:
           POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
@@ -249,6 +289,77 @@ jobs:
       - name: Fixture logs and cleanup
         if: always()
         run: scripts/test-servers.py --ci-services stop
+      - name: SQL service container logs on failure
+        if: failure()
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+          MYSQL_CONTAINER: ${{ job.services.mysql.id }}
+        run: |
+          mkdir -p .tools/protocol-logs
+          status=0
+          docker logs "$POSTGRES_CONTAINER" 2>&1 | tee .tools/protocol-logs/postgres-container.log || status=1
+          docker logs "$MYSQL_CONTAINER" 2>&1 | tee .tools/protocol-logs/mysql-container.log || status=1
+          exit "$status"
+      - name: Collect private server logs without traversing data directories
+        if: always()
+        run: scripts/test-servers.py logs
+      - name: Preserve private server diagnostics
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: protocol-server-logs
+          path: .tools/protocol-logs/
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
+
+  h2spec:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14'
+      - name: Install pinned Rust
+        run: rustup toolchain install nightly-2026-08-20 --profile minimal
+      - name: Build verified h2spec source and run every strict test
+        run: python3 scripts/ci/h2spec.py
+  protocol-wasi:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: wasm32-wasip2
+            toolchain: nightly-2026-08-20
+          - target: wasm32-wasip3
+            toolchain: nightly-2026-09-07
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 30
+    env:
+      TARGET: ${{ matrix.target }}
+      TOOLCHAIN: ${{ matrix.toolchain }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14'
+      - name: Install pinned Rust and Wasmtime
+        run: |
+          rustup toolchain install "$TOOLCHAIN" --profile minimal --target "$TARGET"
+          bash scripts/ci/install-wasmtime.sh
+      - name: Install checksum-pinned wasm C compiler and archiver
+        run: python3 scripts/ci/install-wasm-toolchain.py
+      - name: Execute TLS, HTTP codecs and all streaming allocation gates
+        run: python3 scripts/ci/run-tests.py protocol-wasi --target "$TARGET"
 
   dependencies:
     runs-on: ubuntu-24.04
@@ -310,7 +421,7 @@ jobs:
           cargo +nightly-2026-08-20 miri setup
       - name: Check core's explicitly marked pure-Rust tests
         run: python3 scripts/ci/run-tests.py miri
-  # PENDING: record/review Ubuntu 24.04 x86_64 iai candidates and commit a real baseline.
+  # Compare against the committed Ubuntu 24.04 x86_64 instruction baseline.
   instructions:
     runs-on: ubuntu-24.04
     permissions:
@@ -331,11 +442,27 @@ jobs:
           sudo apt-get install --yes valgrind
           python3 scripts/ci/install-tools.py gungraun-runner
       - name: Three fresh-process instruction counts against reviewed baselines
-        run: python3 scripts/ci/instructions.py
+        env:
+          RECORD_BASELINES: ${{ github.event_name == 'workflow_dispatch' && inputs.record_baselines }}
+        run: |
+          if [[ "$RECORD_BASELINES" == "true" ]]; then
+            python3 scripts/ci/instructions.py --record-baselines
+          else
+            python3 scripts/ci/instructions.py
+          fi
+      - name: Upload measured baseline candidates, including missing-baseline failures
+        if: ${{ !cancelled() && hashFiles('.tools/instruction-baselines/measurements.json') != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: instruction-baselines
+          path: .tools/instruction-baselines/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
   ci-gate:
     name: ci-gate
     if: always()
-    needs: [workflow-lint, lint-native, lint-wasm, test-native, self-hosted-windows, wasi, web, protocol, dependencies, loom, miri, instructions]
+    needs: [workflow-lint, lint-native, lint-wasm, test-native, self-hosted-windows, wasi, web, protocol, h2spec, protocol-wasi, dependencies, loom, miri, instructions]
     runs-on: ubuntu-24.04
     permissions:
       contents: read

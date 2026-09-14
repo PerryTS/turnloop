@@ -32,32 +32,52 @@ enum Kind {
     Tcp,
     Listener,
     Udp,
+    Stdio(Stdio),
 }
 #[derive(Debug)]
 enum Socket {
     Tcp(TcpSocket),
     Udp(UdpSocket),
+    Stdio,
 }
 #[derive(Debug)]
-struct ResultFuture(u32);
+struct ResultFuture(u32, bool);
+type CliResult = std::result::Result<(), wasip3::cli::types::ErrorCode>;
+impl ResultFuture {
+    unsafe fn read(&self, area: *mut u8) -> u32 {
+        // SAFETY: caller pins a correctly aligned result area until acknowledgement.
+        unsafe {
+            if self.1 {
+                (CliResult::VTABLE.start_read)(self.0, area)
+            } else {
+                (SocketResult::VTABLE.start_read)(self.0, area)
+            }
+        }
+    }
+}
 impl Drop for ResultFuture {
     fn drop(&mut self) {
         // SAFETY: owned future is dropped only after any raw read has been cancelled.
         unsafe {
-            (SocketResult::VTABLE.drop_readable)(self.0);
+            if self.1 {
+                (CliResult::VTABLE.drop_readable)(self.0);
+            } else {
+                (SocketResult::VTABLE.drop_readable)(self.0);
+            }
         }
     }
 }
 #[derive(Debug)]
 struct Streams {
-    reader: wasip3::wit_bindgen::rt::async_support::StreamReader<u8>,
+    reader: Option<wasip3::wit_bindgen::rt::async_support::StreamReader<u8>>,
     writer: Option<wasip3::wit_bindgen::rt::async_support::StreamWriter<u8>>,
-    read_done: ResultFuture,
-    write_done: ResultFuture,
+    read_done: Option<ResultFuture>,
+    write_done: Option<ResultFuture>,
     read_closed: bool,
     read_result: Option<Result<()>>,
     write_result: Option<Result<()>>,
 }
+/// Owning accepted transport, attached only on its original WASI agent.
 #[derive(Debug)]
 pub struct Detached {
     streams: Option<Streams>,
@@ -95,6 +115,7 @@ struct Pending {
     area: [u32; 32],
     lease: Option<BufLease>,
 }
+/// Same-agent notification endpoint; WASI has no OS threads.
 #[derive(Default)]
 pub struct WasiWake;
 impl Wake for WasiWake {
@@ -105,6 +126,7 @@ impl Wake for WasiWake {
         0
     }
 }
+/// Experimental WASI 0.3 driver with a persistent waitable set.
 pub struct WasiP3 {
     resources: Vec<Option<Resource>>,
     ops: Vec<Option<Pending>>,
@@ -177,10 +199,10 @@ fn streams(socket: &TcpSocket) -> Streams {
     let (writer, send) = wasip3::wit_stream::new::<u8>();
     let write_done = socket.send(send);
     Streams {
-        reader,
+        reader: Some(reader),
         writer: Some(writer),
-        read_done: ResultFuture(read_done.take_handle()),
-        write_done: ResultFuture(write_done.take_handle()),
+        read_done: Some(ResultFuture(read_done.take_handle(), false)),
+        write_done: Some(ResultFuture(write_done.take_handle(), false)),
         read_closed: false,
         read_result: None,
         write_result: None,
@@ -340,6 +362,51 @@ unsafe impl Backend for WasiP3 {
     }
     fn open(&mut self, h: Handle, spec: Open) -> Result<()> {
         let (addr, kind, reuse, backlog) = match spec {
+            Open::Pipe(_) | Open::PipeListener { .. } => {
+                return Err(Error::new(ErrorKind::Unsupported));
+            }
+            Open::Stdio(which) => {
+                let (reader, read_done, writer, write_done) = if which == Stdio::Stdin {
+                    let (reader, done) = wasip3::cli::stdin::read_via_stream();
+                    (
+                        Some(reader),
+                        Some(ResultFuture(done.take_handle(), true)),
+                        None,
+                        None,
+                    )
+                } else {
+                    let (writer, reader) = wasip3::wit_stream::new::<u8>();
+                    let done = if which == Stdio::Stdout {
+                        wasip3::cli::stdout::write_via_stream(reader)
+                    } else {
+                        wasip3::cli::stderr::write_via_stream(reader)
+                    };
+                    (
+                        None,
+                        None,
+                        Some(writer),
+                        Some(ResultFuture(done.take_handle(), true)),
+                    )
+                };
+                return self.install(
+                    h,
+                    Detached {
+                        streams: Some(Streams {
+                            reader,
+                            writer,
+                            read_done,
+                            write_done,
+                            read_closed: false,
+                            read_result: None,
+                            write_result: None,
+                        }),
+                        incoming: None,
+                        socket: Socket::Stdio,
+                        kind: Kind::Stdio(which),
+                    },
+                    None,
+                );
+            }
             Open::Tcp { addr, .. } => (addr, Kind::Tcp, false, 0),
             Open::Listener { addr, opts } => (addr, Kind::Listener, opts.reuse_port, opts.backlog),
             Open::Udp { addr, opts } => (addr, Kind::Udp, opts.reuse_port, 0),
@@ -384,18 +451,35 @@ unsafe impl Backend for WasiP3 {
         match &self.get(h)?.transport.socket {
             Socket::Tcp(s) => s.get_local_address(),
             Socket::Udp(s) => s.get_local_address(),
+            Socket::Stdio => return Err(Error::new(ErrorKind::Unsupported)),
         }
         .map(native)
         .map_err(error)
     }
     fn submit(&mut self, request: Request) -> Result<()> {
+        if matches!(
+            request.operation,
+            Operation::ProcessExit
+                | Operation::WatchSignal
+                | Operation::SendHandle(_)
+                | Operation::RecvHandle
+        ) {
+            return Err(Error::new(ErrorKind::Unsupported));
+        }
         let h = request.handle;
         let r = self.get(h)?;
         let valid = match &request.operation {
             Operation::Accept { .. } => r.transport.kind == Kind::Listener,
             Operation::RecvFrom(_) | Operation::SendTo { .. } => r.transport.kind == Kind::Udp,
             Operation::Connect => r.transport.kind == Kind::Tcp && r.connect.is_some(),
-            _ => r.transport.kind == Kind::Tcp,
+            Operation::Read { .. } => {
+                matches!(r.transport.kind, Kind::Tcp | Kind::Stdio(Stdio::Stdin))
+            }
+            Operation::Write(_) | Operation::Writev(_) | Operation::Shutdown => matches!(
+                r.transport.kind,
+                Kind::Tcp | Kind::Stdio(Stdio::Stdout | Stdio::Stderr)
+            ),
+            _ => false,
         };
         if !valid || self.ops.get(request.op.index()).is_none_or(Option::is_some) {
             return Err(Error::new(ErrorKind::InvalidInput));
@@ -594,6 +678,17 @@ fn start(p: &mut Pending, set: &WaitSet, kind: WaitKind, waitable: u32, code: u3
 fn result(p: &mut Pending) -> Result<()> {
     socket_result(&mut p.area[16..21])
 }
+fn stream_result(r: &Resource, p: &mut Pending) -> Result<()> {
+    if matches!(r.transport.kind, Kind::Stdio(_)) {
+        if p.area[16] & 255 == 0 {
+            Ok(())
+        } else {
+            Err(Error::new(ErrorKind::Other))
+        }
+    } else {
+        result(p)
+    }
+}
 fn socket_result(area: &mut [u32]) -> Result<()> {
     // Other(Some(string)) owns a canonical list. Consume it ourselves because
     // it may be a retained slot; generated lifting would free it as a String.
@@ -669,17 +764,20 @@ fn execute(
                 if code & 15 == 1 {
                     let s = r.transport.streams.as_mut().expect("connected");
                     s.read_closed = true;
-                    let f = s.read_done.0;
+                    let f = s.read_done.as_ref().expect("read result").0;
                     // SAFETY: this future is read once at EOF into the pinned result area.
                     let code = unsafe {
-                        (SocketResult::VTABLE.start_read)(f, p.area.as_mut_ptr().add(16).cast())
+                        s.read_done
+                            .as_ref()
+                            .expect("read result")
+                            .read(p.area.as_mut_ptr().add(16).cast())
                     };
                     start(p, set, WaitKind::ReadDone, f, code);
                     return Ok(None);
                 }
             }
             WaitKind::ReadDone => {
-                let result = result(p);
+                let result = stream_result(r, p);
                 r.transport.streams.as_mut().expect("connected").read_result = Some(result);
                 result?;
                 return Ok(Some((Outcome::Eof, true)));
@@ -691,7 +789,7 @@ fn execute(
                 p.offset += (code >> 4) as usize;
             }
             WaitKind::WriteDone => {
-                let result = result(p);
+                let result = stream_result(r, p);
                 r.transport
                     .streams
                     .as_mut()
@@ -735,6 +833,10 @@ fn execute(
     }
     let t = &mut r.transport;
     match &p.request.operation {
+        Operation::ProcessExit
+        | Operation::WatchSignal
+        | Operation::SendHandle(_)
+        | Operation::RecvHandle => return Err(Error::new(ErrorKind::Unsupported)),
         Operation::Connect => {
             let Socket::Tcp(s) = &t.socket else {
                 unreachable!()
@@ -773,11 +875,14 @@ fn execute(
                 return Ok(Some((Outcome::Eof, true)));
             }
             if s.read_closed {
-                let f = s.read_done.0;
+                let f = s.read_done.as_ref().expect("read result").0;
                 // SAFETY: an earlier cancelled future read did not consume its result;
                 // the new request owns its fixed return area until acknowledgement.
                 let code = unsafe {
-                    (SocketResult::VTABLE.start_read)(f, p.area.as_mut_ptr().add(16).cast())
+                    s.read_done
+                        .as_ref()
+                        .expect("read result")
+                        .read(p.area.as_mut_ptr().add(16).cast())
                 };
                 start(p, set, WaitKind::ReadDone, f, code);
                 return Ok(None);
@@ -787,6 +892,8 @@ fn execute(
                 .as_ref()
                 .ok_or(Error::new(ErrorKind::InvalidInput))?
                 .reader
+                .as_ref()
+                .expect("readable")
                 .handle();
             let Some(output) = read_buffer(p, pool) else {
                 return Ok(None);
@@ -832,11 +939,14 @@ fn execute(
                 return Ok(Some((Outcome::Shutdown, true)));
             }
             s.writer.take();
-            let future = s.write_done.0;
+            let future = s.write_done.as_ref().expect("write result").0;
             // SAFETY: close send stream once, then wait for its actual send-result
             // acknowledgement before returning Shutdown. Area stays pinned.
             let code = unsafe {
-                (SocketResult::VTABLE.start_read)(future, p.area.as_mut_ptr().add(16).cast())
+                s.write_done
+                    .as_ref()
+                    .expect("write result")
+                    .read(p.area.as_mut_ptr().add(16).cast())
             };
             start(p, set, WaitKind::WriteDone, future, code);
         }
@@ -937,7 +1047,11 @@ fn quiesce(p: &mut Pending, set: &WaitSet, r: &mut Resource) {
                 WaitKind::Read => (u8::VTABLE.cancel_read)(waitable),
                 WaitKind::Write => (u8::VTABLE.cancel_write)(waitable),
                 WaitKind::ReadDone | WaitKind::WriteDone => {
-                    (SocketResult::VTABLE.cancel_read)(waitable)
+                    if matches!(r.transport.kind, Kind::Stdio(_)) {
+                        (CliResult::VTABLE.cancel_read)(waitable)
+                    } else {
+                        (SocketResult::VTABLE.cancel_read)(waitable)
+                    }
                 }
             }
         }
@@ -954,7 +1068,7 @@ fn quiesce(p: &mut Pending, set: &WaitSet, r: &mut Resource) {
             r.transport.streams.as_mut().expect("connected").read_closed = true;
         }
         WaitKind::ReadDone | WaitKind::WriteDone if code & 15 == 0 => {
-            let result = result(p);
+            let result = stream_result(r, p);
             let s = r.transport.streams.as_mut().expect("connected");
             if matches!(kind, WaitKind::ReadDone) {
                 s.read_result = Some(result);

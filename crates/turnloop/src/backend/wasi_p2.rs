@@ -34,14 +34,15 @@ enum Kind {
     Tcp,
     Listener,
     Udp,
+    Stdio(Stdio),
 }
 // Declaration order matters: pollables must be dropped before their parents.
 #[derive(Debug)]
 struct Streams {
-    read_poll: Pollable,
-    write_poll: Pollable,
-    input: InputStream,
-    output: OutputStream,
+    read_poll: Option<Pollable>,
+    write_poll: Option<Pollable>,
+    input: Option<InputStream>,
+    output: Option<OutputStream>,
 }
 #[derive(Debug)]
 struct Datagrams {
@@ -54,6 +55,7 @@ struct Datagrams {
 enum Socket {
     Tcp(TcpSocket),
     Udp(UdpSocket),
+    Stdio,
 }
 /// An accepted transport, owned by core until attached. Explicit WASI transfer
 /// between loops is unsupported; no WASI resource is sent to an OS thread.
@@ -61,7 +63,7 @@ enum Socket {
 pub struct Detached {
     streams: Option<Streams>,
     datagrams: Option<Datagrams>,
-    poll: Pollable,
+    poll: Option<Pollable>,
     socket: Socket,
     kind: Kind,
 }
@@ -81,6 +83,7 @@ struct Pending {
     offset: usize,
     flushing: bool,
 }
+/// Same-agent notification endpoint; WASI has no OS threads.
 #[derive(Default)]
 pub struct WasiWake;
 impl Wake for WasiWake {
@@ -91,6 +94,7 @@ impl Wake for WasiWake {
         0
     }
 }
+/// WASI 0.2 pollable driver with retained canonical buffers.
 pub struct WasiP2 {
     resources: Vec<Option<Resource>>,
     ops: Vec<Option<Pending>>,
@@ -168,10 +172,10 @@ fn stream_error(e: StreamError) -> Error {
 }
 fn streams(input: InputStream, output: OutputStream) -> Streams {
     Streams {
-        read_poll: input.subscribe(),
-        write_poll: output.subscribe(),
-        input,
-        output,
+        read_poll: Some(input.subscribe()),
+        write_poll: Some(output.subscribe()),
+        input: Some(input),
+        output: Some(output),
     }
 }
 impl WasiP2 {
@@ -330,6 +334,33 @@ unsafe impl Backend for WasiP2 {
     }
     fn open(&mut self, h: Handle, spec: Open) -> Result<()> {
         let (addr, kind, reuse, backlog) = match spec {
+            Open::Pipe(_) | Open::PipeListener { .. } => {
+                return Err(Error::new(ErrorKind::Unsupported));
+            }
+            Open::Stdio(which) => {
+                let input = (which == Stdio::Stdin).then(wasip2::cli::stdin::get_stdin);
+                let output = match which {
+                    Stdio::Stdin => None,
+                    Stdio::Stdout => Some(wasip2::cli::stdout::get_stdout()),
+                    Stdio::Stderr => Some(wasip2::cli::stderr::get_stderr()),
+                };
+                return self.install(
+                    h,
+                    Detached {
+                        streams: Some(Streams {
+                            read_poll: input.as_ref().map(InputStream::subscribe),
+                            write_poll: output.as_ref().map(OutputStream::subscribe),
+                            input,
+                            output,
+                        }),
+                        datagrams: None,
+                        poll: None,
+                        socket: Socket::Stdio,
+                        kind: Kind::Stdio(which),
+                    },
+                    None,
+                );
+            }
             Open::Tcp { addr, .. } => (addr, Kind::Tcp, false, 0),
             Open::Listener { addr, opts } => (addr, Kind::Listener, opts.reuse_port, opts.backlog),
             Open::Udp { addr, opts } => (addr, Kind::Udp, opts.reuse_port, 0),
@@ -358,7 +389,7 @@ unsafe impl Backend for WasiP2 {
                 output,
             };
             Detached {
-                poll: socket.subscribe(),
+                poll: Some(socket.subscribe()),
                 streams: None,
                 datagrams: Some(datagrams),
                 socket: Socket::Udp(socket),
@@ -378,7 +409,7 @@ unsafe impl Backend for WasiP2 {
                 socket.finish_listen().map_err(error)?;
             }
             Detached {
-                poll: socket.subscribe(),
+                poll: Some(socket.subscribe()),
                 streams: None,
                 datagrams: None,
                 socket: Socket::Tcp(socket),
@@ -393,17 +424,34 @@ unsafe impl Backend for WasiP2 {
         let a = match &self.get(h)?.transport.socket {
             Socket::Tcp(s) => s.local_address(),
             Socket::Udp(s) => s.local_address(),
+            Socket::Stdio => return Err(Error::new(ErrorKind::Unsupported)),
         };
         a.map(native).map_err(error)
     }
     fn submit(&mut self, request: Request) -> Result<()> {
+        if matches!(
+            request.operation,
+            Operation::ProcessExit
+                | Operation::WatchSignal
+                | Operation::SendHandle(_)
+                | Operation::RecvHandle
+        ) {
+            return Err(Error::new(ErrorKind::Unsupported));
+        }
         let h = request.handle;
         let r = self.get(h)?;
         let valid = match &request.operation {
             Operation::Accept { .. } => r.transport.kind == Kind::Listener,
             Operation::RecvFrom(_) | Operation::SendTo { .. } => r.transport.kind == Kind::Udp,
             Operation::Connect => r.transport.kind == Kind::Tcp && r.connect.is_some(),
-            _ => r.transport.kind == Kind::Tcp,
+            Operation::Read { .. } => {
+                matches!(r.transport.kind, Kind::Tcp | Kind::Stdio(Stdio::Stdin))
+            }
+            Operation::Write(_) | Operation::Writev(_) | Operation::Shutdown => matches!(
+                r.transport.kind,
+                Kind::Tcp | Kind::Stdio(Stdio::Stdout | Stdio::Stderr)
+            ),
+            _ => false,
         };
         if !valid || self.ops.get(request.op.index()).is_none_or(Option::is_some) {
             return Err(Error::new(ErrorKind::InvalidInput));
@@ -478,11 +526,15 @@ unsafe impl Backend for WasiP2 {
                 }
                 let t = &r.transport;
                 let poll = if let Some(s) = &t.streams {
-                    if d == 0 { &s.read_poll } else { &s.write_poll }
+                    if d == 0 {
+                        s.read_poll.as_ref().expect("readable")
+                    } else {
+                        s.write_poll.as_ref().expect("writable")
+                    }
                 } else if let Some(s) = &t.datagrams {
                     if d == 0 { &s.read_poll } else { &s.write_poll }
                 } else {
-                    &t.poll
+                    t.poll.as_ref().expect("socket pollable")
                 };
                 self.handles.push(poll.handle());
                 self.owners.push((r.handle, d));
@@ -537,6 +589,10 @@ fn execute(
 ) -> Result<Option<(Outcome<Detached>, bool)>> {
     let t = &mut r.transport;
     match &mut p.request.operation {
+        Operation::ProcessExit
+        | Operation::WatchSignal
+        | Operation::SendHandle(_)
+        | Operation::RecvHandle => Err(Error::new(ErrorKind::Unsupported)),
         Operation::Connect => {
             let Socket::Tcp(socket) = &t.socket else {
                 unreachable!()
@@ -564,7 +620,7 @@ fn execute(
             let transport = Detached {
                 streams: Some(streams(input, output)),
                 datagrams: None,
-                poll: socket.subscribe(),
+                poll: Some(socket.subscribe()),
                 socket: Socket::Tcp(socket),
                 kind: Kind::Tcp,
             };
@@ -578,7 +634,8 @@ fn execute(
                 .streams
                 .as_ref()
                 .ok_or(Error::new(ErrorKind::InvalidInput))?;
-            let permitted = s.output.check_write().map_err(stream_error)? as usize;
+            let output = s.output.as_ref().ok_or(Error::new(ErrorKind::BrokenPipe))?;
+            let permitted = output.check_write().map_err(stream_error)? as usize;
             if permitted == 0 {
                 return Err(Error::new(ErrorKind::WouldBlock));
             }
@@ -593,15 +650,13 @@ fn execute(
                     continue;
                 }
                 let n = (bytes.len() - skip).min(permitted);
-                s.output
-                    .write(&bytes[skip..skip + n])
-                    .map_err(stream_error)?;
+                output.write(&bytes[skip..skip + n]).map_err(stream_error)?;
                 p.offset += n;
                 break;
             }
             let total: usize = bufs.bufs.iter().flatten().map(|b| b.as_slice().len()).sum();
             if p.offset == total {
-                s.output.flush().map_err(stream_error)?;
+                output.flush().map_err(stream_error)?;
                 p.flushing = true;
             }
             Ok(None)
@@ -618,6 +673,12 @@ fn execute(
             Ok(Some((Outcome::Wrote(n), true)))
         }
         Operation::Shutdown => {
+            if matches!(t.kind, Kind::Stdio(_)) {
+                let s = t.streams.as_mut().expect("stdio streams");
+                s.write_poll.take();
+                s.output.take();
+                return Ok(Some((Outcome::Shutdown, true)));
+            }
             let Socket::Tcp(socket) = &t.socket else {
                 unreachable!()
             };
@@ -638,7 +699,8 @@ fn write(
         .streams
         .as_ref()
         .ok_or(Error::new(ErrorKind::InvalidInput))?;
-    let permitted = s.output.check_write().map_err(stream_error)? as usize;
+    let output = s.output.as_ref().ok_or(Error::new(ErrorKind::BrokenPipe))?;
+    let permitted = output.check_write().map_err(stream_error)? as usize;
     if permitted == 0 {
         return Err(Error::new(ErrorKind::WouldBlock));
     }
@@ -647,13 +709,13 @@ fn write(
     }
     let n = (bytes.len() - *offset).min(permitted);
     if n > 0 {
-        s.output
+        output
             .write(&bytes[*offset..*offset + n])
             .map_err(stream_error)?;
         *offset += n;
     }
     if *offset == bytes.len() {
-        s.output.flush().map_err(stream_error)?;
+        output.flush().map_err(stream_error)?;
         *flushing = true;
     }
     Ok(None)
@@ -692,7 +754,11 @@ fn receive(
             .as_ref()
             .ok_or(Error::new(ErrorKind::InvalidInput))?;
         let limit = output.len().min(scratch.len() * 4);
-        match abi::read(&s.input, &mut output[..limit], scratch) {
+        match abi::read(
+            s.input.as_ref().expect("readable"),
+            &mut output[..limit],
+            scratch,
+        ) {
             Ok(0) => return Err(Error::new(ErrorKind::WouldBlock)),
             Ok(n) => (n, None),
             Err(StreamError::Closed) => return Ok(Some((Outcome::Eof, true))),

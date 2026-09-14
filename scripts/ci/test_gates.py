@@ -80,12 +80,48 @@ class Gates(unittest.TestCase):
     def test_fan_in_declares_every_job(self):
         import re
         source = (ROOT / '.github/workflows/ci.yml').read_text()
-        jobs = set(re.findall(r'^  ([a-z][a-z-]+):$', source.split('jobs:\n')[1], re.MULTILINE))
+        jobs = set(re.findall(r'^  ([a-z][a-z0-9-]+):$', source.split('jobs:\n')[1], re.MULTILINE))
         declared = re.search(r'^    needs: \[(.+)\]$', source, re.MULTILINE)[1]
         self.assertEqual(set(declared.split(', ')), jobs - {'ci-gate'})
         for workflow in (ROOT / '.github/workflows').glob('*.yml'):
             for action in re.findall(r'uses: ([^\n]+)', workflow.read_text()):
                 self.assertRegex(action, r'^[^@]+@[0-9a-f]{40} # v')
+
+    def test_h2spec_rejects_partial_skipped_duplicate_and_failed_reports(self):
+        h2 = module('h2spec')
+        import xml.etree.ElementTree as ET
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'report.xml'
+            report = ET.Element('testsuites')
+            suite = ET.SubElement(report, 'testsuite', tests='147', failures='0', errors='0', skipped='0')
+            for index in range(147):
+                ET.SubElement(suite, 'testcase', package='http2', classname=str(index))
+            def check():
+                ET.ElementTree(report).write(path)
+                h2.check_report(path)
+            check()
+            for tag in ('failure', 'error', 'skipped'):
+                bad = ET.SubElement(suite[0], tag)
+                with self.subTest(tag=tag), self.assertRaises(RuntimeError):
+                    check()
+                suite[0].remove(bad)
+            suite[-1].set('classname', '0')
+            with self.assertRaises(RuntimeError):
+                check()
+            suite.remove(suite[-1])
+            with self.assertRaises(RuntimeError):
+                check()
+            report.remove(suite)
+            with self.assertRaises(RuntimeError):
+                check()
+
+    def test_h2spec_checksum_precedes_extraction(self):
+        h2 = module('h2spec')
+        with tempfile.TemporaryDirectory() as folder:
+            directory = Path(folder)
+            with self.assertRaisesRegex(RuntimeError, 'checksum mismatch'):
+                h2.extract_source(b'not trusted', {'sha256': '0' * 64}, directory)
+            self.assertEqual(list(directory.iterdir()), [])
 
     def test_exact_ci_sha_event_and_workflow(self):
         gate = module('check-ci')
@@ -195,6 +231,47 @@ class Gates(unittest.TestCase):
             path.write_text(source.replace("'single' || 'max'", "'single' || 'single'"))
             with self.assertRaises(RuntimeError):
                 lint.check_queue(path)
+
+    def test_checked_tests_delivers_stdin_and_requires_execution(self):
+        import sys
+        runner = module('run-tests')
+        command = [sys.executable, '-c',
+                   'import sys; assert sys.stdin.read() == "fixture\\n"; print("test result: ok. 1 passed;")']
+        self.assertEqual(runner.checked_tests(command, cwd=ROOT, input_text='fixture\n'), 1)
+        with self.assertRaisesRegex(RuntimeError, 'positive passed-test count'):
+            runner.checked_tests([sys.executable, '-c', 'import sys; sys.stdin.read(); print("test result: ok. 0 passed;")'],
+                                 cwd=ROOT, input_text='fixture\n')
+
+    def test_wasi_runner_preserves_protocol_and_release_allocation_gates(self):
+        import sys
+        runner = module('run-tests')
+        packages = [package(name) for name in ('core', 'contract', 'http', 'decoder')]
+        for p, kind in zip(packages, ('core', 'contract', 'protocol', 'codec')):
+            p['manifest_path'] = str(ROOT / 'crates' / p['name'] / 'Cargo.toml')
+            p['metadata'] = {'turnloop-ci': {'role': kind, 'wasi-tests': ['subject']}}
+            p['targets'] = [{'name': name, 'kind': ['test']} for name in ('subject', 'allocations')]
+        packages[0]['metadata']['turnloop-ci'] = {'role': 'core', 'wasi-lib-tests': True}
+        packages[1]['metadata']['turnloop-ci']['wasi-allocation-tests'] = ['allocations']
+        data = dict(packages=packages, workspace_members=[p['id'] for p in packages], workspace_root=str(ROOT))
+        for suite in ('wasi', 'protocol-wasi'):
+            commands = []
+            original = runner.checked_tests
+            def execute(command, **kwargs):
+                commands.append((command, kwargs))
+                return original([sys.executable, '-c', 'import sys; sys.stdin.read(); print("test result: ok. 1 passed;")'], **kwargs)
+            with patch.object(sys, 'argv', ['run-tests.py', suite, '--target', 'wasm32-wasip3']), \
+                 patch.object(runner, 'metadata', return_value=data), \
+                 patch.object(runner, 'checked_tests', side_effect=execute):
+                runner.main()
+            names = [c[c.index('-p') + 1] for c, _ in commands]
+            if suite == 'protocol-wasi':
+                self.assertEqual(names, ['http', 'decoder'])
+            else:
+                self.assertEqual(names, ['core', 'contract', 'contract', 'contract'])
+                self.assertTrue(all('--all-features' in c for c, _ in commands))
+                self.assertEqual(['--release' in c for c, _ in commands], [True, False, True, True])
+                self.assertIn('allocations', commands[-1][0])
+                self.assertTrue(all(k['input_text'] == 'turnloop revision two stdin fixture\n' for _, k in commands[1:]))
 
 
 if __name__ == '__main__':
