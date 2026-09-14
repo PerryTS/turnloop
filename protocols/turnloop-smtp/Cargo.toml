@@ -1,0 +1,13 @@
+[package]
+name = "turnloop-smtp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+base64.workspace = true
+lettre.workspace = true
+
+[dev-dependencies]
+rustls.workspace = true

@@ -1,0 +1,9 @@
+[package]
+name = "turnloop-redis"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dev-dependencies]
+rustls.workspace = true
