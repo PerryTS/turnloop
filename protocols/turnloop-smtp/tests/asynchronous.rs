@@ -1,4 +1,6 @@
 #![cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#[path = "../../../crates/turnloop-io/tests/support/count.rs"]
+mod count;
 use std::{
     future::Future,
     pin::Pin,
@@ -175,4 +177,37 @@ fn starttls_auth_pipeline_and_recipient_results() {
         drive(&mut ex, &mut client);
         drive(&mut ex, &mut server);
     }
+}
+#[test]
+fn warmed_async_send_allocates_only_owned_result() {
+    let mut ex = LocalExecutor::<Platform>::new(LoopConfig::default()).expect("executor");
+    let h = ex.handle();
+    let listener = Listener::bind(&h, "127.0.0.1:0".parse().expect("address")).expect("listen");
+    let address = listener.local_addr().expect("address");
+    let mut server = ex
+        .spawn_local(async move {
+            let mut s = listener.accept().await.expect("accept");
+            write_all(&mut s, b"220 test\r\n").await.expect("hello");
+            assert!(line(&mut s).await.starts_with(b"EHLO"));
+            write_all(&mut s, b"250-test\r\n250 PIPELINING\r\n")
+                .await
+                .expect("hello");
+            for _ in 0..101 {
+                assert!(line(&mut s).await.starts_with(b"MAIL FROM:"));
+                assert_eq!(line(&mut s).await, b"RCPT TO:<ok@example.test>\r\n");
+                write_all(&mut s, b"250 sender\r\n250 recipient\r\n")
+                    .await
+                    .expect("envelope");
+                assert_eq!(line(&mut s).await, b"DATA\r\n");
+                write_all(&mut s, b"354 go\r\n").await.expect("DATA");
+                assert_eq!(line(&mut s).await, b"payload\r\n");
+                assert_eq!(line(&mut s).await, b".\r\n");
+                write_all(&mut s, b"250 queued\r\n").await.expect("sent");
+            }
+            101
+        })
+        .expect("server");
+    let mut client=ex.spawn_local(async move {count::prove_counter().await;let at=h.now()+Duration::from_secs(30);let mut c=Transport::connect(&h,&ConnectOptions{address,protocol:turnloop_smtp::Config{tls:Tls::None,..Default::default()},tls:None},at).await.expect("connect");for i in 0..101 {let envelope=Envelope{from:"a@example.test".into(),to:vec!["ok@example.test".into()]};let id="id@example.test".into();let (result,n)=count::measure(c.send(envelope,id,b"payload\r\n",at)).await;let info=result.expect("send");assert_eq!(info.accepted,["ok@example.test"]);assert_eq!(info.response_code,250);if i>0 {assert_eq!(n,3,"only owned accepted vector, recipient and response; zero adapter allocations");}}}).expect("client");
+    drive(&mut ex, &mut client);
+    assert_eq!(drive(&mut ex, &mut server), 101);
 }

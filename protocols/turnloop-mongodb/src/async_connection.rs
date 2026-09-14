@@ -37,6 +37,11 @@ impl<B: Backend> Connection<B> {
         tls: Option<&ClientTls>,
         at: Instant,
     ) -> io::Result<Self> {
+        let at = if options.connect_timeout.is_zero() {
+            at
+        } else {
+            at.min(executor.now() + options.connect_timeout)
+        };
         let stream = deadline(executor, at, async {
             executor
                 .connect(address, Default::default())
@@ -111,6 +116,12 @@ impl<B: Backend> Connection<B> {
             .core_mut()
             .command(1, body, sequences, time(self.executor.now()))
             .map_err(io::Error::other)?;
+        let at = self
+            .driver
+            .core()
+            .next_timeout()
+            .map(instant)
+            .map_or(at, |d| at.min(d));
         let mut exchange = self.driver.exchange();
         deadline(&self.executor, at, async {
             loop {
@@ -154,6 +165,11 @@ impl<B: Backend> Connection<B> {
         operation
             .send(exchange.core_mut(), time(self.executor.now()))
             .map_err(io::Error::other)?;
+        let at = exchange
+            .core()
+            .next_timeout()
+            .map(instant)
+            .map_or(at, |d| at.min(d));
         let result = deadline(&self.executor, at, async {
             loop {
                 let mut event = None;

@@ -178,6 +178,66 @@ pub struct Topology {
     seed_count: usize,
     events: VecDeque<TopologyEvent>,
 }
+/// Retained candidate names for async callers which cannot keep references to a
+/// mutating topology between polls. Capacities survive selection and filtering.
+#[derive(Default)]
+pub struct SelectionBuffer {
+    names: Vec<String>,
+    len: usize,
+}
+trait CandidateList<'a> {
+    fn clear(&mut self);
+    fn push(&mut self, name: &'a str);
+    fn names(&self) -> impl Iterator<Item = &str>;
+    fn retain(&mut self, keep: impl FnMut(&str) -> bool);
+    fn is_empty(&self) -> bool;
+}
+impl<'a> CandidateList<'a> for Vec<&'a str> {
+    fn clear(&mut self) {
+        Vec::clear(self);
+    }
+    fn push(&mut self, name: &'a str) {
+        Vec::push(self, name);
+    }
+    fn names(&self) -> impl Iterator<Item = &str> {
+        self.iter().copied()
+    }
+    fn retain(&mut self, mut keep: impl FnMut(&str) -> bool) {
+        Vec::retain(self, |s| keep(s));
+    }
+    fn is_empty(&self) -> bool {
+        Vec::is_empty(self)
+    }
+}
+impl<'a> CandidateList<'a> for SelectionBuffer {
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+    fn push(&mut self, name: &'a str) {
+        if self.len == self.names.len() {
+            self.names.push(String::with_capacity(name.len()));
+        }
+        self.names[self.len].clear();
+        self.names[self.len].push_str(name);
+        self.len += 1;
+    }
+    fn names(&self) -> impl Iterator<Item = &str> {
+        self.names[..self.len].iter().map(String::as_str)
+    }
+    fn retain(&mut self, mut keep: impl FnMut(&str) -> bool) {
+        let mut to = 0;
+        for from in 0..self.len {
+            if keep(&self.names[from]) {
+                self.names.swap(to, from);
+                to += 1;
+            }
+        }
+        self.len = to;
+    }
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
 impl Topology {
     pub fn new(options: &Options, now: Instant) -> Self {
         let kind = if options.direct {
@@ -498,6 +558,38 @@ impl Topology {
         }
         Ok(())
     }
+    /// Select with retained owned scratch space, using the same filtering policy
+    /// as candidates_deprioritized. No allocations after topology warm-up.
+    pub fn select_reusing<'a>(
+        &'a self,
+        pref: ReadPreference,
+        tags: &[BTreeMap<String, String>],
+        max_staleness: Option<Duration>,
+        excluded: &[&str],
+        entropy: [u64; 2],
+        scratch: &mut SelectionBuffer,
+    ) -> Result<Option<&'a str>> {
+        self.candidates_inner(pref, tags, max_staleness, excluded, scratch)?;
+        if scratch.is_empty() && !excluded.is_empty() {
+            self.candidates_inner(pref, tags, max_staleness, &[], scratch)?;
+        }
+        if scratch.len == 0 {
+            return Ok(None);
+        }
+        let a = ((u128::from(entropy[0]) * scratch.len as u128) >> 64) as usize;
+        let mut b = if scratch.len == 1 {
+            a
+        } else {
+            ((u128::from(entropy[1]) * (scratch.len - 1) as u128) >> 64) as usize
+        };
+        if scratch.len > 1 && b >= a {
+            b += 1;
+        }
+        let two = [scratch.names[a].as_str(), scratch.names[b].as_str()];
+        Ok(self
+            .choose(&two, [0, 0])
+            .and_then(|s| self.servers.get_key_value(s).map(|(a, _)| a.as_str())))
+    }
     /// Power-of-two choice; supply independent uniformly distributed host entropy.
     pub fn choose<'a>(&self, candidates: &[&'a str], entropy: [u64; 2]) -> Option<&'a str> {
         if candidates.is_empty() {
@@ -543,7 +635,7 @@ impl Topology {
         tags: &[BTreeMap<String, String>],
         max_staleness: Option<Duration>,
         excluded: &[&str],
-        out: &mut Vec<&'a str>,
+        out: &mut impl CandidateList<'a>,
     ) -> Result<()> {
         out.clear();
         if !self.compatible() {
@@ -641,33 +733,30 @@ impl Topology {
             && !tags.is_empty()
         {
             let matching = tags.iter().find(|t| {
-                out.iter().any(|a| {
+                out.names().any(|a| {
                     t.iter()
-                        .all(|(k, v)| self.servers[*a].tags.get(k) == Some(v))
+                        .all(|(k, v)| self.servers[a].tags.get(k) == Some(v))
                 })
             });
             if let Some(t) = matching {
                 out.retain(|a| {
                     t.iter()
-                        .all(|(k, v)| self.servers[*a].tags.get(k) == Some(v))
+                        .all(|(k, v)| self.servers[a].tags.get(k) == Some(v))
                 });
             } else {
                 out.clear();
             }
         }
         if out.is_empty() && pref == ReadPreference::SecondaryPreferred {
-            out.extend(
-                self.servers
-                    .iter()
-                    .filter(|(a, s)| {
-                        !excluded.contains(&a.as_str()) && s.kind == ServerType::RSPrimary
-                    })
-                    .map(|(a, _)| a.as_str()),
-            );
+            for (a, s) in &self.servers {
+                if !excluded.contains(&a.as_str()) && s.kind == ServerType::RSPrimary {
+                    out.push(a);
+                }
+            }
         }
-        if let Some(min) = out.iter().filter_map(|a| self.servers[*a].rtt).min() {
+        if let Some(min) = out.names().filter_map(|a| self.servers[a].rtt).min() {
             out.retain(|a| {
-                self.servers[*a]
+                self.servers[a]
                     .rtt
                     .is_some_and(|r| r <= min + self.local_threshold)
             });

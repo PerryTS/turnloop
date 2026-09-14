@@ -34,6 +34,9 @@ impl<B: Backend> ClusterClient<B> {
         this.refresh(at).await?;
         Ok(this)
     }
+    pub fn reconnect_count(&self) -> u64 {
+        self.nodes.iter().map(|(_, c)| c.reconnect_count()).sum()
+    }
     pub fn slots(&self) -> &SlotMap {
         &self.slots
     }

@@ -1,4 +1,6 @@
 #![cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#[path = "../../../crates/turnloop-io/tests/support/count.rs"]
+mod count;
 use std::{
     future::Future,
     pin::Pin,
@@ -187,4 +189,102 @@ fn copy_stream_drop_closes_session() {
         .expect("spawn");
     drive(&mut ex, &mut client);
     drive(&mut ex, &mut server);
+}
+
+#[test]
+fn warmed_async_pool_queries_allocate_zero_and_idle_waits() {
+    let mut ex = LocalExecutor::<Platform>::new(LoopConfig::default()).expect("executor");
+    let h = ex.handle();
+    let listener = Listener::bind(&h, "127.0.0.1:0".parse().expect("address")).expect("listen");
+    let address = listener.local_addr().expect("address");
+    let mut server = ex
+        .spawn_local(async move {
+            let mut s = listener.accept().await.expect("accept");
+            startup(&mut s).await;
+            for _ in 0..1001 {
+                assert_eq!(query(&mut s).await, b"SELECT 42\0");
+                write_all(&mut s, RESULT).await.expect("reply");
+            }
+            let mut b = [0];
+            assert_eq!(read(&mut s, &mut b).await.expect("EOF"), 0);
+            1001
+        })
+        .expect("server");
+    let idle = std::rc::Rc::new(std::cell::Cell::new(false));
+    let client_idle = idle.clone();
+    let mut client = ex
+        .spawn_local(async move {
+            count::prove_counter().await;
+            let at = h.now() + Duration::from_secs(30);
+            let pool = Pool::new(
+                &h,
+                ConnectOptions {
+                    address,
+                    protocol: Default::default(),
+                    tls: None,
+                    channel_binding: None,
+                },
+                turnloop_postgres::pool::Config {
+                    max: 1,
+                    max_idle: 1,
+                    idle_timeout: Some(Duration::from_secs(60)),
+                    ..Default::default()
+                },
+                Duration::from_secs(5),
+            )
+            .expect("pool");
+            for i in 0..1001 {
+                let (rows, n) = count::measure(async {
+                    let mut c = pool.acquire(at).await.expect("acquire");
+                    let mut rows = 0;
+                    assert_eq!(
+                        c.query("SELECT 42", at, |e| {
+                            if let Event::Row { mut row, .. } = e {
+                                assert_eq!(
+                                    row.next().expect("row").expect("value"),
+                                    Some(b"42".as_slice())
+                                );
+                                rows += 1;
+                            }
+                            Ok(())
+                        })
+                        .await
+                        .expect("query"),
+                        Outcome::Success
+                    );
+                    rows
+                })
+                .await;
+                assert_eq!(rows, 1);
+                if i > 0 {
+                    assert_eq!(n, 0, "query + checkout/release must allocate zero");
+                }
+            }
+            client_idle.set(true);
+            h.sleep(Duration::from_millis(60))
+                .await
+                .expect("idle timer");
+            pool.end().await.expect("end");
+        })
+        .expect("client");
+    let end = ex.handle().now() + Duration::from_secs(30);
+    while !idle.get() {
+        assert!(ex.handle().now() < end);
+        ex.turn(Timeout::Until(end)).expect("turn");
+    }
+    // Drain finite completions; then the pooled idle socket has no readiness
+    // subscription, and a turn must actually wait for the timer.
+    let mut waited = false;
+    for _ in 0..8 {
+        let before = ex.handle().now();
+        let info = ex.turn(Timeout::Until(end)).expect("idle turn");
+        if ex.handle().now().duration_since(before) >= Duration::from_millis(10) {
+            assert_eq!(info.os_waits, 1);
+            waited = true;
+            break;
+        }
+    }
+    assert!(waited, "idle pooled connection spun instead of parking");
+    drive(&mut ex, &mut client);
+    assert_eq!(drive(&mut ex, &mut server), 1001);
 }

@@ -6,9 +6,7 @@ use crate::{
         Operation, OperationAction, OperationKind, OperationOptions, RetrySession,
         ServerCapabilities,
     },
-    topology::{
-        ApplicationError, ApplicationErrorKind, ServerType, Topology, TopologyEvent, TopologyType,
-    },
+    topology::{ApplicationError, ApplicationErrorKind, ServerType, Topology, TopologyEvent},
     uri::{Address, Options, ReadPreference},
 };
 use bson::{
@@ -39,6 +37,7 @@ struct State<B: Backend + 'static> {
     changed: Option<Waker>,
     waiters: Vec<Waker>,
     heartbeats: u64,
+    candidates: crate::topology::SelectionBuffer,
     failure: Option<String>,
     cleanup: Vec<Pin<Box<dyn Future<Output = ()>>>>,
 }
@@ -46,6 +45,7 @@ struct Owner<B: Backend + 'static> {
     state: Rc<RefCell<State<B>>>,
     executor: ExecutorHandle<B>,
     options: ConnectOptions,
+    random: &'static dyn turnloop_tls::rustls::crypto::SecureRandom,
     _monitor: JoinHandle<()>,
 }
 pub struct Client<B: Backend + 'static> {
@@ -87,16 +87,27 @@ impl<B: Backend + 'static> Client<B> {
     ) -> io::Result<Self> {
         let mut options = options;
         if let Some(name) = options.protocol.srv.clone() {
-            use turnloop_io::dns::{query, Query, Record};
+            use turnloop_io::dns::{Query, Record, query};
             let srv = query(executor, format!("_mongodb._tcp.{name}"), Query::Srv, at).await?;
             let txt = query(executor, name, Query::Txt, at).await?;
-            let records: Vec<_> = srv.into_iter().filter_map(|r| match r {
-                Record::Srv {target,port,..} => Some(Address {host:target,port}), _ => None,
-            }).collect();
-            let txt: Vec<_> = txt.into_iter().filter_map(|r| match r {
-                Record::Txt {text,..} => Some(text), _ => None,
-            }).collect();
-            options.protocol.resolve(&records,&txt).map_err(io::Error::other)?;
+            let records: Vec<_> = srv
+                .into_iter()
+                .filter_map(|r| match r {
+                    Record::Srv { target, port, .. } => Some(Address { host: target, port }),
+                    _ => None,
+                })
+                .collect();
+            let txt: Vec<_> = txt
+                .into_iter()
+                .filter_map(|r| match r {
+                    Record::Txt { text, .. } => Some(text),
+                    _ => None,
+                })
+                .collect();
+            options
+                .protocol
+                .resolve(&records, &txt)
+                .map_err(io::Error::other)?;
         }
         let state = Rc::new(RefCell::new(State {
             topology: Topology::new(&options.protocol, time(executor.now())),
@@ -104,6 +115,7 @@ impl<B: Backend + 'static> Client<B> {
             changed: None,
             waiters: Vec::new(),
             heartbeats: 0,
+            candidates: Default::default(),
             failure: None,
             cleanup: Vec::new(),
         }));
@@ -117,50 +129,53 @@ impl<B: Backend + 'static> Client<B> {
                 let mut state = shared.borrow_mut();
                 state.changed = Some(cx.waker().clone());
                 let now = exec.now();
-                state.cleanup.retain_mut(|future| future.as_mut().poll(cx).is_pending());
+                state
+                    .cleanup
+                    .retain_mut(|future| future.as_mut().poll(cx).is_pending());
                 // Each probe owns one connection future. No waiting is done inside
                 // the driver turn and all servers progress independently.
                 for m in &mut monitors {
                     if let Some(future) = &mut m.pending
-                        && let Poll::Ready((connection, result)) = future.as_mut().poll(cx) {
-                            m.pending = None;
-                            m.connection = connection;
-                            state.heartbeats += 1;
-                            match result {
-                                Ok(hello) => {
-                                    state.topology.update(
-                                        &m.address,
-                                        &hello,
-                                        time(now),
-                                        now.saturating_duration_since(m.started),
-                                    );
-                                    if state
-                                        .topology
-                                        .servers
-                                        .get(&m.address)
-                                        .is_some_and(|s| s.kind.readable())
-                                    {
-                                        if let Some(pool) = state.pools.get(&m.address) {
-                                            pool.update_policy(|p| p.ready(time(now)));
-                                        } else {
-                                            let result = Address::parse(&m.address)
-                                                .map_err(io::Error::other)
-                                                .and_then(|address| {
-                                                    super::pool::create(&exec, address, &config)
-                                                });
-                                            match result {
-                                                Ok(pool) => {
-                                                    state.pools.insert(m.address.clone(), pool);
-                                                }
-                                                Err(e) => state.failure = Some(e.to_string()),
+                        && let Poll::Ready((connection, result)) = future.as_mut().poll(cx)
+                    {
+                        m.pending = None;
+                        m.connection = connection;
+                        state.heartbeats += 1;
+                        match result {
+                            Ok(hello) => {
+                                state.topology.update(
+                                    &m.address,
+                                    &hello,
+                                    time(now),
+                                    now.saturating_duration_since(m.started),
+                                );
+                                if state
+                                    .topology
+                                    .servers
+                                    .get(&m.address)
+                                    .is_some_and(|s| s.kind.readable())
+                                {
+                                    if let Some(pool) = state.pools.get(&m.address) {
+                                        pool.update_policy(|p| p.ready(time(now)));
+                                    } else {
+                                        let result = Address::parse(&m.address)
+                                            .map_err(io::Error::other)
+                                            .and_then(|address| {
+                                                super::pool::create(&exec, address, &config)
+                                            });
+                                        match result {
+                                            Ok(pool) => {
+                                                state.pools.insert(m.address.clone(), pool);
                                             }
+                                            Err(e) => state.failure = Some(e.to_string()),
                                         }
                                     }
                                 }
-                                Err(_) => network_failure(&mut state, &m.address, now),
                             }
-                            wake(&state);
+                            Err(_) => network_failure(&mut state, &m.address, now),
                         }
+                        wake(&state);
+                    }
                 }
                 state.topology.handle_timeout(time(now));
                 while let Some(event) = state.topology.poll_event() {
@@ -269,27 +284,29 @@ impl<B: Backend + 'static> Client<B> {
                     timer = at.map(|at| (at, exec.sleep_until(at)));
                 }
                 if let Some((_, sleep)) = &mut timer
-                    && let Poll::Ready(result) = Pin::new(sleep).poll(cx) {
-                        if let Err(e) = result {
-                            state.failure = Some(e.to_string());
-                            wake(&state);
-                            return Poll::Ready(());
-                        }
-                        timer = None;
-                        cx.waker().wake_by_ref();
+                    && let Poll::Ready(result) = Pin::new(sleep).poll(cx)
+                {
+                    if let Err(e) = result {
+                        state.failure = Some(e.to_string());
+                        wake(&state);
+                        return Poll::Ready(());
                     }
+                    timer = None;
+                    cx.waker().wake_by_ref();
+                }
                 Poll::Pending
             }))
             .map_err(turnloop_io::error)?;
         let mut session = [0; 16];
-        turnloop_tls::rustls::crypto::ring::default_provider()
-            .secure_random
+        let random = turnloop_tls::rustls::crypto::ring::default_provider().secure_random;
+        random
             .fill(&mut session)
             .map_err(|_| io::Error::other("secure entropy unavailable"))?;
         let owner = Rc::new(Owner {
             state,
             executor: executor.clone(),
             options,
+            random,
             _monitor: monitor,
         });
         let this = Self {
@@ -302,6 +319,9 @@ impl<B: Backend + 'static> Client<B> {
         let mut address = String::new();
         select(&this.owner, ReadPreference::Primary, None, at, &mut address).await?;
         Ok(this)
+    }
+    pub fn last_retry_count(&self) -> u8 {
+        self.operation.retry_count()
     }
     pub fn heartbeat_count(&self) -> u64 {
         self.owner.state.borrow().heartbeats
@@ -347,16 +367,13 @@ impl<B: Backend + 'static> Client<B> {
             )
             .map_err(io::Error::other)?;
         struct Cancel<'a>(&'a mut Operation);
-        impl Drop for Cancel<'_> { fn drop(&mut self) { self.0.cancel(); } }
+        impl Drop for Cancel<'_> {
+            fn drop(&mut self) {
+                self.0.cancel();
+            }
+        }
         let cancel = Cancel(&mut self.operation);
-        run(
-            &self.owner,
-            cancel.0,
-            at,
-            &mut self.selected,
-            &mut receive,
-        )
-        .await
+        run(&self.owner, cancel.0, at, &mut self.selected, &mut receive).await
     }
     /// Own batches while exposing one document at a time. getMore and killCursors
     /// retain the selected server; neither operation is retried on another server.
@@ -412,6 +429,12 @@ async fn select<B: Backend + 'static>(
     at: Instant,
     address: &mut String,
 ) -> io::Result<ServerCapabilities> {
+    let timeout = owner.options.protocol.server_selection_timeout;
+    let at = if timeout.is_zero() {
+        at
+    } else {
+        at.min(owner.executor.now() + timeout)
+    };
     deadline(
         &owner.executor,
         at,
@@ -421,52 +444,32 @@ async fn select<B: Backend + 'static>(
                 return Poll::Ready(Err(io::Error::other(e.clone())));
             }
             let options = &owner.options.protocol;
-            // The common primary/direct case needs no temporary candidate vector.
-            let fast = options.read_preference_tags.is_empty()
-                && options.max_staleness.is_none()
-                && preference == ReadPreference::Primary;
-            let mut candidates = Vec::new();
-            let chosen = if fast {
-                if !state.topology.compatible() {
-                    return Poll::Ready(Err(io::Error::other("incompatible MongoDB wire version")));
-                }
-                let suitable = |a: &str, s: &crate::topology::Server| {
-                    state.pools.contains_key(a) && (s.kind == ServerType::RSPrimary
-                        || state.topology.kind == TopologyType::Single && s.kind.readable()
-                        || s.kind == ServerType::Standalone || s.kind == ServerType::Mongos)
-                };
-                state.topology.servers.iter().find(|(a,s)| Some(a.as_str()) != excluded && suitable(a,s))
-                    .or_else(|| state.topology.servers.iter().find(|(a,s)| suitable(a,s)))
-                    .map(|(a,_)| a.as_str())
-            } else {
-                let excluded = excluded.map_or([""], |e| [e]);
-                if let Err(e) = state.topology.candidates_deprioritized(
+            let mut entropy = [0; 16];
+            owner
+                .random
+                .fill(&mut entropy)
+                .map_err(|_| io::Error::other("secure entropy unavailable"))?;
+            let excluded = excluded.map_or([""], |e| [e]);
+            let State {
+                topology,
+                candidates,
+                ..
+            } = &mut *state;
+            let chosen = topology
+                .select_reusing(
                     preference,
                     &options.read_preference_tags,
                     options.max_staleness,
                     &excluded,
-                    &mut candidates,
-                ) {
-                    return Poll::Ready(Err(io::Error::other(e)));
-                }
-                let mut entropy = [0; 16];
-                if turnloop_tls::rustls::crypto::ring::default_provider()
-                    .secure_random
-                    .fill(&mut entropy)
-                    .is_err()
-                {
-                    return Poll::Ready(Err(io::Error::other("secure entropy unavailable")));
-                }
-                state.topology.choose(
-                    &candidates,
                     [
                         u64::from_le_bytes(entropy[..8].try_into().expect("eight bytes")),
                         u64::from_le_bytes(entropy[8..].try_into().expect("eight bytes")),
                     ],
+                    candidates,
                 )
-            };
+                .map_err(io::Error::other)?;
             if let Some(chosen) = chosen {
-                let s = &state.topology.servers[chosen];
+                let s = &topology.servers[chosen];
                 let caps = ServerCapabilities {
                     wire_version: s.max_wire_version,
                     sessions: s.session_timeout.is_some(),
@@ -524,18 +527,26 @@ async fn run<B: Backend + 'static>(
                             return Ok(());
                         }
                         let mut state = owner.state.borrow_mut();
-                        if let (Some(error), Some(server)) = (operation.last_error(), state.topology.servers.get(selected.as_str())) {
+                        if let (Some(error), Some(server)) = (
+                            operation.last_error(),
+                            state.topology.servers.get(selected.as_str()),
+                        ) {
                             let application = ApplicationError {
-                                generation:server.generation, max_wire_version:server.max_wire_version,
-                                handshake_complete:true,
-                                kind:match error.kind {
+                                generation: server.generation,
+                                max_wire_version: server.max_wire_version,
+                                handshake_complete: true,
+                                kind: match error.kind {
                                     crate::ErrorKind::Network => ApplicationErrorKind::Network,
                                     crate::ErrorKind::Timeout => ApplicationErrorKind::Timeout,
                                     _ => ApplicationErrorKind::Command,
                                 },
-                                response:error.response.as_deref(),
+                                response: error.response.as_deref(),
                             };
-                            state.topology.application_error(selected, application, time(owner.executor.now()));
+                            state.topology.application_error(
+                                selected,
+                                application,
+                                time(owner.executor.now()),
+                            );
                         }
                         state.topology.request_check(time(owner.executor.now()));
                         if let Some(w) = &state.changed {
@@ -560,41 +571,45 @@ pub struct Cursor<B: Backend + 'static> {
     closed: bool,
 }
 impl<B: Backend + 'static> Cursor<B> {
+    pub fn id(&self) -> i64 {
+        self.core.id
+    }
     pub async fn next(&mut self, at: Instant) -> io::Result<Option<RawDocumentBuf>> {
         loop {
-        if let Some(row) = self.rows.pop_front() {
-            return Ok(Some(row));
-        }
-        if self.closed
-            || !self
-                .core
-                .get_more(&mut self.command)
-                .map_err(io::Error::other)?
-        {
-            return Ok(None);
-        }
-        let pool = self
-            .owner
-            .state
-            .borrow()
-            .pools
-            .get(&self.core.server)
-            .cloned()
-            .ok_or_else(|| io::Error::other("cursor server removed"))?;
-        let mut connection = pool.acquire(at).await?;
-        connection
-            .command(self.command.raw(), &[], at, |reply| {
-                let batch = crate::command::CursorBatch::parse(reply).map_err(io::Error::other)?;
-                self.core.accept(&batch).map_err(io::Error::other)?;
-                for row in batch.rows() {
-                    self.rows
-                        .push_back(row.map_err(io::Error::other)?.to_owned());
-                }
-                Ok(())
-            })
-            .await?;
-        // A live cursor may return an empty batch. Await another real getMore;
-        // only id=0 terminates the stream, and the same deadline bounds the loop.
+            if let Some(row) = self.rows.pop_front() {
+                return Ok(Some(row));
+            }
+            if self.closed
+                || !self
+                    .core
+                    .get_more(&mut self.command)
+                    .map_err(io::Error::other)?
+            {
+                return Ok(None);
+            }
+            let pool = self
+                .owner
+                .state
+                .borrow()
+                .pools
+                .get(&self.core.server)
+                .cloned()
+                .ok_or_else(|| io::Error::other("cursor server removed"))?;
+            let mut connection = pool.acquire(at).await?;
+            connection
+                .command(self.command.raw(), &[], at, |reply| {
+                    let batch =
+                        crate::command::CursorBatch::parse(reply).map_err(io::Error::other)?;
+                    self.core.accept(&batch).map_err(io::Error::other)?;
+                    for row in batch.rows() {
+                        self.rows
+                            .push_back(row.map_err(io::Error::other)?.to_owned());
+                    }
+                    Ok(())
+                })
+                .await?;
+            // A live cursor may return an empty batch. Await another real getMore;
+            // only id=0 terminates the stream, and the same deadline bounds the loop.
         }
     }
     pub async fn close(&mut self, at: Instant) -> io::Result<()> {
@@ -624,11 +639,26 @@ impl<B: Backend + 'static> Cursor<B> {
 
 impl<B: Backend + 'static> Drop for Cursor<B> {
     fn drop(&mut self) {
-        if self.closed || self.core.id == 0 { return; }
-        let pool = self.owner.state.borrow().pools.get(&self.core.server).cloned();
-        let Some(pool) = pool else { return; };
+        if self.closed || self.core.id == 0 {
+            return;
+        }
+        let pool = self
+            .owner
+            .state
+            .borrow()
+            .pools
+            .get(&self.core.server)
+            .cloned();
+        let Some(pool) = pool else {
+            return;
+        };
         let mut command = crate::command::Command::new();
-        if command.kill_cursor(&self.core.database, &self.core.collection, self.core.id).is_err() { return; }
+        if command
+            .kill_cursor(&self.core.database, &self.core.collection, self.core.id)
+            .is_err()
+        {
+            return;
+        }
         let at = self.owner.executor.now() + Duration::from_secs(5);
         let mut state = self.owner.state.borrow_mut();
         state.cleanup.push(Box::pin(async move {
@@ -636,6 +666,8 @@ impl<B: Backend + 'static> Drop for Cursor<B> {
                 let _ = connection.command(command.raw(), &[], at, |_| Ok(())).await;
             }
         }));
-        if let Some(w) = &state.changed { w.wake_by_ref(); }
+        if let Some(w) = &state.changed {
+            w.wake_by_ref();
+        }
     }
 }

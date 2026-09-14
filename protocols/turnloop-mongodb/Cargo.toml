@@ -39,6 +39,8 @@ workspace = true
 [package.metadata.turnloop-ci]
 role = "protocol"
 wasi-tests = ["asynchronous"]
+wasi-integration-tests = ["async_server"]
+wasi-setup-tests = ["real_mongodb"]
 integration-tests = ["real_mongodb", "async_server"]
 
 [target.'cfg(all(target_os = "wasi", target_env = "p3"))'.dependencies]
@@ -54,4 +56,8 @@ required-features = ["turnloop"]
 
 [[test]]
 name = "async_server"
+required-features = ["turnloop"]
+
+[[example]]
+name = "turnloop"
 required-features = ["turnloop"]

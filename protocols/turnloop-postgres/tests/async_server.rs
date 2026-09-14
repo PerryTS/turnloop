@@ -183,6 +183,37 @@ fn real_async_tls_queries_copy_cancel_pool_and_connection_kill() {
                 c.query("SELECT 1", at, |_| Ok(())).await.expect("reuse"),
                 Outcome::Success
             );
+            let mut pid = String::new();
+            other
+                .query("SELECT pg_backend_pid()", at, |e| {
+                    if let Event::Row { mut row, .. } = e {
+                        pid = std::str::from_utf8(
+                            row.next().expect("row").expect("value").expect("pid"),
+                        )
+                        .expect("UTF-8")
+                        .to_owned();
+                    }
+                    Ok(())
+                })
+                .await
+                .expect("victim pid");
+            assert!(pid.parse::<i32>().expect("backend PID") > 0);
+            let mut killed = false;
+            c.query(&format!("SELECT pg_terminate_backend({pid})"), at, |e| {
+                if let Event::Row { mut row, .. } = e {
+                    assert_eq!(
+                        row.next().expect("row").expect("value"),
+                        Some(b"t".as_slice())
+                    );
+                    killed = true;
+                }
+                Ok(())
+            })
+            .await
+            .expect("terminate backend");
+            assert!(killed);
+            assert!(other.query("SELECT 1", at, |_| Ok(())).await.is_err());
+            assert!(!other.is_reusable());
             let pool = Pool::new(
                 &h,
                 options,

@@ -59,6 +59,37 @@ under workspace `.tools/`. Test certificate keys are public fixture data.
 
 ## Getting started on turnloop
 
+Enable `turnloop-smtp = { version = "0.1.0-alpha.1", features = ["turnloop"] }`
+and use the `asynchronous` module: `Transport::connect and send`. The default feature set remains sans-I/O.
+The adapter reuses `turnloop-io`; the host owns `LocalExecutor` and calls `turn`.
+Spawn local futures through its handle and keep their `JoinHandle`s until completion.
+
+```sh
+cargo run -p turnloop-smtp --features turnloop --example turnloop
+```
+
+[The complete example](examples/turnloop.rs) connects to `127.0.0.1:2525` by default;
+`TURNLOOP_DB_ADDR` overrides that development endpoint. All operations take an
+absolute `turnloop_io::Instant` deadline, shared across authentication, I/O and retries.
+Callbacks borrow row/reply storage; copy values only when retaining them.
+Dropping a pending operation closes its transport before a pool can reuse it.
+
+For TLS, set the protocol's TLS mode and provide
+`turnloop_tls::asynchronous::ClientTls` with the trust configuration, verified
+server name and current Unix seconds. Certificates are verified; a requested TLS
+upgrade without a configuration fails. Native TCP and WASI 0.2 sockets share the
+same driver. Browser raw TCP is unavailable; Windows accepts a host-provided
+`Backend` until the repository's production IOCP provider is integrated.
+
+`send` returns accepted/rejected recipient details from the server, including
+partial success; errors preserve the full envelope in `SendFailure`. Authentication,
+STARTTLS/implicit TLS and advertised PIPELINING are handled by the existing core.
+The allocation gate counts only the three existing owned-result allocations for
+a one-recipient delivery; the async transport adds zero allocations after warm-up.
+
+
+## Getting started on turnloop
+
 Enable the `turnloop` feature and construct `asynchronous::AsyncConnection::new`
 with a connected `turnloop::AsyncIo` (TCP/pipe) or `turnloop_tls::TlsStream` and
 this crate's sans-I/O `Connection`. Submit commands through `core_mut()`, then

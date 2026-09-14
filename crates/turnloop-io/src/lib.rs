@@ -8,8 +8,8 @@ use std::{
     pin::Pin,
 };
 pub use turnloop::{self, AsyncIo, ExecutorHandle, Instant, backend::Backend};
-pub mod pool;
 pub mod dns;
+pub mod pool;
 
 /// A TCP, pipe, TLS or host stream with cancellation-safe futures-io operations.
 pub trait Stream: AsyncRead + AsyncWrite + Unpin {}
@@ -181,7 +181,7 @@ pub trait SansIo: Output {
 pub struct Driver<S, C: SansIo> {
     stream: Option<S>,
     core: Option<C>,
-    input: [u8; 16384],
+    input: Box<[u8]>,
     start: usize,
     end: usize,
 }
@@ -190,7 +190,7 @@ impl<S: Stream, C: SansIo> Driver<S, C> {
         Self {
             stream: Some(stream),
             core: Some(core),
-            input: [0; 16384],
+            input: vec![0; 16384].into_boxed_slice(),
             start: 0,
             end: 0,
         }

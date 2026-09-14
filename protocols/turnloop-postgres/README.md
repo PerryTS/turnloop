@@ -2,7 +2,43 @@
 
 A pull-driven PostgreSQL v3 client core, built on `postgres-protocol` frontend
 messages, framing and SCRAM. It never opens a socket, starts a thread, reads a
-clock, schedules a timer or generates entropy. Production code forbids unsafe.
+clock, schedules a timer or generates entropy. The sans-I/O code forbids unsafe.
+
+## Getting started on turnloop
+
+Enable `turnloop-postgres = { version = "0.1.0-alpha.1", features = ["turnloop"] }`
+and use the `asynchronous` module: `Client::connect, query, execute, copy_in/copy_out and notification`. The default feature set remains sans-I/O.
+The adapter reuses `turnloop-io`; the host owns `LocalExecutor` and calls `turn`.
+Spawn local futures through its handle and keep their `JoinHandle`s until completion.
+
+```sh
+cargo run -p turnloop-postgres --features turnloop --example turnloop
+```
+
+[The complete example](examples/turnloop.rs) connects to `127.0.0.1:5432` by default;
+`TURNLOOP_DB_ADDR` overrides that development endpoint. All operations take an
+absolute `turnloop_io::Instant` deadline, shared across authentication, I/O and retries.
+Callbacks borrow row/reply storage; copy values only when retaining them.
+Dropping a pending operation closes its transport before a pool can reuse it.
+
+For TLS, set the protocol's TLS mode and provide
+`turnloop_tls::asynchronous::ClientTls` with the trust configuration, verified
+server name and current Unix seconds. Certificates are verified; a requested TLS
+upgrade without a configuration fails. Native TCP and WASI 0.2 sockets share the
+same driver. Browser raw TCP is unavailable; Windows accepts a host-provided
+`Backend` until the repository's production IOCP provider is integrated.
+
+`Pool::new` accepts the existing `pool::Config` (max, max_idle, idle/acquire
+limits, max_uses); `acquire(deadline)` returns an exclusive lease. A transaction
+still open at release destroys the connection. Named `ExtendedQuery` values use
+the core prepared-statement cache. `notification(deadline)` is the async next
+operation after `LISTEN`; query callbacks also receive interleaved notifications.
+`copy_in` lends a chunk writer with `finish`; dropping it closes the session.
+`copy_out` lends each chunk to a callback without buffering the complete transfer.
+`cancel_token().cancel(...)` sends CancelRequest over a separate connection.
+SCRAM-SHA-256-PLUS uses the certificate endpoint digest supplied in
+`ConnectOptions::channel_binding`; plain SCRAM is available without it.
+
 
 ## Driving a connection
 

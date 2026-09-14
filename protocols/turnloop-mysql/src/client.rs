@@ -15,6 +15,8 @@ pub struct Connection<B: Backend, S: Stream = AsyncIo<B>> {
     executor: ExecutorHandle<B>,
     driver: AsyncConnection<Transport<S>>,
     pub connection_id: u32,
+    /// Whether full caching_sha2 authentication used RSA-OAEP on this session.
+    pub rsa_authenticated: bool,
 }
 pub(super) fn time(now: Instant) -> crate::Instant {
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -61,6 +63,7 @@ impl<B: Backend, S: Stream> Connection<B, S> {
             Transport::Plain(stream),
             crate::Connection::new(config).map_err(io::Error::other)?,
         );
+        let mut rsa_authenticated = false;
         let connection_id = deadline(executor, at, async {
             loop {
                 let mut upgrade = false;
@@ -93,6 +96,7 @@ impl<B: Backend, S: Stream> Connection<B, S> {
                         .map_err(io::Error::other)?;
                 }
                 if seed {
+                    rsa_authenticated = true;
                     let mut entropy = [0; 20];
                     turnloop_tls::rustls::crypto::ring::default_provider()
                         .secure_random
@@ -113,6 +117,7 @@ impl<B: Backend, S: Stream> Connection<B, S> {
             executor: executor.clone(),
             driver,
             connection_id,
+            rsa_authenticated,
         })
     }
     pub fn is_reusable(&self) -> bool {

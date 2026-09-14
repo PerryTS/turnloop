@@ -81,7 +81,8 @@ pub mod executor;
 
 #[cfg(feature = "executor")]
 pub use executor::{
-    AsyncIo, Blocking, Close, ExecutorConfig, ExecutorHandle, JoinError, JoinHandle, LocalExecutor, Sleep,
+    AsyncIo, Blocking, Close, ExecutorConfig, ExecutorHandle, JoinError, JoinHandle, LocalExecutor,
+    Sleep,
 };
 
 #[cfg(all(test, not(loom)))]

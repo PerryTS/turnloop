@@ -23,20 +23,54 @@ fn drive<T>(executor: &mut LocalExecutor<Platform>, task: &mut turnloop::JoinHan
     }
     finish(task)
 }
-use turnloop_mongodb::{asynchronous::{Client,ConnectOptions},uri::Options,operation::OperationKind,bson::{doc,Document,raw::RawDocumentBuf}};
-fn raw(d:Document)->RawDocumentBuf{RawDocumentBuf::try_from(&d).expect("BSON")}
+use turnloop_mongodb::{
+    asynchronous::{Client, ConnectOptions},
+    bson::{Document, doc, raw::RawDocumentBuf},
+    operation::OperationKind,
+    uri::Options,
+};
+fn raw(d: Document) -> RawDocumentBuf {
+    RawDocumentBuf::try_from(&d).expect("BSON")
+}
 #[test]
-#[ignore="private MongoDB fixture, after real_mongodb bootstrap"]
-fn real_async_auth_tls_sdam_pool_cursor_retry_and_primary_stepdown(){
-    let port=std::env::var("TURNLOOP_TEST_MONGODB_PORT").expect("standalone port");
-    let tls_port=std::env::var("TURNLOOP_TEST_MONGODB_TLS_PORT").expect("TLS port");
-    let replica=std::env::var("TURNLOOP_TEST_MONGODB_REPLICA_PORTS").expect("replica ports");let seeds=replica.split(',').map(|p|format!("127.0.0.1:{p}")).collect::<Vec<_>>().join(",");
-    use turnloop_tls::rustls::pki_types::{CertificateDer,pem::PemObject};
-    let certs=std::fs::read(std::path::PathBuf::from(std::env::var_os("TURNLOOP_TEST_MONGODB_TOOLS").expect("tools")).join("cert.pem")).expect("certs");
-    let ca=CertificateDer::pem_slice_iter(&certs).collect::<Result<Vec<_>,_>>().expect("certificates");
-    let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("wall time").as_secs();
-    let tls=turnloop_tls::asynchronous::ClientTls{config:turnloop_tls::ClientConfig::new(turnloop_tls::ClientOptions{ca:Some(ca),alpn:vec![],..Default::default()},now).expect("TLS config"),server_name:"localhost".try_into().expect("name"),unix_seconds:now};
-    let mut ex=LocalExecutor::<Platform>::new(LoopConfig::default()).expect("executor");let h=ex.handle();
+#[ignore = "private MongoDB fixture, after real_mongodb bootstrap"]
+fn real_async_auth_tls_sdam_pool_cursor_retry_and_primary_stepdown() {
+    let port = std::env::var("TURNLOOP_TEST_MONGODB_PORT").expect("standalone port");
+    let tls_port = std::env::var("TURNLOOP_TEST_MONGODB_TLS_PORT").expect("TLS port");
+    let replica = std::env::var("TURNLOOP_TEST_MONGODB_REPLICA_PORTS").expect("replica ports");
+    let seeds = replica
+        .split(',')
+        .map(|p| format!("127.0.0.1:{p}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    use turnloop_tls::rustls::pki_types::{CertificateDer, pem::PemObject};
+    let certs = std::fs::read(
+        std::path::PathBuf::from(std::env::var_os("TURNLOOP_TEST_MONGODB_TOOLS").expect("tools"))
+            .join("cert.pem"),
+    )
+    .expect("certs");
+    let ca = CertificateDer::pem_slice_iter(&certs)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("certificates");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("wall time")
+        .as_secs();
+    let tls = turnloop_tls::asynchronous::ClientTls {
+        config: turnloop_tls::ClientConfig::new(
+            turnloop_tls::ClientOptions {
+                ca: Some(ca),
+                alpn: vec![],
+                ..Default::default()
+            },
+            now,
+        )
+        .expect("TLS config"),
+        server_name: "localhost".try_into().expect("name"),
+        unix_seconds: now,
+    };
+    let mut ex = LocalExecutor::<Platform>::new(LoopConfig::default()).expect("executor");
+    let h = ex.handle();
     let mut task=ex.spawn_local(async move{
         let at=h.now()+Duration::from_secs(75);
         for (uri,tls) in [(format!("mongodb://lane:pencil@127.0.0.1:{port}/admin?directConnection=true"),None),(format!("mongodb://lane:pencil@127.0.0.1:{tls_port}/admin?directConnection=true&tls=true"),Some(tls))]{
@@ -57,5 +91,18 @@ fn real_async_auth_tls_sdam_pool_cursor_retry_and_primary_stepdown(){
         h.sleep(Duration::from_secs(1)).await.expect("election wait");
         let mut after_primary=String::new();c.command(&raw(doc!{"hello":1,"$db":"admin"}),&[],OperationKind::Read,at,|r|{assert!(r.get_bool("isWritablePrimary").expect("primary"));after_primary=r.get_str("me").expect("me").to_owned();Ok(())}).await.expect("reselection");assert_ne!(before_primary,after_primary);
         let mut rows=0;c.command(&raw(doc!{"find":"items","filter":{},"$db":"async_lane"}),&[],OperationKind::Read,at,|r|{rows=turnloop_mongodb::command::CursorBatch::parse(r).expect("batch").rows().count();Ok(())}).await.expect("persisted read");assert_eq!(rows,3);
-    }).expect("spawn");drive(&mut ex,&mut task);
+        for kind in [OperationKind::Write, OperationKind::Read] {
+            let name=if kind==OperationKind::Write {"insert"} else {"find"};
+            c.command(&raw(doc!{"configureFailPoint":"failCommand","mode":{"times":1},"data":{"failCommands":[name],"errorCode":6,"errorLabels":["RetryableWriteError"]},"$db":"admin"}),&[],OperationKind::RunCommand,at,|_|Ok(())).await.expect("arm one retry");
+            let body=if kind==OperationKind::Write {doc!{"insert":"retry_items","documents":[{"_id":99}],"$db":"async_lane"}}else{doc!{"find":"retry_items","filter":{},"$db":"async_lane"}};
+            let mut replies=0;
+            c.command(&raw(body),&[],kind,at,|r| {if kind==OperationKind::Write {assert_eq!(r.get_i32("n").expect("insert count"),1);}else{assert_eq!(turnloop_mongodb::command::CursorBatch::parse(r).expect("batch").rows().count(),1);}replies+=1;Ok(())}).await.expect("retry command");
+            assert_eq!(replies,1);assert_eq!(c.last_retry_count(),1,"failpoint must force one retry");
+        }
+        let cursor=c.cursor(&raw(doc!{"find":"items","filter":{},"batchSize":1,"$db":"async_lane"}),at).await.expect("cleanup cursor");let id=cursor.id();assert_ne!(id,0);drop(cursor);
+        h.sleep(Duration::from_millis(50)).await.expect("cursor cleanup deadline");
+        let error=c.command(&raw(doc!{"getMore":id,"collection":"items","$db":"async_lane"}),&[],OperationKind::RunCommand,at,|_|panic!("dropped cursor must be killed")).await.expect_err("CursorNotFound");
+        assert_eq!(error.get_ref().and_then(|e|e.downcast_ref::<turnloop_mongodb::Error>()).expect("MongoDB error").code,Some(43));
+    }).expect("spawn");
+    drive(&mut ex, &mut task);
 }

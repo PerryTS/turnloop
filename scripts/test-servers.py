@@ -362,7 +362,10 @@ def redis_start():
                 # Old nodes.conf contains stale node endpoints and must not be reused.
                 node_file = directory / 'nodes.conf'
                 node_file.unlink(missing_ok=True)
-                lines += ['cluster-enabled yes', 'cluster-config-file nodes.conf',
+                # Replication can write an RDB even when periodic saves are off.
+                # This private fixture starts a new cluster, never reuses its data.
+                (directory / 'dump.rdb').unlink(missing_ok=True)
+                lines += ['enable-debug-command yes', 'cluster-enabled yes', 'cluster-config-file nodes.conf',
                           'cluster-node-timeout 1000', 'cluster-announce-ip 127.0.0.1',
                           f'cluster-announce-port {value}']
             else:
@@ -370,7 +373,7 @@ def redis_start():
                           f'sentinel auth-pass turnloop {TURNLOOP_TEST_REDIS_PASSWORD}']
             config.write_text('\n'.join(lines) + '\n')
             with startup_logs(f'Redis {label}', directory / 'server.log'):
-                process = private_process([REDIS_SERVER, config] + (['--sentinel'] if label == 'sentinel' else []), directory / 'server.log')
+                process = private_process([str(Path(shutil.which(REDIS_SERVER) or REDIS_SERVER).resolve()), config] + (['--sentinel'] if label == 'sentinel' else []), directory / 'server.log')
                 REDIS_CHILDREN[process.pid] = process
                 records.append({'pid': process.pid, 'port': value, 'config': str(config)})
                 REDIS_STATE.write_text(json.dumps(records))

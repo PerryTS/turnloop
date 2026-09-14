@@ -31,8 +31,7 @@ impl Policy for Core {
     }
     fn checkin(&mut self, lease: Lease, now: Instant, destroy: bool) -> io::Result<()> {
         if destroy {
-            self.clear();
-            self.ready(time(now));
+            return self.discard(lease, time(now)).map_err(io::Error::other);
         }
         self.checkin(lease, time(now)).map_err(io::Error::other)
     }

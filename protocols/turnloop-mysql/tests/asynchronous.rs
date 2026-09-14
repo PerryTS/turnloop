@@ -1,4 +1,6 @@
 #![cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#[path = "../../../crates/turnloop-io/tests/support/count.rs"]
+mod count;
 use std::{
     future::Future,
     pin::Pin,
@@ -210,4 +212,63 @@ fn pool_max_uses_opens_replacement() {
         .expect("spawn");
     drive(&mut ex, &mut client);
     drive(&mut ex, &mut server);
+}
+#[test]
+fn warmed_async_pool_ping_allocates_zero() {
+    let mut ex = LocalExecutor::<Platform>::new(LoopConfig::default()).expect("executor");
+    let h = ex.handle();
+    let listener = Listener::bind(&h, "127.0.0.1:0".parse().expect("address")).expect("listen");
+    let address = listener.local_addr().expect("address");
+    let mut server = ex
+        .spawn_local(async move {
+            let mut s = listener.accept().await.expect("accept");
+            write_all(&mut s, &handshake("mysql_native_password", Caps::empty()))
+                .await
+                .expect("hello");
+            assert!(!packet(&mut s).await.is_empty());
+            write_all(&mut s, &ok(2, 0, 2)).await.expect("auth");
+            for _ in 0..1001 {
+                assert_eq!(packet(&mut s).await, [14]);
+                write_all(&mut s, &ok(1, 0, 2)).await.expect("ping");
+            }
+            let mut b = [0];
+            assert_eq!(read(&mut s, &mut b).await.expect("EOF"), 0);
+            1001
+        })
+        .expect("server");
+    let mut client = ex
+        .spawn_local(async move {
+            count::prove_counter().await;
+            let at = h.now() + Duration::from_secs(30);
+            let pool = Pool::new(
+                &h,
+                ConnectOptions {
+                    address,
+                    protocol: Default::default(),
+                    tls: None,
+                },
+                turnloop_mysql::pool::Config {
+                    max: 1,
+                    max_idle: 1,
+                    ..Default::default()
+                },
+                Duration::from_secs(5),
+            )
+            .expect("pool");
+            for i in 0..1001 {
+                let (result, n) = count::measure(async {
+                    let mut c = pool.acquire(at).await.expect("acquire");
+                    c.ping(at).await
+                })
+                .await;
+                assert_eq!(result.expect("ping"), Outcome::Success);
+                if i > 0 {
+                    assert_eq!(n, 0, "async ping + checkout/release");
+                }
+            }
+            pool.end().await.expect("end");
+        })
+        .expect("client");
+    drive(&mut ex, &mut client);
+    assert_eq!(drive(&mut ex, &mut server), 1001);
 }

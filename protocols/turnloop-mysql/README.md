@@ -2,7 +2,39 @@
 
 A sans-I/O MySQL v10 client, built on `mysql_common` handshake/auth/value packets.
 No sockets, filesystem access, threads, implicit clocks, timers or entropy reads
-in production. The crate forbids unsafe. TLS and entropy are explicit requests.
+in the default sans-I/O feature set. The crate forbids unsafe. TLS and entropy are explicit requests.
+
+## Getting started on turnloop
+
+Enable `turnloop-mysql = { version = "0.1.0-alpha.1", features = ["turnloop"] }`
+and use the `asynchronous` module: `Connection::connect, query, prepare/execute, begin and Pool::acquire`. The default feature set remains sans-I/O.
+The adapter reuses `turnloop-io`; the host owns `LocalExecutor` and calls `turn`.
+Spawn local futures through its handle and keep their `JoinHandle`s until completion.
+
+```sh
+cargo run -p turnloop-mysql --features turnloop --example turnloop
+```
+
+[The complete example](examples/turnloop.rs) connects to `127.0.0.1:3306` by default;
+`TURNLOOP_DB_ADDR` overrides that development endpoint. All operations take an
+absolute `turnloop_io::Instant` deadline, shared across authentication, I/O and retries.
+Callbacks borrow row/reply storage; copy values only when retaining them.
+Dropping a pending operation closes its transport before a pool can reuse it.
+
+For TLS, set the protocol's TLS mode and provide
+`turnloop_tls::asynchronous::ClientTls` with the trust configuration, verified
+server name and current Unix seconds. Certificates are verified; a requested TLS
+upgrade without a configuration fails. Native TCP and WASI 0.2 sockets share the
+same driver. Browser raw TCP is unavailable; Windows accepts a host-provided
+`Backend` until the repository's production IOCP provider is integrated.
+
+`Pool::new` uses `pool::Config` with mysql2 queue/max/idle policy. Leases own their
+connection until drop, and never return unfinished transactions to the pool.
+`begin` returns a transaction guard with explicit commit/rollback; dropping an
+unfinished guard closes its connection. Multi-statements require
+`Config::multiple_statements`; callbacks receive every result set. Full
+caching_sha2 RSA authentication obtains fresh OAEP entropy from the TLS provider.
+
 
 ## Host contract
 

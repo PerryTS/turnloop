@@ -1,4 +1,6 @@
 #![cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#[path = "../../../crates/turnloop-io/tests/support/count.rs"]
+mod count;
 use std::{
     future::Future,
     pin::Pin,
@@ -103,4 +105,51 @@ fn pipeline_reconnect_replays_and_timeout_closes() {
         .expect("spawn");
     drive(&mut ex, &mut client);
     drive(&mut ex, &mut server);
+}
+#[test]
+fn warmed_async_pipeline_allocates_zero() {
+    let mut ex = LocalExecutor::<Platform>::new(LoopConfig::default()).expect("executor");
+    let h = ex.handle();
+    let listener = Listener::bind(&h, "127.0.0.1:0".parse().expect("address")).expect("listen");
+    let address = listener.local_addr().expect("address");
+    let mut server = ex
+        .spawn_local(async move {
+            let mut s = listener.accept().await.expect("accept");
+            for _ in 0..1001 {
+                incr(&mut s).await;
+                incr(&mut s).await;
+                write_all(&mut s, b":41\r\n:42\r\n").await.expect("reply");
+            }
+            2002
+        })
+        .expect("server");
+    let mut client = ex
+        .spawn_local(async move {
+            count::prove_counter().await;
+            let at = h.now() + Duration::from_secs(30);
+            let mut c = Client::connect(&h, &options(address), at)
+                .await
+                .expect("connect");
+            let mut replies = 0;
+            for i in 0..1001 {
+                let (result, n) = count::measure(c.pipeline(
+                    &[&[b"INCR", b"counter"], &[b"INCR", b"counter"]],
+                    at,
+                    |j, v| {
+                        assert_eq!(v.expect("value"), Value::Integer(41 + j as i64));
+                        replies += 1;
+                        Ok(())
+                    },
+                ))
+                .await;
+                result.expect("pipeline");
+                if i > 0 {
+                    assert_eq!(n, 0, "pipeline async overhead");
+                }
+            }
+            assert_eq!(replies, 2002);
+        })
+        .expect("client");
+    drive(&mut ex, &mut client);
+    assert_eq!(drive(&mut ex, &mut server), 2002);
 }

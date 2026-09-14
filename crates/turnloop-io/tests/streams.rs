@@ -78,7 +78,10 @@ fn tcp_roundtrip_and_deadline() {
     finish(&mut timeout);
 }
 
-#[cfg(any(not(target_arch = "wasm32"), all(target_os = "wasi", target_env = "p2")))]
+#[cfg(any(
+    not(target_arch = "wasm32"),
+    all(target_os = "wasi", target_env = "p2")
+))]
 #[test]
 fn resolve_and_cancel_reuse_executor_slots() {
     use turnloop::executor::ExecutorConfig;

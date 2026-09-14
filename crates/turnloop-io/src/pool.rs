@@ -284,8 +284,13 @@ fn drive<B: Backend, P: Policy, C: Connection, F: Connector<B, Connection = C>>(
                         }
                         entry.client = None;
                         entry.connecting = None;
-                        if entry.closing.is_none() { entry.closed = true; state.policy.closed(id, now)?; }
-                    } else { state.policy.closed(id, now)?; }
+                        if entry.closing.is_none() {
+                            entry.closed = true;
+                            state.policy.closed(id, now)?;
+                        }
+                    } else {
+                        state.policy.closed(id, now)?;
+                    }
                 }
                 Action::Remove(id) => {
                     if let Some(i) = state.entries.iter().position(|e| e.id == id) {
@@ -315,45 +320,54 @@ fn drive<B: Backend, P: Policy, C: Connection, F: Connector<B, Connection = C>>(
             }
         }
         let mut progressed = false;
+        let closing = state.entries.iter().any(|entry| entry.closing.is_some());
         for entry in &mut state.entries {
             if let Some(future) = &mut entry.closing
-                && let Poll::Ready(result) = Pin::new(future).poll(cx) {
+                && let Poll::Ready(result) = Pin::new(future).poll(cx)
+            {
                 result.map_err(error)?;
                 entry.closing = None;
                 entry.closed = true;
                 progressed = true;
                 state.policy.closed(entry.id, now)?;
             }
-            if let Some(future) = &mut entry.connecting
-                && let Poll::Ready(result) = future.as_mut().poll(cx) {
-                    entry.connecting = None;
-                    progressed = true;
-                    match result {
-                        Ok(client) => {
-                            entry.handle = client.handle();
-                            entry.client = Some(client);
-                            state.policy.connected(entry.id, now)?;
-                        }
-                        Err(_) => state.policy.connect_failed(entry.id, now)?,
+            if !closing
+                && let Some(future) = &mut entry.connecting
+                && let Poll::Ready(result) = future.as_mut().poll(cx)
+            {
+                entry.connecting = None;
+                progressed = true;
+                match result {
+                    Ok(client) => {
+                        entry.handle = client.handle();
+                        entry.client = Some(client);
+                        state.policy.connected(entry.id, now)?;
                     }
+                    Err(_) => state.policy.connect_failed(entry.id, now)?,
                 }
+            }
         }
         state.entries.retain(|entry| !entry.closed);
         if state.ended && state.entries.is_empty() {
-            for w in &state.end_wakers { w.wake_by_ref(); }
+            for w in &state.end_wakers {
+                w.wake_by_ref();
+            }
         }
-        if !progressed { break; }
+        if !progressed {
+            break;
+        }
     }
     let at = state.policy.next_deadline();
     if timer.as_ref().map(|(at, _)| *at) != at {
         *timer = at.map(|at| (at, executor.sleep_until(at)));
     }
     if let Some((_, sleep)) = timer
-        && let Poll::Ready(result) = Pin::new(sleep).poll(cx) {
-            result.map_err(error)?;
-            *timer = None;
-            cx.waker().wake_by_ref();
-        }
+        && let Poll::Ready(result) = Pin::new(sleep).poll(cx)
+    {
+        result.map_err(error)?;
+        *timer = None;
+        cx.waker().wake_by_ref();
+    }
     Ok(())
 }
 struct Pending<'a, B: Backend, P: Policy, C> {
@@ -398,13 +412,14 @@ impl<B: Backend, P: Policy, C: Connection> Drop for Lease<B, P, C> {
     fn drop(&mut self) {
         let mut state = self.owner.state.borrow_mut();
         if let Some(client) = self.client.take()
-            && let Some(entry) = state.entries.iter_mut().find(|e| e.id == P::id(self.lease)) {
-                let destroy = !client.reusable();
-                entry.client = Some(client);
-                let _ = state
-                    .policy
-                    .checkin(self.lease, self.owner.executor.now(), destroy);
-            }
+            && let Some(entry) = state.entries.iter_mut().find(|e| e.id == P::id(self.lease))
+        {
+            let destroy = !client.reusable();
+            entry.client = Some(client);
+            let _ = state
+                .policy
+                .checkin(self.lease, self.owner.executor.now(), destroy);
+        }
         wake(&state.changed);
     }
 }

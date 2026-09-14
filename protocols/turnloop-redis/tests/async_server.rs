@@ -98,9 +98,213 @@ fn real_async_tls_pipeline_pubsub_deadlines_reconnect_cluster_sentinel() {
         assert_eq!(c.command(&[b"GET",b"async-counter"],at).await.expect("reconnect GET").bytes(),Some(b"2".as_slice()));assert_eq!(c.reconnect_count(),1);
         let mut subscriber=c.subscribe(&[b"async-channel"],at).await.expect("subscribe");assert_eq!(secure.command(&[b"PUBLISH",b"async-channel",b"payload"],at).await.expect("publish"),Value::Integer(1));assert!(matches!(subscriber.next(at).await.expect("message"),Event::Message{channel,payload,..}if channel==b"async-channel"&&payload==b"payload"));drop(subscriber);
         assert_eq!(secure.command(&[b"BLPOP",b"missing-async-key",b"0"],h.now()+Duration::from_millis(10)).await.expect_err("blocking timeout").kind(),std::io::ErrorKind::TimedOut);assert!(!secure.is_connected());
-        let mut cluster=ClusterClient::connect(&h,cluster_options,at).await.expect("cluster");assert_eq!(cluster.command(&[b"SET",b"{async}key",b"value"],at).await.expect("cluster SET").bytes(),Some(b"OK".as_slice()));assert_eq!(cluster.command(&[b"GET",b"{async}key"],at).await.expect("cluster GET").bytes(),Some(b"value".as_slice()));
+        let mut cluster=ClusterClient::connect(&h,cluster_options.clone(),at).await.expect("cluster");assert_eq!(cluster.command(&[b"SET",b"{async}key",b"value"],at).await.expect("cluster SET").bytes(),Some(b"OK".as_slice()));assert_eq!(cluster.command(&[b"GET",b"{async}key"],at).await.expect("cluster GET").bytes(),Some(b"value".as_slice()));
+        exercise_cluster(&h, &cluster_options, &mut cluster, at).await;
         let mut master=sentinel(&h,vec![Endpoint{host:"127.0.0.1".into(),port:sentinel_options.address.port()}],"turnloop".into(),&sentinel_options,&plain,at).await.expect("Sentinel ROLE");assert_eq!(master.command(&[b"PING"],at).await.expect("discovered PING").bytes(),Some(b"PONG".as_slice()));
         9
     }).expect("spawn");
     assert_eq!(drive(&mut ex, &mut task), 9);
+}
+async fn exercise_cluster(
+    h: &ExecutorHandle<Platform>,
+    options: &ConnectOptions,
+    cluster: &mut ClusterClient<Platform>,
+    at: Instant,
+) {
+    use turnloop_redis::routing::key_slot;
+    let key = (0..10000)
+        .map(|i| format!("async-migrate-{i}"))
+        .find(|k| {
+            cluster
+                .slots()
+                .endpoint(key_slot(k.as_bytes()))
+                .expect("slot")
+                .port
+                != options.address.port()
+        })
+        .expect("foreign key");
+    let slot = key_slot(key.as_bytes());
+    let slot_text = slot.to_string();
+    let source = cluster.slots().endpoint(slot).expect("source").clone();
+    let mut source_options = options.clone();
+    source_options.address.set_port(source.port);
+    let mut src = Client::connect(h, &source_options, at)
+        .await
+        .expect("source");
+    let mut dst = Client::connect(h, options, at).await.expect("destination");
+    src.command(&[b"DEL", key.as_bytes()], at)
+        .await
+        .expect("empty slot key");
+    let source_id = src
+        .command(&[b"CLUSTER", b"MYID"], at)
+        .await
+        .expect("source id");
+    let dest_id = dst
+        .command(&[b"CLUSTER", b"MYID"], at)
+        .await
+        .expect("destination id");
+    dst.command(
+        &[
+            b"CLUSTER",
+            b"SETSLOT",
+            slot_text.as_bytes(),
+            b"IMPORTING",
+            source_id.bytes().expect("id"),
+        ],
+        at,
+    )
+    .await
+    .expect("importing");
+    src.command(
+        &[
+            b"CLUSTER",
+            b"SETSLOT",
+            slot_text.as_bytes(),
+            b"MIGRATING",
+            dest_id.bytes().expect("id"),
+        ],
+        at,
+    )
+    .await
+    .expect("migrating");
+    assert_eq!(
+        cluster
+            .command(&[b"SET", key.as_bytes(), b"asked"], at)
+            .await
+            .expect("ASK routed SET")
+            .bytes(),
+        Some(b"OK".as_slice())
+    );
+    assert_eq!(
+        cluster.slots().endpoint(slot).expect("ASK keeps slot").port,
+        source.port
+    );
+    assert_eq!(
+        cluster
+            .command(&[b"GET", key.as_bytes()], at)
+            .await
+            .expect("ASK GET")
+            .bytes(),
+        Some(b"asked".as_slice())
+    );
+    dst.command(
+        &[
+            b"CLUSTER",
+            b"SETSLOT",
+            slot_text.as_bytes(),
+            b"NODE",
+            dest_id.bytes().expect("id"),
+        ],
+        at,
+    )
+    .await
+    .expect("destination owns slot");
+    src.command(
+        &[
+            b"CLUSTER",
+            b"SETSLOT",
+            slot_text.as_bytes(),
+            b"NODE",
+            dest_id.bytes().expect("id"),
+        ],
+        at,
+    )
+    .await
+    .expect("source releases slot");
+    assert_eq!(
+        cluster
+            .command(&[b"GET", key.as_bytes()], at)
+            .await
+            .expect("MOVED GET")
+            .bytes(),
+        Some(b"asked".as_slice())
+    );
+    assert_eq!(
+        cluster
+            .slots()
+            .endpoint(slot)
+            .expect("MOVED updates slot")
+            .port,
+        options.address.port()
+    );
+    // Fixture-only graceful restart (save config/data and exec). Send once via
+    // raw I/O, so reconnect cannot replay a second restart.
+    // https://github.com/redis/redis/blob/8.4/src/debug.c
+    let before = dst
+        .command(&[b"INFO", b"SERVER"], at)
+        .await
+        .expect("before restart");
+    let run_id = |v: &Value| {
+        std::str::from_utf8(v.bytes().expect("INFO"))
+            .expect("utf8")
+            .lines()
+            .find_map(|l| l.strip_prefix("run_id:"))
+            .expect("run id")
+            .to_owned()
+    };
+    let before = run_id(&before);
+    let reconnects = cluster.reconnect_count();
+    assert_eq!(
+        dst.command(&[b"SAVE"], at)
+            .await
+            .expect("persist restart data")
+            .bytes(),
+        Some(b"OK".as_slice())
+    );
+    let mut control = h
+        .connect(options.address, Default::default())
+        .await
+        .expect("restart socket");
+    write_all(
+        &mut control,
+        b"*3\r\n$5\r\nDEBUG\r\n$7\r\nRESTART\r\n$2\r\n50\r\n",
+    )
+    .await
+    .expect("restart command");
+    drop(control);
+    h.sleep(Duration::from_secs(3))
+        .await
+        .expect("restart timer");
+    let after = dst
+        .command(&[b"INFO", b"SERVER"], at)
+        .await
+        .expect("restarted INFO");
+    assert_ne!(before, run_id(&after));
+    assert_eq!(
+        cluster
+            .command(&[b"GET", key.as_bytes()], at)
+            .await
+            .expect("cluster reconnect")
+            .bytes(),
+        Some(b"asked".as_slice())
+    );
+    assert!(cluster.reconnect_count() > reconnects);
+    cluster
+        .command(&[b"DEL", key.as_bytes()], at)
+        .await
+        .expect("cleanup key");
+    src.command(
+        &[
+            b"CLUSTER",
+            b"SETSLOT",
+            slot_text.as_bytes(),
+            b"NODE",
+            source_id.bytes().expect("id"),
+        ],
+        at,
+    )
+    .await
+    .expect("restore source");
+    dst.command(
+        &[
+            b"CLUSTER",
+            b"SETSLOT",
+            slot_text.as_bytes(),
+            b"NODE",
+            source_id.bytes().expect("id"),
+        ],
+        at,
+    )
+    .await
+    .expect("restore destination");
 }

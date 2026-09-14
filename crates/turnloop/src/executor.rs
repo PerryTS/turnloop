@@ -183,7 +183,9 @@ impl<B: Backend> Shared<B> {
             for slot in self.slots.borrow_mut().iter_mut() {
                 if slot.used && slot.closing.is_some() && slot.closing == completion.handle {
                     slot.result = Some(OpResult::Closed);
-                    if let Some(w) = &slot.waker { w.wake_by_ref(); }
+                    if let Some(w) = &slot.waker {
+                        w.wake_by_ref();
+                    }
                 }
             }
         }
@@ -248,7 +250,7 @@ impl<B: Backend> LocalExecutor<B> {
                             abandoned: false,
                             op: None,
                             timer: None,
-                closing: None,
+                            closing: None,
                             result: None,
                             waker: None,
                             bytes: vec![0; executor.buffer_size].into_boxed_slice(),
@@ -388,11 +390,19 @@ impl<B: Backend> ExecutorHandle<B> {
     /// Run owned work on the shared bounded blocking pool. Cancellation discards
     /// its result; an already running closure retains all its owned data.
     pub fn blocking<F: FnOnce() -> BlockingResult + Send + 'static>(&self, work: F) -> Blocking<B> {
-        Blocking { executor:self.clone(), work:Some(Box::new(work)), key:None }
+        Blocking {
+            executor: self.clone(),
+            work: Some(Box::new(work)),
+            key: None,
+        }
     }
     /// Close a resource and await physical release after its terminal I/O results.
     pub fn close(&self, handle: Handle) -> Close<B> {
-        Close { executor:self.clone(), handle:Some(handle), key:None }
+        Close {
+            executor: self.clone(),
+            handle: Some(handle),
+            key: None,
+        }
     }
     /// Connect TCP without blocking the host. Dropping closes the pending socket.
     pub fn connect(&self, addr: SocketAddr, opts: TcpOpts) -> Connect<B> {
@@ -976,7 +986,9 @@ impl<B: Backend> Future for Close<B> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         let shared = &this.executor.shared;
-        let key = if let Some(key) = this.key { key } else {
+        let key = if let Some(key) = this.key {
+            key
+        } else {
             let key = shared.reserve(cx)?;
             let Some(handle) = this.handle.take() else {
                 shared.free(key);
@@ -984,17 +996,27 @@ impl<B: Backend> Future for Close<B> {
             };
             let result = {
                 let mut driver = shared.driver.borrow_mut();
-                if driver.is_closing(handle) { Ok(()) } else { driver.close(handle, Token(0)) }
+                if driver.is_closing(handle) {
+                    Ok(())
+                } else {
+                    driver.close(handle, Token(0))
+                }
             };
             if let Err(e) = result {
                 shared.free(key);
-                return Poll::Ready(if e.kind == ErrorKind::NotFound { Ok(()) } else { Err(e) });
+                return Poll::Ready(if e.kind == ErrorKind::NotFound {
+                    Ok(())
+                } else {
+                    Err(e)
+                });
             }
             shared.slots.borrow_mut()[key.index].closing = Some(handle);
             this.key = Some(key);
             key
         };
-        let Some(result) = shared.result(key, cx) else { return Poll::Pending; };
+        let Some(result) = shared.result(key, cx) else {
+            return Poll::Pending;
+        };
         shared.free(key);
         this.key = None;
         Poll::Ready(match result {
@@ -1006,7 +1028,9 @@ impl<B: Backend> Future for Close<B> {
 }
 impl<B: Backend> Drop for Close<B> {
     fn drop(&mut self) {
-        if let Some(key) = self.key.take() { self.executor.shared.abandon(key); }
+        if let Some(key) = self.key.take() {
+            self.executor.shared.abandon(key);
+        }
     }
 }
 

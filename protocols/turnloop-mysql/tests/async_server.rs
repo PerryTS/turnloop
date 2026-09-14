@@ -121,11 +121,27 @@ fn real_async_tls_rsa_text_binary_multi_results_transactions_pool() {
                     .expect("rollback"),
                 Outcome::Success
             );
+            let mut admin_options = options.clone();
+            admin_options.protocol.user = "auth_admin".into();
+            let mut admin = Connection::connect(&h, &admin_options, at)
+                .await
+                .expect("auth admin");
+            assert_eq!(
+                admin
+                    .query("FLUSH PRIVILEGES", at, |_| Ok(()))
+                    .await
+                    .expect("clear SHA2 cache"),
+                Outcome::Success
+            );
             let mut rsa = options.clone();
             rsa.protocol.user = "auth_rsa_user".into();
             rsa.protocol.tls = false;
             rsa.tls = None;
             let mut rsa = Connection::connect(&h, &rsa, at).await.expect("RSA auth");
+            assert!(
+                rsa.rsa_authenticated,
+                "full RSA path must execute after cache flush"
+            );
             assert_eq!(rsa.ping(at).await.expect("RSA ping"), Outcome::Success);
             let pool = Pool::new(
                 &h,
