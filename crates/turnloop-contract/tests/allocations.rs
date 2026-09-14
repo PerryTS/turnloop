@@ -713,6 +713,7 @@ fn regular_file_jobs_reuse_pool_storage() {
     std::fs::remove_file(path).expect("remove file");
 }
 
+#[cfg(not(target_os = "wasi"))]
 #[test]
 fn file_readiness_survives_pool_backpressure_without_allocations_or_spin() {
     use std::{io::Write, os::fd::OwnedFd};
