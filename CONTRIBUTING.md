@@ -13,6 +13,7 @@ required, with no nightly language features in the library. WASI 0.3 alone uses
 `nightly-2026-09-07` and Wasmtime 46.0.0, based on the WASM lane's successful spike.
 
 ```bash
+python3 scripts/ci/check-paths.py
 cargo +nightly-2026-08-20 fmt --all --check
 cargo +nightly-2026-08-20 clippy --locked --workspace --all-targets --all-features -- \
   -D warnings -D clippy::undocumented_unsafe_blocks
@@ -27,6 +28,16 @@ cargo +nightly-2026-08-20 deny --locked check
 python3 scripts/ci/lint-workflows.py
 python3 -m unittest discover -s scripts/ci -p 'test_*.py' -v
 ```
+
+`check-paths.py` reads Git's index for exact path spellings and the working tree
+for file references, so it also catches unstaged source edits on case-insensitive
+disks. It rejects file/directory case collisions, Rust includes and module paths
+(including disabled cfg branches and inline modules), and Cargo readme/license-file
+paths. It understands literal/raw strings and literal `concat!` with
+`env!("CARGO_MANIFEST_DIR")`; other computed include paths fail for manual resolution.
+Comments and string contents are not scanned as Rust code. Stage new referenced
+files with their exact case before the final check. Run its synthetic Git regression
+with `python3 -m unittest discover -s scripts/ci -p test_paths.py -v`.
 
 Every unsafe block must explain its safety with `// SAFETY:` and crate roots deny
 `unsafe_op_in_unsafe_fn`. No `unwrap()` on I/O paths. Assert actual completions,
@@ -142,6 +153,9 @@ be real Cargo test targets, not names of ignored unit-test functions. CI runs ea
 with `--include-ignored --test-threads=1 --nocapture`; ignored real-server tests
 must actually execute. The protocol job fails if any protocol member lacks a
 declaration, or a selected suite runs zero tests.
+The runner attempts every declared suite even after failures, prints a per-suite
+PASS/FAIL table, and appends it to `GITHUB_STEP_SUMMARY` when set. Missing/invalid
+metadata, command failures and zero executed tests remain failures of the job.
 
 CI sets `TURNLOOP_TEST_REQUIRED=1`. A harness must **fail**, never return success,
 if a required connection/certificate variable is absent, a service is unavailable,
@@ -175,6 +189,9 @@ port is loopback-only; there is no fallback to a default port or system instance
 scripts/test-servers.py run cargo test --workspace -- --include-ignored
 scripts/test-servers.py start   # prints shell exports; explicitly source them to run tests
 scripts/test-servers.py stop
+# Reproduce PostgreSQL's CI configuration with separate proxied TCP connections:
+scripts/test-servers.py --services postgres --postgres-proxy run cargo test \
+  -p turnloop-postgres --test server -- --include-ignored --test-threads=1 --nocapture
 # Explicit subset for machines unable to run SQL; does not count as a full pass:
 scripts/test-servers.py --services redis,mongodb,smtp run cargo test \
   -p turnloop-redis -p turnloop-mongodb -p turnloop-smtp -- --include-ignored --test-threads=1
@@ -201,8 +218,23 @@ In the managed macOS sandbox PostgreSQL initialization fails at `shmget` and
 MySQL initialization crashes. Those real-server tests are **UNRUN (sandbox)**;
 run the full command outside the sandbox.
 
+Local PostgreSQL initializes the administrator as `turnloop`, matching CI's
+`POSTGRES_USER`; a `postgres` database exists but a `postgres` role is not assumed.
+Both paths apply the same three SSL `ALTER SYSTEM` settings and reload, then check
+effective TLS settings and pending restarts and print versions, roles and timeout
+settings. The optional loopback TCP proxy preserves bytes and half-closes, opens
+one upstream connection per client, and reports forwarded bytes, connection counts
+and CancelRequests. The cancel test observes its exact backend PID using another
+`scram_user` session, requires SQLSTATE 57014 and checks subsequent session reuse.
+
 HTTP fixture servers use the same lifecycle and authenticated private-instance
 shutdown. Node **26.5.1** is pinned with setup-node on native and protocol CI.
+Node fetch and `node:http2` legs are mandatory on every native runner. curl legs
+use the installed executable's `curl -V` capabilities (`Protocols: http`, plus
+`Features: HTTP2` for h2); missing HTTP2 skips only that curl leg. Tests print each
+verified leg and run a real 100-stream Node regression with curl HTTP2 unavailable.
+All fixture network connections use explicit IPv4 loopback; `localhost` in TLS
+certificates/SNI or HTTP authority fields does not select the transport address.
 The `service-group = "http"` metadata selects HTTP/TLS/WebSocket interop targets:
 
 ```bash
@@ -224,11 +256,40 @@ every test and the zero-allocation thresholds. This avoids pinned WASI 0.3
 libtest CLI-argument lowering calling the generated allocator shim without a
 valid stack; these targets always run their full list, regardless of test filters. Both WASI 0.2 and 0.3 have a
 required protocol job, independent of the pending production backend contracts.
-For ring on macOS, set `CC_wasm32_wasip2` and `CC_wasm32_unknown_unknown` to
-`/opt/homebrew/opt/llvm/bin/clang`, and the corresponding `AR_*` values to
-`/opt/homebrew/opt/llvm/bin/llvm-ar`; Linux CI uses clang/llvm-ar. Protocol library
-and all-test-target Clippy covers browser wasm, while browser runtime contracts
-remain pending with the backend lane.
+For ring, install the same pinned C toolchain used by CI on Linux x86_64 or
+macOS arm64 (no system installation required):
+
+```bash
+python3 scripts/ci/install-wasm-toolchain.py
+source .tools/wasm-env.sh
+cargo clippy --locked --workspace --all-targets --target wasm32-wasip2 -- -D warnings
+cargo clippy --locked --workspace --all-targets --target wasm32-unknown-unknown -- -D warnings
+bash scripts/ci/install-wasmtime.sh
+python3 scripts/ci/run-tests.py protocol-wasi --target wasm32-wasip2
+python3 scripts/ci/run-tests.py protocol-wasi --target wasm32-wasip3
+```
+
+The installer verifies [wasi-sdk 34.0's official release hashes](https://github.com/WebAssembly/wasi-sdk/releases/tag/wasi-sdk-34)
+against `scripts/ci/tools.json` before extraction into `.tools/`. It provides
+absolute target-specific `CC_*`/`AR_*` paths for p2, p3 and browser wasm; CI receives
+them through `GITHUB_ENV`. It compiles a wasm object and archives it for each target
+before reporting success. This fixes CI run 34874044440's missing `llvm-ar` and
+Apple clang's absent wasm backend. The SDK includes a WASI sysroot; Rust retains
+its own target linker/libc, and ring builds its freestanding C objects with clang.
+No extra browser libc or default rustls provider is enabled. Re-source the file
+in each local shell; do not set a global `CC` that would change native builds.
+
+`turnloop-tls` additionally declares `wasi-tests = ["portable"]`: its in-memory
+transport runs real ring-backed handshakes, encrypted records, ALPN, resumption,
+certificate rejection and injected deadlines without native sockets or threads.
+This establishes TLS correctness, not allocation freedom of upstream rustls records: a
+separate probe measured four allocations per bidirectional record exchange in
+rustls 0.23.45. Existing core/HTTP/decoder allocation gates remain mandatory.
+The HTTP/decoder codec and allocation suites continue to execute on p2 and p3.
+Database/SMTP real-server TLS suites still need their native fixture transports;
+compilation of those targets is not counted as WASI server execution. Protocol
+library and all-test-target Clippy covers browser wasm; browser runtime contracts
+remain owned by the backend lane.
 
 The shared rustls configuration disables defaults and selects ring/std/tls12.
 SQL/Redis/SMTP/Mongo test transports and the TLS library use the same version and
@@ -246,7 +307,7 @@ stages unpublished siblings together and verifies every packaged library. Never
 use `--no-verify` to bypass this dependency chain. Do not remove their ignored test bodies
 or treat a failed initializer as a test pass.
 
-CI's PostgreSQL 16/MySQL **9.6.0** service containers are provisioned by
+CI's PostgreSQL **16.13**/MySQL **9.6.0** service containers are provisioned by
 `scripts/test-servers.py --ci-services`. Redis runs natively at **8.4.0**, matching
 the local fixture. `python3 scripts/ci/install-redis.py` builds the official tarball
 after verifying its committed SHA-256 against Redis's published release digest,
@@ -260,7 +321,8 @@ The six-node Redis cluster (three masters and three replicas), single/TLS instan
 and Sentinel use the native runner's configurations, auth and certificates. The
 five MongoDB instances use private named Linux containers; CI pulls their image
 before the bounded startup wait. SQL TLS probes precede the metadata-selected Rust
-suites. Mongo container ownership labels are checked during cleanup. The Docker
+suites. Mongo containers run with the host UID/GID, and their ownership labels
+are checked during cleanup. The Docker
 path is **UNRUN locally** because the development sandbox has no Docker.
 
 Private server stdout and stderr are captured together under `.tools/`: Redis
@@ -268,7 +330,15 @@ Private server stdout and stderr are captured together under `.tools/`: Redis
 `mongod.log`, SQL `sql/*init*.log`, `postgres.log`, `mysqld-console.log` and
 `mysql.log`, SMTP `smtp/server.log`, and HTTP `http/server.log`. Startup failures
 print the relevant last 40 lines (at most 16 KiB per file), including errors before internal logging is
-initialized. CI preserves these files in the `protocol-server-logs` artifact.
+initialized. `scripts/test-servers.py logs` prints bounded tails and copies only
+known log files to the flat `.tools/protocol-logs/` directory. CI uploads that
+directory as `protocol-server-logs`, without recursively scanning server data.
+On protocol job failure, CI also prints and preserves both SQL service container
+logs. The only fixture build cache is `.tools/redis-build`; it contains no data.
+Mongo cleanup stops/removes containers or stops native servers, reaps owned
+children and verifies closed ports before deleting recorded data directories.
+Private PostgreSQL/MySQL data is deleted after shutdown, including partial data
+from failed initialization. Logs and certificates are retained outside data roots.
 Cleanup reaps owned Redis children, removes state for crashed instances, and
 checks private config identity before a separate invocation sends SHUTDOWN.
 An unresponsive or unidentified instance retains its record. Cleanup failures

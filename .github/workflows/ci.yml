@@ -19,12 +19,6 @@ defaults:
     shell: bash
 env:
   CARGO_TERM_COLOR: always
-  CC_wasm32_wasip2: clang
-  AR_wasm32_wasip2: llvm-ar
-  CC_wasm32_wasip3: clang
-  AR_wasm32_wasip3: llvm-ar
-  CC_wasm32_unknown_unknown: clang
-  AR_wasm32_unknown_unknown: llvm-ar
   RUST_BACKTRACE: '1'
 jobs:
   workflow-lint:
@@ -47,6 +41,7 @@ jobs:
         run: python3 scripts/ci/install-tools.py actionlint zizmor shellcheck
       - name: Lint automation and exercise gate failures
         run: |
+          python3 scripts/ci/check-paths.py
           python3 scripts/ci/lint-workflows.py
           python3 -m unittest discover -s scripts/ci -p 'test_*.py' -v
   lint-native:
@@ -99,6 +94,8 @@ jobs:
           persist-credentials: false
       - name: Install pinned Rust
         run: rustup toolchain install nightly-2026-08-20 --profile minimal --component rustfmt,clippy
+      - name: Install checksum-pinned wasm C compiler and archiver
+        run: python3 scripts/ci/install-wasm-toolchain.py
       - name: Cross-target Clippy and stable
         run: |
           rustup target add --toolchain nightly-2026-08-20 "$TARGET"
@@ -190,6 +187,8 @@ jobs:
         run: |
           rustup toolchain install "$TOOLCHAIN" --profile minimal --component clippy --target "$TARGET"
           bash scripts/ci/install-wasmtime.sh
+      - name: Install checksum-pinned wasm C compiler and archiver
+        run: python3 scripts/ci/install-wasm-toolchain.py
       - name: Lint and run actual WASI contracts
         run: |
           cargo +"$TOOLCHAIN" clippy --locked --workspace --all-targets --all-features --target "$TARGET" -- -D warnings -D clippy::undocumented_unsafe_blocks
@@ -219,6 +218,8 @@ jobs:
           python3 scripts/ci/install-tools.py wasm-pack
           google-chrome --version
           firefox --version
+      - name: Install checksum-pinned wasm C compiler and archiver
+        run: python3 scripts/ci/install-wasm-toolchain.py
       - name: Chrome and Firefox contracts
         run: python3 scripts/ci/run-tests.py web
       - name: Node subset
@@ -230,7 +231,7 @@ jobs:
     timeout-minutes: 45
     services:
       postgres:
-        image: postgres:16
+        image: postgres:16.13
         env:
           POSTGRES_DB: turnloop
           POSTGRES_USER: turnloop
@@ -287,12 +288,26 @@ jobs:
       - name: Fixture logs and cleanup
         if: always()
         run: scripts/test-servers.py --ci-services stop
+      - name: SQL service container logs on failure
+        if: failure()
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+          MYSQL_CONTAINER: ${{ job.services.mysql.id }}
+        run: |
+          mkdir -p .tools/protocol-logs
+          status=0
+          docker logs "$POSTGRES_CONTAINER" 2>&1 | tee .tools/protocol-logs/postgres-container.log || status=1
+          docker logs "$MYSQL_CONTAINER" 2>&1 | tee .tools/protocol-logs/mysql-container.log || status=1
+          exit "$status"
+      - name: Collect private server logs without traversing data directories
+        if: always()
+        run: scripts/test-servers.py logs
       - name: Preserve private server diagnostics
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: protocol-server-logs
-          path: .tools/**/*.log
+          path: .tools/protocol-logs/
           include-hidden-files: true
           if-no-files-found: ignore
           retention-days: 7
@@ -340,7 +355,9 @@ jobs:
         run: |
           rustup toolchain install "$TOOLCHAIN" --profile minimal --target "$TARGET"
           bash scripts/ci/install-wasmtime.sh
-      - name: Execute HTTP codecs and all streaming allocation gates
+      - name: Install checksum-pinned wasm C compiler and archiver
+        run: python3 scripts/ci/install-wasm-toolchain.py
+      - name: Execute TLS, HTTP codecs and all streaming allocation gates
         run: python3 scripts/ci/run-tests.py protocol-wasi --target "$TARGET"
 
   dependencies:

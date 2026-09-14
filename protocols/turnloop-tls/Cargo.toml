@@ -29,3 +29,8 @@ workspace = true
 role = "protocol"
 service-group = "http"
 integration-tests = ["tls"]
+wasi-tests = ["portable"]
+
+[[test]]
+name = "portable"
+harness = false
