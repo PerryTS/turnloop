@@ -261,7 +261,16 @@ impl Decoder {
                 {
                     return Err(invalid("HTTP/1.1 requires exactly one Host"));
                 }
-                let (cl, te) = lengths(&head)?;
+                // RFC 9112 6.3: successful CONNECT starts a tunnel regardless of
+                // message framing fields in its response.
+                let (cl, te) = if self.mode == Mode::Response
+                    && self.connect_request
+                    && (200..300).contains(&head.status)
+                {
+                    (None, false)
+                } else {
+                    lengths(&head)?
+                };
                 head.keep_alive = !head.token("connection", "close")
                     && (head.version == 1 || head.token("connection", "keep-alive"));
                 self.keep_alive = head.keep_alive;

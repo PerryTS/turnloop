@@ -599,3 +599,125 @@ fn streaming_compression_fragmented_bounded_and_truncated() {
         assert!(failure, "truncated {encoding} must fail");
     }
 }
+
+#[test]
+fn h2_bodyless_responses_send_lengths_and_failure_completion() {
+    let mut client = http2::Connection::new(http2::Role::Client, Default::default()).unwrap();
+    let mut server = http2::Connection::new(http2::Role::Server, Default::default()).unwrap();
+    transfer(&mut client, &mut server);
+    transfer(&mut server, &mut client);
+    transfer(&mut client, &mut server);
+    let id = client.open(&request_headers(), true).unwrap();
+    transfer(&mut client, &mut server);
+    server
+        .send_headers(
+            id,
+            &[
+                Header::new(":status", "304"),
+                Header::new("content-length", "100"),
+            ],
+            true,
+        )
+        .unwrap();
+    transfer(&mut server, &mut client);
+    let id = client.open(&request_headers(), true).unwrap();
+    transfer(&mut client, &mut server);
+    assert!(
+        server
+            .send_headers(
+                id,
+                &[
+                    Header::new(":status", "200"),
+                    Header::new("content-length", "100")
+                ],
+                true
+            )
+            .is_err()
+    );
+    server
+        .send_headers(
+            id,
+            &[
+                Header::new(":status", "200"),
+                Header::new("content-length", "2"),
+            ],
+            false,
+        )
+        .unwrap();
+    assert!(server.send_data(id, b"too much", true).is_err());
+    assert_eq!(server.send_data(id, b"ok", true).unwrap(), 2);
+    transfer(&mut server, &mut client);
+    let last = client.open(&request_headers(), true).unwrap();
+    client.eof();
+    assert_eq!(client.poll_failed_stream(), Some(last));
+    assert_eq!(client.poll_failed_stream(), None);
+    let mut client = http2::Connection::new(http2::Role::Client, Default::default()).unwrap();
+    let now = Instant::now();
+    client.set_settings_deadline(Some(now));
+    assert_eq!(client.handle_timeout(now).unwrap().code, "SETTINGS_TIMEOUT");
+    assert!(client.handle_timeout(now).is_none());
+}
+
+#[test]
+fn h2_negative_initial_window_stalls_and_recovers() {
+    let mut client = http2::Connection::new(http2::Role::Client, Default::default()).unwrap();
+    let mut server = http2::Connection::new(http2::Role::Server, Default::default()).unwrap();
+    transfer(&mut client, &mut server);
+    transfer(&mut server, &mut client);
+    transfer(&mut client, &mut server);
+    let id = client.open(&request_headers(), true).unwrap();
+    transfer(&mut client, &mut server);
+    server
+        .send_headers(id, &[Header::new(":status", "200")], false)
+        .unwrap();
+    assert_eq!(server.send_data(id, &[7; 20], false).unwrap(), 20);
+    let mut wire = Vec::new();
+    http2::encode_frame(4, 0, 0, &[0, 4, 0, 0, 0, 0], &mut wire).unwrap();
+    server.receive(&wire).unwrap();
+    assert_eq!(server.send_data(id, b"stalled", false).unwrap(), 0);
+    wire.clear();
+    http2::encode_frame(8, 0, id, &21u32.to_be_bytes(), &mut wire).unwrap();
+    server.receive(&wire).unwrap();
+    assert_eq!(server.send_data(id, b"resume", false).unwrap(), 1);
+}
+#[test]
+fn proxy_credentials_and_cross_origin_mixed_case_headers() {
+    let mut request = Request::new("http://origin.test/path#fragment", "POST").unwrap();
+    request.headers.push(Header {
+        name: "Authorization".into(),
+        value: b"secret".to_vec(),
+    });
+    request.headers.push(Header {
+        name: "Content-Type".into(),
+        value: b"text/plain".to_vec(),
+    });
+    request
+        .redirect(
+            302,
+            Some("http://other.test/"),
+            RedirectMode::Follow,
+            DEFAULT_MAX_REDIRECTS,
+        )
+        .unwrap();
+    assert!(request.headers.is_empty());
+    let proxy = url::Url::parse("http://us%65r:p%61ss@localhost:8080").unwrap();
+    let route = Route::new(request.url.clone(), Some(proxy.clone()));
+    let head = route.request_head(&request, None);
+    assert_eq!(head.target, "http://other.test/");
+    assert_eq!(
+        head.get("proxy-authorization"),
+        Some(b"Basic dXNlcjpwYXNz".as_slice())
+    );
+    let request = Request::new("https://origin.test/", "GET").unwrap();
+    let route = Route::new(request.url.clone(), Some(proxy));
+    assert_eq!(
+        route.connect_head(None).unwrap().get("proxy-authorization"),
+        Some(b"Basic dXNlcjpwYXNz".as_slice())
+    );
+    assert!(
+        route
+            .request_head(&request, None)
+            .get("proxy-authorization")
+            .is_none()
+    );
+}

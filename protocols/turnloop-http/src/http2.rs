@@ -128,6 +128,10 @@ struct Stream {
     recv_length: Option<u64>,
     received: u64,
     head_request: bool,
+    recv_no_body: bool,
+    send_no_body: bool,
+    send_length: Option<u64>,
+    sent: u64,
 }
 impl Stream {
     fn closed(&self) -> bool {
@@ -246,7 +250,7 @@ impl Connection {
         if !self.failed {
             return None;
         }
-        let stream = self.streams.iter_mut().find(|s| !s.closed())?;
+        let stream = self.streams.iter_mut().find(|s| !s.remote_end)?;
         stream.local_end = true;
         stream.remote_end = true;
         Some(stream.id)
@@ -293,6 +297,10 @@ impl Connection {
             recv_length: None,
             received: 0,
             head_request: false,
+            recv_no_body: false,
+            send_no_body: false,
+            send_length: None,
+            sent: 0,
         };
         if let Some(i) = self
             .streams
@@ -350,6 +358,21 @@ impl Connection {
         if s.sent_head && !end_stream {
             return Err(protocol("trailers must end stream"));
         }
+        let no_body = self.role == Role::Server
+            && (s.head_request
+                || headers
+                    .iter()
+                    .any(|h| h.name == ":status" && matches!(h.value.as_slice(), b"204" | b"304")));
+        let length = if s.sent_head {
+            s.send_length
+        } else if no_body {
+            None
+        } else {
+            content_length(headers)?
+        };
+        if end_stream && length.is_some_and(|n| n != s.sent) {
+            return Err(protocol("outgoing content-length mismatch"));
+        }
         self.scratch.clear();
         self.encoder.encode(headers, &mut self.scratch);
         let count = self.scratch.len().max(1).div_ceil(self.peer_frame);
@@ -368,6 +391,8 @@ impl Connection {
         }
         let s = &mut self.streams[i];
         s.sent_head |= !informational;
+        s.send_no_body = no_body;
+        s.send_length = length;
         s.local_end = end_stream;
         if self.role == Role::Client {
             s.head_request = headers
@@ -392,10 +417,19 @@ impl Connection {
             return Ok(0);
         }
         let end = end_stream && n == bytes.len();
+        if s.send_no_body && !bytes.is_empty() {
+            return Err(protocol("DATA on bodyless response"));
+        }
+        if s.send_length.is_some_and(|length| {
+            s.sent + n as u64 > length || (end && s.sent + n as u64 != length)
+        }) {
+            return Err(protocol("outgoing content-length mismatch"));
+        }
         self.frame(0, u8::from(end), id, &bytes[..n])?;
         self.send_window -= n as i64;
         let s = &mut self.streams[i];
         s.send_window -= n as i64;
+        s.sent += n as u64;
         s.local_end = end;
         Ok(n)
     }
@@ -514,8 +548,8 @@ impl Connection {
                 s.unreleased += flow as u32;
                 s.received += payload.len() as u64;
                 let end = f.flags & 1 != 0;
-                if s.head_request && !payload.is_empty() {
-                    return Err(protocol("DATA on HEAD response"));
+                if s.recv_no_body && !payload.is_empty() {
+                    return Err(protocol("DATA on bodyless response"));
                 }
                 if s.recv_length
                     .is_some_and(|n| s.received > n || (end && n != s.received))
@@ -759,7 +793,16 @@ impl Connection {
             return Err(protocol("trailers without END_STREAM"));
         }
         if !s.received_head && !informational {
-            s.recv_length = content_length(&headers)?;
+            s.recv_no_body = self.role == Role::Client
+                && (s.head_request
+                    || headers.iter().any(|h| {
+                        h.name == ":status" && matches!(h.value.as_slice(), b"204" | b"304")
+                    }));
+            s.recv_length = if s.recv_no_body {
+                None
+            } else {
+                content_length(&headers)?
+            };
             if self.role == Role::Server {
                 s.head_request = headers
                     .iter()
@@ -767,7 +810,7 @@ impl Connection {
             }
             s.received_head = true;
         }
-        if end && !s.head_request && s.recv_length.is_some_and(|n| n != s.received) {
+        if end && s.recv_length.is_some_and(|n| n != s.received) {
             return Err(protocol("content-length mismatch"));
         }
         s.remote_end = end;
@@ -879,6 +922,9 @@ fn validate_headers(headers: &[Header], request: bool, trailers: bool) -> Result
                 return Err(protocol("invalid status"));
             }
         }
+    }
+    if trailers && headers.iter().any(|h| h.name == "content-length") {
+        return Err(protocol("content-length in trailers"));
     }
     content_length(headers)?;
     Ok(())

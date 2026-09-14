@@ -12,6 +12,8 @@ url = "2"
 httparse = "1"
 flate2 = "1"
 brotli = "8"
+base64 = "0.22"
+percent-encoding = "2"
 turnloop-tls = { path = "../turnloop-tls" }
 
 [dev-dependencies]

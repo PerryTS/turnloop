@@ -28,6 +28,7 @@ pub trait Resolver {
     fn poll(&mut self, token: Self::Token, addresses: &mut Vec<IpAddr>) -> Option<Result<()>>;
     fn cancel(&mut self, token: Self::Token);
 }
+pub const DEFAULT_MAX_REDIRECTS: usize = 20;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RedirectMode {
     Follow,
@@ -501,6 +502,8 @@ impl Route {
         let mut headers = vec![Header::new("host", &target)];
         if let Some(value) = authorization {
             headers.push(Header::new("proxy-authorization", value));
+        } else if let Some(value) = self.proxy.as_ref().and_then(proxy_authorization) {
+            headers.push(Header::new("proxy-authorization", value));
         }
         Some(Head {
             method: "CONNECT".into(),
@@ -510,6 +513,22 @@ impl Route {
             headers,
             keep_alive: true,
         })
+    }
+    /// Serialize origin-form for direct/tunnel traffic and absolute-form for HTTP proxies.
+    /// Proxy credentials are never forwarded inside an HTTPS tunnel.
+    pub fn request_head(&self, request: &Request, authorization: Option<&[u8]>) -> Head {
+        let proxy_http = self.proxy.is_some() && self.target.scheme() == "http";
+        let mut head = request.head(proxy_http);
+        head.headers
+            .retain(|h| !h.name.eq_ignore_ascii_case("proxy-authorization"));
+        if proxy_http {
+            if let Some(auth) = authorization {
+                head.headers.push(Header::new("proxy-authorization", auth));
+            } else if let Some(value) = self.proxy.as_ref().and_then(proxy_authorization) {
+                head.headers.push(Header::new("proxy-authorization", value));
+            }
+        }
+        head
     }
     pub fn tunnel_response(&mut self, status: u16) -> Result<TransportRequest> {
         if !(200..300).contains(&status) {
@@ -741,4 +760,21 @@ impl Http1Connection {
     pub fn reusable(&self) -> bool {
         !self.active && !self.close_requested && self.lifecycle.delivered && self.decoder.reusable()
     }
+}
+
+fn proxy_authorization(proxy: &Url) -> Option<String> {
+    use base64::Engine;
+    if proxy.username().is_empty() && proxy.password().is_none() {
+        return None;
+    }
+    let mut credential =
+        percent_encoding::percent_decode_str(proxy.username()).collect::<Vec<u8>>();
+    credential.push(b':');
+    credential.extend(percent_encoding::percent_decode_str(
+        proxy.password().unwrap_or(""),
+    ));
+    Some(format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(credential)
+    ))
 }

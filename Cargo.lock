@@ -808,11 +808,13 @@ dependencies = [
 name = "turnloop-http"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "brotli",
  "bytes",
  "flate2",
  "http",
  "httparse",
+ "percent-encoding",
  "rcgen",
  "ruzstd",
  "turnloop-tls",
