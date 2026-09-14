@@ -103,6 +103,26 @@ mod retained {
             return ptr::without_provenance_mut(align);
         }
         let arena = ACTIVE.load(Ordering::Relaxed);
+        if !arena.is_null() && old_len != 0 {
+            // SAFETY: active scope retains the arena; old describes a canonical allocation.
+            let arena = unsafe { &*arena };
+            if let Some(index) = arena.locate(old, old_len) {
+                assert_eq!(align, 1);
+                if len <= DATAGRAM_CAPACITY {
+                    return old;
+                }
+                let layout = Layout::from_size_align(len, align).expect("canonical layout");
+                // SAFETY: allocate a new heap list before releasing retained storage.
+                let new = unsafe { alloc(layout) };
+                if new.is_null() {
+                    handle_alloc_error(layout);
+                }
+                // SAFETY: old has old_len initialized bytes and new has len capacity.
+                unsafe { ptr::copy_nonoverlapping(old, new, old_len.min(len)) };
+                arena.release(index);
+                return new;
+            }
+        }
         if !arena.is_null() && old_len == 0 && align == 1 && len <= DATAGRAM_CAPACITY {
             // SAFETY: scoped holds an Rc to the arena until this import returns.
             let arena = unsafe { &*arena };
@@ -213,7 +233,6 @@ mod tests {
     use super::*;
     #[test]
     fn pending_lists_keep_distinct_storage_across_scopes_and_owners() {
-        #[allow(improper_ctypes)]
         unsafe extern "C" {
             fn cabi_realloc(old: *mut u8, old_len: usize, align: usize, len: usize) -> *mut u8;
         }
@@ -263,5 +282,55 @@ mod tests {
         drop(b_list);
         drop(reservation_b);
         assert_eq!(Rc::strong_count(&second), 1);
+    }
+    #[test]
+    fn error_strings_and_exceptional_growth_return_owned_storage() {
+        unsafe extern "C" {
+            fn cabi_realloc(old: *mut u8, old_len: usize, align: usize, len: usize) -> *mut u8;
+        }
+        let arena = Arena::shared();
+        let _reservation = arena.reserve();
+        let ptr = scoped(|| {
+            // SAFETY: fresh canonical byte allocation, valid layout.
+            unsafe { cabi_realloc(std::ptr::null_mut(), 0, 1, 17) }
+        });
+        // SAFETY: initialize the full list as canonical error text.
+        unsafe { ptr.write_bytes(b'x', 17) };
+        let mut error = [1, 14, 1, ptr as u32, 17];
+        assert_eq!(
+            super::super::socket_result(&mut error)
+                .expect_err("Other string")
+                .kind,
+            crate::ErrorKind::Other
+        );
+        let reused = scoped(|| {
+            // SAFETY: a fresh list after error consumption must reuse its slot.
+            unsafe { cabi_realloc(std::ptr::null_mut(), 0, 1, 17) }
+        });
+        assert_eq!(reused, ptr);
+        // SAFETY: initialize before canonical realloc copies the old prefix.
+        unsafe { reused.write_bytes(0x58, 17) };
+        let grown = scoped(|| {
+            // SAFETY: canonical growth with the allocation's actual original size.
+            unsafe { cabi_realloc(reused, 17, 1, 65537) }
+        });
+        assert_ne!(grown, reused);
+        // SAFETY: growth initialized only the original prefix; initialize the tail
+        // before creating a byte slice and taking ownership of the whole list.
+        let bytes = unsafe {
+            grown.add(17).write_bytes(0x39, 65537 - 17);
+            ReturnBytes::take(grown as u32, 65537)
+        };
+        assert!(bytes[..17].iter().all(|&x| x == 0x58));
+        assert!(bytes[17..].iter().all(|&x| x == 0x39));
+        let mut fixed_error = [1, 9, 0, 0, 0];
+        assert_eq!(
+            super::super::socket_result(&mut fixed_error)
+                .expect_err("refused")
+                .kind,
+            crate::ErrorKind::ConnectionRefused
+        );
+        // SAFETY: empty canonical lists may legally use a null pointer.
+        assert!(unsafe { ReturnBytes::take(0, 0) }.is_empty());
     }
 }

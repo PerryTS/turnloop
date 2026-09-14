@@ -592,17 +592,20 @@ fn start(p: &mut Pending, set: &WaitSet, kind: WaitKind, waitable: u32, code: u3
     }
 }
 fn result(p: &mut Pending) -> Result<()> {
+    socket_result(&mut p.area[16..21])
+}
+fn socket_result(area: &mut [u32]) -> Result<()> {
     // Other(Some(string)) owns a canonical list. Consume it ourselves because
     // it may be a retained slot; generated lifting would free it as a String.
-    if p.area[16] & 255 == 1 && p.area[17] & 255 == 14 {
-        if p.area[18] & 255 == 1 {
+    if area[0] & 255 == 1 && area[1] & 255 == 14 {
+        if area[2] & 255 == 1 {
             // SAFETY: completed SocketResult initialized the owned error text.
-            drop(unsafe { return_storage::ReturnBytes::take(p.area[19], p.area[20] as usize) });
+            drop(unsafe { return_storage::ReturnBytes::take(area[3], area[4] as usize) });
         }
         return Err(Error::new(ErrorKind::Other));
     }
-    // SAFETY: completed SocketResult at word 16; remaining variants own no lists.
-    unsafe { (SocketResult::VTABLE.lift)(p.area.as_mut_ptr().add(16).cast()) }.map_err(error)
+    // SAFETY: completed SocketResult at the start of area; remaining variants own no lists.
+    unsafe { (SocketResult::VTABLE.lift)(area.as_mut_ptr().cast()) }.map_err(error)
 }
 fn read_outcome(p: &mut Pending, n: usize) -> (Outcome<Detached>, bool) {
     if let Some(b) = &mut p.lease {
