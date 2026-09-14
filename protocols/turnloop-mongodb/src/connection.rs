@@ -138,16 +138,14 @@ impl Connection {
         self.request_id = id;
         self.expected = id;
         self.tx_at = 0;
-        let command = body
-            .iter_elements()
-            .next()
-            .transpose()
-            .map_err(|_| Error::protocol("Invalid command"))?
-            .ok_or_else(|| Error::protocol("Empty command"))?;
+        let command = body.iter_elements().next().transpose().map_err(|_|Error::protocol("Invalid command"))?.ok_or_else(||Error::protocol("Empty command"))?;
+        self.compress(command.key().as_str())
+    }
+    fn compress(&mut self, command:&str)->Result<()> {
         // Compression spec § Commands Not to Compress: includes authentication secrets.
         if self.zlib
             && !matches!(
-                command.key().as_str(),
+                command,
                 "hello"
                     | "isMaster"
                     | "ismaster"
@@ -415,6 +413,19 @@ impl Connection {
             };
         }
         Ok(())
+    }
+    /// Sends an already encoded OP_MSG template with a fresh wire request id.
+    /// Used by Operation to retain sequence storage and session identity on retries.
+    pub fn command_encoded(&mut self,token:u64,frame:&[u8],now:Instant)->Result<()> {
+        if self.state!=State::Ready||!self.tx.is_empty(){return Err(Error::protocol("Connection busy"));}
+        let message=Message::parse(frame,self.max_message_size)?;
+        if message.flags!=0||message.body.get_str("$db").is_err(){return Err(Error::protocol("Operation template requires $db and no wire flags"));}
+        if message.body.as_bytes().len()>self.max_bson_size{return Err(Error::protocol("Command exceeds maxBsonObjectSize"));}
+        for seq in message.sequences(){let mut n=0;for d in seq.documents(){n+=1;if n>self.max_write_batch_size||d.as_bytes().len()>self.max_bson_size{return Err(Error::protocol("Write sequence exceeds server limits"));}}}
+        let command=message.body.iter_elements().next().transpose().map_err(|_|Error::protocol("Invalid command"))?.ok_or_else(||Error::protocol("Empty command"))?;
+        self.tx.clear();self.tx.extend_from_slice(frame);self.request_id=self.request_id.wrapping_add(1).max(1);self.expected=self.request_id;self.tx[4..8].copy_from_slice(&self.request_id.to_le_bytes());self.tx_at=0;
+        if let Err(e)=self.compress(command.key().as_str()){self.tx.clear();return Err(e);}
+        self.token=Some(token);self.state=State::Command;self.deadline=if self.options.socket_timeout.is_zero(){None}else{Some(now+self.options.socket_timeout)};Ok(())
     }
     pub fn next_timeout(&self) -> Option<Instant> {
         self.deadline

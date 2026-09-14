@@ -12,6 +12,7 @@ pub mod command;
 pub mod connection;
 pub mod error;
 pub mod pool;
+pub mod operation;
 pub mod retry;
 pub mod session;
 pub mod topology;

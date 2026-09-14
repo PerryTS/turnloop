@@ -475,11 +475,29 @@ impl Topology {
     }
     /// Writes use Primary; host supplies random entropy for unbiased selection from
     /// the latency window. `candidates` reuses a caller-owned vector.
-    pub fn candidates<'a>(
+    pub fn candidates<'a>(&'a self,pref:ReadPreference,tags:&[BTreeMap<String,String>],max_staleness:Option<Duration>,out:&mut Vec<&'a str>)->Result<()> {
+        self.candidates_deprioritized(pref,tags,max_staleness,&[],out)
+    }
+    pub fn candidates_deprioritized<'a>(&'a self,pref:ReadPreference,tags:&[BTreeMap<String,String>],max_staleness:Option<Duration>,excluded:&[&str],out:&mut Vec<&'a str>)->Result<()> {
+        self.candidates_inner(pref,tags,max_staleness,excluded,out)?;
+        if out.is_empty()&&!excluded.is_empty(){self.candidates_inner(pref,tags,max_staleness,&[],out)?;}
+        Ok(())
+    }
+    /// Power-of-two choice; supply independent uniformly distributed host entropy.
+    pub fn choose<'a>(&self,candidates:&[&'a str],entropy:[u64;2])->Option<&'a str>{
+        if candidates.is_empty(){return None;}let a=(entropy[0] as u128*candidates.len() as u128>>64) as usize;
+        if candidates.len()==1{return Some(candidates[0]);}
+        let mut b=(entropy[1] as u128*(candidates.len()-1) as u128>>64) as usize;if b>=a{b+=1;}
+        Some(if self.servers.get(candidates[a])?.operation_count<=self.servers.get(candidates[b])?.operation_count{candidates[a]}else{candidates[b]})
+    }
+    pub fn operation_started(&mut self,address:&str)->Result<()>{let s=self.servers.get_mut(address).ok_or_else(||Error::protocol("Selected server was removed"))?;s.operation_count=s.operation_count.checked_add(1).ok_or_else(||Error::protocol("Server operation count overflow"))?;Ok(())}
+    pub fn operation_finished(&mut self,address:&str){if let Some(s)=self.servers.get_mut(address){s.operation_count=s.operation_count.saturating_sub(1);}}
+    fn candidates_inner<'a>(
         &'a self,
         pref: ReadPreference,
         tags: &[BTreeMap<String, String>],
         max_staleness: Option<Duration>,
+        excluded: &[&str],
         out: &mut Vec<&'a str>,
     ) -> Result<()> {
         out.clear();
@@ -489,7 +507,7 @@ impl Topology {
                 "Incompatible MongoDB wire version",
             ));
         }
-        if pref == ReadPreference::Primary && (!tags.is_empty() || max_staleness.is_some()) {
+        if pref == ReadPreference::Primary && (tags.iter().any(|t|!t.is_empty()) || max_staleness.is_some()) {
             return Err(Error::new(
                 ErrorKind::InvalidArgument,
                 "Primary read preference does not allow tags or staleness",
@@ -505,7 +523,9 @@ impl Topology {
         }
         let primary = self
             .servers
-            .values()
+            .iter()
+            .filter(|(a,_)|!excluded.contains(&a.as_str()))
+            .map(|(_,s)|s)
             .find(|s| s.kind == ServerType::RSPrimary);
         let max_write = self
             .servers
@@ -563,7 +583,7 @@ impl Topology {
             true
         };
         for (a, s) in &self.servers {
-            if filter(s) {
+            if !excluded.contains(&a.as_str()) && filter(s) {
                 out.push(a);
             }
         }
@@ -590,7 +610,7 @@ impl Topology {
             out.extend(
                 self.servers
                     .iter()
-                    .filter(|(_, s)| s.kind == ServerType::RSPrimary)
+                    .filter(|(a, s)| !excluded.contains(&a.as_str()) && s.kind == ServerType::RSPrimary)
                     .map(|(a, _)| a.as_str()),
             );
         }

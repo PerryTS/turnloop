@@ -143,6 +143,12 @@ impl<'a> Message<'a> {
             sections,
         })
     }
+    /// Replaces only the body; document sequences retain their original bytes/order.
+    pub fn encode_with_body(&self,out:&mut Vec<u8>,body:&RawDocument,max:usize)->Result<()> {
+        encode(out,self.request_id,0,0,body,&[],max)?;
+        let mut at=0;while at<self.sections.len(){let start=at;let kind=self.sections[at];at+=1;let n=i32_at(self.sections,at)? as usize;at+=n;if kind==1{out.extend_from_slice(&self.sections[start..at]);}}
+        if out.len()>max||out.len()>i32::MAX as usize{out.clear();return Err(Error::protocol("Message exceeds maxMessageSizeBytes"));}let n=out.len() as i32;out[..4].copy_from_slice(&n.to_le_bytes());Ok(())
+    }
     pub fn sequences(&self) -> Sequences<'a> {
         Sequences {
             bytes: self.sections,
