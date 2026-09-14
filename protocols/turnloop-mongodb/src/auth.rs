@@ -3,7 +3,7 @@
 use crate::{uri::Credential, Error, ErrorKind, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use bson::{doc, spec::BinarySubtype, Binary, Document};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Digest;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mechanism {
@@ -47,12 +47,15 @@ impl Scram {
         }
         let username = credential.username.replace('=', "=3D").replace(',', "=2C");
         let password = match mechanism {
-            Mechanism::Sha1 => format!(
-                "{:x}",
-                md5::Md5::digest(
-                    format!("{}:mongo:{}", credential.username, credential.password).as_bytes()
-                )
-            ),
+            Mechanism::Sha1 => {
+                use std::fmt::Write;
+                let digest = md5::Md5::digest(format!("{}:mongo:{}", credential.username, credential.password).as_bytes());
+                let mut hex = String::with_capacity(32);
+                for byte in digest {
+                    write!(hex, "{byte:02x}").expect("writing to a String cannot fail");
+                }
+                hex
+            },
             Mechanism::Sha256 => stringprep::saslprep(&credential.password)
                 .map_err(|_| auth_error("Password cannot be SASLprep normalized"))?
                 .into_owned(),

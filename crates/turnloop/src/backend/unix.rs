@@ -307,7 +307,6 @@ unsafe impl Backend for Unix {
         timeout: Option<Duration>,
         events: &mut Vec<Event<Detached>>,
     ) -> Result<PollInfo> {
-        let cached = self.has_work();
         while events.len() < events.capacity() {
             let Some(op) = self.cancelled.pop_front() else {
                 break;
@@ -320,9 +319,10 @@ unsafe impl Backend for Unix {
             });
         }
         self.run_ready(events);
-        // A pending cancellation or a cached EAGAIN attempt consumes this turn.
-        // Even if no completion resulted, never hide an additional wait afterward.
-        if cached || !events.is_empty() || events.len() == events.capacity() {
+        // Cached readiness can end in EAGAIN without producing a completion.
+        // In that case use this turn's single OS wait with its exact timeout;
+        // returning now would turn an idle socket into a timer polling loop.
+        if self.has_work() || !events.is_empty() || events.len() == events.capacity() {
             return Ok(PollInfo::default());
         }
         self.polled.clear();

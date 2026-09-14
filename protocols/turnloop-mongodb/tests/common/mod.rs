@@ -14,27 +14,24 @@ use turnloop_mongodb::{
     Connection, ConnectionEvent, Error, ErrorKind, Result,
 };
 pub fn raw(d: &Document) -> RawDocumentBuf {
-    RawDocumentBuf::try_from(d).unwrap()
+    RawDocumentBuf::try_from(d).expect("fixture operation must succeed")
 }
 pub fn tools_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.tools/mongodb")
+    std::env::var_os("TURNLOOP_TEST_MONGODB_TOOLS")
+        .expect("TURNLOOP_TEST_MONGODB_TOOLS required; run scripts/test-servers.py")
+        .into()
 }
 pub fn ports() -> Vec<(String, u16)> {
-    let v: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(tools_dir().join("servers.json")).expect("Run scripts/mongodb.py run"),
-    )
-    .unwrap();
-    v["servers"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| {
-            (
-                v["name"].as_str().unwrap().to_owned(),
-                v["port"].as_u64().unwrap() as u16,
-            )
-        })
-        .collect()
+    let port = |name| std::env::var(name).expect("required private MongoDB port").parse::<u16>().expect("valid port");
+    let mut ports = vec![("standalone".to_owned(), port("TURNLOOP_TEST_MONGODB_PORT")),
+        ("tls".to_owned(), port("TURNLOOP_TEST_MONGODB_TLS_PORT"))];
+    let replicas = std::env::var("TURNLOOP_TEST_MONGODB_REPLICA_PORTS").expect("required replica ports");
+    let replicas: Vec<_> = replicas.split(',').collect();
+    assert_eq!(replicas.len(), 3, "three replica members must run");
+    for (i, value) in replicas.iter().enumerate() {
+        ports.push((format!("rs{i}"), value.parse().expect("replica port")));
+    }
+    ports
 }
 trait Socket: Read + Write {}
 impl<T: Read + Write> Socket for T {}
@@ -50,17 +47,15 @@ impl Driver {
         let socket = TcpStream::connect(address).map_err(network)?;
         socket
             .set_read_timeout(Some(Duration::from_secs(10)))
-            .unwrap();
+            .map_err(network)?;
         socket
             .set_write_timeout(Some(Duration::from_secs(10)))
-            .unwrap();
+            .map_err(network)?;
         let tls = options.tls;
         let mut core = Connection::new(options);
         let mut entropy = [0u8; 24];
-        std::fs::File::open("/dev/urandom")
-            .unwrap()
-            .read_exact(&mut entropy)
-            .unwrap();
+        rustls::crypto::ring::default_provider()
+            .secure_random.fill(&mut entropy).expect("test nonce entropy");
         use base64::Engine;
         let nonce = base64::engine::general_purpose::STANDARD.encode(entropy);
         core.connected(Instant::now(), &nonce)?;
@@ -70,16 +65,16 @@ impl Driver {
                 Some(ConnectionEvent::UpgradeTls)
             ));
             let mut roots = rustls::RootCertStore::empty();
-            let cert = std::fs::read(tools_dir().join("cert.pem")).unwrap();
+            let cert = std::fs::read(tools_dir().join("cert.pem")).map_err(network)?;
             for c in rustls_pemfile::certs(&mut cert.as_slice()) {
-                roots.add(c.unwrap()).unwrap();
+                roots.add(c.expect("fixture operation must succeed")).expect("fixture operation must succeed");
             }
             let cfg = rustls::ClientConfig::builder()
                 .with_root_certificates(roots)
                 .with_no_client_auth();
             let mut conn =
-                rustls::ClientConnection::new(Arc::new(cfg), "localhost".try_into().unwrap())
-                    .unwrap();
+                rustls::ClientConnection::new(Arc::new(cfg), "localhost".try_into().expect("fixture operation must succeed"))
+                    .expect("fixture operation must succeed");
             let mut socket = socket;
             while conn.is_handshaking() {
                 conn.complete_io(&mut socket).map_err(network)?;

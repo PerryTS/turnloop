@@ -1,13 +1,20 @@
+#![deny(unsafe_op_in_unsafe_fn)]
+#[cfg(target_arch = "wasm32")]
+fn main() {}
+#[cfg(not(target_arch = "wasm32"))]
+#[path = "../tests/common/mod.rs"]
 mod common;
+#[cfg(not(target_arch = "wasm32"))]
 use common::{ports, Driver};
+#[cfg(not(target_arch = "wasm32"))]
 use std::{
     net::TcpStream,
     time::{Duration, Instant},
 };
+#[cfg(not(target_arch = "wasm32"))]
 use turnloop_mongodb::bson::doc;
-#[test]
-#[ignore = "private server cleanup only"]
-fn shutdown_private() {
+#[cfg(not(target_arch = "wasm32"))]
+fn main() {
     let entries = ports();
     let rs: Vec<_> = entries
         .iter()
@@ -36,7 +43,7 @@ fn shutdown_private() {
                 && d.core
                     .hello
                     .as_ref()
-                    .unwrap()
+                    .expect("fixture operation must succeed")
                     .get_bool("ismaster")
                     .unwrap_or(false)
                 {
@@ -62,7 +69,7 @@ fn shutdown_private() {
         }
         let tls = if name == "tls" { "&tls=true" } else { "" };
         let uri = format!("mongodb://127.0.0.1:{port}/?directConnection=true{tls}");
-        let mut d = Driver::connect(&uri).unwrap();
+        let mut d = Driver::connect(&uri).expect("fixture operation must succeed");
         if !name.starts_with("rs") {
             let _ = d.run(
                 "admin",
@@ -73,7 +80,7 @@ fn shutdown_private() {
         let mut d = Driver::connect(&format!(
             "mongodb://lane:pencil@127.0.0.1:{port}/admin?directConnection=true{tls}"
         ))
-        .unwrap();
+        .expect("fixture operation must succeed");
         let result = d.run("admin", doc! {"shutdown":1,"force":true,"timeoutSecs":0});
         assert!(
             result.is_err_and(|e| e.kind == turnloop_mongodb::ErrorKind::Network),

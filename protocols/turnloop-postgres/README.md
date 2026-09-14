@@ -114,7 +114,7 @@ tests. Real-server tests are explicitly ignored by default; missing fixture
 variables panic when those tests are selected. Run from the workspace:
 
 ```sh
-python3 scripts/sql-servers.py run cargo test -p turnloop-postgres --test server -- --ignored
+python3 scripts/test-servers.py run cargo test -p turnloop-postgres --test server -- --ignored
 ```
 
 The script creates private data/certificates/logs under `.tools`, uses random

@@ -85,6 +85,7 @@ jobs:
           cargo +nightly-2026-08-20 clippy --locked --workspace --all-targets --target "$TARGET" --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks
           rustup toolchain install stable --profile minimal --target "$TARGET"
           cargo +stable check --locked --workspace --all-targets --all-features --target "$TARGET"
+  # PENDING Windows shared contracts until the IOCP production provider lands (wave 2).
   test-native:
     strategy:
       fail-fast: false
@@ -105,6 +106,8 @@ jobs:
         run: rustup toolchain install nightly-2026-08-20 --profile minimal --component rustfmt,clippy
       - name: Workspace and single-threaded contracts, default and all features
         run: python3 scripts/ci/run-tests.py native
+      - name: Portable timer benchmark with workload assertions
+        run: cargo +nightly-2026-08-20 run --release -p turnloop-bench --locked -- --portable --timers
   self-hosted-windows:
     if: vars.SELF_HOSTED_WINDOWS == 'true'
     # zizmor: ignore[self-hosted-runner] -- Owner-enabled, ephemeral isolated Windows runner required by the platform contract.
@@ -125,6 +128,7 @@ jobs:
         run: |
           cargo +nightly-2026-08-20 clippy --locked --workspace --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks
           python3 scripts/ci/run-tests.py native
+  # PENDING wave 2: integrate WASI providers and nonzero shared contracts; retain failing gate.
   wasi:
     strategy:
       fail-fast: false
@@ -156,6 +160,7 @@ jobs:
         run: |
           cargo +"$TOOLCHAIN" clippy --locked --workspace --all-targets --all-features --target "$TARGET" -- -D warnings -D clippy::undocumented_unsafe_blocks
           python3 scripts/ci/run-tests.py wasi --target "$TARGET"
+  # PENDING wave 2: add browser/Node contract targets and metadata, then run both browsers.
   web:
     runs-on: ubuntu-24.04
     permissions:
@@ -308,6 +313,7 @@ jobs:
           cargo +nightly-2026-08-20 miri setup
       - name: Check core's explicitly marked pure-Rust tests
         run: python3 scripts/ci/run-tests.py miri
+  # PENDING: record/review Ubuntu 24.04 x86_64 iai candidates and commit a real baseline.
   instructions:
     runs-on: ubuntu-24.04
     permissions:

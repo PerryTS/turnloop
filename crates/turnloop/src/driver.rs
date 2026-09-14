@@ -726,7 +726,6 @@ impl<B: Backend> Driver<B> {
             if timeout == Some(Duration::ZERO)
                 || queued
                 || notified
-                || self.backend.has_work()
                 || !self.notifier.park()
             {
                 timeout = Some(Duration::ZERO);

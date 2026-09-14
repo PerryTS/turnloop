@@ -1,3 +1,5 @@
+#![cfg(not(target_arch = "wasm32"))]
+#![deny(unsafe_op_in_unsafe_fn)]
 mod support;
 use std::{
     io::{Read, Write},
@@ -37,11 +39,11 @@ impl Driver {
             connect_deadline: Some(Instant::now() + Duration::from_secs(10)),
             ..Config::default()
         };
-        let core = Connection::new(config).unwrap();
-        let port: u16 = std::env::var("TURNLOOP_PG_PORT")
+        let core = Connection::new(config).expect("fixture operation must succeed");
+        let port: u16 = std::env::var("TURNLOOP_TEST_POSTGRES_PORT")
             .expect("private server port required")
             .parse()
-            .unwrap();
+            .expect("fixture operation must succeed");
         let mut d = Self {
             core,
             io: Transport::connect(port),
@@ -58,26 +60,26 @@ impl Driver {
         d
     }
     fn flush(&mut self) {
-        self.io.write_all(self.core.output()).unwrap();
+        self.io.write_all(self.core.output()).expect("fixture operation must succeed");
         let n = self.core.output().len();
-        self.core.consume_output(n).unwrap();
-        self.io.flush().unwrap();
+        self.core.consume_output(n).expect("fixture operation must succeed");
+        self.io.flush().expect("fixture operation must succeed");
     }
     fn step(&mut self, results: &mut Results, copy: Option<&[u8]>) {
         self.flush();
         let mut any = false;
-        while let Some(event) = self.core.next_event().unwrap() {
+        while let Some(event) = self.core.next_event().expect("fixture operation must succeed") {
             any = true;
             match event {
                 Event::UpgradeTls => {
                     self.io.upgrade();
-                    self.core.tls_established().unwrap();
+                    self.core.tls_established().expect("fixture operation must succeed");
                     self.ssl = true;
                 }
                 Event::ScramNeeded { plus } => {
                     // RFC 5929 tls-server-end-point for the SHA256 fixture certificate.
                     let binding = if plus {
-                        let cert = std::fs::read(support::tools().join("server.der")).unwrap();
+                        let cert = std::fs::read(support::tools().join("server.der")).expect("fixture operation must succeed");
                         let digest = rustls::crypto::ring::default_provider()
                             .cipher_suites
                             .iter()
@@ -85,7 +87,7 @@ impl Driver {
                                 suite.suite() == rustls::CipherSuite::TLS13_AES_128_GCM_SHA256
                             })
                             .and_then(|suite| suite.tls13())
-                            .unwrap()
+                            .expect("fixture operation must succeed")
                             .common
                             .hash_provider
                             .hash(&cert);
@@ -97,7 +99,7 @@ impl Driver {
                     };
                     self.core
                         .start_scram(ScramSha256::new(&self.password, binding))
-                        .unwrap();
+                        .expect("fixture operation must succeed");
                     self.scram = true;
                     self.plus = plus;
                 }
@@ -105,10 +107,10 @@ impl Driver {
                 Event::Connected => {}
                 Event::Row { row, .. } => results
                     .rows
-                    .push(row.map(|v| v.unwrap().map(Vec::from)).collect()),
+                    .push(row.map(|v| v.expect("fixture operation must succeed").map(Vec::from)).collect()),
                 Event::Fields { fields, .. } => {
                     results.fields.extend(fields.map(|f| {
-                        let f = f.unwrap();
+                        let f = f.expect("fixture operation must succeed");
                         (f.name.into(), f.data_type_id, f.format)
                     }));
                 }
@@ -130,8 +132,8 @@ impl Driver {
                 Event::CopyIn { .. } => {
                     self.core
                         .copy_data(copy.expect("COPY input fixture required"))
-                        .unwrap();
-                    self.core.copy_finish(None).unwrap();
+                        .expect("fixture operation must succeed");
+                    self.core.copy_finish(None).expect("fixture operation must succeed");
                 }
                 Event::CopyOut { .. } | Event::CopyDone { .. } => {}
                 Event::CopyData { data, .. } => results.copies.extend_from_slice(data),
@@ -141,9 +143,9 @@ impl Driver {
         self.flush();
         if !any {
             let mut bytes = [0; 4096];
-            let n = self.io.read(&mut bytes).unwrap();
+            let n = self.io.read(&mut bytes).expect("fixture operation must succeed");
             assert!(n > 0, "unexpected EOF");
-            self.core.receive(&bytes[..n]).unwrap();
+            self.core.receive(&bytes[..n]).expect("fixture operation must succeed");
         }
     }
     fn drain(&mut self, copy: Option<&[u8]>) -> Results {
@@ -154,13 +156,13 @@ impl Driver {
         result
     }
     fn query(&mut self, sql: &str) -> Results {
-        self.core.query(1, sql, None).unwrap();
+        self.core.query(1, sql, None).expect("fixture operation must succeed");
         self.drain(None)
     }
 }
 
 #[test]
-#[ignore = "requires private PostgreSQL 16; use scripts/sql-servers.py run"]
+#[ignore = "requires private PostgreSQL 16; use scripts/test-servers.py run"]
 fn authentication_queries_pipeline_copy_cancel() {
     for user in ["clear_user", "md5_user", "scram_user", "tls_user"] {
         let tls = if user == "tls_user" {
@@ -200,7 +202,7 @@ fn authentication_queries_pipeline_copy_cancel() {
             },
             None,
         )
-        .unwrap();
+        .expect("fixture operation must succeed");
     let r = d.drain(None);
     assert_eq!(r.rows[0][0], Some(42i32.to_be_bytes().to_vec()));
     assert_eq!(r.fields[0], ("answer".into(), 23, 1));
@@ -220,11 +222,11 @@ fn authentication_queries_pipeline_copy_cancel() {
             },
             None,
         )
-        .unwrap();
+        .expect("fixture operation must succeed");
     d.core
         .query(4, "SELECT missing_column FROM items", None)
-        .unwrap();
-    d.core.query(5, "SELECT 99", None).unwrap();
+        .expect("fixture operation must succeed");
+    d.core.query(5, "SELECT 99", None).expect("fixture operation must succeed");
     let r = d.drain(None);
     assert_eq!(
         r.completed.iter().map(|r| r.0).collect::<Vec<_>>(),
@@ -249,12 +251,12 @@ fn authentication_queries_pipeline_copy_cancel() {
     }
     assert_eq!(r.notices, 1);
     assert_eq!(r.notifications, [("changes".into(), "payload".into())]);
-    d.core.query(6, "COPY items FROM STDIN", None).unwrap();
+    d.core.query(6, "COPY items FROM STDIN", None).expect("fixture operation must succeed");
     let r = d.drain(Some(b"3\tthree\n4\tfour\n"));
     assert_eq!(r.tags, [("COPY 2".into(), Some(2))]);
     let r = d.query("COPY (SELECT * FROM items ORDER BY id) TO STDOUT");
     assert_eq!(r.copies, b"1\tone\n2\ttwo\n3\tthree\n4\tfour\n");
-    d.core.query(7, "SELECT pg_sleep(10)", None).unwrap();
+    d.core.query(7, "SELECT pg_sleep(10)", None).expect("fixture operation must succeed");
     d.flush();
     // Separate query proves the backend started before sending CancelRequest.
     let mut observer = Driver::connect("postgres", SslMode::Disable);
@@ -266,11 +268,11 @@ fn authentication_queries_pipeline_copy_cancel() {
         }
         assert!(Instant::now() < until);
     }
-    let port: u16 = std::env::var("TURNLOOP_PG_PORT").unwrap().parse().unwrap();
+    let port: u16 = std::env::var("TURNLOOP_TEST_POSTGRES_PORT").expect("fixture operation must succeed").parse().expect("fixture operation must succeed");
     TcpStream::connect(("127.0.0.1", port))
-        .unwrap()
-        .write_all(&d.core.cancel_request().unwrap())
-        .unwrap();
+        .expect("fixture operation must succeed")
+        .write_all(&d.core.cancel_request().expect("fixture operation must succeed"))
+        .expect("fixture operation must succeed");
     let r = d.drain(None);
     assert_eq!(r.errors[0].0, "57014");
     assert_eq!(r.completed[0].1, Outcome::ServerError);
@@ -281,7 +283,7 @@ fn authentication_queries_pipeline_copy_cancel() {
 }
 
 #[test]
-#[ignore = "requires private PostgreSQL 16; use scripts/sql-servers.py run"]
+#[ignore = "requires private PostgreSQL 16; use scripts/test-servers.py run"]
 fn all_common_types_in_text_binary_and_arrays() {
     use turnloop_postgres::types::{Value, decode};
     let mut d = Driver::connect("scram_user", SslMode::Disable);
@@ -309,7 +311,7 @@ fn all_common_types_in_text_binary_and_arrays() {
         assert!(text.errors.is_empty(), "{text:?}");
         assert_eq!(text.rows.len(), 1);
         assert_eq!(text.fields[0].1, oid);
-        let text_value = decode(oid, 0, text.rows[0][0].as_deref()).unwrap();
+        let text_value = decode(oid, 0, text.rows[0][0].as_deref()).expect("fixture operation must succeed");
         assert!(!matches!(text_value, Value::Null | Value::Raw { .. }));
         d.core
             .execute(
@@ -323,11 +325,11 @@ fn all_common_types_in_text_binary_and_arrays() {
                 },
                 None,
             )
-            .unwrap();
+            .expect("fixture operation must succeed");
         let binary = d.drain(None);
         assert!(binary.errors.is_empty(), "{binary:?}");
         assert_eq!(binary.rows.len(), 1);
-        let binary_value = decode(oid, 1, binary.rows[0][0].as_deref()).unwrap();
+        let binary_value = decode(oid, 1, binary.rows[0][0].as_deref()).expect("fixture operation must succeed");
         if !matches!(oid, 1082 | 1114 | 1184) {
             assert_eq!(text_value, binary_value, "OID {oid}");
         } else {
@@ -340,7 +342,7 @@ fn all_common_types_in_text_binary_and_arrays() {
         let r = d.query(&sql);
         assert!(r.errors.is_empty(), "{r:?}");
         let array_oid = r.fields[0].1;
-        let v = decode(array_oid, 0, r.rows[0][0].as_deref()).unwrap();
+        let v = decode(array_oid, 0, r.rows[0][0].as_deref()).expect("fixture operation must succeed");
         let Value::Array(values) = v else {
             panic!("array not decoded")
         };
@@ -359,9 +361,9 @@ fn all_common_types_in_text_binary_and_arrays() {
                 },
                 None,
             )
-            .unwrap();
+            .expect("fixture operation must succeed");
         let r = d.drain(None);
-        let Value::Array(values) = decode(array_oid, 1, r.rows[0][0].as_deref()).unwrap() else {
+        let Value::Array(values) = decode(array_oid, 1, r.rows[0][0].as_deref()).expect("fixture operation must succeed") else {
             panic!("binary array not decoded")
         };
         assert_eq!(values.len(), 2);
@@ -371,7 +373,7 @@ fn all_common_types_in_text_binary_and_arrays() {
 }
 
 #[test]
-#[ignore = "requires private PostgreSQL 16; use scripts/sql-servers.py run"]
+#[ignore = "requires private PostgreSQL 16; use scripts/test-servers.py run"]
 fn pool_reuses_real_connection_and_explicit_idle_timeout() {
     use turnloop_postgres::pool::{Config, Event, Pool};
     let now = Instant::now();
@@ -379,8 +381,8 @@ fn pool_reuses_real_connection_and_explicit_idle_timeout() {
         max: 1,
         ..Config::default()
     })
-    .unwrap();
-    pool.checkout(1, now, None).unwrap();
+    .expect("fixture operation must succeed");
+    pool.checkout(1, now, None).expect("fixture operation must succeed");
     let Some(Event::Connect(id)) = pool.next_event() else {
         panic!()
     };
@@ -391,14 +393,14 @@ fn pool_reuses_real_connection_and_explicit_idle_timeout() {
             .errors
             .is_empty()
     );
-    pool.connected(id, now).unwrap();
+    pool.connected(id, now).expect("fixture operation must succeed");
     pool.next_event();
     let Some(Event::Acquired(lease)) = pool.next_event() else {
         panic!()
     };
-    pool.checkin(lease, now, false).unwrap();
+    pool.checkin(lease, now, false).expect("fixture operation must succeed");
     pool.next_event();
-    pool.checkout(2, now, None).unwrap();
+    pool.checkout(2, now, None).expect("fixture operation must succeed");
     let Some(Event::Acquired(lease)) = pool.next_event() else {
         panic!()
     };
@@ -407,16 +409,16 @@ fn pool_reuses_real_connection_and_explicit_idle_timeout() {
         connection.query("SELECT id FROM pooled").rows[0][0],
         Some(b"42".to_vec())
     );
-    pool.checkin(lease, now, false).unwrap();
+    pool.checkin(lease, now, false).expect("fixture operation must succeed");
     pool.next_event();
-    pool.handle_timeout(pool.next_timeout().unwrap());
+    pool.handle_timeout(pool.next_timeout().expect("fixture operation must succeed"));
     assert_eq!(pool.next_event(), Some(Event::Close(id)));
-    connection.core.end().unwrap();
+    connection.core.end().expect("fixture operation must succeed");
     connection.flush();
     assert!(matches!(
-        connection.core.next_event().unwrap(),
+        connection.core.next_event().expect("fixture operation must succeed"),
         Some(turnloop_postgres::Event::Closed { .. })
     ));
-    pool.closed(id, now).unwrap();
+    pool.closed(id, now).expect("fixture operation must succeed");
     assert_eq!(pool.total_count(), 0);
 }

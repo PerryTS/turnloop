@@ -71,4 +71,4 @@ subscription changes and error/result ownership allocate as documented in the
 lane report. No production unsafe code.
 
 Tests: `cargo test -p turnloop-redis`; full real Redis/TLS/cluster/Sentinel tests:
-`python3 scripts/servers.py test` from the workspace root.
+`python3 scripts/test-servers.py run cargo test --workspace -- --include-ignored` from the workspace root.

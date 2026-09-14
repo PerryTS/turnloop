@@ -63,7 +63,7 @@ def role(package):
     explicit = settings(package).get('role')
     if explicit:
         return explicit
-    # Transitional suffixes survive turnloop -> turnloop without a package list.
+    # Classify helper roles without a hard-coded package list.
     name = package['name']
     if name.endswith('-contract'):
         return 'contract'

@@ -40,8 +40,8 @@ driver.turn(Timeout::Until(deadline), &mut completions)?;
 Use the pinned nightly for dependency resolution under the seven-day publication
 soak. The workspace also builds with stable Rust 1.97.1.
 
-- [Design and host boundary](DESIGN.md)
-- [Contributing, checks and private test servers](CONTRIBUTING.md)
-- [Release and first-publication procedure](RELEASING.md)
-- [Integration status and verification](docs/INTEGRATION_REPORT.md)
-- [MIT license](LICENSE)
+- [Design and host boundary](https://github.com/PerryTS/turnloop/blob/main/DESIGN.md)
+- [Contributing, checks and private test servers](https://github.com/PerryTS/turnloop/blob/main/CONTRIBUTING.md)
+- [Release and first-publication procedure](https://github.com/PerryTS/turnloop/blob/main/RELEASING.md)
+- [Integration status and verification](https://github.com/PerryTS/turnloop/blob/main/docs/INTEGRATION_REPORT.md)
+- [MIT license](https://github.com/PerryTS/turnloop/blob/main/LICENSE)

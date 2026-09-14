@@ -14,13 +14,13 @@ pub enum Transport {
 }
 impl Transport {
     pub fn connect(port: u16) -> Self {
-        let stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let stream = TcpStream::connect(("127.0.0.1", port)).expect("fixture operation must succeed");
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
-            .unwrap();
+            .expect("fixture operation must succeed");
         stream
             .set_write_timeout(Some(Duration::from_secs(10)))
-            .unwrap();
+            .expect("fixture operation must succeed");
         Self::Plain(stream)
     }
     pub fn upgrade(&mut self) {
@@ -29,17 +29,17 @@ impl Transport {
         };
         let mut roots = RootCertStore::empty();
         roots
-            .add(fs::read(tools().join("server.der")).unwrap().into())
-            .unwrap();
+            .add(fs::read(tools().join("server.der")).expect("fixture operation must succeed").into())
+            .expect("fixture operation must succeed");
         let config = ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
         let session =
-            ClientConnection::new(Arc::new(config), ServerName::try_from("localhost").unwrap())
-                .unwrap();
-        let mut stream = StreamOwned::new(session, socket.try_clone().unwrap());
+            ClientConnection::new(Arc::new(config), ServerName::try_from("localhost").expect("fixture operation must succeed"))
+                .expect("fixture operation must succeed");
+        let mut stream = StreamOwned::new(session, socket.try_clone().expect("fixture operation must succeed"));
         while stream.conn.is_handshaking() {
-            stream.conn.complete_io(&mut stream.sock).unwrap();
+            stream.conn.complete_io(&mut stream.sock).expect("fixture operation must succeed");
         }
         *self = Self::Tls(Box::new(stream));
     }
@@ -67,7 +67,7 @@ impl Write for Transport {
     }
 }
 pub fn tools() -> PathBuf {
-    std::env::var_os("TURNLOOP_SQL_TOOLS")
-        .expect("run via scripts/sql-servers.py run cargo test --workspace -- --ignored")
+    std::env::var_os("TURNLOOP_TEST_SQL_TOOLS")
+        .expect("run via scripts/test-servers.py run cargo test --workspace -- --ignored")
         .into()
 }

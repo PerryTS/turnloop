@@ -8,7 +8,7 @@ platform where their subject executes; a cross-target check is not a test pass.
 ## Local checks
 
 Use the pinned nightly (`nightly-2026-08-20`) to resolve dependencies with the
-seven-day minimum publish age. Keep `Cargo.lock` committed. Stable Rust is also
+seven-day minimum publish age. Keep `Cargo.lock` committed. Stable Rust 1.97.1 (the verified MSRV) is also
 required, with no nightly language features in the library. WASI 0.3 alone uses
 `nightly-2026-09-07` and Wasmtime 46.0.0, based on the WASM lane's successful spike.
 
@@ -60,7 +60,7 @@ path dependencies of publishable crates need explicit registry version requireme
 Optional `[package.metadata.turnloop-ci]` describes test capabilities. The role
 may be `core`, `contract`, `protocol` or `bench`. During integration, `*-contract`,
 `*-bench` suffixes and direct `protocols/` members are recognized from metadata;
-that also supports the turnloop → turnloop rename. Other crates default to core.
+other crates default to core.
 Use explicit roles for layouts that differ.
 
 Core must mark **real pure-Rust** Miri-compatible library test filters. No default
@@ -120,32 +120,67 @@ or a requested capability is missing. Without that flag local tests may be ignor
 explicitly; describe them as UNRUN. Tests must assert rows, authenticated sessions,
 round trips, replicated writes, cluster redirections, etc., not merely open sockets.
 
-| Variable | CI value / meaning |
+The local runner and Linux CI use the same **port-based** fixture contract. Every
+port is loopback-only; there is no fallback to a default port or system instance.
+
+| Variable | Meaning |
 |---|---|
-| `TURNLOOP_TEST_POSTGRES_URL` | `postgres://turnloop:turnloop@127.0.0.1:5432/turnloop` (PostgreSQL 16, SCRAM) |
-| `TURNLOOP_TEST_MYSQL_URL` | `mysql://turnloop:turnloop@localhost:3306/turnloop` (MySQL 9) |
-| `TURNLOOP_TEST_MYSQL_TLS_CA` | Absolute path to ephemeral CA PEM |
-| `TURNLOOP_TEST_MYSQL_TLS_SERVER_NAME` | `localhost`; certificate SAN includes localhost and 127.0.0.1 |
-| `TURNLOOP_TEST_MYSQL_AUTH_PLUGIN` | `caching_sha2_password`; TLS and certificate validation required |
-| `TURNLOOP_TEST_REDIS_URL` | `redis://127.0.0.1:6379` (Redis 8) |
-| `TURNLOOP_TEST_REDIS_CLUSTER_URLS` | Comma-separated Redis seed URLs, ports 7000–7002; three masters plus three replicas |
-| `TURNLOOP_TEST_MONGODB_URL` | `mongodb://turnloop:turnloop@127.0.0.1:27017/turnloop?authSource=admin` (Mongo 8 standalone, SCRAM) |
-| `TURNLOOP_TEST_MONGODB_REPLICA_URL` | `mongodb://127.0.0.1:27018,127.0.0.1:27019,127.0.0.1:27020/turnloop?replicaSet=turnloop-rs` |
+| `TURNLOOP_TEST_POSTGRES_PORT` | PostgreSQL port; database `postgres`, users `scram_user`, `md5_user`, `clear_user`, `tls_user`, password `fixture-password` |
+| `TURNLOOP_TEST_MYSQL_PORT` | MySQL port; database `turnloop_test`, users `sql_user`, `auth_rsa_user`, `tls_user`, password `fixture-password` |
+| `TURNLOOP_TEST_SQL_TOOLS` | Directory containing `server.der`, `server.crt`, `server.key`; verified TLS and PostgreSQL channel binding |
+| `TURNLOOP_TEST_REDIS_PORT` | Password/ACL Redis instance; user `lane` |
+| `TURNLOOP_TEST_REDIS_PASSWORD` | Disposable Redis password |
+| `TURNLOOP_TEST_REDIS_TLS_PORT` | Same instance with TLS, checked against committed test CA |
+| `TURNLOOP_TEST_REDIS_CLUSTER_PORT` | Seed of six-node cluster: three masters, three replicas |
+| `TURNLOOP_TEST_REDIS_SENTINEL_PORT` | Sentinel monitoring `turnloop`, with authenticated master |
+| `TURNLOOP_TEST_MONGODB_PORT` | Fresh authenticated standalone; suite bootstraps user `lane`, password `pencil` |
+| `TURNLOOP_TEST_MONGODB_REPLICA_PORTS` | Three comma-separated ports; set `turnloop_test`, keyfile auth |
+| `TURNLOOP_TEST_MONGODB_TLS_PORT` | Fresh TLS standalone; same authentication tests |
+| `TURNLOOP_TEST_MONGODB_TOOLS` | Directory containing MongoDB `cert.pem` |
+| `TURNLOOP_TEST_SMTP_PORT` | Postfix smtp-sink loopback port |
+| `TURNLOOP_TEST_SMTP_TOOLS` | Directory containing sink message dumps for byte assertions |
 
-The replica set binds loopback without authentication for topology/majority tests;
-standalone Mongo provides authenticated coverage. Cluster members announce
-loopback endpoints reachable by the host test process. Bootstrap scripts prove
-all members become healthy and perform a cluster read/write and majority Mongo
-write. MySQL uses a generated certificate and a verified TLS query; insecure
-transport is forbidden for its application user. Credentials are disposable
-fixture constants, not production secrets. Service containers are isolated per job;
-`cleanup-services.sh` removes only the explicitly named extra cluster containers.
+```bash
+scripts/test-servers.py run cargo test --workspace -- --include-ignored
+scripts/test-servers.py start   # prints shell exports; explicitly source them to run tests
+scripts/test-servers.py stop
+# Explicit subset for machines unable to run SQL; does not count as a full pass:
+scripts/test-servers.py --services redis,mongodb,smtp run cargo test \
+  -p turnloop-redis -p turnloop-mongodb -p turnloop-smtp -- --include-ignored --test-threads=1
+```
 
-HTTP/WebSocket/TLS/SMTP harnesses should create their own loopback peers inside
-these integration targets (and assert protocol exchanges). There are no shared
-external services for those protocols. Native service tests must be cfg-gated out
-of WASM builds, while pure protocol tests remain portable. Current lane harnesses
-were incomplete at CI handoff; use this single convention when integrating them.
+The runner owns only private instances and data under `.tools/`, always cleans up
+on command failure, and fails when a selected capability cannot start. It locates
+installed binaries on PATH (with macOS/PostgreSQL installation fallbacks); it does
+not install or upgrade system software. PostgreSQL supports cleartext, MD5,
+SCRAM and TLS/PLUS fixtures; MySQL covers caching-SHA2 fast/full/RSA and TLS, and
+records native-password plugin availability (MySQL 9 removed that plugin).
+MongoDB cleanup is an explicit example invoked only by `stop`, never a test that
+could shut down a concurrently running suite. SMTP's installed-sink test uses the
+runner; in-process TLS/auth SMTP peers remain normal tests.
+
+In the managed macOS sandbox PostgreSQL initialization fails at `shmget` and
+MySQL initialization crashes. Those real-server tests are **UNRUN (sandbox)**;
+run the full command outside the sandbox. Do not remove their ignored test bodies
+or treat a failed initializer as a test pass.
+
+## Pending platform and measurement gates
+
+The `wasi`, `web`, Windows shared-contract portion of `test-native`, and
+`instructions` jobs intentionally remain required and failing until their missing
+inputs land. Their commands and the strict `ci-gate` fan-in are retained. No
+`continue-on-error`, empty-test success or expected skip is permitted for them.
+
+- **Wave 2 Windows:** adapt `spikes/iocp` to the production Backend, instantiate
+  `turnloop-contract` on IOCP, run all contracts (including no-spin) on Windows.
+- **Wave 2 WASI:** integrate both providers, provide nonzero shared contracts on
+  `wasm32-wasip2` and `wasm32-wasip3`, run the existing `run-tests.py wasi` commands.
+  Resolve the p3 bounded waitable-set API before claiming D7 compliance.
+- **Wave 2 web:** provide real browser and Node test targets, add `web-tests` and
+  `node-tests` metadata, run Chrome, Firefox and Node via `run-tests.py`.
+- **Linux instruction baseline:** run the candidate command below on Ubuntu
+  24.04 x86_64, review three rounds and exact controls, commit the measured baseline.
+  macOS timings must never substitute for Linux instruction counts.
 
 ## Instruction regression gate
 

@@ -113,7 +113,7 @@ Run `cargo test -p turnloop-mysql`; real server tests are ignored by default and
 assert required fixture variables if selected. From the workspace:
 
 ```sh
-TURNLOOP_SQL_SERVER=mysql python3 scripts/sql-servers.py run cargo test -p turnloop-mysql --test server -- --ignored
+TURNLOOP_SQL_SERVER=mysql python3 scripts/test-servers.py run cargo test -p turnloop-mysql --test server -- --ignored
 ```
 
 The private fixture script starts/stops only its own instances and keeps files

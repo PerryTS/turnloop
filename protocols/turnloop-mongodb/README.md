@@ -115,7 +115,7 @@ explicit. Full stream lifecycle orchestration is not yet included.
 ## Verification
 
 From the workspace root: `scripts/verify-mongodb.sh`. Real servers:
-`python3 scripts/mongodb.py run`. The latter starts five isolated MongoDB processes
+`python3 scripts/test-servers.py run`. The latter starts five isolated MongoDB processes
 (standalone, three replica members, TLS standalone), runs the blocking std socket /
 rustls tests, then stops its children and verifies all private ports closed. Replica-set
 initiation, users and all administrative commands use this crate; no Mongo shell or
