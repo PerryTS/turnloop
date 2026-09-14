@@ -7,8 +7,12 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[features]
+executor = ["turnloop/executor", "dep:futures-io"]
+
 [dependencies]
 turnloop.workspace = true
+futures-io = { workspace = true, optional = true }
 
 [lints]
 workspace = true

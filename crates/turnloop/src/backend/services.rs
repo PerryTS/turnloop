@@ -13,10 +13,8 @@ struct ChildState {
 }
 impl ChildState {
     fn reap(&mut self) -> Result<Option<ExitStatus>> {
-        if self.status.is_none() {
-            if let Some(status) = self.child.try_wait().map_err(Error::from)? {
-                self.status = Some(ExitStatus { code: status.code(), signal: status.signal() });
-            }
+        if self.status.is_none() && let Some(status) = self.child.try_wait().map_err(Error::from)? {
+            self.status = Some(ExitStatus { code: status.code(), signal: status.signal() });
         }
         Ok(self.status)
     }

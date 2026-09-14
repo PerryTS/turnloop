@@ -329,6 +329,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92d699e522242e69e3003b94ecc1f960f3a5e015aa7c5d7486e65ad01dd94f5e"
 
 [[package]]
+name = "futures-io"
+version = "0.3.31"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e5c1b78ca4aae1ac06c48a526a655760685149f0d465d21f37abfe57ce075c6"
+
+[[package]]
 name = "futures-task"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1391,6 +1397,7 @@ dependencies = [
 name = "turnloop"
 version = "0.1.0"
 dependencies = [
+ "futures-io",
  "libc",
  "loom",
 ]
@@ -1409,6 +1416,7 @@ dependencies = [
 name = "turnloop-contract"
 version = "0.1.0"
 dependencies = [
+ "futures-io",
  "libc",
  "turnloop",
 ]

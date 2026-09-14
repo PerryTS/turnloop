@@ -232,3 +232,67 @@ pub fn external_waits<B: Backend>() {
     }
     assert!(!l.alive());
 }
+
+/// Signal both a demonstrably live child and its grandchild; inherited stdout
+/// reaches EOF only after every process holding its write end has terminated.
+pub fn process_group<B: Backend>(program: &std::ffi::OsStr) {
+    let mut l = Driver::<B>::new(Config::default()).expect("loop");
+    let mut spec = ProcessSpec::new(program); spec.args.push("grandchild".into());
+    spec.new_process_group = true; spec.stdio[1] = ProcessStdio::Pipe;
+    let process = l.spawn(&spec, Token(1)).expect("spawn tree");
+    let stdout = process.stdout.expect("child stdout");
+    l.read_start(stdout, Token(2)).expect("read readiness marker");
+    let mut out = Completions::default(); let mut marker = Vec::new();
+    let until = l.now() + Duration::from_secs(5);
+    while !marker.contains(&b'\n') {
+        assert!(l.now() < until, "grandchild never became ready");
+        l.turn(Timeout::Until(until), &mut out).expect("turn");
+        for c in out.drain() { match c.result { OpResult::Read { n, lease: Some(b) } => { assert!(n > 0); marker.extend_from_slice(b.as_slice()); }, other => panic!("unexpected {other:?}") } }
+    }
+    let pid = std::str::from_utf8(&marker).expect("marker UTF8").trim().strip_prefix("grandchild:").expect("grandchild marker").parse::<u32>().expect("grandchild PID");
+    assert!(pid > 0); assert_ne!(pid, process.pid);
+    l.kill_group(process.handle, Signal::Kill).expect("kill process group");
+    let mut exited = 0; let mut eof = 0;
+    while exited == 0 || eof == 0 {
+        assert!(l.now() < until, "process group still owns stdout");
+        l.turn(Timeout::Until(until), &mut out).expect("turn");
+        for c in out.drain() { match c.result {
+            OpResult::Exited(status) => { assert!(status.code != Some(0)); exited += 1; }
+            OpResult::Eof => eof += 1,
+            other => panic!("unexpected {other:?}"),
+        }}
+    }
+    assert_eq!((exited, eof), (1, 1));
+    assert!(l.kill(process.handle, Signal::Kill).is_err(), "reaped PID must never be signaled");
+}
+/// Subscribed signals and a live sleeping process must preserve the no-spin limits.
+pub fn services_no_spin<B: Backend>(program: &std::ffi::OsStr) {
+    let mut l = Driver::<B>::new(Config::default()).expect("loop");
+    let mut spec = ProcessSpec::new(program); spec.args.push("sleep".into());
+    let child = l.spawn(&spec, Token(100)).expect("sleeping child");
+    let signal = l.signal_start(Signal::Usr2, Token(101)).expect("idle signal");
+    l.set_ref(child.handle, false).expect("unref child");
+    l.set_ref(signal, false).expect("unref signal");
+    let mut out = Completions::default();
+    // Drain registration readiness before measuring exact timer waits.
+    l.turn(Timeout::Now, &mut out).expect("registration turn"); assert!(out.is_empty());
+    let mut count = 0; let mut waits = 0;
+    for micros in [500, 2_000, 10_000] {
+        for _ in 0..20 {
+            let at = l.now() + Duration::from_micros(micros);
+            let timer = l.timer(at, None, Token(1)).expect("timer");
+            let mut turns = 0; let mut zero = 0;
+            loop {
+                turns += 1; assert!(turns <= 2, "registered services spun");
+                let info = l.turn(Timeout::Until(at), &mut out).expect("turn");
+                zero += info.zero_event_waits; waits += info.os_waits;
+                assert!(zero <= 1); assert!(info.os_waits <= 1);
+                if !out.is_empty() { assert_eq!(out.len(), 1); assert!(matches!(out[0].result, OpResult::Timer)); assert!(l.now() >= at); count += 1; break; }
+            }
+            l.close(timer, Token(2)).expect("close timer"); l.turn(Timeout::Now, &mut out).expect("drain close");
+            assert_eq!(out.len(), 1); assert!(matches!(out[0].result, OpResult::Closed));
+        }
+    }
+    assert_eq!(count, 60); assert!(waits >= 60);
+    assert!(!l.alive(), "unreferenced services cannot keep the loop alive");
+}

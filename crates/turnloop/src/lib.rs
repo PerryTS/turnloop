@@ -37,3 +37,6 @@ pub use time::Instant;
 
 mod external_wait;
 pub use external_wait::{WaitCondition, WaitResult};
+
+#[cfg(feature = "executor")]
+pub mod executor;

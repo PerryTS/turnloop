@@ -90,6 +90,7 @@ pub struct Unix {
     polled: Vec<Ready>,
     pool: BufferPool,
     services: super::services::Services,
+    files: super::files::Files,
 }
 fn direction(op: &Operation) -> usize {
     usize::from(!matches!(
@@ -239,11 +240,12 @@ unsafe impl Backend for Unix {
             ready: VecDeque::with_capacity(config.max_handles),
             cancelled: VecDeque::with_capacity(config.max_operations),
             polled: Vec::with_capacity(config.events_per_turn),
+            files: super::files::Files::new(config, pool.clone()),
             pool,
             services: super::services::Services::new(config.max_handles),
         })
     }
-    fn set_notifier(&mut self, notifier: Notifier) { self.services.set_notifier(notifier); }
+    fn set_notifier(&mut self, notifier: Notifier) { self.files.set_notifier(notifier.clone()); self.services.set_notifier(notifier); }
     fn signal(&mut self, h: Handle, signal: Signal) -> Result<()> { self.services.signal(h, signal) }
     fn kill(&mut self, h: Handle, signal: Signal, group: bool) -> Result<()> { self.services.kill(h, signal, group) }
     fn spawn(&mut self, h: Handle, pipes: [Option<Handle>; 3], spec: &ProcessSpec) -> Result<u32> {
@@ -381,6 +383,10 @@ unsafe impl Backend for Unix {
         let h = request.handle;
         if self.services.contains(h) { return self.services.submit(&request); }
         let r = self.get(h)?;
+        if r.transport.kind == Kind::File {
+            let fd = r.transport.fd.try_clone().map_err(Error::from)?;
+            return self.files.submit(request, fd);
+        }
         let valid = match &request.operation {
             Operation::Accept { .. } => matches!(r.transport.kind, Kind::Listener | Kind::PipeListener),
             Operation::SendHandle(_) | Operation::RecvHandle => r.transport.kind == Kind::Pipe,
@@ -421,6 +427,7 @@ unsafe impl Backend for Unix {
         Ok(())
     }
     fn cancel(&mut self, op: OpId) -> Result<()> {
+        if self.files.cancel(op) { return Ok(()); }
         if self.services.cancel(op) { return Ok(()); }
         let p = self
             .ops
@@ -436,7 +443,7 @@ unsafe impl Backend for Unix {
         Ok(())
     }
     fn has_work(&self) -> bool {
-        !self.ready.is_empty() || !self.cancelled.is_empty() || self.services.has_work()
+        !self.ready.is_empty() || !self.cancelled.is_empty() || self.services.has_work() || self.files.has_work()
     }
     fn poll(
         &mut self,
@@ -454,6 +461,7 @@ unsafe impl Backend for Unix {
                 result: Ok(Outcome::Cancelled),
             });
         }
+        self.files.poll(events);
         self.services.poll(events);
         self.run_ready(events);
         // Cached readiness can end in EAGAIN without producing a completion.
@@ -482,6 +490,7 @@ unsafe impl Backend for Unix {
             let h = r.handle;
             self.schedule(h);
         }
+        self.files.poll(events);
         self.services.poll(events);
         self.run_ready(events);
         Ok(info)

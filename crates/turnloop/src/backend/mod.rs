@@ -233,3 +233,6 @@ mod ipc;
 mod signals;
 #[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
 mod services;
+
+#[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
+mod files;

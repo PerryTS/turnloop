@@ -10,3 +10,10 @@ Cross-compilation is not runtime execution. Raw outputs: `.tools/core2/`.
 - **PASS** `cargo check -p turnloop` (exit 0; log 1789403548-662864).
 - **PASS** `cargo test -p turnloop-contract --test native_surface -- --test-threads=1` (exit 0; log 1789403604-260402).
 - **FAIL** `cargo clippy -p turnloop -p turnloop-contract --all-targets -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 101; log 1789403650-349026).
+- **FAIL** `cargo check -p turnloop` (exit 101; log 1789403784-513664).
+- **PASS** `cargo check -p turnloop` (exit 0; log 1789403838-759359).
+- **PASS** `cargo check -p turnloop --features executor` (exit 0; log 1789404051-297516).
+- **PASS** `cargo clippy -p turnloop -p turnloop-contract --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 0; log 1789404080-249518).
+- **FAIL** `cargo test -p turnloop-contract --features executor --test executor -- --test-threads=1` (exit 101; log 1789404153-917636).
+- **PASS** `cargo clippy -p turnloop -p turnloop-contract --all-targets --all-features --target x86_64-unknown-linux-gnu -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 0; log 1789404161-645415).
+- **FAIL** `cargo test -p turnloop-contract --all-features --test native_surface --test executor -- --test-threads=1` (exit 101; log 1789404275-238389).
