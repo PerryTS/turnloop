@@ -26,6 +26,45 @@ def checked_tests(command, *, cwd, env=None, minimum_groups=1):
     if sum(count > 0 for count in groups) < minimum_groups:
         fail('Suite completed without a positive passed-test count. Add real executable tests.')
     print(f'PASS executed {passed} tests')
+    return passed
+
+
+def protocol_tests(packages, base, root, env):
+    """Finish every declared suite, then fail the job if any one failed."""
+    results = []
+    for package in packages:
+        name = package['name']
+        targets = settings(package).get('integration-tests', [])
+        if not targets:
+            results.append((name, 'FAIL', 'Missing integration-tests metadata'))
+            continue
+        available = {t['name'] for t in package['targets'] if 'test' in t['kind']}
+        for target in targets:
+            suite = f'{name}/{target}'
+            try:
+                if target not in available:
+                    fail(f'Unknown integration test target: {suite}')
+                count = checked_tests(base + ['-p', name, '--test', target,
+                    '--', '--include-ignored', '--test-threads=1', '--nocapture'], cwd=root, env=env)
+            except (RuntimeError, subprocess.CalledProcessError, OSError) as error:
+                print(f'FAIL {suite}: {error}', file=sys.stderr, flush=True)
+                results.append((suite, 'FAIL', str(error)))
+            else:
+                results.append((suite, 'PASS', f'{count} tests passed'))
+    if not results:
+        results.append(('protocol', 'FAIL', 'No executable suites selected'))
+    def cell(value):
+        return value.replace('|', '&#124;').replace('\n', ' ').replace('\r', ' ')
+    table = '\n'.join(['## Protocol suites', '', '| Suite | Result | Details |',
+                       '| --- | --- | --- |'] +
+                      ['| ' + ' | '.join(cell(value) for value in row) + ' |' for row in results]) + '\n'
+    print(table, flush=True)
+    if summary := os.environ.get('GITHUB_STEP_SUMMARY'):
+        with open(summary, 'a', encoding='utf-8') as output:
+            output.write(table + '\n')
+    if any(status == 'FAIL' for _, status, _ in results):
+        fail('Protocol suites failed; see the per-suite results above')
+    return results
 
 
 def native_tests(data, base, root, *, windows):
@@ -134,16 +173,7 @@ def main():
             packages = [p for p in packages if settings(p).get('service-group') == 'http']
             if not packages:
                 fail('HTTP interop group must contain executable suites')
-        for package in packages:
-            targets = settings(package).get('integration-tests', [])
-            if not targets:
-                fail(f'{package["name"]}: integration-tests metadata must identify real-server test targets')
-            available = {t['name'] for t in package['targets'] if 'test' in t['kind']}
-            for target in targets:
-                if target not in available:
-                    fail(f'Unknown integration test target: {package["name"]}/{target}')
-                checked_tests(base + ['-p', package['name'], '--test', target,
-                    '--', '--include-ignored', '--test-threads=1', '--nocapture'], cwd=root, env=env)
+        protocol_tests(packages, base, root, env)
 
 
 if __name__ == '__main__':

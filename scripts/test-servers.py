@@ -5,7 +5,7 @@ Default: all services, fail on missing capability. Select a subset explicitly wi
 --services postgres,mysql,redis,mongodb,smtp,http; never silently bypass unavailable tests.
 """
 import argparse
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import shutil
 import shlex
 from pathlib import Path
@@ -17,6 +17,7 @@ import signal
 import socket
 import time
 import secrets
+import stat
 import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,7 +31,13 @@ hostnossl all tls_user 127.0.0.1/32 reject
 host all scram_user 127.0.0.1/32 scram-sha-256
 host all md5_user 127.0.0.1/32 md5
 host all clear_user 127.0.0.1/32 password
-host all postgres 127.0.0.1/32 trust
+"""
+
+# Shared by local and Docker provisioning; ALTER SYSTEM is deliberately applied
+# after startup in both environments, followed by a reload and effective checks.
+POSTGRES_SETTINGS = """ALTER SYSTEM SET ssl='on';
+ALTER SYSTEM SET ssl_cert_file='server.crt';
+ALTER SYSTEM SET ssl_key_file='server.key';
 """
 
 MYSQL_USERS = """CREATE DATABASE IF NOT EXISTS turnloop_test;
@@ -162,7 +169,52 @@ def sql_stop():
                      f'--socket={SQL_TOOLS / "mysql.sock"}', '-u', 'root', 'shutdown'])
         else:
             raise RuntimeError('unknown private server in state file')
+    for name in ('pgdata', 'mysqldata'):
+        remove_private_data(SQL_TOOLS / name, SQL_TOOLS)
+    SQL_CHILDREN.clear()
     SQL_STATE.unlink()
+
+
+def remove_private_data(directory, parent):
+    """Remove only private data, after its server stopped; never follow symlinks."""
+    directory, parent = Path(directory), Path(parent).resolve()
+    if directory.is_symlink() or not directory.resolve().is_relative_to(parent) or directory.resolve() == parent:
+        raise RuntimeError(f'Invalid private data directory: {directory}')
+    if not directory.exists():
+        return
+    # Native servers and Docker --user use our UID. Repair restrictive modes
+    # before traversal; logs and certificates live outside these data roots.
+    directory.chmod(0o700)
+    for root, dirs, _files in os.walk(directory, followlinks=False):
+        for name in dirs:
+            path = Path(root) / name
+            if not path.is_symlink():
+                path.chmod(0o700)
+    shutil.rmtree(directory)
+
+
+def postgres_configure(psql):
+    sql_command(psql, input=POSTGRES_USERS + POSTGRES_SETTINGS, text=True, stdout=subprocess.DEVNULL)
+    sql_command([*psql, '-c', 'SELECT pg_reload_conf()'])
+    effective = """SELECT current_setting('ssl') = 'on'
+        AND current_setting('ssl_cert_file') = 'server.crt'
+        AND current_setting('ssl_key_file') = 'server.key'
+        AND NOT EXISTS (SELECT FROM pg_settings WHERE pending_restart)"""
+    for _ in range(50):
+        result = subprocess.run([str(x) for x in [*psql, '-Atc', effective]],
+                                check=True, capture_output=True, text=True)
+        if result.stdout.strip() == 't':
+            break
+        time.sleep(.1)
+    else:
+        raise RuntimeError('PostgreSQL TLS reload did not take effect')
+    sql_command([*psql, '-c', """SELECT version();
+        SELECT rolname, rolsuper FROM pg_roles WHERE rolname IN
+          ('postgres', 'turnloop', 'scram_user', 'tls_user', 'md5_user', 'clear_user');
+        SELECT name, setting, source, pending_restart FROM pg_settings WHERE name IN
+          ('ssl', 'ssl_cert_file', 'ssl_key_file', 'statement_timeout',
+           'idle_in_transaction_session_timeout', 'idle_session_timeout', 'max_connections')
+          ORDER BY name;"""])
 
 
 def sql_certificates():
@@ -182,17 +234,30 @@ def sql_start():
     if SQL_STATE.exists():
         raise RuntimeError('state exists; run stop first')
     cert, key = sql_certificates()
+    # Record before initdb/mysqld initialization so failed partial data is removed.
+    SQL_STATE.write_text(json.dumps({'servers': [], 'env': {}}))
+    try:
+        return sql_start_private(cert, key)
+    except BaseException as error:
+        cleanup_after_failure(error, sql_stop)
+        raise
+
+
+def sql_start_private(cert, key):
     only_mysql = "postgres" not in SELECTED
     pg = SQL_TOOLS / 'pgdata'
     if not only_mysql and not (pg / 'PG_VERSION').exists():
         with startup_logs('PostgreSQL initdb', SQL_TOOLS / 'postgres-init.log'), (SQL_TOOLS / 'postgres-init.log').open('wb') as log:
-            sql_command([SQL_BIN / 'initdb', '-D', pg, '--username=postgres', '--auth=trust', '--encoding=UTF8', '--locale=C'], stdout=log, stderr=log)
+            sql_command([SQL_BIN / 'initdb', '-D', pg, '--username=turnloop', '--auth=trust', '--encoding=UTF8', '--locale=C'], stdout=log, stderr=log)
     pgport, myport = sql_port(), sql_port()
     while myport == pgport:
         myport = sql_port()
     if not only_mysql:
-        (pg / 'pg_hba.conf').write_text(POSTGRES_HBA)
-        (pg / 'postgresql.conf').write_text(f"listen_addresses='127.0.0.1'\nport={pgport}\nunix_socket_directories='{SQL_TOOLS}'\nssl=on\nssl_cert_file='{cert}'\nssl_key_file='{key}'\nmax_connections=30\n")
+        (pg / 'pg_hba.conf').write_text(POSTGRES_HBA.replace('127.0.0.1/32', '0.0.0.0/0'))
+        (pg / 'postgresql.conf').write_text(f"listen_addresses='127.0.0.1'\nport={pgport}\nunix_socket_directories='{SQL_TOOLS}'\n")
+        shutil.copyfile(cert, pg / 'server.crt')
+        shutil.copyfile(key, pg / 'server.key')
+        (pg / 'server.key').chmod(0o600)
     state = {'servers': [], 'env': {'TURNLOOP_TEST_POSTGRES_PORT': str(pgport), 'TURNLOOP_TEST_MYSQL_PORT': str(myport), 'TURNLOOP_TEST_SQL_TOOLS': str(SQL_TOOLS)}}
     SQL_STATE.write_text(json.dumps(state))
     def spawn(binary, args, log):
@@ -213,9 +278,9 @@ def sql_start():
         if not only_mysql:
             with startup_logs('PostgreSQL', SQL_TOOLS / 'postgres.log'):
                 p = spawn('postgres', ['-D', pg], 'postgres.log')
-                psql = [SQL_BIN / 'psql', '-h', '127.0.0.1', '-p', pgport, '-U', 'postgres', '-d', 'postgres', '-v', 'ON_ERROR_STOP=1']
+                psql = [SQL_BIN / 'psql', '-h', SQL_TOOLS, '-p', pgport, '-U', 'turnloop', '-d', 'postgres', '-v', 'ON_ERROR_STOP=1']
                 ready(p, [*psql, '-c', 'SELECT 1'])
-                sql_command([*psql], input=POSTGRES_USERS, text=True, stdout=subprocess.DEVNULL)
+                postgres_configure(psql)
         if 'mysql' not in SELECTED:
             return {k:v for k,v in state['env'].items() if not (k == 'TURNLOOP_TEST_MYSQL_PORT' and 'mysql' not in SELECTED) and not (k == 'TURNLOOP_TEST_POSTGRES_PORT' and 'postgres' not in SELECTED)}
         my = SQL_TOOLS / 'mysqldata'
@@ -412,7 +477,12 @@ def mongo_stop():
     if not MONGO_MANIFEST.exists():
         return
     state = json.loads(MONGO_MANIFEST.read_text())
-    if not MONGO_PROCESSES:
+    if (TOOLS / 'docker-fixtures.json').exists():
+        # Stopping a docker-run client alone does not prove mongod has exited.
+        docker_cleanup()
+        for process in MONGO_PROCESSES.values():
+            process.wait(timeout=40)
+    elif not MONGO_PROCESSES and any(port_open(entry['port']) for entry in state['servers']):
         subprocess.run(['cargo', 'run', '-p', 'turnloop-mongodb', '--example', 'cleanup-private'], cwd=MONGO_ROOT, check=True, env={**os.environ, **mongo_env()})
     else:
         for process in MONGO_PROCESSES.values():
@@ -421,13 +491,22 @@ def mongo_stop():
         for process in MONGO_PROCESSES.values():
             process.wait(timeout=40)
     for entry in state['servers']:
-        try:
-            with socket.create_connection(('127.0.0.1', entry['port']), timeout=.2):
-                raise RuntimeError('Private server still listening: ' + entry['name'])
-        except OSError:
-            pass
+        if port_open(entry['port']):
+            raise RuntimeError('Private server still listening: ' + entry['name'])
+    for entry in state['servers']:
+        if 'dbpath' in entry:
+            remove_private_data(entry['dbpath'], MONGO_RUN)
+    MONGO_PROCESSES.clear()
     MONGO_MANIFEST.unlink()
     print('Private MongoDB servers stopped', flush=True)
+
+
+def port_open(port):
+    try:
+        with socket.create_connection(('127.0.0.1', port), timeout=.2):
+            return True
+    except ConnectionRefusedError:
+        return False
 
 def mongo_start():
     if MONGO_MANIFEST.exists():
@@ -451,6 +530,9 @@ def mongo_start():
             directory.mkdir(exist_ok=True)
             # New run DB path preserves earlier logs and prevents leftover users.
             db=directory/secrets.token_hex(6);db.mkdir()
+            entry = {'name': name, 'port': port, 'dbpath': str(db)}
+            state['servers'].append(entry)
+            MONGO_MANIFEST.write_text(json.dumps(state))
             cmd=[find_binary('mongod'),'--bind_ip','127.0.0.1','--port',str(port),'--dbpath',str(db),'--logpath',str(directory/'mongod.log'),'--logappend','--nounixsocket','--setParameter','enableTestCommands=1','--wiredTigerCacheSizeGB','0.25']
             if name.startswith('rs'):
                 cmd += ['--replSet','turnloop_test','--keyFile',str(key)]
@@ -461,7 +543,7 @@ def mongo_start():
             with startup_logs(f'MongoDB {name}', directory / 'process.log', directory / 'mongod.log'):
                 p = private_process(cmd, directory / 'process.log')
                 MONGO_PROCESSES[name] = p
-                state['servers'].append({'name':name,'port':port,'pid':p.pid})
+                entry['pid'] = p.pid
                 MONGO_MANIFEST.write_text(json.dumps(state))
                 wait_port(f'MongoDB {name}', port, p, timeout=30)
         print('Private MongoDB ready: '+json.dumps(state),flush=True)
@@ -657,12 +739,42 @@ def start_all():
         cleanup_after_failure(error, stop_all)
         raise
 
+
+def collect_logs():
+    """Stage only known log files; artifact upload must never walk database data."""
+    destination = TOOLS / 'protocol-logs'
+    destination.mkdir(parents=True, exist_ok=True)
+    paths = list(SQL_TOOLS.glob('*.log'))
+    paths += list(REDIS_DATA.glob('*/server.log'))
+    for name in ('standalone', 'rs0', 'rs1', 'rs2', 'tls'):
+        paths += [MONGO_RUN / name / log for log in ('process.log', 'mongod.log')]
+    paths += [TOOLS / name / 'server.log' for name in ('smtp', 'http')]
+    for source in sorted(paths):
+        try:
+            if not stat.S_ISREG(source.lstat().st_mode):
+                continue
+            # Flatten filenames so the destination can contain no server dirs.
+            target = destination / '-'.join(source.relative_to(TOOLS).parts)
+            shutil.copyfile(source, target)
+            target.chmod(0o644)
+            with source.open('rb') as log:
+                log.seek(0, os.SEEK_END)
+                log.seek(max(0, log.tell() - 16384))
+                tail = b'\n'.join(log.read().splitlines()[-40:]).decode(errors='replace')
+            print(f'--- {source} ---\n{tail}', file=sys.stderr, flush=True)
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            print(f'Log unavailable: {source}: {error}', file=sys.stderr, flush=True)
+
+
 def main():
     global SELECTED, CI_SERVICES
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--ci-services', action='store_true', help='Linux CI: provision PostgreSQL/MySQL service containers; run native Redis and private Mongo containers')
     parser.add_argument('--services', default='postgres,mysql,redis,mongodb,smtp,http')
-    parser.add_argument('action', choices=['start', 'stop', 'run'])
+    parser.add_argument('--postgres-proxy', action='store_true', help='run only: forward PostgreSQL TCP, including separate CancelRequests, like docker-proxy')
+    parser.add_argument('action', choices=['start', 'stop', 'run', 'logs'])
     parser.add_argument('command', nargs=argparse.REMAINDER)
     args = parser.parse_args()
     SELECTED = set(args.services.split(','))
@@ -671,8 +783,12 @@ def main():
         prepare_docker_wrappers()
     if SELECTED - {'postgres', 'mysql', 'redis', 'mongodb', 'smtp', 'http'}:
         parser.error('unknown service')
+    if args.postgres_proxy and (args.action != 'run' or 'postgres' not in SELECTED):
+        parser.error('--postgres-proxy requires run with the postgres service')
     os.chdir(ROOT)
-    if args.action == 'stop':
+    if args.action == 'logs':
+        collect_logs()
+    elif args.action == 'stop':
         stop_all()
     elif args.action == 'start':
         for key, value in start_all().items():
@@ -682,10 +798,29 @@ def main():
             parser.error('run needs a command')
         env = start_all()
         try:
-            result = subprocess.run(args.command, env={**os.environ, **env})
+            # Loaded here so importlib-based fixture tests need no sys.path changes.
+            if args.postgres_proxy:
+                import importlib.util
+                spec = importlib.util.spec_from_file_location('tcp_proxy', ROOT / 'scripts/fixtures/tcp_proxy.py')
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                context = module.TcpProxy(int(env['TURNLOOP_TEST_POSTGRES_PORT']))
+            else:
+                context = nullcontext()
+            with context as proxy:
+                if proxy is not None:
+                    print(f'PostgreSQL proxy: {proxy.port} -> {env["TURNLOOP_TEST_POSTGRES_PORT"]}', flush=True)
+                    env['TURNLOOP_TEST_POSTGRES_PORT'] = str(proxy.port)
+                result = subprocess.run(args.command, env={**os.environ, **env})
+            if proxy is not None:
+                message = (f'PostgreSQL proxy forwarded {proxy.bytes_forwarded} bytes on '
+                           f'{proxy.connections} connections; {proxy.cancel_requests} CancelRequests')
+                print(message, flush=True)
+                (SQL_TOOLS / 'postgres-proxy.log').write_text(message + '\n')
             if result.returncode:
                 raise subprocess.CalledProcessError(result.returncode, args.command)
         except BaseException as error:
+            collect_logs()
             cleanup_after_failure(error, stop_all)
             if isinstance(error, subprocess.CalledProcessError):
                 return error.returncode
@@ -717,6 +852,7 @@ existing = json.loads(record.read_text()) if record.exists() else []
 existing.append(container)
 record.write_text(json.dumps(existing))
 args = ['docker', 'run', '--rm', '--name', container, '--label', 'turnloop.fixture=' + str(root),
+        '--user', str(os.getuid()) + ':' + str(os.getgid()),
         '--network', 'host', '--volume', str(root.parent) + ':' + str(root.parent),
         '--workdir', str(root.parent), '--entrypoint', name]
 if 'REDISCLI_AUTH' in os.environ:
@@ -765,9 +901,8 @@ def sql_ci_start():
     subprocess.run(['docker', 'exec', '--user', 'root', pg, 'chmod', '600', pgdata + '/server.key'], check=True)
     hba = SQL_TOOLS / 'pg_hba.conf'
     hba.write_text(POSTGRES_HBA.replace('127.0.0.1/32', '0.0.0.0/0'))
-    subprocess.run([*psql], input=POSTGRES_USERS + "\nALTER SYSTEM SET ssl='on';\nALTER SYSTEM SET ssl_cert_file='server.crt';\nALTER SYSTEM SET ssl_key_file='server.key';\n", text=True, check=True)
     subprocess.run(['docker', 'cp', str(hba), pg + ':' + pgdata + '/pg_hba.conf'], check=True)
-    subprocess.run([*psql, '-c', 'SELECT pg_reload_conf()'], check=True)
+    postgres_configure(psql)
     # MySQL's default data-directory certificate names are picked up on restart.
     for source, name in ((cert, 'ca.pem'), (cert, 'server-cert.pem'), (key, 'server-key.pem')):
         subprocess.run(['docker', 'cp', str(source), mysql + ':/var/lib/mysql/' + name], check=True)

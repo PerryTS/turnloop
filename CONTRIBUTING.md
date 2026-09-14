@@ -153,6 +153,9 @@ be real Cargo test targets, not names of ignored unit-test functions. CI runs ea
 with `--include-ignored --test-threads=1 --nocapture`; ignored real-server tests
 must actually execute. The protocol job fails if any protocol member lacks a
 declaration, or a selected suite runs zero tests.
+The runner attempts every declared suite even after failures, prints a per-suite
+PASS/FAIL table, and appends it to `GITHUB_STEP_SUMMARY` when set. Missing/invalid
+metadata, command failures and zero executed tests remain failures of the job.
 
 CI sets `TURNLOOP_TEST_REQUIRED=1`. A harness must **fail**, never return success,
 if a required connection/certificate variable is absent, a service is unavailable,
@@ -186,6 +189,9 @@ port is loopback-only; there is no fallback to a default port or system instance
 scripts/test-servers.py run cargo test --workspace -- --include-ignored
 scripts/test-servers.py start   # prints shell exports; explicitly source them to run tests
 scripts/test-servers.py stop
+# Reproduce PostgreSQL's CI configuration with separate proxied TCP connections:
+scripts/test-servers.py --services postgres --postgres-proxy run cargo test \
+  -p turnloop-postgres --test server -- --include-ignored --test-threads=1 --nocapture
 # Explicit subset for machines unable to run SQL; does not count as a full pass:
 scripts/test-servers.py --services redis,mongodb,smtp run cargo test \
   -p turnloop-redis -p turnloop-mongodb -p turnloop-smtp -- --include-ignored --test-threads=1
@@ -211,6 +217,15 @@ runner; in-process TLS/auth SMTP peers remain normal tests.
 In the managed macOS sandbox PostgreSQL initialization fails at `shmget` and
 MySQL initialization crashes. Those real-server tests are **UNRUN (sandbox)**;
 run the full command outside the sandbox.
+
+Local PostgreSQL initializes the administrator as `turnloop`, matching CI's
+`POSTGRES_USER`; a `postgres` database exists but a `postgres` role is not assumed.
+Both paths apply the same three SSL `ALTER SYSTEM` settings and reload, then check
+effective TLS settings and pending restarts and print versions, roles and timeout
+settings. The optional loopback TCP proxy preserves bytes and half-closes, opens
+one upstream connection per client, and reports forwarded bytes, connection counts
+and CancelRequests. The cancel test observes its exact backend PID using another
+`scram_user` session, requires SQLSTATE 57014 and checks subsequent session reuse.
 
 HTTP fixture servers use the same lifecycle and authenticated private-instance
 shutdown. Node **26.5.1** is pinned with setup-node on native and protocol CI.
@@ -292,7 +307,7 @@ stages unpublished siblings together and verifies every packaged library. Never
 use `--no-verify` to bypass this dependency chain. Do not remove their ignored test bodies
 or treat a failed initializer as a test pass.
 
-CI's PostgreSQL 16/MySQL **9.6.0** service containers are provisioned by
+CI's PostgreSQL **16.13**/MySQL **9.6.0** service containers are provisioned by
 `scripts/test-servers.py --ci-services`. Redis runs natively at **8.4.0**, matching
 the local fixture. `python3 scripts/ci/install-redis.py` builds the official tarball
 after verifying its committed SHA-256 against Redis's published release digest,
@@ -306,7 +321,8 @@ The six-node Redis cluster (three masters and three replicas), single/TLS instan
 and Sentinel use the native runner's configurations, auth and certificates. The
 five MongoDB instances use private named Linux containers; CI pulls their image
 before the bounded startup wait. SQL TLS probes precede the metadata-selected Rust
-suites. Mongo container ownership labels are checked during cleanup. The Docker
+suites. Mongo containers run with the host UID/GID, and their ownership labels
+are checked during cleanup. The Docker
 path is **UNRUN locally** because the development sandbox has no Docker.
 
 Private server stdout and stderr are captured together under `.tools/`: Redis
@@ -314,7 +330,15 @@ Private server stdout and stderr are captured together under `.tools/`: Redis
 `mongod.log`, SQL `sql/*init*.log`, `postgres.log`, `mysqld-console.log` and
 `mysql.log`, SMTP `smtp/server.log`, and HTTP `http/server.log`. Startup failures
 print the relevant last 40 lines (at most 16 KiB per file), including errors before internal logging is
-initialized. CI preserves these files in the `protocol-server-logs` artifact.
+initialized. `scripts/test-servers.py logs` prints bounded tails and copies only
+known log files to the flat `.tools/protocol-logs/` directory. CI uploads that
+directory as `protocol-server-logs`, without recursively scanning server data.
+On protocol job failure, CI also prints and preserves both SQL service container
+logs. The only fixture build cache is `.tools/redis-build`; it contains no data.
+Mongo cleanup stops/removes containers or stops native servers, reaps owned
+children and verifies closed ports before deleting recorded data directories.
+Private PostgreSQL/MySQL data is deleted after shutdown, including partial data
+from failed initialization. Logs and certificates are retained outside data roots.
 Cleanup reaps owned Redis children, removes state for crashed instances, and
 checks private config identity before a separate invocation sends SHUTDOWN.
 An unresponsive or unidentified instance retains its record. Cleanup failures
