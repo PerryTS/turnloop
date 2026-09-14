@@ -37,6 +37,15 @@ extern "C" {
     fn release(id: u32, key: u64);
     fn dispose(id: u32);
     fn schedules(id: u32) -> u32;
+    #[cfg(feature = "web-worker")]
+    #[wasm_bindgen(js_name=workerSupported)]
+    fn worker_supported() -> bool;
+    #[cfg(feature = "web-worker")]
+    #[wasm_bindgen(js_name=workerPending)]
+    fn worker_pending(id: u32) -> bool;
+    #[cfg(feature = "web-worker")]
+    #[wasm_bindgen(catch, js_name=attachWorker)]
+    fn attach_worker(id: u32, capacity: u32, accept: &Function) -> std::result::Result<JsValue, JsValue>;
 }
 fn error(_: JsValue) -> Error {
     Error::new(ErrorKind::Other)
@@ -69,6 +78,8 @@ pub struct Web {
     ops: Vec<Option<Pending>>,
     pool: BufferPool,
     failure: Option<Error>,
+    #[cfg(feature = "web-worker")]
+    worker: Option<Closure<dyn FnMut(u64, u64) -> bool>>,
 }
 impl Web {
     pub(crate) fn configure(&mut self, schedule: &Function) -> Result<()> {
@@ -76,6 +87,25 @@ impl Web {
     }
     pub fn schedule_count(&self) -> u32 {
         schedules(self.id)
+    }
+    #[cfg(feature = "web-worker")]
+    pub(crate) fn worker_poster(&mut self, capacity: u32, poster: Poster) -> Result<JsValue> {
+        if !worker_supported() { return Err(Error::new(ErrorKind::Unsupported)); }
+        if self.worker.is_some() || capacity == 0 || !capacity.is_power_of_two() || capacity > 1_048_576 {
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
+        let accept = Closure::wrap(Box::new(move |token, value| {
+            poster.post(Token(token), Payload::U64(value)).is_ok()
+        }) as Box<dyn FnMut(u64, u64) -> bool>);
+        let descriptor = attach_worker(self.id, capacity, accept.as_ref().unchecked_ref()).map_err(error)?;
+        self.worker = Some(accept);
+        Ok(descriptor)
+    }
+    fn worker_has_work(&self) -> bool {
+        #[cfg(feature = "web-worker")]
+        { worker_pending(self.id) }
+        #[cfg(not(feature = "web-worker"))]
+        { false }
     }
     fn resource(&self, h: Handle) -> Result<&Resource> {
         self.resources
@@ -106,6 +136,8 @@ unsafe impl Backend for Web {
             ops: (0..config.max_operations).map(|_| None).collect(),
             pool,
             failure: None,
+            #[cfg(feature = "web-worker")]
+            worker: None,
         })
     }
     fn now(&self) -> Instant {
@@ -205,6 +237,7 @@ unsafe impl Backend for Web {
     }
     fn has_work(&self) -> bool {
         self.failure.is_some()
+            || self.worker_has_work()
             || self
                 .ops
                 .iter()

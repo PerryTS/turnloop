@@ -1,3 +1,5 @@
+#[path = "allocations.rs"]
+mod allocations;
 use js_sys::{Function, Promise};
 use std::{cell::Cell, rc::Rc, time::Duration};
 use turnloop::*;
@@ -9,6 +11,17 @@ extern "C" {
     fn guard(p: &Promise) -> Promise;
     fn sleep(ms: f64) -> Promise;
     fn stats(base: &str) -> Promise;
+    #[cfg(feature = "web-worker")]
+    fn producers(descriptor: &JsValue, count: u32) -> JsValue;
+    #[cfg(feature = "web-worker")]
+    #[wasm_bindgen(js_name=stopProducers)]
+    fn stop_producers(group: &JsValue);
+    #[cfg(feature = "web-worker")]
+    #[wasm_bindgen(js_name=producersDone)]
+    fn producers_done(group: &JsValue) -> Promise;
+    #[cfg(feature = "web-worker")]
+    #[wasm_bindgen(js_name=fillRing)]
+    fn fill_ring(descriptor: &JsValue);
 }
 fn base() -> &'static str {
     option_env!("TURNLOOP_WEB_FIXTURE").unwrap_or("http://127.0.0.1:18765")
@@ -145,6 +158,8 @@ async fn fetch_bytes_abort_and_close_ordering() {
     l.close(h, Token(3)).expect("close");
     l.turn(Timeout::Now, &mut out).expect("closed");
     assert!(matches!(out[0].result, OpResult::Closed));
+    let baseline = JsFuture::from(stats(base())).await.expect("baseline");
+    let baseline = js_sys::Reflect::get(&baseline, &"slow".into()).expect("slow count").as_f64().expect("number");
     let (h, op) = l
         .fetch(&(base().to_owned() + "/slow"), ReadBuf::Pooled, Token(4))
         .expect("slow fetch");
@@ -155,7 +170,7 @@ async fn fetch_bytes_abort_and_close_ordering() {
         if js_sys::Reflect::get(&value, &"slow".into())
             .expect("slow count")
             .as_f64()
-            .is_some_and(|n| n > 0.0)
+            .is_some_and(|n| n > baseline)
         {
             observed = true;
             break;
@@ -222,4 +237,79 @@ async fn websocket_bytes_and_schedule_coalescing() {
     }
     assert!(wrote && read);
     l.close(h, Token(202)).expect("close");
+}
+
+#[cfg(feature = "web-worker")]
+#[wasm_bindgen_test(async)]
+async fn worker_mpsc_backpressure_and_no_lost_wake() {
+    let mut l = Loop::new(Config {post_capacity: 8, events_per_turn: 4, ..Config::default()}).expect("loop");
+    let descriptor = l.worker_poster(16).expect("isolated SAB + Atomics.waitAsync required");
+    fill_ring(&descriptor);
+    let mut out = Completions::with_capacity(3);
+    let mut full = 0;
+    while full < 16 {
+        scheduled(&mut l, &mut out).await;
+        for c in out.drain() { assert!(matches!(c.result,OpResult::Posted(Payload::U64(n)) if n==c.token.0));full+=1; }
+    }
+    assert_eq!(full,16);
+    let group = producers(&descriptor,1000);
+    let mut seen = vec![false;2000];
+    let mut count = 0;
+    while count < 2000 {
+        scheduled(&mut l, &mut out).await;
+        for c in out.drain() {
+            let n=c.token.0.checked_sub(0xf123456700000000).expect("full token") as usize;
+            assert!(n<2000 && !seen[n]);seen[n]=true;
+            assert!(matches!(c.result,OpResult::Posted(Payload::U64(v)) if v==(n as u64)^u64::MAX));
+            count+=1;
+        }
+    }
+    JsFuture::from(producers_done(&group)).await.expect("both workers finished");
+    stop_producers(&group);
+    assert_eq!(count,2000);assert!(seen.into_iter().all(|s|s));
+    let before=l.schedule_count();
+    JsFuture::from(sleep(20.0)).await.expect("idle");
+    assert_eq!(l.schedule_count(),before,"no periodic wake while ring empty");
+}
+#[wasm_bindgen_test(async)]
+async fn steady_rust_websocket_posts_and_timers_allocate_nothing() {
+    let mut l = Loop::new(Config::default()).expect("loop");
+    let h = websocket(&mut l).await;
+    let mut out = Completions::default();
+    static BYTES: [u8;64] = [0x59;64];
+    let mut total=0;
+    for _ in 0..100 {
+        allocations::measure(|| {
+            l.read(h,ReadBuf::Pooled,Token(1)).expect("read");
+            // SAFETY: static immutable bytes survive until the write completes.
+            let bytes=unsafe {IoBuf::from_raw_parts(BYTES.as_ptr(),BYTES.len())};
+            l.write(h,WriteBuf::Provided(bytes),Token(2)).expect("write");
+            l.poster().post(Token(3),Payload::U64(4)).expect("post");
+            let timer=l.timer(l.now(),None,Token(5)).expect("timer");
+            l.close(timer,Token(6)).expect("close timer");
+        });
+        let mut received=0;
+        let mut written=0;
+        let mut posts=0;
+        let mut cancelled=0;
+        let mut closed=0;
+        for _ in 0..1000 {
+            allocations::measure(|| l.turn(Timeout::Now,&mut out).expect("turn"));
+            for c in out.drain() {
+                match c.result {
+                    OpResult::Read {n,lease:Some(b)}=>{assert_eq!(b.as_slice(),BYTES);received+=n;},
+                    OpResult::Wrote(n)=>written+=n,
+                    OpResult::Posted(Payload::U64(4))=>posts+=1,
+                    OpResult::Cancelled=>cancelled+=1,
+                    OpResult::Closed=>closed+=1,
+                    other=>panic!("unexpected {other:?}"),
+                }
+            }
+            if received==64 && written==64 && posts==1 && cancelled==1 && closed==1 {break;}
+            JsFuture::from(sleep(1.0)).await.expect("host yield");
+        }
+        assert_eq!((received,written,posts,cancelled,closed),(64,64,1,1,1));
+        total+=received;
+    }
+    assert_eq!(total,6400);
 }

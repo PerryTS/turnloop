@@ -6,7 +6,7 @@ const get = id => { const h=hosts.get(id); if(!h) throw new Error('closed turnlo
 export function createHost(capacity) {
   if(nextHost > 0xffffffff) throw new Error('host identity exhausted');
   const id=nextHost++;
-  hosts.set(id,{ops:new Array(capacity).fill(null),resources:new Map(),schedule:()=>{},scheduled:false,epoch:0,timer:null,deadline:null,schedules:0});
+  hosts.set(id,{ops:new Array(capacity).fill(null),resources:new Map(),schedule:()=>{},scheduled:false,epoch:0,timer:null,deadline:null,schedules:0,worker:null});
   return id;
 }
 export function now() { return performance.now(); }
@@ -17,7 +17,7 @@ export function wake(id) {
   const epoch=++h.epoch;
   queueMicrotask(()=>{if(hosts.get(id)===h && h.scheduled && h.epoch===epoch){h.scheduled=false;h.schedule();}});
 }
-export function beginTurn(id) {const h=get(id);h.scheduled=false;h.epoch++;}
+export function beginTurn(id) {const h=get(id);h.scheduled=false;h.epoch++;h.worker?.pump();}
 export function deadlineChanged(id,deadline) {
   const h=get(id);if(h.deadline===deadline)return;
   clearTimeout(h.timer);h.timer=null;h.deadline=deadline;
@@ -94,5 +94,73 @@ export function release(id,key) {
   if(r.socket){r.socket.onopen=r.socket.onmessage=r.socket.onerror=r.socket.onclose=null;r.socket.close();}
   h.resources.delete(key);
 }
-export function dispose(id) {const h=get(id);clearTimeout(h.timer);for(const key of h.resources.keys())release(id,key);hosts.delete(id);}
+export function dispose(id) {const h=get(id);clearTimeout(h.timer);h.worker?.stop();for(const key of h.resources.keys())release(id,key);hosts.delete(id);}
 export function schedules(id) {return get(id).schedules;}
+
+// Shared queue is available only through the web-worker Rust feature. No Rust
+// linear memory is shared; producers transfer two unsigned 64-bit values.
+class SharedPoster {
+  constructor(buffer,capacity) {
+    if(!Number.isInteger(capacity) || capacity<=0 || capacity>1048576 || (capacity&(capacity-1)))throw new Error('invalid capacity');
+    this.capacity=capacity;this.words=new Int32Array(buffer);
+    if(this.words.length!==7+capacity*4)throw new Error('capacity mismatch');
+  }
+  post(token,value) {
+    const w=this.words;
+    if(Atomics.load(w,6) || Atomics.compareExchange(w,2,0,1)!==0)return false;
+    try {
+      if(Atomics.load(w,6))return false;
+      const head=Atomics.load(w,0)>>>0,tail=Atomics.load(w,1)>>>0;
+      if(((head-tail)>>>0)>=this.capacity)return false;
+      const off=7+(head&(this.capacity-1))*4;
+      w[off]=Number(BigInt.asIntN(32,token));w[off+1]=Number(BigInt.asIntN(32,token>>32n));
+      w[off+2]=Number(BigInt.asIntN(32,value));w[off+3]=Number(BigInt.asIntN(32,value>>32n));
+      Atomics.store(w,0,(head+1)|0);
+    } finally {Atomics.store(w,2,0);}
+    Atomics.add(w,3,1);
+    if(Atomics.exchange(w,4,0)===1){Atomics.add(w,5,1);Atomics.notify(w,3,1);}
+    return true;
+  }
+}
+export function workerSupported() {
+  return typeof SharedArrayBuffer==='function' && typeof Atomics.waitAsync==='function'
+    && (typeof window==='undefined' || globalThis.crossOriginIsolated===true);
+}
+export function workerPending(id) {
+  const w=get(id).worker?.words;
+  return !!w && Atomics.load(w,0)!==Atomics.load(w,1);
+}
+export function attachWorker(id,capacity,accept) {
+  const h=get(id);
+  if(!workerSupported() || h.worker)throw new Error('worker poster unavailable');
+  if(!Number.isInteger(capacity) || capacity<=0 || capacity>1048576 || (capacity&(capacity-1)))throw new Error('invalid capacity');
+  const buffer=new SharedArrayBuffer((7+capacity*4)*4),w=new Int32Array(buffer);
+  let waiting=false,stopped=false;
+  const pump=()=>{
+    if(stopped)return;
+    // Each call examines at most the ring's fixed capacity. Full core queue
+    // retains this record; the next owner turn resumes consumption.
+    for(let count=0;count<capacity;count++) {
+      const tail=Atomics.load(w,1)>>>0;
+      if(tail===(Atomics.load(w,0)>>>0))break;
+      const off=7+(tail&(capacity-1))*4;
+      const token=BigInt(w[off]>>>0)|(BigInt(w[off+1]>>>0)<<32n);
+      const value=BigInt(w[off+2]>>>0)|(BigInt(w[off+3]>>>0)<<32n);
+      if(!accept(token,value))break;
+      Atomics.store(w,1,(tail+1)|0);
+    }
+    if(Atomics.load(w,0)!==Atomics.load(w,1)){wake(id);return;}
+    if(waiting)return;
+    const sequence=Atomics.load(w,3);
+    Atomics.store(w,4,1);
+    if(Atomics.load(w,0)!==Atomics.load(w,1)){Atomics.store(w,4,0);wake(id);return;}
+    const wait=Atomics.waitAsync(w,3,sequence);
+    if(wait.async) {
+      waiting=true;
+      wait.value.then(()=>{waiting=false;Atomics.store(w,4,0);pump();});
+    } else {Atomics.store(w,4,0);wake(id);}
+  };
+  h.worker={words:w,pump,stop:()=>{stopped=true;Atomics.store(w,6,1);Atomics.add(w,3,1);Atomics.notify(w,3);}};
+  pump();
+  return {buffer,capacity,producerSource:SharedPoster.toString()};
+}

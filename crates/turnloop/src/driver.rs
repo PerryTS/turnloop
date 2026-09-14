@@ -971,6 +971,15 @@ impl Driver<crate::backend::web::Web> {
     pub fn schedule_count(&self) -> u32 {
         self.backend.schedule_count()
     }
+    /// Attach a bounded Worker Poster. Returns a JS descriptor with `buffer`
+    /// (SharedArrayBuffer), `capacity`, and `producerSource` (SharedPoster class).
+    /// Construct that class in a Worker with the transferred descriptor; post
+    /// returns false on contention/full/closed, retaining the caller's values.
+    /// Browsers require COOP/COEP isolation and Atomics.waitAsync; see docs/wasm.md.
+    #[cfg(feature = "web-worker")]
+    pub fn worker_poster(&mut self, capacity: u32) -> Result<wasm_bindgen::JsValue> {
+        self.backend.worker_poster(capacity, self.poster())
+    }
     /// Fetch one complete response into a provided or pooled buffer. Responses
     /// larger than that buffer complete with ResourceLimit, never truncated data.
     pub fn fetch(&mut self, url: &str, buf: ReadBuf, token: Token) -> Result<(Handle, OpId)> {
