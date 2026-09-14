@@ -244,3 +244,120 @@ fn invalid_input_is_bounded_and_commands_are_atomic() {
         .unwrap();
     assert!(c.next_event().is_err());
 }
+
+fn sha256(b: &[u8]) -> [u8; 32] {
+    let p = rustls::crypto::ring::default_provider();
+    let h = p
+        .cipher_suites
+        .iter()
+        .find(|s| s.suite() == rustls::CipherSuite::TLS13_AES_128_GCM_SHA256)
+        .unwrap()
+        .tls13()
+        .unwrap()
+        .common
+        .hash_provider;
+    h.hash(b).as_ref().try_into().unwrap()
+}
+fn hmac(key: &[u8], message: &[u8]) -> [u8; 32] {
+    let mut inner = vec![0x36; 64];
+    let mut outer = vec![0x5c; 64];
+    for (i, b) in key.iter().enumerate() {
+        inner[i] ^= *b;
+        outer[i] ^= *b;
+    }
+    inner.extend_from_slice(message);
+    outer.extend_from_slice(&sha256(&inner));
+    sha256(&outer)
+}
+fn base64(bytes: &[u8]) -> String {
+    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut s = String::new();
+    for chunk in bytes.chunks(3) {
+        let a = chunk[0] as usize;
+        let b = chunk.get(1).copied().unwrap_or(0) as usize;
+        let c = chunk.get(2).copied().unwrap_or(0) as usize;
+        s.push(alphabet[a >> 2] as char);
+        s.push(alphabet[((a & 3) << 4) | (b >> 4)] as char);
+        s.push(if chunk.len() > 1 {
+            alphabet[((b & 15) << 2) | (c >> 6)] as char
+        } else {
+            '='
+        });
+        s.push(if chunk.len() > 2 {
+            alphabet[c & 63] as char
+        } else {
+            '='
+        });
+    }
+    s
+}
+#[test]
+fn scram_and_plus_verify_server_signature_and_reject_bad_verifier() {
+    // PBKDF2-HMAC-SHA256('secret','salt',4096), independently generated with Python hashlib.
+    let salted = hex_salted_password();
+    for (plus, valid) in [(false, true), (true, true), (false, false)] {
+        let mut c = Connection::new(Config {
+            ssl: if plus {
+                SslMode::Require
+            } else {
+                SslMode::Disable
+            },
+            channel_binding_required: plus,
+            ..Config::default()
+        })
+        .unwrap();
+        flush(&mut c);
+        if plus {
+            c.receive(b"S").unwrap();
+            assert!(matches!(c.next_event().unwrap(), Some(Event::UpgradeTls)));
+            c.tls_established().unwrap();
+            flush(&mut c);
+        }
+        let mut mechanisms = 10u32.to_be_bytes().to_vec();
+        mechanisms.extend_from_slice(b"SCRAM-SHA-256-PLUS\0SCRAM-SHA-256\0\0");
+        c.receive(&frame(b'R', &mechanisms)).unwrap();
+        assert!(matches!(c.next_event().unwrap(),Some(Event::ScramNeeded {plus:p}) if p==plus));
+        let binding = if plus {
+            ChannelBinding::tls_server_end_point(vec![7; 32])
+        } else {
+            ChannelBinding::unsupported()
+        };
+        let scram = ScramSha256::new(b"secret", binding);
+        let first = std::str::from_utf8(scram.message()).unwrap().to_owned();
+        let bare = first.splitn(3, ',').nth(2).unwrap();
+        let nonce = bare.split_once("r=").unwrap().1;
+        let server_first = format!("r={nonce}server,s=c2FsdA==,i=4096");
+        c.start_scram(scram).unwrap();
+        assert_eq!(flush(&mut c)[0], b'p');
+        let mut continuation = 11u32.to_be_bytes().to_vec();
+        continuation.extend_from_slice(server_first.as_bytes());
+        c.receive(&frame(b'R', &continuation)).unwrap();
+        assert!(c.next_event().unwrap().is_none());
+        let response = flush(&mut c);
+        let client_final = std::str::from_utf8(&response[5..]).unwrap();
+        let without_proof = client_final.split_once(",p=").unwrap().0;
+        let auth_message = format!("{bare},{server_first},{without_proof}");
+        let mut signature = hmac(&hmac(&salted, b"Server Key"), auth_message.as_bytes());
+        if !valid {
+            signature[0] ^= 1;
+        }
+        let mut final_message = 12u32.to_be_bytes().to_vec();
+        final_message.extend_from_slice(format!("v={}", base64(&signature)).as_bytes());
+        c.receive(&frame(b'R', &final_message)).unwrap();
+        if valid {
+            assert!(c.next_event().unwrap().is_none());
+            c.receive(&[frame(b'R', &0u32.to_be_bytes()), frame(b'Z', b"I")].concat())
+                .unwrap();
+            assert!(matches!(c.next_event().unwrap(), Some(Event::Connected)));
+        } else {
+            assert!(c.next_event().is_err());
+            assert!(!c.is_ready());
+        }
+    }
+}
+fn hex_salted_password() -> [u8; 32] {
+    [
+        96, 154, 98, 181, 182, 135, 186, 101, 146, 177, 42, 85, 44, 121, 254, 59, 241, 158, 78, 20,
+        90, 22, 123, 121, 91, 122, 202, 181, 232, 159, 160, 246,
+    ]
+}
