@@ -67,3 +67,70 @@ fn timers_io_posts() {
 fn no_spin() {
     contract::no_spin::<Platform>();
 }
+
+#[test]
+fn repeated_eof_shutdown_and_empty_datagram() {
+    use std::time::Duration;
+    use turnloop::*;
+    let mut l = Loop::new(Config::default()).expect("loop");
+    let (_, a, b) = contract::pair(&mut l);
+    let mut out = Completions::with_capacity(1);
+    let mut shutdowns = 0;
+    let mut eofs = 0;
+    for _ in 0..3 {
+        l.shutdown(a, Token(1)).expect("shutdown");
+        let until = l.now() + Duration::from_secs(2);
+        while shutdowns <= eofs {
+            assert!(l.now() < until);
+            l.turn(Timeout::Until(until), &mut out)
+                .expect("shutdown turn");
+            for c in out.drain() {
+                assert!(matches!(c.result, OpResult::Shutdown));
+                shutdowns += 1;
+            }
+        }
+        l.read(b, ReadBuf::Pooled, Token(2)).expect("EOF read");
+        while eofs < shutdowns {
+            assert!(l.now() < until);
+            l.turn(Timeout::Until(until), &mut out).expect("EOF turn");
+            for c in out.drain() {
+                assert!(matches!(c.result, OpResult::Eof));
+                eofs += 1;
+            }
+        }
+    }
+    assert_eq!((shutdowns, eofs), (3, 3));
+    let addr = "127.0.0.1:0".parse().expect("address");
+    let a = l.udp_bind(addr, &UdpOpts::default()).expect("UDP");
+    let b = l.udp_bind(addr, &UdpOpts::default()).expect("UDP");
+    l.recv(b, ReadBuf::Pooled, Token(3)).expect("receive");
+    l.send_to(
+        a,
+        WriteBuf::Owned(Vec::new()),
+        l.local_addr(b).expect("address"),
+        Token(4),
+    )
+    .expect("send empty");
+    let until = l.now() + Duration::from_secs(2);
+    let mut received = 0;
+    let mut written = 0;
+    while received + written < 2 {
+        assert!(l.now() < until);
+        l.turn(Timeout::Until(until), &mut out).expect("UDP turn");
+        for c in out.drain() {
+            match c.result {
+                OpResult::RecvFrom {
+                    n: 0,
+                    lease: Some(b),
+                    ..
+                } => {
+                    assert!(b.as_slice().is_empty());
+                    received += 1;
+                }
+                OpResult::Wrote(0) => written += 1,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+    assert_eq!((received, written), (1, 1));
+}

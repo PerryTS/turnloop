@@ -541,7 +541,9 @@ unsafe impl Backend for WasiP3 {
 impl Drop for WasiP3 {
     fn drop(&mut self) {
         for p in self.ops.iter_mut().flatten() {
-            let r = self.resources[p.request.handle.index()].as_mut().expect("owner");
+            let r = self.resources[p.request.handle.index()]
+                .as_mut()
+                .expect("owner");
             quiesce(p, &self.wait_set, r);
         }
     }
@@ -666,7 +668,11 @@ fn execute(
             }
             WaitKind::WriteDone => {
                 let result = result(p);
-                r.transport.streams.as_mut().expect("connected").write_result = Some(result);
+                r.transport
+                    .streams
+                    .as_mut()
+                    .expect("connected")
+                    .write_result = Some(result);
                 result?;
                 return Ok(Some((Outcome::Shutdown, true)));
             }
@@ -734,7 +740,10 @@ fn execute(
             start(p, set, WaitKind::Accept, stream, code);
         }
         Operation::Read { .. } => {
-            let s = t.streams.as_ref().ok_or(Error::new(ErrorKind::InvalidInput))?;
+            let s = t
+                .streams
+                .as_ref()
+                .ok_or(Error::new(ErrorKind::InvalidInput))?;
             if let Some(result) = s.read_result {
                 result?;
                 return Ok(Some((Outcome::Eof, true)));
@@ -743,7 +752,9 @@ fn execute(
                 let f = s.read_done.0;
                 // SAFETY: an earlier cancelled future read did not consume its result;
                 // the new request owns its fixed return area until acknowledgement.
-                let code = unsafe { (SocketResult::VTABLE.start_read)(f, p.area.as_mut_ptr().add(16).cast()) };
+                let code = unsafe {
+                    (SocketResult::VTABLE.start_read)(f, p.area.as_mut_ptr().add(16).cast())
+                };
                 start(p, set, WaitKind::ReadDone, f, code);
                 return Ok(None);
             }
@@ -921,8 +932,11 @@ fn quiesce(p: &mut Pending, set: &WaitSet, r: &mut Resource) {
         WaitKind::ReadDone | WaitKind::WriteDone if code & 15 == 0 => {
             let result = result(p);
             let s = r.transport.streams.as_mut().expect("connected");
-            if matches!(kind, WaitKind::ReadDone) { s.read_result = Some(result); }
-            else { s.write_result = Some(result); }
+            if matches!(kind, WaitKind::ReadDone) {
+                s.read_result = Some(result);
+            } else {
+                s.write_result = Some(result);
+            }
         }
         WaitKind::Receive if code == 2 => {
             if p.area[0] & 255 == 0 {
@@ -947,7 +961,9 @@ fn quiesce(p: &mut Pending, set: &WaitSet, r: &mut Resource) {
 // SAFETY: caller transfers an owned canonical list allocated with alignment one.
 // Empty canonical lists may have a null address, which Vec cannot accept.
 unsafe fn owned_bytes(ptr: u32, len: usize) -> Vec<u8> {
-    if len == 0 { Vec::new() } else {
+    if len == 0 {
+        Vec::new()
+    } else {
         // SAFETY: nonempty canonical list transfers len initialized bytes/capacity.
         unsafe { Vec::from_raw_parts(ptr as *mut u8, len, len) }
     }

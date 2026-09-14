@@ -45,7 +45,11 @@ extern "C" {
     fn worker_pending(id: u32) -> bool;
     #[cfg(feature = "web-worker")]
     #[wasm_bindgen(catch, js_name=attachWorker)]
-    fn attach_worker(id: u32, capacity: u32, accept: &Function) -> std::result::Result<JsValue, JsValue>;
+    fn attach_worker(
+        id: u32,
+        capacity: u32,
+        accept: &Function,
+    ) -> std::result::Result<JsValue, JsValue>;
 }
 fn error(_: JsValue) -> Error {
     Error::new(ErrorKind::Other)
@@ -90,22 +94,33 @@ impl Web {
     }
     #[cfg(feature = "web-worker")]
     pub(crate) fn worker_poster(&mut self, capacity: u32, poster: Poster) -> Result<JsValue> {
-        if !worker_supported() { return Err(Error::new(ErrorKind::Unsupported)); }
-        if self.worker.is_some() || capacity == 0 || !capacity.is_power_of_two() || capacity > 1_048_576 {
+        if !worker_supported() {
+            return Err(Error::new(ErrorKind::Unsupported));
+        }
+        if self.worker.is_some()
+            || capacity == 0
+            || !capacity.is_power_of_two()
+            || capacity > 1_048_576
+        {
             return Err(Error::new(ErrorKind::InvalidInput));
         }
         let accept = Closure::wrap(Box::new(move |token, value| {
             poster.post(Token(token), Payload::U64(value)).is_ok()
         }) as Box<dyn FnMut(u64, u64) -> bool>);
-        let descriptor = attach_worker(self.id, capacity, accept.as_ref().unchecked_ref()).map_err(error)?;
+        let descriptor =
+            attach_worker(self.id, capacity, accept.as_ref().unchecked_ref()).map_err(error)?;
         self.worker = Some(accept);
         Ok(descriptor)
     }
     fn worker_has_work(&self) -> bool {
         #[cfg(feature = "web-worker")]
-        { worker_pending(self.id) }
+        {
+            worker_pending(self.id)
+        }
         #[cfg(not(feature = "web-worker"))]
-        { false }
+        {
+            false
+        }
     }
     fn resource(&self, h: Handle) -> Result<&Resource> {
         self.resources

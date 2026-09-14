@@ -1,8 +1,5 @@
 import http from 'node:http';
 import { createHash } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
-import { fileURLToPath } from 'node:url';
-const root=fileURLToPath(new URL('../',import.meta.url));
 const stats={slow:0,fetches:0,aborted:0,websockets:0,echoed:0};
 const server=http.createServer(async(req,res)=>{
   res.setHeader('Access-Control-Allow-Origin','*');
@@ -12,13 +9,7 @@ const server=http.createServer(async(req,res)=>{
   if(req.url==='/bytes') { stats.fetches++; res.end(Buffer.from(Array.from({length:257},(_,i)=>(i*73+19)&255))); }
   else if(req.url==='/slow') { stats.slow++; stats.fetches++; const timer=setTimeout(()=>res.end('slow'),10000); res.on('close',()=>{clearTimeout(timer);if(!res.writableEnded)stats.aborted++;}); }
   else if(req.url==='/stats') res.end(JSON.stringify(stats));
-  else {
-    const paths={'/worker-poster.js':'worker-poster.js','/isolated.html':'tests/isolated.html','/worker-browser.js':'tests/worker-browser.js'};
-    const path=paths[req.url];
-    if(!path){res.writeHead(404);res.end();return;}
-    try { res.setHeader('Content-Type',path.endsWith('.html')?'text/html':'text/javascript');res.end(await readFile(root+path)); }
-    catch { res.writeHead(500);res.end(); }
-  }
+  else {res.writeHead(404);res.end();}
 });
 server.on('upgrade',(req,socket,head)=>{
   if(req.url!=='/echo'){socket.destroy();return;}
@@ -44,5 +35,5 @@ server.on('upgrade',(req,socket,head)=>{
   };
   socket.on('data',data=>{pending=Buffer.concat([pending,data]);parse();});socket.on('error',()=>{});parse();
 });
-server.listen(18765,'127.0.0.1',()=>console.log('fixture ready 18765'));
+server.listen(0,'127.0.0.1',()=>console.log(JSON.stringify({url:`http://127.0.0.1:${server.address().port}`})));
 process.on('SIGTERM',()=>{server.close();process.exit(0);});

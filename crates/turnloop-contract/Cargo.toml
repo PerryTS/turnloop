@@ -20,6 +20,11 @@ libc.workspace = true
 role = "contract"
 web-tests = ["browser"]
 node-tests = ["node"]
+web-tests-features = ["web-worker"]
+node-tests-features = ["web-worker"]
+web-fixture = "tests/web/fixture.mjs"
+wasi-tests = ["wasi"]
+wasi-allocation-tests = ["allocations"]
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dev-dependencies]
 wasm-bindgen = "=0.2.108"

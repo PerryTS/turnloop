@@ -327,3 +327,76 @@ fn cancellation_reserves_survive_a_full_event_backlog() {
     assert_eq!((cancelled, closed, posts), (16, 16, 80));
     assert_eq!(allocations, 0, "cancel/close reserves under backpressure");
 }
+
+#[test]
+fn steady_udp_and_deadline_poll_allocate_nothing() {
+    let mut l = Loop::new(Config::default()).expect("loop");
+    let addr = "127.0.0.1:0".parse().expect("address");
+    let a = l.udp_bind(addr, &UdpOpts::default()).expect("UDP a");
+    let b = l.udp_bind(addr, &UdpOpts::default()).expect("UDP b");
+    let to = l.local_addr(b).expect("destination");
+    static BYTES: [u8; 64] = [0x42; 64];
+    let mut out = Completions::default();
+    let mut bytes = 0;
+    let mut total = 0;
+    for i in 0..101 {
+        ALLOCS.with(|n| n.set(0));
+        ACTIVE.with(|v| v.set(i != 0));
+        l.recv(b, ReadBuf::Pooled, Token(1)).expect("receive");
+        // SAFETY: static immutable input stays alive through terminal completion.
+        let input = unsafe { IoBuf::from_raw_parts(BYTES.as_ptr(), BYTES.len()) };
+        l.send_to(a, WriteBuf::Provided(input), to, Token(2))
+            .expect("send");
+        let mut read = 0;
+        let mut wrote = 0;
+        let until = l.now() + Duration::from_secs(2);
+        while read != 64 || wrote != 64 {
+            assert!(l.now() < until);
+            l.turn(Timeout::Until(until), &mut out).expect("turn");
+            for c in out.drain() {
+                match c.result {
+                    OpResult::RecvFrom {
+                        n, lease: Some(b), ..
+                    } => {
+                        assert_eq!(b.as_slice(), BYTES);
+                        read += n;
+                    }
+                    OpResult::Wrote(n) => wrote += n,
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+        }
+        ACTIVE.with(|v| v.set(false));
+        if i != 0 {
+            bytes += read;
+            total += ALLOCS.with(|n| n.get());
+        }
+    }
+    assert_eq!(bytes, 6400, "UDP allocation subject ran");
+    assert_eq!(total, 0, "steady UDP allocations");
+    let mut expiries = 0;
+    ALLOCS.with(|n| n.set(0));
+    ACTIVE.with(|v| v.set(true));
+    for _ in 0..20 {
+        let at = l.now() + Duration::from_millis(2);
+        let h = l.timer(at, None, Token(3)).expect("timer");
+        while l.now() < at || expiries == 0 {
+            l.turn(Timeout::Until(at), &mut out).expect("deadline poll");
+            if out.iter().any(|c| matches!(c.result, OpResult::Timer)) {
+                expiries += 1;
+                break;
+            }
+        }
+        // A clock crossing between checks must still deliver the timer.
+        l.turn(Timeout::Now, &mut out).expect("deadline drain");
+        expiries += out
+            .iter()
+            .filter(|c| matches!(c.result, OpResult::Timer))
+            .count();
+        l.close(h, Token(4)).expect("close");
+        l.turn(Timeout::Now, &mut out).expect("close drain");
+    }
+    ACTIVE.with(|v| v.set(false));
+    assert_eq!(expiries, 20);
+    assert_eq!(ALLOCS.with(|n| n.get()), 0, "deadline poll return lists");
+}

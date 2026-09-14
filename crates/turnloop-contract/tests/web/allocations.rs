@@ -3,7 +3,11 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 struct Counting;
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static COUNT: AtomicUsize = AtomicUsize::new(0);
-fn record() { if ACTIVE.load(Ordering::Relaxed) { COUNT.fetch_add(1, Ordering::Relaxed); } }
+fn record() {
+    if ACTIVE.load(Ordering::Relaxed) {
+        COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+}
 // SAFETY: forwards the complete allocator contract unchanged to System. Counter
 // updates use initialized statics and never allocate or call JavaScript.
 unsafe impl GlobalAlloc for Counting {
@@ -32,8 +36,12 @@ static ALLOCATOR: Counting = Counting;
 pub fn measure<T>(f: impl FnOnce() -> T) -> T {
     COUNT.store(0, Ordering::Relaxed);
     ACTIVE.store(true, Ordering::Relaxed);
-    let result=f();
+    let result = f();
     ACTIVE.store(false, Ordering::Relaxed);
-    assert_eq!(COUNT.load(Ordering::Relaxed),0,"Rust steady-state allocations");
+    assert_eq!(
+        COUNT.load(Ordering::Relaxed),
+        0,
+        "Rust steady-state allocations"
+    );
     result
 }

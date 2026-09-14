@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+from web_fixture import WebFixture
 from common import PIN, P3_PIN, ROOT, cargo, entrypoint, fail, members, metadata, role, run, select, settings
 
 
@@ -53,7 +54,23 @@ def main():
             fail('wasi requires --target wasm32-wasip2 or wasm32-wasip3')
         env['CARGO_TARGET_' + args.target.upper().replace('-', '_') + '_RUNNER'] = str(ROOT / 'scripts/ci/wasmtime-runner.sh')
         for package in select(data, 'contract'):
-            checked_tests(base + ['-p', package['name'], '--', '--test-threads=1'], cwd=root, env=env)
+            features = ['--features', 'wasi-p3-experimental'] if args.target == 'wasm32-wasip3' else []
+            available = {t['name'] for t in package['targets'] if 'test' in t['kind']}
+            failures = []
+            for key, profile in [('wasi-tests', []), ('wasi-allocation-tests', ['--release'])]:
+                targets = settings(package).get(key, [])
+                if not targets:
+                    fail(f'{package["name"]}: declare {key}; each binary must execute real tests')
+                for target in targets:
+                    if target not in available:
+                        fail(f'{package["name"]}: missing {key} target {target}')
+                    try:
+                        checked_tests(base + ['-p', package['name'], '--test', target] + features + profile
+                                      + ['--', '--nocapture', '--test-threads=1'], cwd=root, env=env)
+                    except (subprocess.CalledProcessError, RuntimeError) as error:
+                        failures.append(str(error))
+            if failures:
+                fail('WASI gates failed: ' + '; '.join(failures))
     elif args.suite in ('web', 'node'):
         env['RUSTUP_TOOLCHAIN'] = PIN
         for package in select(data, 'contract'):
@@ -71,7 +88,13 @@ def main():
                 features = settings(package).get(key + '-features', [])
                 if features:
                     command += ['--features', ','.join(features)]
-                checked_tests(command, cwd=root, env=env, minimum_groups=2 if args.suite == 'web' else 1)
+                fixture_path = settings(package).get('web-fixture')
+                if not fixture_path:
+                    fail(f'{package["name"]}: declare web-fixture for actual HTTP/WebSocket traffic')
+                with WebFixture(Path(package['manifest_path']).parent / fixture_path) as fixture:
+                    env['TURNLOOP_WEB_FIXTURE'] = fixture.url
+                    checked_tests(command, cwd=root, env=env, minimum_groups=2 if args.suite == 'web' else 1)
+                    fixture.verify(minimum=2 if args.suite == 'web' else 1)
     elif args.suite == 'loom':
         env['RUSTFLAGS'] = '--cfg loom'
         for package in select(data, 'core'):

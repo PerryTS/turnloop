@@ -114,7 +114,9 @@ pub fn poll(input: &[u32], storage: &mut [u32], ready: &mut Vec<usize>) {
             raw_poll(input.as_ptr(), input.len(), result.as_mut_ptr());
         }
         assert!(result[1] <= input.len());
-        if result[1] == 0 { return; }
+        if result[1] == 0 {
+            return;
+        }
         // SAFETY: canonical lowering initialized precisely result[1] u32 indices.
         let indices = unsafe { std::slice::from_raw_parts(result[0] as *const u32, result[1]) };
         for &i in indices {
@@ -138,7 +140,9 @@ pub fn read(
             0 => {
                 let n = result[2] as usize;
                 assert!(n <= output.len());
-                if n == 0 { return Ok(0); }
+                if n == 0 {
+                    return Ok(0);
+                }
                 // SAFETY: host initialized n bytes in the active arena; output is exclusive.
                 unsafe {
                     ptr::copy_nonoverlapping(result[1] as *const u8, output.as_mut_ptr(), n);
@@ -198,7 +202,9 @@ pub fn receive(
         // SAFETY: canonical payload is live and contains record[1] initialized bytes.
         if n != 0 {
             // SAFETY: nonempty canonical payload and exclusive output are live.
-            unsafe { ptr::copy_nonoverlapping(record[0] as *const u8, output.as_mut_ptr(), n); }
+            unsafe {
+                ptr::copy_nonoverlapping(record[0] as *const u8, output.as_mut_ptr(), n);
+            }
         }
         // SAFETY: last 32 bytes contain the canonical IP address variant.
         let address = unsafe { std::slice::from_raw_parts(record.as_ptr().add(2).cast(), 32) };
@@ -206,7 +212,9 @@ pub fn receive(
     })
 }
 pub fn send(stream: &OutgoingDatagramStream, bytes: &[u8], to: SocketAddr) -> Result<usize> {
-    if bytes.len() > 65535 { return Err(Error::new(ErrorKind::InvalidInput)); }
+    if bytes.len() > 65535 {
+        return Err(Error::new(ErrorKind::InvalidInput));
+    }
     let mut record = [0u32; 11];
     record[0] = bytes.as_ptr() as u32;
     record[1] = bytes.len() as u32;
