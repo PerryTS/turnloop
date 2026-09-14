@@ -9,8 +9,11 @@ use std::{
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Configuration fixed by the first process-wide blocking-pool submission.
 pub struct PoolConfig {
+    /// Number of lazily started process-wide blocking workers.
     pub threads: usize,
+    /// Maximum queued blocking jobs before ResourceLimit is returned.
     pub queue_capacity: usize,
 }
 impl Default for PoolConfig {
@@ -22,8 +25,11 @@ impl Default for PoolConfig {
     }
 }
 #[derive(Debug)]
+/// Owned hostname and port for a pool-backed native address lookup.
 pub struct DnsRequest {
+    /// Hostname resolved by the native resolver.
     pub host: String,
+    /// Port included in each resolved socket address.
     pub port: u16,
 }
 pub(crate) enum WorkOutput {
@@ -76,7 +82,9 @@ impl WorkPort {
     }
 }
 #[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
-pub(crate) trait ReusableWork: Send + Sync { fn run(&self); }
+pub(crate) trait ReusableWork: Send + Sync {
+    fn run(&self);
+}
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
     use super::*;
@@ -139,7 +147,10 @@ mod native {
                         let job = match job {
                             Task::Boxed(job) => job,
                             #[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
-                            Task::Reusable(work) => { work.run(); continue; }
+                            Task::Reusable(work) => {
+                                work.run();
+                                continue;
+                            }
                         };
                         let result = if job.cancel.load(Ordering::Acquire) {
                             Err(Error::new(ErrorKind::Cancelled))
@@ -202,15 +213,28 @@ mod native {
     }
     #[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
     pub(crate) fn reusable(config: PoolConfig, work: Arc<dyn ReusableWork>) -> Result<()> {
-        if config.threads == 0 || config.queue_capacity == 0 { return Err(Error::new(ErrorKind::InvalidInput)); }
-        let pool = POOL.get_or_init(|| start(config)).as_ref().map_err(|&e| e)?;
-        if pool.config != config { return Err(Error::new(ErrorKind::InvalidInput)); }
-        let mut jobs = pool.state.jobs.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if jobs.len() == pool.config.queue_capacity { return Err(Error::new(ErrorKind::ResourceLimit)); }
+        if config.threads == 0 || config.queue_capacity == 0 {
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
+        let pool = POOL
+            .get_or_init(|| start(config))
+            .as_ref()
+            .map_err(|&e| e)?;
+        if pool.config != config {
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
+        let mut jobs = pool
+            .state
+            .jobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if jobs.len() == pool.config.queue_capacity {
+            return Err(Error::new(ErrorKind::ResourceLimit));
+        }
         jobs.push_back(Task::Reusable(work));
-        pool.state.ready.notify_one(); Ok(())
+        pool.state.ready.notify_one();
+        Ok(())
     }
-
 }
 pub(crate) fn submit(
     config: PoolConfig,

@@ -120,9 +120,13 @@ impl Poller for Kqueue {
         ];
         // SAFETY: live descriptor, integer-only query of its access mode.
         let mode = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        if mode < 0 { return Err(last_error()); }
+        if mode < 0 {
+            return Err(last_error());
+        }
         let (offset, count) = match mode & libc::O_ACCMODE {
-            libc::O_RDONLY => (0, 1), libc::O_WRONLY => (1, 1), _ => (0, 2),
+            libc::O_RDONLY => (0, 1),
+            libc::O_WRONLY => (1, 1),
+            _ => (0, 2),
         };
         // SAFETY: descriptors and selected initialized input records are valid.
         if unsafe {
@@ -143,22 +147,39 @@ impl Poller for Kqueue {
     fn deregister(&mut self, fd: RawFd) -> Result<()> {
         // SAFETY: live descriptor, integer-only access-mode query.
         let mode = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        if mode < 0 { return Err(last_error()); }
+        if mode < 0 {
+            return Err(last_error());
+        }
         for filter in [libc::EVFILT_READ, libc::EVFILT_WRITE] {
             if (filter == libc::EVFILT_READ && mode & libc::O_ACCMODE == libc::O_WRONLY)
-                || (filter == libc::EVFILT_WRITE && mode & libc::O_ACCMODE == libc::O_RDONLY) { continue; }
+                || (filter == libc::EVFILT_WRITE && mode & libc::O_ACCMODE == libc::O_RDONLY)
+            {
+                continue;
+            }
             let ev = event(fd as usize, filter, libc::EV_DELETE, 0, 0);
             // SAFETY: live kqueue and initialized deletion, with no wait/output.
-            if unsafe { libc::kevent(self.fd(), &ev, 1, std::ptr::null_mut(), 0, std::ptr::null()) } < 0 {
-                let e = last_error(); if e.os != Some(libc::ENOENT) { return Err(e); }
+            if unsafe { libc::kevent(self.fd(), &ev, 1, std::ptr::null_mut(), 0, std::ptr::null()) }
+                < 0
+            {
+                let e = last_error();
+                if e.os != Some(libc::ENOENT) {
+                    return Err(e);
+                }
             }
         }
         Ok(())
     }
     fn process(&mut self, pid: u32, key: u64) -> Result<Option<OwnedFd>> {
-        let ev = event(pid as usize, libc::EVFILT_PROC, libc::EV_ADD | libc::EV_ONESHOT, libc::NOTE_EXIT, key);
+        let ev = event(
+            pid as usize,
+            libc::EVFILT_PROC,
+            libc::EV_ADD | libc::EV_ONESHOT,
+            libc::NOTE_EXIT,
+            key,
+        );
         // SAFETY: live kqueue, initialized process filter, no output wait.
-        if unsafe { libc::kevent(self.fd(), &ev, 1, std::ptr::null_mut(), 0, std::ptr::null()) } < 0 {
+        if unsafe { libc::kevent(self.fd(), &ev, 1, std::ptr::null_mut(), 0, std::ptr::null()) } < 0
+        {
             return Err(last_error());
         }
         Ok(None)
@@ -166,7 +187,9 @@ impl Poller for Kqueue {
     fn remove_process(&mut self, pid: u32, _fd: Option<RawFd>) {
         let ev = event(pid as usize, libc::EVFILT_PROC, libc::EV_DELETE, 0, 0);
         // SAFETY: live kqueue; deleting an expired one-shot may return ENOENT.
-        unsafe { libc::kevent(self.fd(), &ev, 1, std::ptr::null_mut(), 0, std::ptr::null()); }
+        unsafe {
+            libc::kevent(self.fd(), &ev, 1, std::ptr::null_mut(), 0, std::ptr::null());
+        }
     }
     fn wait(&mut self, timeout: Option<Duration>, out: &mut Vec<Ready>) -> Result<PollInfo> {
         let ts = timeout.map(timespec);

@@ -1,4 +1,4 @@
-#![deny(unsafe_op_in_unsafe_fn)]
+#![deny(unsafe_op_in_unsafe_fn, missing_docs)]
 //! Host-driven, completion-shaped I/O. No thread is created by the driver.
 
 /// Backend selected from the compilation target, independently of Cargo features.
@@ -25,6 +25,7 @@ mod sync;
 pub use notifier::{Notifier, PostError, Poster};
 
 #[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
+/// The native driver selected for the compilation target; owned by one thread.
 pub type Loop = Driver<backend::Platform>;
 #[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
 pub use backend::unix::Detached;

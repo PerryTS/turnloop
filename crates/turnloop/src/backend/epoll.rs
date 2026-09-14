@@ -171,14 +171,24 @@ impl Poller for Epoll {
         Ok(())
     }
     fn process(&mut self, pid: u32, key: u64) -> Result<Option<OwnedFd>> {
-        if cfg!(feature = "process-sigchld") { return Err(std::io::Error::from_raw_os_error(libc::ENOSYS).into()); }
+        if cfg!(feature = "process-sigchld") {
+            return Err(std::io::Error::from_raw_os_error(libc::ENOSYS).into());
+        }
         // SAFETY: pidfd_open takes only integer arguments and returns an owned fd.
-        let fd = owned(unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0u32) } as i32)?;
-        add(self.fd(), fd.as_raw_fd(), key, libc::EPOLLIN | libc::EPOLLET)?;
+        let fd =
+            owned(unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0u32) } as i32)?;
+        add(
+            self.fd(),
+            fd.as_raw_fd(),
+            key,
+            libc::EPOLLIN | libc::EPOLLET,
+        )?;
         Ok(Some(fd))
     }
     fn remove_process(&mut self, _pid: u32, fd: Option<RawFd>) {
-        if let Some(fd) = fd { let _ = self.deregister(fd); }
+        if let Some(fd) = fd {
+            let _ = self.deregister(fd);
+        }
     }
     fn wait(&mut self, timeout: Option<Duration>, out: &mut Vec<Ready>) -> Result<PollInfo> {
         let n = if let Some(timer) = &self.timer {

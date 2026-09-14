@@ -23,3 +23,11 @@ Cross-compilation is not runtime execution. Raw outputs: `.tools/core2/`.
 - **PASS** `cargo test -p turnloop-contract --all-features --test native_surface --test executor -- --test-threads=1` (exit 0; log 1789404456-296511).
 - **FAIL** `cargo test -p turnloop -p turnloop-contract --all-features -- --test-threads=1` (exit 101; log 1789404534-233569).
 - **PASS** `cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 0; log 1789404543-528808).
+- **PASS** `cargo test -p turnloop-contract --test allocations --all-features -- --test-threads=1` (exit 0; log 1789404636-981771).
+- **PASS** `cargo test -p turnloop-contract --all-features --test native_surface descriptor_roundtrip_through_a_spawned_process -- --test-threads=1` (exit 0; log 1789404652-878283).
+- **FAIL** `env RUSTFLAGS=-Dmissing_docs cargo check -p turnloop --all-features` (exit 101; log 1789404669-142275).
+- **FAIL** `cargo rustc -p turnloop --lib --all-features -- -Dmissing_docs` (exit 101; log 1789404677-734806).
+- **PASS** `cargo rustc -p turnloop --lib --all-features -- -Dmissing_docs` (exit 0; log 1789404822-899085).
+- **PASS** `cargo +stable check --workspace --all-targets --all-features --locked` (exit 0; log 1789404837-9402).
+- **FAIL** `cargo clippy -p turnloop -p turnloop-contract -p turnloop-bench --all-targets --all-features --target x86_64-pc-windows-msvc -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 101; log 1789404837-933909).
+- **FAIL** `cargo clippy --workspace --all-targets --all-features --target wasm32-wasip2 -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 101; log 1789404837-928928).

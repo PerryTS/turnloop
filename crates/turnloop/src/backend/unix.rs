@@ -38,30 +38,47 @@ pub struct Detached {
     original_mode: Option<libc::termios>,
 }
 impl std::fmt::Debug for Detached {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.debug_struct("Detached").field("fd", &self.fd).field("kind", &self.kind).finish_non_exhaustive() }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Detached")
+            .field("fd", &self.fd)
+            .field("kind", &self.kind)
+            .finish_non_exhaustive()
+    }
 }
 impl Detached {
     pub(super) fn new(fd: OwnedFd, kind: Kind) -> Self {
         // SAFETY: termios is plain C storage, filled by tcgetattr on a terminal.
         let mut mode: libc::termios = unsafe { std::mem::zeroed() };
         // SAFETY: live fd and writable termios; ENOTTY means no restoration needed.
-        let original_mode = (unsafe { libc::tcgetattr(fd.as_raw_fd(), &mut mode) } == 0).then_some(mode);
-        Self { fd, kind, original_flags: None, original_mode }
+        let original_mode =
+            (unsafe { libc::tcgetattr(fd.as_raw_fd(), &mut mode) } == 0).then_some(mode);
+        Self {
+            fd,
+            kind,
+            original_flags: None,
+            original_mode,
+        }
     }
     /// Adopt an owned Unix descriptor, classifying stream/file/TTY or socket.
     /// The descriptor must have no concurrent I/O users. Status flags and terminal
     /// settings are restored when this transport is closed, detached or dropped.
-    pub fn from_fd(fd: OwnedFd) -> Result<Self> { super::ipc::classify(fd) }
+    pub fn from_fd(fd: OwnedFd) -> Result<Self> {
+        super::ipc::classify(fd)
+    }
 }
 impl Drop for Detached {
     fn drop(&mut self) {
         if let Some(mode) = &self.original_mode {
             // SAFETY: descriptor is still owned; restore before OwnedFd drops.
-            unsafe { libc::tcsetattr(self.fd.as_raw_fd(), libc::TCSANOW, mode); }
+            unsafe {
+                libc::tcsetattr(self.fd.as_raw_fd(), libc::TCSANOW, mode);
+            }
         }
         if let Some(flags) = self.original_flags {
             // SAFETY: descriptor is still owned and flags came from F_GETFL.
-            unsafe { libc::fcntl(self.fd.as_raw_fd(), libc::F_SETFL, flags); }
+            unsafe {
+                libc::fcntl(self.fd.as_raw_fd(), libc::F_SETFL, flags);
+            }
         }
     }
 }
@@ -81,6 +98,7 @@ struct Pending {
     offset: usize,
     passed: Option<Detached>,
 }
+/// Completion engine shared by kqueue and epoll, with native process and signal services.
 pub struct Unix {
     poller: SystemPoller,
     resources: Vec<Option<Resource>>,
@@ -95,7 +113,10 @@ pub struct Unix {
 fn direction(op: &Operation) -> usize {
     usize::from(!matches!(
         op,
-        Operation::Accept { .. } | Operation::Read { .. } | Operation::RecvFrom(_) | Operation::RecvHandle
+        Operation::Accept { .. }
+            | Operation::Read { .. }
+            | Operation::RecvFrom(_)
+            | Operation::RecvHandle
     ))
 }
 impl Unix {
@@ -106,12 +127,7 @@ impl Unix {
             .filter(|r| r.handle == h)
             .ok_or(Error::new(ErrorKind::NotFound))
     }
-    fn install(
-        &mut self,
-        h: Handle,
-        transport: Detached,
-        connect: Option<Addr>,
-    ) -> Result<()> {
+    fn install(&mut self, h: Handle, transport: Detached, connect: Option<Addr>) -> Result<()> {
         if self.resources.get(h.index()).is_none_or(Option::is_some) {
             return Err(Error::new(ErrorKind::InvalidInput));
         }
@@ -245,9 +261,16 @@ unsafe impl Backend for Unix {
             services: super::services::Services::new(config.max_handles),
         })
     }
-    fn set_notifier(&mut self, notifier: Notifier) { self.files.set_notifier(notifier.clone()); self.services.set_notifier(notifier); }
-    fn signal(&mut self, h: Handle, signal: Signal) -> Result<()> { self.services.signal(h, signal) }
-    fn kill(&mut self, h: Handle, signal: Signal, group: bool) -> Result<()> { self.services.kill(h, signal, group) }
+    fn set_notifier(&mut self, notifier: Notifier) {
+        self.files.set_notifier(notifier.clone());
+        self.services.set_notifier(notifier);
+    }
+    fn signal(&mut self, h: Handle, signal: Signal) -> Result<()> {
+        self.services.signal(h, signal)
+    }
+    fn kill(&mut self, h: Handle, signal: Signal, group: bool) -> Result<()> {
+        self.services.kill(h, signal, group)
+    }
     fn spawn(&mut self, h: Handle, pipes: [Option<Handle>; 3], spec: &ProcessSpec) -> Result<u32> {
         use std::os::unix::process::CommandExt;
         use std::process::{Command, Stdio as ChildStdio};
@@ -256,30 +279,65 @@ unsafe impl Backend for Unix {
         // SAFETY: writable sigaction storage; null input only queries disposition.
         let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
         // SAFETY: query a valid signal with initialized writable output storage.
-        if unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut action) } < 0 { return Err(last_error()); }
-        if action.sa_sigaction == libc::SIG_IGN || action.sa_flags & libc::SA_NOCLDWAIT != 0 { return Err(Error::new(ErrorKind::InvalidInput)); }
+        if unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut action) } < 0 {
+            return Err(last_error());
+        }
+        if action.sa_sigaction == libc::SIG_IGN || action.sa_flags & libc::SA_NOCLDWAIT != 0 {
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
         let mut command = Command::new(&spec.program);
         command.args(&spec.args);
-        if spec.env_clear { command.env_clear(); }
+        if spec.env_clear {
+            command.env_clear();
+        }
         command.envs(spec.env.iter().map(|(k, v)| (k, v)));
-        if let Some(cwd) = &spec.cwd { command.current_dir(cwd); }
-        if let Some(uid) = spec.uid { command.uid(uid); }
-        if let Some(gid) = spec.gid { command.gid(gid); }
-        if spec.new_process_group { command.process_group(0); }
+        if let Some(cwd) = &spec.cwd {
+            command.current_dir(cwd);
+        }
+        if let Some(uid) = spec.uid {
+            command.uid(uid);
+        }
+        if let Some(gid) = spec.gid {
+            command.gid(gid);
+        }
+        if spec.new_process_group {
+            command.process_group(0);
+        }
         for (i, stdio) in spec.stdio.iter().enumerate() {
             let stream = match stdio {
                 ProcessStdio::Inherit => ChildStdio::inherit(),
                 ProcessStdio::Null => ChildStdio::null(),
                 ProcessStdio::Pipe => ChildStdio::piped(),
-                ProcessStdio::Handle(h) => ChildStdio::from(self.get(*h)?.transport.fd.try_clone().map_err(Error::from)?),
+                ProcessStdio::Handle(h) => ChildStdio::from(
+                    self.get(*h)?
+                        .transport
+                        .fd
+                        .try_clone()
+                        .map_err(Error::from)?,
+                ),
             };
-            match i { 0 => { command.stdin(stream); }, 1 => { command.stdout(stream); }, _ => { command.stderr(stream); } }
+            match i {
+                0 => {
+                    command.stdin(stream);
+                }
+                1 => {
+                    command.stdout(stream);
+                }
+                _ => {
+                    command.stderr(stream);
+                }
+            }
         }
         let mut child = command.spawn().map_err(Error::from)?;
         let pid = child.id();
-        let stdio: [Option<OwnedFd>; 3] = [child.stdin.take().map(Into::into), child.stdout.take().map(Into::into), child.stderr.take().map(Into::into)];
+        let stdio: [Option<OwnedFd>; 3] = [
+            child.stdin.take().map(Into::into),
+            child.stdout.take().map(Into::into),
+            child.stderr.take().map(Into::into),
+        ];
         let result = (|| {
-            self.services.child(h, child, spec.new_process_group, &mut self.poller)?;
+            self.services
+                .child(h, child, spec.new_process_group, &mut self.poller)?;
             for (handle, fd) in pipes.into_iter().zip(stdio) {
                 if let (Some(handle), Some(fd)) = (handle, fd) {
                     let transport = super::ipc::classify(fd)?;
@@ -289,31 +347,49 @@ unsafe impl Backend for Unix {
             Ok(pid)
         })();
         if result.is_err() {
-            for handle in std::iter::once(h).chain(pipes.into_iter().flatten()) { self.release(handle); }
+            for handle in std::iter::once(h).chain(pipes.into_iter().flatten()) {
+                self.release(handle);
+            }
         }
         result
     }
     fn tty_set_mode(&mut self, h: Handle, mode: TtyMode) -> Result<()> {
         let r = self.get(h)?;
-        let original = r.transport.original_mode.ok_or(Error::new(ErrorKind::InvalidInput))?;
+        let original = r
+            .transport
+            .original_mode
+            .ok_or(Error::new(ErrorKind::InvalidInput))?;
         let mut termios = original;
         if mode != TtyMode::Normal {
             // SAFETY: initialized termios structure with exclusive local access.
-            unsafe { libc::cfmakeraw(&mut termios); }
-            if mode == TtyMode::Raw { termios.c_lflag |= libc::ISIG; }
+            unsafe {
+                libc::cfmakeraw(&mut termios);
+            }
+            if mode == TtyMode::Raw {
+                termios.c_lflag |= libc::ISIG;
+            }
         }
         // SAFETY: owned tty fd and valid termios; TCSANOW does not drain/block output.
-        if unsafe { libc::tcsetattr(r.transport.fd.as_raw_fd(), libc::TCSANOW, &termios) } < 0 { return Err(last_error()); }
+        if unsafe { libc::tcsetattr(r.transport.fd.as_raw_fd(), libc::TCSANOW, &termios) } < 0 {
+            return Err(last_error());
+        }
         Ok(())
     }
     fn tty_window_size(&self, h: Handle) -> Result<WindowSize> {
         let r = self.get(h)?;
-        if r.transport.original_mode.is_none() { return Err(Error::new(ErrorKind::InvalidInput)); }
+        if r.transport.original_mode.is_none() {
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
         // SAFETY: winsize is plain C output storage.
         let mut size: libc::winsize = unsafe { std::mem::zeroed() };
         // SAFETY: owned tty fd and writable winsize output.
-        if unsafe { libc::ioctl(r.transport.fd.as_raw_fd(), libc::TIOCGWINSZ, &mut size) } < 0 { return Err(last_error()); }
-        Ok(WindowSize { columns: size.ws_col, rows: size.ws_row })
+        if unsafe { libc::ioctl(r.transport.fd.as_raw_fd(), libc::TIOCGWINSZ, &mut size) } < 0 {
+            return Err(last_error());
+        }
+        Ok(WindowSize {
+            columns: size.ws_col,
+            rows: size.ws_row,
+        })
     }
     fn now(&self) -> Instant {
         Instant::now()
@@ -332,7 +408,11 @@ unsafe impl Backend for Unix {
                 return self.install(h, transport, None);
             }
             Open::Stdio(which) => {
-                let fd = match which { Stdio::Stdin => 0, Stdio::Stdout => 1, Stdio::Stderr => 2 };
+                let fd = match which {
+                    Stdio::Stdin => 0,
+                    Stdio::Stdout => 1,
+                    Stdio::Stderr => 2,
+                };
                 let transport = super::ipc::stdio(fd)?;
                 return self.install(h, transport, None);
             }
@@ -381,18 +461,27 @@ unsafe impl Backend for Unix {
     }
     fn submit(&mut self, request: Request) -> Result<()> {
         let h = request.handle;
-        if self.services.contains(h) { return self.services.submit(&request); }
+        if self.services.contains(h) {
+            return self.services.submit(&request);
+        }
         let r = self.get(h)?;
         if r.transport.kind == Kind::File {
             let fd = r.transport.fd.try_clone().map_err(Error::from)?;
             return self.files.submit(request, fd);
         }
         let valid = match &request.operation {
-            Operation::Accept { .. } => matches!(r.transport.kind, Kind::Listener | Kind::PipeListener),
+            Operation::Accept { .. } => {
+                matches!(r.transport.kind, Kind::Listener | Kind::PipeListener)
+            }
             Operation::SendHandle(_) | Operation::RecvHandle => r.transport.kind == Kind::Pipe,
             Operation::RecvFrom(_) | Operation::SendTo { .. } => r.transport.kind == Kind::Udp,
-            Operation::Connect => matches!(r.transport.kind, Kind::Tcp | Kind::Pipe) && r.connect.is_some(),
-            _ => matches!(r.transport.kind, Kind::Tcp | Kind::Pipe | Kind::Stream | Kind::File),
+            Operation::Connect => {
+                matches!(r.transport.kind, Kind::Tcp | Kind::Pipe) && r.connect.is_some()
+            }
+            _ => matches!(
+                r.transport.kind,
+                Kind::Tcp | Kind::Pipe | Kind::Stream | Kind::File
+            ),
         };
         if !valid || self.ops.get(request.op.index()).is_none_or(Option::is_some) {
             return Err(Error::new(ErrorKind::InvalidInput));
@@ -403,11 +492,19 @@ unsafe impl Backend for Unix {
         }
         let passed = if let Operation::SendHandle(source) = request.operation {
             let source = self.get(source)?;
-            if !matches!(source.transport.kind, Kind::Tcp | Kind::Listener | Kind::Udp | Kind::Pipe | Kind::PipeListener) {
+            if !matches!(
+                source.transport.kind,
+                Kind::Tcp | Kind::Listener | Kind::Udp | Kind::Pipe | Kind::PipeListener
+            ) {
                 return Err(Error::new(ErrorKind::Unsupported));
             }
-            Some(Detached::new(source.transport.fd.try_clone().map_err(Error::from)?, source.transport.kind))
-        } else { None };
+            Some(Detached::new(
+                source.transport.fd.try_clone().map_err(Error::from)?,
+                source.transport.kind,
+            ))
+        } else {
+            None
+        };
         let d = direction(&request.operation);
         let i = request.op.index();
         let r = self.resources[h.index()].as_mut().expect("validated");
@@ -427,8 +524,12 @@ unsafe impl Backend for Unix {
         Ok(())
     }
     fn cancel(&mut self, op: OpId) -> Result<()> {
-        if self.files.cancel(op) { return Ok(()); }
-        if self.services.cancel(op) { return Ok(()); }
+        if self.files.cancel(op) {
+            return Ok(());
+        }
+        if self.services.cancel(op) {
+            return Ok(());
+        }
         let p = self
             .ops
             .get(op.index())
@@ -443,7 +544,10 @@ unsafe impl Backend for Unix {
         Ok(())
     }
     fn has_work(&self) -> bool {
-        !self.ready.is_empty() || !self.cancelled.is_empty() || self.services.has_work() || self.files.has_work()
+        !self.ready.is_empty()
+            || !self.cancelled.is_empty()
+            || self.services.has_work()
+            || self.files.has_work()
     }
     fn poll(
         &mut self,
@@ -474,7 +578,9 @@ unsafe impl Backend for Unix {
         let info = self.poller.wait(timeout, &mut self.polled)?;
         for i in 0..self.polled.len() {
             let e = self.polled[i];
-            if self.services.ready(e.key) { continue; }
+            if self.services.ready(e.key) {
+                continue;
+            }
             let Some(r) = self
                 .resources
                 .get_mut(e.key as u32 as usize)
@@ -540,7 +646,10 @@ fn execute(
         Operation::ProcessExit | Operation::WatchSignal => Err(Error::new(ErrorKind::InvalidInput)),
         Operation::Connect => {
             if !r.connecting {
-                let a = r.connect.as_ref().ok_or(Error::new(ErrorKind::InvalidInput))?;
+                let a = r
+                    .connect
+                    .as_ref()
+                    .ok_or(Error::new(ErrorKind::InvalidInput))?;
                 // SAFETY: nonblocking socket and live initialized sockaddr.
                 let n = unsafe { libc::connect(fd, a.ptr(), a.len) };
                 if n < 0 {
@@ -576,13 +685,24 @@ fn execute(
             Ok(Some((Outcome::Connected, true)))
         }
         Operation::SendHandle(_) => {
-            super::ipc::send(fd, p.passed.as_ref().ok_or(Error::new(ErrorKind::InvalidInput))?)?;
+            super::ipc::send(
+                fd,
+                p.passed
+                    .as_ref()
+                    .ok_or(Error::new(ErrorKind::InvalidInput))?,
+            )?;
             Ok(Some((Outcome::HandleSent, true)))
         }
-        Operation::RecvHandle => Ok(Some((Outcome::HandleReceived(super::ipc::receive(fd)?), true))),
+        Operation::RecvHandle => Ok(Some((
+            Outcome::HandleReceived(super::ipc::receive(fd)?),
+            true,
+        ))),
         Operation::Accept { multishot } => {
             if r.transport.kind == Kind::PipeListener {
-                return Ok(Some((Outcome::PipeAccepted(super::ipc::accept(fd)?), !*multishot)));
+                return Ok(Some((
+                    Outcome::PipeAccepted(super::ipc::accept(fd)?),
+                    !*multishot,
+                )));
             }
             let (fd, peer) = socket::accept(fd)?;
             Ok(Some((
@@ -603,9 +723,18 @@ fn execute(
             // SAFETY: WriteBuf guarantees stable initialized bytes until completion.
             let n = unsafe {
                 if matches!(r.transport.kind, Kind::Stream | Kind::File) {
-                    super::ipc::write(fd, bytes[p.offset..].as_ptr().cast(), bytes.len() - p.offset)
+                    super::ipc::write(
+                        fd,
+                        bytes[p.offset..].as_ptr().cast(),
+                        bytes.len() - p.offset,
+                    )
                 } else {
-                    libc::send(fd, bytes[p.offset..].as_ptr().cast(), bytes.len() - p.offset, send_flags())
+                    libc::send(
+                        fd,
+                        bytes[p.offset..].as_ptr().cast(),
+                        bytes.len() - p.offset,
+                        send_flags(),
+                    )
                 }
             };
             if n < 0 {
@@ -648,7 +777,9 @@ fn execute(
             let n = unsafe {
                 if matches!(r.transport.kind, Kind::Stream | Kind::File) {
                     super::ipc::writev(fd, iov.as_ptr(), count as i32)
-                } else { libc::sendmsg(fd, &msg, send_flags()) }
+                } else {
+                    libc::sendmsg(fd, &msg, send_flags())
+                }
             };
             if n < 0 {
                 return Err(last_error());
@@ -757,25 +888,61 @@ mod process_races {
     fn child_exited_before_native_registration_is_reaped_once() {
         let mut backend = Unix::new(&Config::default(), BufferPool::new(2, 64)).expect("backend");
         backend.set_notifier(Notifier::new(backend.waker()));
-        let child = std::process::Command::new("/bin/sh").args(["-c", "exit 23"]).spawn().expect("child");
+        let child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 23"])
+            .spawn()
+            .expect("child");
         let pid = child.id();
         // SAFETY: initialized siginfo output and an owned child PID. WNOWAIT
         // proves exit occurred while deliberately preserving status for turnloop.
         let mut status: libc::siginfo_t = unsafe { std::mem::zeroed() };
         // SAFETY: valid child identity and writable output; wait only for its exit.
-        assert_eq!(unsafe { libc::waitid(libc::P_PID, pid, &mut status, libc::WEXITED | libc::WNOWAIT) }, 0);
-        let h = Handle { owner: 1, key: 1 << 32 };
-        let op = OpId { owner: 1, key: 1 << 32 };
-        backend.services.child(h, child, false, &mut backend.poller).expect("register already exited child");
-        backend.submit(Request { op, handle: h, operation: Operation::ProcessExit }).expect("exit operation");
+        assert_eq!(
+            unsafe { libc::waitid(libc::P_PID, pid, &mut status, libc::WEXITED | libc::WNOWAIT) },
+            0
+        );
+        let h = Handle {
+            owner: 1,
+            key: 1 << 32,
+        };
+        let op = OpId {
+            owner: 1,
+            key: 1 << 32,
+        };
+        backend
+            .services
+            .child(h, child, false, &mut backend.poller)
+            .expect("register already exited child");
+        backend
+            .submit(Request {
+                op,
+                handle: h,
+                operation: Operation::ProcessExit,
+            })
+            .expect("exit operation");
         let mut events = Vec::with_capacity(4);
-        backend.poll(Some(Duration::ZERO), &mut events).expect("exit poll");
+        backend
+            .poll(Some(Duration::ZERO), &mut events)
+            .expect("exit poll");
         assert_eq!(events.len(), 1);
-        assert!(matches!(events[0].result, Ok(Outcome::Exited(ExitStatus { code: Some(23), signal: None }))));
-        events.clear(); backend.poll(Some(Duration::ZERO), &mut events).expect("duplicate check"); assert!(events.is_empty());
+        assert!(matches!(
+            events[0].result,
+            Ok(Outcome::Exited(ExitStatus {
+                code: Some(23),
+                signal: None
+            }))
+        ));
+        events.clear();
+        backend
+            .poll(Some(Duration::ZERO), &mut events)
+            .expect("duplicate check");
+        assert!(events.is_empty());
         let mut code = 0;
         // SAFETY: query only the fixture child's wait status, without blocking.
-        assert_eq!(unsafe { libc::waitpid(pid as i32, &mut code, libc::WNOHANG) }, -1);
+        assert_eq!(
+            unsafe { libc::waitpid(pid as i32, &mut code, libc::WNOHANG) },
+            -1
+        );
         assert_eq!(last_error().os, Some(libc::ECHILD));
     }
 }

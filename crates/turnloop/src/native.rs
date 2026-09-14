@@ -59,8 +59,14 @@ impl ProcessSpec {
     /// Launch a program with inherited environment, directory and standard streams.
     pub fn new(program: impl Into<OsString>) -> Self {
         Self {
-            program: program.into(), args: Vec::new(), env: Vec::new(), env_clear: false,
-            cwd: None, stdio: [ProcessStdio::Inherit; 3], uid: None, gid: None,
+            program: program.into(),
+            args: Vec::new(),
+            env: Vec::new(),
+            env_clear: false,
+            cwd: None,
+            stdio: [ProcessStdio::Inherit; 3],
+            uid: None,
+            gid: None,
             new_process_group: false,
         }
     }
