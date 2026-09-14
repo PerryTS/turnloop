@@ -70,6 +70,7 @@ struct IoSlot {
     abandoned: bool,
     op: Option<OpId>,
     timer: Option<Handle>,
+    closing: Option<Handle>,
     result: Option<OpResult>,
     waker: Option<Waker>,
     bytes: Box<[u8]>,
@@ -138,6 +139,7 @@ impl<B: Backend> Shared<B> {
         slot.op = None;
         slot.waker = None;
         slot.timer = None;
+        slot.closing = None;
         drop(slots);
         if let Some(
             OpResult::Accepted { conn, .. }
@@ -177,6 +179,14 @@ impl<B: Backend> Shared<B> {
         slot.result.take()
     }
     fn dispatch(&self, completion: Completion) {
+        if matches!(completion.result, OpResult::Closed) {
+            for slot in self.slots.borrow_mut().iter_mut() {
+                if slot.used && slot.closing.is_some() && slot.closing == completion.handle {
+                    slot.result = Some(OpResult::Closed);
+                    if let Some(w) = &slot.waker { w.wake_by_ref(); }
+                }
+            }
+        }
         if completion.token.0 & TAG == 0 {
             return;
         }
@@ -238,6 +248,7 @@ impl<B: Backend> LocalExecutor<B> {
                             abandoned: false,
                             op: None,
                             timer: None,
+                closing: None,
                             result: None,
                             waker: None,
                             bytes: vec![0; executor.buffer_size].into_boxed_slice(),
@@ -366,13 +377,22 @@ impl<B: Backend> ExecutorHandle<B> {
     pub fn now(&self) -> Instant {
         self.shared.driver.borrow().now()
     }
-    /// Resolve through the driver's native blocking pool. WASI/web return Unsupported.
+    /// Resolve through WASI ip-name-lookup or the native blocking pool. Web returns Unsupported.
     pub fn resolve(&self, request: DnsRequest) -> Resolve<B> {
         Resolve {
             executor: self.clone(),
             request: Some(request),
             key: None,
         }
+    }
+    /// Run owned work on the shared bounded blocking pool. Cancellation discards
+    /// its result; an already running closure retains all its owned data.
+    pub fn blocking<F: FnOnce() -> BlockingResult + Send + 'static>(&self, work: F) -> Blocking<B> {
+        Blocking { executor:self.clone(), work:Some(Box::new(work)), key:None }
+    }
+    /// Close a resource and await physical release after its terminal I/O results.
+    pub fn close(&self, handle: Handle) -> Close<B> {
+        Close { executor:self.clone(), handle:Some(handle), key:None }
     }
     /// Connect TCP without blocking the host. Dropping closes the pending socket.
     pub fn connect(&self, addr: SocketAddr, opts: TcpOpts) -> Connect<B> {
@@ -937,6 +957,109 @@ impl<B: Backend> Future for Resolve<B> {
     }
 }
 impl<B: Backend> Drop for Resolve<B> {
+    fn drop(&mut self) {
+        if let Some(key) = self.key.take() {
+            self.executor.shared.abandon(key);
+        }
+    }
+}
+/// Await acknowledgement of physical resource release. Dropping the future
+/// abandons observation, while the close itself continues in the driver.
+pub struct Close<B: Backend> {
+    executor: ExecutorHandle<B>,
+    handle: Option<Handle>,
+    key: Option<Key>,
+}
+impl<B: Backend> Unpin for Close<B> {}
+impl<B: Backend> Future for Close<B> {
+    type Output = Result<()>;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let shared = &this.executor.shared;
+        let key = if let Some(key) = this.key { key } else {
+            let key = shared.reserve(cx)?;
+            let Some(handle) = this.handle.take() else {
+                shared.free(key);
+                return Poll::Ready(Err(Error::new(ErrorKind::InvalidInput)));
+            };
+            let result = {
+                let mut driver = shared.driver.borrow_mut();
+                if driver.is_closing(handle) { Ok(()) } else { driver.close(handle, Token(0)) }
+            };
+            if let Err(e) = result {
+                shared.free(key);
+                return Poll::Ready(if e.kind == ErrorKind::NotFound { Ok(()) } else { Err(e) });
+            }
+            shared.slots.borrow_mut()[key.index].closing = Some(handle);
+            this.key = Some(key);
+            key
+        };
+        let Some(result) = shared.result(key, cx) else { return Poll::Pending; };
+        shared.free(key);
+        this.key = None;
+        Poll::Ready(match result {
+            OpResult::Closed => Ok(()),
+            OpResult::Err(e) => Err(e),
+            _ => Err(Error::new(ErrorKind::Other)),
+        })
+    }
+}
+impl<B: Backend> Drop for Close<B> {
+    fn drop(&mut self) {
+        if let Some(key) = self.key.take() { self.executor.shared.abandon(key); }
+    }
+}
+
+/// Owned blocking work, cancelled on drop.
+pub struct Blocking<B: Backend> {
+    executor: ExecutorHandle<B>,
+    work: Option<Box<dyn FnOnce() -> BlockingResult + Send>>,
+    key: Option<Key>,
+}
+impl<B: Backend> Unpin for Blocking<B> {}
+impl<B: Backend> Future for Blocking<B> {
+    type Output = Result<Payload>;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let shared = &this.executor.shared;
+        let key = match this.key {
+            Some(key) => key,
+            None => {
+                if this.work.is_none() {
+                    return Poll::Ready(Err(Error::new(ErrorKind::InvalidInput)));
+                }
+                let key = shared.reserve(cx)?;
+                let request = this
+                    .work
+                    .take()
+                    .ok_or(Error::new(ErrorKind::InvalidInput))?;
+                let result = shared.driver.borrow_mut().blocking(request, key.token());
+                match result {
+                    Ok(op) => {
+                        shared.slots.borrow_mut()[key.index].op = Some(op);
+                        this.key = Some(key);
+                        key
+                    }
+                    Err(e) => {
+                        shared.free(key);
+                        return Poll::Ready(Err(e));
+                    }
+                }
+            }
+        };
+        let Some(result) = shared.result(key, cx) else {
+            return Poll::Pending;
+        };
+        shared.free(key);
+        this.key = None;
+        Poll::Ready(match result {
+            OpResult::Blocking(addresses) => Ok(addresses),
+            OpResult::Err(e) => Err(e),
+            _ => Err(Error::new(ErrorKind::Cancelled)),
+        })
+    }
+}
+impl<B: Backend> Drop for Blocking<B> {
     fn drop(&mut self) {
         if let Some(key) = self.key.take() {
             self.executor.shared.abandon(key);

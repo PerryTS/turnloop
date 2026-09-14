@@ -27,10 +27,19 @@ workspace = true
 
 [package.metadata.turnloop-ci]
 role = "protocol"
-integration-tests = ["smtp"]
+wasi-tests = ["asynchronous"]
+integration-tests = ["smtp", "async_server"]
 
 [features]
 turnloop = ["dep:turnloop-io", "dep:turnloop-tls"]
 
 [target.'cfg(all(target_os = "wasi", target_env = "p3"))'.dependencies]
 turnloop-io = { workspace = true, optional = true, features = ["wasi-p3-experimental"] }
+
+[[test]]
+name = "asynchronous"
+required-features = ["turnloop"]
+
+[[test]]
+name = "async_server"
+required-features = ["turnloop"]

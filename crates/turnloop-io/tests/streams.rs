@@ -78,7 +78,7 @@ fn tcp_roundtrip_and_deadline() {
     finish(&mut timeout);
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(not(target_arch = "wasm32"), all(target_os = "wasi", target_env = "p2")))]
 #[test]
 fn resolve_and_cancel_reuse_executor_slots() {
     use turnloop::executor::ExecutorConfig;
@@ -121,7 +121,7 @@ fn resolve_and_cancel_reuse_executor_slots() {
     assert_eq!(finish(&mut task), 16);
 }
 
-#[cfg(target_os = "wasi")]
+#[cfg(all(target_os = "wasi", target_env = "p3"))]
 #[test]
 fn unsupported_wasi_dns_releases_reserved_slots() {
     use turnloop::executor::ExecutorConfig;

@@ -9,6 +9,7 @@ use std::{
 };
 pub use turnloop::{self, AsyncIo, ExecutorHandle, Instant, backend::Backend};
 pub mod pool;
+pub mod dns;
 
 /// A TCP, pipe, TLS or host stream with cancellation-safe futures-io operations.
 pub trait Stream: AsyncRead + AsyncWrite + Unpin {}
@@ -62,12 +63,28 @@ pub async fn deadline<B: Backend, F: Future<Output = io::Result<T>>, T>(
 }
 /// Resolve a service endpoint using the loop's DNS capability. Literal IPs need
 /// no resolver and work on every raw-socket backend.
-pub async fn resolve<B: Backend>(executor: &ExecutorHandle<B>, host: &str, port: u16, at: Instant) -> io::Result<SocketAddr> {
-    if let Ok(ip) = host.parse() { return Ok(SocketAddr::new(ip, port)); }
+pub async fn resolve<B: Backend>(
+    executor: &ExecutorHandle<B>,
+    host: &str,
+    port: u16,
+    at: Instant,
+) -> io::Result<SocketAddr> {
+    if let Ok(ip) = host.parse() {
+        return Ok(SocketAddr::new(ip, port));
+    }
     deadline(executor, at, async {
-        executor.resolve(turnloop::DnsRequest { host: host.to_owned(), port }).await.map_err(error)?
-            .into_iter().next().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "DNS returned no addresses"))
-    }).await
+        executor
+            .resolve(turnloop::DnsRequest {
+                host: host.to_owned(),
+                port,
+            })
+            .await
+            .map_err(error)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "DNS returned no addresses"))
+    })
+    .await
 }
 /// Core-owned wire output. Acknowledged only after a successful complete flush.
 pub trait Output {
@@ -187,7 +204,9 @@ impl<S: Stream, C: SansIo> Driver<S, C> {
     pub fn is_connected(&self) -> bool {
         self.stream.is_some()
     }
-    pub fn stream(&self) -> Option<&S> { self.stream.as_ref() }
+    pub fn stream(&self) -> Option<&S> {
+        self.stream.as_ref()
+    }
     /// Close immediately. Submitted transport storage remains owned by AsyncIo.
     pub fn abort(&mut self) {
         self.stream.take();
@@ -196,7 +215,9 @@ impl<S: Stream, C: SansIo> Driver<S, C> {
     /// Install a new transport after the protocol has entered its reconnect
     /// state. Bytes from the failed transport are never fed to the new session.
     pub fn replace_stream(&mut self, stream: S) -> io::Result<()> {
-        if self.stream.is_some() { return Err(io::Error::other("transport is still connected")); }
+        if self.stream.is_some() {
+            return Err(io::Error::other("transport is still connected"));
+        }
         self.start = 0;
         self.end = 0;
         self.stream = Some(stream);
@@ -204,14 +225,22 @@ impl<S: Stream, C: SansIo> Driver<S, C> {
     }
     /// Guard a complete operation, including pauses between protocol events.
     pub fn exchange(&mut self) -> Exchange<'_, S, C> {
-        Exchange { driver: self, committed: false }
+        Exchange {
+            driver: self,
+            committed: false,
+        }
     }
     /// A TLS transition is legal only at a drained plaintext boundary.
     pub fn upgrade_stream(&mut self) -> io::Result<&mut S> {
         if self.start != self.end || !self.core().output().is_empty() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "undrained TLS boundary"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "undrained TLS boundary",
+            ));
         }
-        self.stream.as_mut().ok_or_else(|| io::ErrorKind::NotConnected.into())
+        self.stream
+            .as_mut()
+            .ok_or_else(|| io::ErrorKind::NotConnected.into())
     }
     /// Flush COPY or other output that has no corresponding input event.
     pub async fn flush(&mut self) -> io::Result<()> {
@@ -294,17 +323,27 @@ pub struct Exchange<'a, S: Stream, C: SansIo> {
     committed: bool,
 }
 impl<S: Stream, C: SansIo> Exchange<'_, S, C> {
-    pub fn commit(&mut self) { self.committed = true; }
+    pub fn commit(&mut self) {
+        self.committed = true;
+    }
 }
 impl<S: Stream, C: SansIo> std::ops::Deref for Exchange<'_, S, C> {
     type Target = Driver<S, C>;
-    fn deref(&self) -> &Self::Target { self.driver }
+    fn deref(&self) -> &Self::Target {
+        self.driver
+    }
 }
 impl<S: Stream, C: SansIo> std::ops::DerefMut for Exchange<'_, S, C> {
-    fn deref_mut(&mut self) -> &mut Self::Target { self.driver }
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.driver
+    }
 }
 impl<S: Stream, C: SansIo> Drop for Exchange<'_, S, C> {
-    fn drop(&mut self) { if !self.committed { self.driver.abort(); } }
+    fn drop(&mut self) {
+        if !self.committed {
+            self.driver.abort();
+        }
+    }
 }
 impl<S, C: SansIo> Drop for Driver<S, C> {
     fn drop(&mut self) {

@@ -64,10 +64,10 @@ mod tests {
     }
 }
 
-#[path="client.rs"]
+#[path = "client.rs"]
 mod client;
 pub use client::*;
 
-#[path="cluster.rs"]
+#[path = "cluster.rs"]
 mod cluster;
-pub use cluster::{ClusterClient,sentinel};
+pub use cluster::{ClusterClient, sentinel};

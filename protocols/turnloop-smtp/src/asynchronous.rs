@@ -72,6 +72,6 @@ mod tests {
     }
 }
 
-#[path="transport.rs"]
+#[path = "transport.rs"]
 mod transport;
 pub use transport::*;

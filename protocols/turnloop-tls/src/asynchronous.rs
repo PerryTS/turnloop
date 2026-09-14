@@ -25,20 +25,48 @@ pub enum Transport<S> {
     Closed,
 }
 impl<S: Stream> Transport<S> {
-    pub async fn upgrade<B: Backend>(&mut self, tls: &ClientTls, executor: &ExecutorHandle<B>, at: Instant) -> io::Result<()> {
+    pub async fn upgrade<B: Backend>(
+        &mut self,
+        tls: &ClientTls,
+        executor: &ExecutorHandle<B>,
+        at: Instant,
+    ) -> io::Result<()> {
         let Self::Plain(stream) = std::mem::replace(self, Self::Closed) else {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "TLS already negotiated"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "TLS already negotiated",
+            ));
         };
-        *self = Self::Tls(Box::new(TlsStream::connect(stream, &tls.config, tls.server_name.clone(), executor, at, tls.unix_seconds).await?));
+        *self = Self::Tls(Box::new(
+            TlsStream::connect(
+                stream,
+                &tls.config,
+                tls.server_name.clone(),
+                executor,
+                at,
+                tls.unix_seconds,
+            )
+            .await?,
+        ));
         Ok(())
     }
-    pub fn is_tls(&self) -> bool { matches!(self, Self::Tls(_)) }
+    pub fn is_tls(&self) -> bool {
+        matches!(self, Self::Tls(_))
+    }
     pub fn get_ref(&self) -> Option<&S> {
-        match self { Self::Plain(s) => Some(s), Self::Tls(s) => Some(s.get_ref()), Self::Closed => None }
+        match self {
+            Self::Plain(s) => Some(s),
+            Self::Tls(s) => Some(s.get_ref()),
+            Self::Closed => None,
+        }
     }
 }
 impl<S: Stream> AsyncRead for Transport<S> {
-    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, bytes: &mut [u8]) -> Poll<io::Result<usize>> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
         match self.get_mut() {
             Self::Plain(s) => Pin::new(s).poll_read(cx, bytes),
             Self::Tls(s) => Pin::new(&mut **s).poll_read(cx, bytes),
@@ -47,7 +75,11 @@ impl<S: Stream> AsyncRead for Transport<S> {
     }
 }
 impl<S: Stream> AsyncWrite for Transport<S> {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, bytes: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
         match self.get_mut() {
             Self::Plain(s) => Pin::new(s).poll_write(cx, bytes),
             Self::Tls(s) => Pin::new(&mut **s).poll_write(cx, bytes),

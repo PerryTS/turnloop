@@ -28,3 +28,6 @@ wasi-p3-experimental = ["turnloop/wasi-p3-experimental"]
 [[test]]
 name = "allocations"
 harness = false
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = ["Win32_NetworkManagement_Dns", "Win32_Foundation", "Win32_Networking_WinSock"] }

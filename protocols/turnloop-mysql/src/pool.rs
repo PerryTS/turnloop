@@ -196,7 +196,10 @@ impl Pool {
         }
         for i in 0..self.slots.len() {
             if matches!(self.slots[i].state, State::Connecting(r) if r.token == token) {
-                self.close(ConnectionId { slot: i, generation: self.slots[i].generation });
+                self.close(ConnectionId {
+                    slot: i,
+                    generation: self.slots[i].generation,
+                });
             }
         }
         self.schedule(now);
