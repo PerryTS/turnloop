@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+from feature_modes import native_modes
 from web_fixture import WebFixture
 from common import PIN, P3_PIN, ROOT, cargo, entrypoint, fail, members, metadata, role, run, select, settings
 
@@ -40,7 +41,22 @@ def checked_tests(command, *, cwd, env=None, minimum_groups=1, input_text=None):
     return passed
 
 
-def protocol_tests(packages, base, root, env):
+def member_features(package, features):
+    """Cargo accepts package/feature only for this member or a direct dependency.
+
+    Sans-IO members without a turnloop dependency have no backend mode. Keep the
+    complete selection on the workspace run; project it for independent positive
+    count checks so an unrelated member cannot mask an empty suite.
+    """
+    if not features or features == ['--all-features']:
+        return list(features)
+    available = {package['name']}
+    available.update(d.get('rename') or d['name'] for d in package['dependencies'])
+    selected = [f for f in features[1].split(',') if f.split('/')[0] in available]
+    return ['--features', ','.join(selected)] if selected else []
+
+
+def protocol_tests(packages, base, root, env, features=()):
     """Finish every declared suite, then fail the job if any one failed."""
     results = []
     for package in packages:
@@ -55,7 +71,7 @@ def protocol_tests(packages, base, root, env):
             try:
                 if target not in available:
                     fail(f'Unknown integration test target: {suite}')
-                count = checked_tests(base + ['-p', name, '--test', target,
+                count = checked_tests(base + member_features(package, features) + ['-p', name, '--test', target,
                     '--', '--include-ignored', '--test-threads=1', '--nocapture'], cwd=root, env=env)
             except (RuntimeError, subprocess.CalledProcessError, OSError) as error:
                 print(f'FAIL {suite}: {error}', file=sys.stderr, flush=True)
@@ -78,7 +94,7 @@ def protocol_tests(packages, base, root, env):
     return results
 
 
-def native_tests(data, base, root, *, windows):
+def native_tests(data, base, root, *, windows, modes):
     contracts = select(data, 'contract')
     pending = []
     for package in contracts:
@@ -96,13 +112,14 @@ def native_tests(data, base, root, *, windows):
             if summary := os.environ.get('GITHUB_STEP_SUMMARY'):
                 with open(summary, 'a', encoding='utf-8') as output:
                     output.write(message + '\n')
-    for features in ([], ['--all-features']):
+    for mode, features in modes:
+        print(f'Native mode: {mode} ({" ".join(features) or "default features"})', flush=True)
         checked_tests(base + ['--workspace'] + features + ['--', '--test-threads=1'], cwd=root)
         # Every portable member must execute independently; another crate's tests
         # cannot hide a cfg-excluded core, protocol codec or fixture suite.
         for package in select(data, 'core') + select(data, 'protocol') + contracts:
             if package['name'] not in pending:
-                checked_tests(base + ['-p', package['name']] + features + ['--', '--test-threads=1'], cwd=root)
+                checked_tests(base + ['-p', package['name']] + member_features(package, features) + ['--', '--test-threads=1'], cwd=root)
 
 
 def main():
@@ -110,6 +127,7 @@ def main():
     parser.add_argument('suite', choices=['native', 'wasi', 'web', 'node', 'loom', 'miri', 'protocol', 'protocol-wasi', 'interop'])
     parser.add_argument('--manifest-path', default='Cargo.toml')
     parser.add_argument('--target')
+    parser.add_argument('--mode', help='One applicable native CI matrix mode; omitted runs all applicable modes')
     parser.add_argument('--browser', choices=['chrome', 'firefox'])
     args = parser.parse_args()
     pin = P3_PIN if args.target == 'wasm32-wasip3' else PIN
@@ -119,9 +137,16 @@ def main():
     env = os.environ.copy()
     if args.target:
         base += ['--target', args.target]
+    if args.mode and args.suite not in ('native', 'interop'):
+        fail('--mode applies only to native and interop suites')
+    platform = sys.platform
+    if args.target:
+        platform = ('win32' if 'windows' in args.target else
+                    'darwin' if 'apple' in args.target else
+                    'linux' if 'linux' in args.target else args.target)
     if args.suite == 'native':
-        windows = 'windows' in args.target if args.target else sys.platform == 'win32'
-        native_tests(data, base, root, windows=windows)
+        native_tests(data, base, root, windows=platform == 'win32',
+                     modes=native_modes(platform, args.mode))
     elif args.suite in ('wasi', 'protocol-wasi'):
         if args.target not in ('wasm32-wasip2', 'wasm32-wasip3'):
             fail('wasi requires --target wasm32-wasip2 or wasm32-wasip3')
@@ -225,7 +250,10 @@ def main():
             packages = [p for p in packages if settings(p).get('service-group') == 'http']
             if not packages:
                 fail('HTTP interop group must contain executable suites')
-        protocol_tests(packages, base, root, env)
+        modes = native_modes(platform, args.mode) if args.suite == 'interop' and args.mode else [('default', [])]
+        for mode, features in modes:
+            print(f'Protocol mode: {mode}', flush=True)
+            protocol_tests(packages, base, root, env, features)
 
 
 if __name__ == '__main__':

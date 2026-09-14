@@ -241,7 +241,12 @@ impl Poller for Epoll {
             }
             return Err(e.into());
         }
+        // The private timerfd implements the wait timeout. Its expiry has the
+        // same meaning as epoll_pwait2 returning zero, even though epoll_wait
+        // represents it as readiness. Notifier and I/O events still count.
+        let mut native_events = 0;
         for e in &self.events[..n as usize] {
+            native_events += usize::from(e.u64 != TIMER);
             let key = e.u64;
             if key == WAKE {
                 drain_counter(self.wake.fd.as_raw_fd())?;
@@ -262,10 +267,82 @@ impl Poller for Epoll {
         }
         Ok(PollInfo {
             waits: 1,
-            zero_event_waits: u32::from(n == 0),
+            zero_event_waits: u32::from(native_events == 0),
         })
     }
     fn fd(&self) -> RawFd {
         self.fd.as_raw_fd()
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn timeout_and_notifier_waits_keep_distinct_counts_after_rearming() {
+        let mut poller = Epoll::new(4).expect("epoll");
+        if cfg!(feature = "epoll-timerfd") {
+            assert!(poller.timer.is_some(), "forced timerfd mode must execute");
+        }
+        let mut ready = Vec::with_capacity(4);
+        let mut timeouts = 0;
+        for duration in [
+            Duration::from_micros(500),
+            Duration::from_millis(2),
+            Duration::from_millis(10),
+        ] {
+            // A notifier-only OS event produces no Ready entry, but is still
+            // native work. This also leaves the fallback's timer armed.
+            poller.waker().wake().expect("notify");
+            let info = poller.wait(Some(duration), &mut ready).expect("wake wait");
+            assert_eq!((info.waits, info.zero_event_waits), (1, 0));
+            assert!(ready.is_empty());
+            // Allow that abandoned timeout to become readable before rearming.
+            // The next wait must honor its new deadline, without stale expiry.
+            std::thread::sleep(duration);
+            let at = Instant::now() + duration;
+            let info = poller.wait(Some(duration), &mut ready).expect("timeout");
+            assert_eq!((info.waits, info.zero_event_waits), (1, 1));
+            assert!(Instant::now() >= at, "the OS wait must reach its deadline");
+            assert!(ready.is_empty());
+            timeouts += 1;
+        }
+        assert_eq!(timeouts, 3);
+        let info = poller.wait(Some(Duration::ZERO), &mut ready).expect("now");
+        assert_eq!((info.waits, info.zero_event_waits), (1, 1));
+        poller.waker().wake().expect("notify unbounded wait");
+        let info = poller.wait(None, &mut ready).expect("unbounded wake");
+        assert_eq!((info.waits, info.zero_event_waits), (1, 0));
+    }
+
+    #[test]
+    fn io_readiness_is_not_a_zero_event_wait() {
+        use std::{io::Write, os::unix::net::UnixStream};
+        let mut poller = Epoll::new(4).expect("epoll");
+        let (reader, mut writer) = UnixStream::pair().expect("socket pair");
+        reader.set_nonblocking(true).expect("nonblocking");
+        let key = 1 << 32;
+        poller.register(reader.as_raw_fd(), key).expect("register");
+        writer.write_all(b"ready").expect("socket bytes");
+        let mut ready = Vec::with_capacity(4);
+        let info = poller
+            .wait(Some(Duration::from_secs(1)), &mut ready)
+            .expect("I/O wait");
+        assert_eq!((info.waits, info.zero_event_waits), (1, 0));
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].key, key);
+        assert!(ready[0].read);
+    }
+
+    #[cfg(feature = "process-sigchld")]
+    #[test]
+    fn forced_sigchld_mode_never_registers_a_pidfd() {
+        let mut poller = Epoll::new(4).expect("epoll");
+        let error = poller
+            .process(std::process::id(), 1 << 32)
+            .expect_err("force SIGCHLD");
+        assert_eq!(error.os, Some(libc::ENOSYS));
     }
 }

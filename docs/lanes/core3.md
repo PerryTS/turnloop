@@ -1,192 +1,175 @@
-# core3 lane report
+# core4 lane report
 
-Implemented all three requested fixes. Final reliability campaigns: **50/50
-contract runs and 10/10 all-feature workspace runs PASS, zero failures**.
-Local instruction measurements prove the idle regression removed. Linux
-Callgrind and native Linux/Windows execution remain **UNRUN**.
-
-Starting revision: 9e9d8aa. Read DESIGN.md, CONTRIBUTING.md, integration report,
-core/CI/Windows/WASM lane reports and core2 command history. No applicable
-AGENTS.md. Integrator checkpoints appeared during work; this agent made no commits
-because .git is read-only. The inherited ci-fix4 report remains in Git history and
-`.tools/core3/inherited-ci-fix4-report.md`.
+Implementation and local verification are complete. **Linux runtime remains
+UNRUN**; exact x86_64/arm64 integrator commands are below. Starting revision:
+`b78d533`. Read DESIGN.md, CONTRIBUTING.md, docs/INTEGRATION_REPORT.md and the
+core/CI lane reports completely; no applicable AGENTS.md. The prior root report
+is preserved in Git history and `.tools/core4/inherited-core3-report.md`.
+Integrator checkpoints appeared during work; this agent made no commits because
+`.git` is read-only.
 
 ## Implemented
 
-- **Idle path:** core2 added full-capacity walks in Services::has_work/poll and
-  Files::has_work/start, repeatedly per turn. Services now use a reserved,
-  coalesced readiness queue and indexed operation lookup. Its atomic empty check
-  avoids locking/scanning on idle turns. Dispatcher unsubscribe joins publication
-  before queued generations are removed. Files schedule only runnable heads;
-  a separate queue resumes pooled reads when a lease is available. Cancelling a
-  blocked read progresses without a lease. No helper starts on the idle path.
-- **Child registration:** the shared kqueue/epoll registration path handles ESRCH
-  by waiting for/reaping only the owned exiting child during spawn, caching its
-  real status, and delivering one normal terminal exit. A nonblocking wait can
-  still report no status during XNU's exit/registration gap; this no longer
-  becomes a failed spawn. No blocking retry or extra wait was added to turn.
-  The existing actual exit-before-registration test remains. A new injection seam
-  forces ESRCH while WNOHANG returns zero, delays normal child exit, and verifies
-  the operation identity, status 23, terminal completion, no duplicate and ECHILD.
-- **Signals:** kqueue subscriptions use SIG_IGN for ordinary signals and SIG_DFL
-  for SIGCHLD, whose default ignores delivery while retaining child wait status.
-  The registry mutex preserves installation and exact original-action restoration
-  across all subscribing threads. Linux retains its async-signal-safe self-pipe
-  handler. A fresh subprocess blocks ordinary SIGUSR1 delivery on every thread,
-  exercises four-loop fan-out/stop/close, then unblocks after unsubscribe. Original
-  code deterministically terminates with SIGUSR1; the fix survives. A stress test
-  performs 256 subscribe/raise/unsubscribe rounds on four loops and threads,
-  asserting exactly one delivery, Stopped and Closed per recipient every round.
-- **Allocations and models:** the new file backpressure gate exercises a held
-  lease, exact 2-ms timer parking, cancellation without a lease and successful
-  resumed bytes with zero allocations. It found Darwin std mutex storage being
-  allocated lazily in an unused file operation slot; all reserved file-slot and
-  service-queue mutexes now initialize during loop setup. The new production
-  readiness-queue loom model covers publication, coalescing and generation reuse.
-
-## Instruction evidence and measurement boundary
-
-[Raw measurements](benchmarks/core3-macos-arm64.jsonl): **390 positive measurements**,
-five rotated/interleaved fresh-process rounds, release **codegen-units=1**, actual
-macOS arm64 `proc_pid_rusage(RUSAGE_INFO_V4).ri_instructions`. No subtraction or
-sample exclusions. Metadata records source and binary SHA-256s; source hashes
-matched before/after measurement. The same extended harness runs starting core
-9e9d8aa, the fix, and pre-core2 baseline revision f747623. These are macOS process
-instruction counts, not Linux Callgrind or user-only counts.
-
-Instructions per operation, [min, max] across all five final rounds:
-
-| Workload | Pre-core2 | Before fix | After fix |
-|---|---:|---:|---:|
-| Integer control | [9.01, 9.04] | [9.01, 9.08] | [9.01, 9.02] |
-| Idle turn | [10,975, 11,145] | [56,388, 56,538] | [11,239, 11,339] |
-| Notify + turn | [11,002, 11,186] | [56,425, 56,508] | [11,251, 11,343] |
-| Timer start/cancel/deliver/close | [1,972, 1,988] | [14,354, 14,371] | [2,058, 2,075] |
-| Timer start/cancel only | [727.42, 728.80] | [726.40, 727.60] | [727.42, 728.38] |
-
-Idle/notify improve about **80%**, timer lifecycle about **86%**. The existing
-steady harness warms 100 turns before measuring 10,000; the original regression
-therefore was not startup masquerading as steady work. Initial unmodified-harness
-before measurements (58.4–58.9k idle) are also retained in `.tools/core3/before.jsonl`.
-The final table uses the identical extended harness on all revisions.
-
-The additional `--instruction-boundaries` mode mirrors each 100-operation
-Callgrind workload, measures destruction separately, and varies reserved capacity:
-
-| Reserved handles | Before idle instructions/turn | After |
-|---|---:|---:|
-| 16 | [12,161, 12,835] | [11,417, 12,036] |
-| 1,024 | [56,379, 56,606] | [11,185, 11,561] |
-| 8,192 | [371,920, 372,855] | [11,211, 11,389] |
-
-There was also a **real benchmark boundary mistake**: Callgrind's setup returns
-owned `(Loop, Completions)` into the measured function, which previously destroyed
-both inside the sample. Default-capacity idle-fixture destruction measured
-[175,273, 377,765] instructions before core2, [1,422,585, 1,713,330] in starting core2,
-and [2,824,295, 3,146,192] after eagerly reserving Darwin mutex storage. These are
-one-time loop disposal costs, including thousands of reserved file/service slots.
-They must not be attributed to 100 idle/notify/timer operations.
-
-All three Gungraun functions now return their fixtures to explicit **unmeasured
-teardown**, preserving every workload/assertion and measuring all 100 operations.
-The integer control, case names, cgu=1, three CI rounds, exact-control policy and
-**3% threshold are unchanged**. The committed Linux baseline is unchanged.
-The integrator should measure/review a boundary-corrected candidate on Linux CI;
-no Linux counts were synthesized. Local steady timer lifecycle cost remains about
-4–5% above pre-core2, despite eliminating the large regression; Linux's actual
-instruction gate remains authoritative and UNRUN here.
+- **Timerfd accounting:** in this checkout, line 516 checks `zero_event_waits`;
+  `os_waits` is line 515. Both epoll branches already report one OS wait. A private
+  timerfd expiry returns a TIMER readiness event, so the old `n == 0` expression
+  incorrectly reported zero empty waits. The fix excludes only private timeout
+  events from the native-work count. Notifier and I/O events still count, even
+  when they produce no user completion. The existing nanosecond one-shot plus
+  single `epoll_wait(-1)` path is preserved; no polling, extra wait or timer floor
+  was added. This is the defect demonstrated by source inspection; runtime proof
+  on Linux must come from the integrator.
+- **Regressions:** retained the original file-backpressure test verbatim. A new
+  allocation gate checks 60 quiet expiries (20 each at 500 us, 2 ms, 10 ms), exact
+  handle/op/token and Timer completion, `now() >= at`, one OS/empty wait, zero
+  waits for queued Closed results, and zero allocations. Epoll unit tests assert
+  timeout/notifier/I/O accounting, rearming after an abandoned timeout expires,
+  Now/Forever handling and actual forced-timerfd selection.
+- **SIGCHLD:** retained the fallback. A mode-specific epoll unit test proves
+  forced SIGCHLD refuses pidfd registration. Every Linux mode runs all existing
+  process/signal contracts, including 256 children, fan-out/churn, reaping,
+  process-group cleanup, stdio, no-spin and allocation tests.
+- **BTree isolation:** removed `turnloop/timer-btree` and moved its implementation
+  and sorted-reference conformance test into the private benchmark crate. Only
+  `turnloop-bench/timer-btree` remains, with no feature forwarding. Production
+  always uses the preallocated 4-ary heap. Both benchmark variants execute nine
+  workloads with positive operation counts and deadline/order checks.
+- **Required modes:** Linux x86_64 and arm64 each get default, timerfd, SIGCHLD,
+  combined fallbacks, executor and all-features arms. macOS/Windows each get
+  default, executor and all-features: **18 native arms**, all unconditional,
+  fail-fast disabled and required through `ci-gate`. Each runs the workspace,
+  independently requires positive core/protocol/contract counts, and runs
+  applicable Node/curl interop. Existing Windows pending-contract metadata and
+  the WASI/web jobs are unchanged.
+- **Feature coverage gate:** `scripts/ci/feature_modes.py` reads the manifest and
+  explicit JSON flow rows in ci.yml (valid YAML). It rejects unlisted public
+  features, including implicit optional-dependency features; all-features cannot
+  grant implicit coverage. Missing/duplicate/optional/unwired mode arms, removed
+  Linux combinations, unknown features and missing ci-gate dependencies fail.
+  The runner consumes the same rows, with optional `--mode`. Workspace selections
+  stay complete; independent member commands project features onto the member
+  and its direct dependencies, as Cargo requires. Sans-IO members without a
+  core dependency have no backend feature to select.
 
 ## Verification
 
-[Complete command ledger](docs/core3-commands.md), including intermediate failures
-and expected negative controls. Raw command output: `.tools/core3/`. PASS means
-actual command success; cross-checks are compilation only.
+[Every verification command and exit status](docs/core4-commands.md), including
+intermediate failures, is recorded. Raw output: `.tools/core4/logs/`. PASS means
+actual command success; cross-Clippy is compilation only.
 
 | Command / group | Result |
-|---|---|
-| `cargo fmt --check` | PASS |
-| `cargo clippy --workspace --all-targets -- -D warnings -D clippy::undocumented_unsafe_blocks`, default and all features | PASS |
-| Same whole-workspace Clippy for `x86_64-unknown-linux-gnu`, default and all features | PASS; checks epoll/pidfd plus forced timerfd/SIGCHLD paths and Gungraun teardown |
-| Core/contract/bench all-target/all-feature Clippy for Linux arm64, FreeBSD, iOS, Windows MSVC, WASI 0.2, browser wasm | PASS |
-| Android core/contract library all-feature Clippy | PASS; full Android test linking/runtime UNRUN |
-| Core/contract/bench all-target/all-feature WASI 0.3 Clippy using nightly-2026-09-07 | PASS |
+| --- | --- |
+| `cargo fmt --all --check` | PASS |
+| `cargo clippy --locked --workspace --all-targets -- -D warnings -D clippy::undocumented_unsafe_blocks`, default and `--all-features` | PASS native |
+| Same full-workspace Clippy with `--target x86_64-unknown-linux-gnu`, default and all features | PASS; Linux runtime UNRUN |
+| Core/contract/bench all-target Linux x86_64 Clippy separately with `--features turnloop/epoll-timerfd` and `--features turnloop/process-sigchld` | PASS |
+| Core/contract/bench all-target/all-feature Clippy for Linux arm64, Windows MSVC, WASI 0.2 and browser wasm | PASS |
+| Same WASI 0.3 Clippy with `cargo +nightly-2026-09-07` | PASS; existing Cargo manifest/config warnings remain, Rust warning-denial passes |
 | `cargo +stable check --locked --workspace --all-targets --all-features` | PASS, stable 1.97.1 |
-| `env RUST_TEST_THREADS=1 cargo test --workspace` | PASS, 222 test passes |
-| `cargo test -p turnloop-contract --all-features -- --test-threads=1` × 50 | **PASS 50/50**, 52 tests/run, zero failures |
-| `env RUST_TEST_THREADS=1 cargo test --workspace --all-features` × 10 | **PASS 10/10**, 237 tests/run, zero failures |
-| `python3 scripts/ci/run-tests.py loom` | PASS, all six models, including new queue model |
-| `env RUSTFLAGS='--cfg loom' cargo clippy -p turnloop --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks` | PASS |
-| `env MIRI_SYSROOT=.tools/core3/miri-sysroot cargo miri setup`, then same env with `python3 scripts/ci/run-tests.py miri` | PASS, both configured pure-Rust tests execute |
-| `env RUSTDOCFLAGS=-Dwarnings cargo doc --locked --workspace --all-features --no-deps` | PASS |
-| `bash scripts/ci/no-tokio.sh` | PASS, eight targets and union, default/all features |
-| `python3 scripts/ci/soak.py` | PASS, 241 locked versions; only the pre-existing exact rustls security exception |
+| `python3 scripts/ci/run-tests.py native` | PASS final: all three macOS modes, **1,174 test passes** including independent repetitions |
+| Workspace tests inside that runner | PASS: default **223**, executor **231**, all features **239** |
+| Independent contract runs inside that runner | PASS: default **46**, executor **53**, all features **53**; each preserves allocation/no-spin/process/signal gates |
+| `python3 scripts/test-servers.py --services http run python3 scripts/ci/run-tests.py interop --mode MODE` for default/executor/all-features | PASS **17 tests per mode**; real Node/curl HTTP, TLS and WebSocket legs, cleanup completed |
+| `cargo run --release --locked -p turnloop-bench -- --portable --timers`, then with `--features timer-btree` | PASS; nine workloads per variant, 100,000 asserted operations per workload; portable ns smoke only, no instruction-performance claim |
+| `python3 -W error -m unittest discover -s scripts/ci -p 'test_*.py' -v` | PASS **84 tests**, including missing-mode/new-feature/zero-test negative controls |
+| `python3 scripts/ci/feature_modes.py` | PASS, **4 public features / 18 required arms** |
+| Checksum-pinned actionlint/zizmor/ShellCheck installation and `python3 scripts/ci/lint-workflows.py` with `.tools/bin` on PATH | PASS; existing strictly validated actionlint queue compatibility wrapper preserved |
+| `bash scripts/ci/no-tokio.sh` | PASS, eight targets plus union, default/all features |
+| `python3 scripts/ci/soak.py` | PASS, 241 locked versions, only the existing exact rustls security exception |
 | `python3 scripts/ci/check-paths.py`; `git diff --check` | PASS |
-| Release benchmark builds and final interleaved ri_instructions measurements | PASS, 390 measurements; actual operation/wait/byte assertions |
-| Original-code SIGUSR1 and ESRCH negative controls | Expected FAIL, proving both regressions detect their defects |
-| `python3 scripts/ci/instructions.py` | **UNRUN**, no Linux/Valgrind host |
+| `python3 .tools/core4/audit.py` | PASS: actual all-feature core graph has only default/executor/timerfd/SIGCHLD; all three native modes have independent positive counts and execute both allocation regressions and process/signal subjects; protected policy/baseline files unchanged |
 
-The final repetition campaigns alone total **4,970 test passes**, 61,440 asserted
-churn signal deliveries and 15,360 reaped children in the 256-child contract.
-RUST_TEST_THREADS=1 follows CONTRIBUTING's process-global signal/allocator isolation;
-there are no retries in the test loop. Ignored external-service tests do not count.
+The final native run executes both allocation regressions six times (workspace
+and independent contract in each mode). The new test asserts **360 expiries**
+with zero allocations across those executions. Ignored real-server tests are
+UNRUN, never included in positive passed-test counts.
 
-## Intermediate failures and scope limits
+Linux/Windows runtime, hosted GitHub CI/ci-gate execution and Linux instruction
+measurements are **UNRUN (no host)**. WASI/browser production backend runtime is
+**UNRUN in this lane**; no cross-check substitutes for it. SQL real-server bodies
+remain **UNRUN (sandbox)** and were not retried here. The pre-existing intentional
+curl-unavailable test logs one UNRUN curl leg while proving its Node 100-stream
+leg ran; ordinary curl HTTP/1 and HTTP/2 legs pass.
 
-- The first 50-run campaign stopped on run 5 (four passes, then SIGCHLD termination
-  in the process-group test). The no-op SIGCHLD handler had the same restore window
-  as SIGUSR1; early fallback unsubscription made it easier to expose. SIGCHLD now
-  uses default-ignore throughout its kqueue subscription. The final 50-run campaign
-  restarted at zero after this correction; its failures count is zero.
-- The new file gate initially measured an unfinished warm-up notification, then
-  exposed one lazy mutex allocation. A completed warm-up timer separates startup
-  from the exact quiet-wait test. A captured allocator stack identified the mutex;
-  production setup now reserves it. No wait limit or zero-allocation assertion was
-  removed or relaxed. Initial Clippy failures only required moving SAFETY comments
-  immediately before unsafe expressions inside assert macros.
-- Two early signal snapshot probes inadvertently used an integrator checkpoint or
-  stale Cargo artifacts after restoring old timestamps. Neither counts as original
-  code evidence. Final negative controls use explicit starting SHA 9e9d8aa and fresh
-  target directories; both fail for their intended reason.
-- Native Linux (both epoll modes), Windows, FreeBSD and mobile runtime tests are
-  **UNRUN**: no hosts. Windows/WASI/web production providers remain the existing
-  other-lane responsibility; scoped cross-compilation does not claim their runtime
-  contracts. Browser runtime and external-server tests are **UNRUN** here. SQL
-  sandbox limits and the inherited whole-workspace p3 getrandom issue are unchanged.
+## Intermediate failures
 
-## Deviations / proposed DESIGN clarification / next steps
+The first macOS wrapper run passed default mode and the executor workspace, then
+Cargo rejected `turnloop-contract/executor` when testing only `-p turnloop`.
+The runner now applies the correct member/dependency feature scope; all 84 Python
+regressions and the complete native wrapper pass after that fix. No test threshold
+or positive-count gate was relaxed. The ledger retains the failed invocation.
 
-Restart audit at checkpoint **a87ae10**: the working tree was clean and all
-implementation/measurement artifacts were already checkpointed. Re-read the
-required design, contribution, integration and relevant lane reports; reviewed
-the complete source diff against 9e9d8aa. No source correction remained.
-`python3 .tools/core3/resume-audit.py` **PASS**: all 46 recorded source/configuration
-hashes and all three measured binary hashes match; all 390 positive measurements
-have five rounds; all 50 contract and 10 workspace logs contain their expected
-52/237 passes and the specific regression subjects. Saved loom/Miri/default-suite
-counts also match. Dependency/soak policy, instruction gate and baseline remain
-unchanged. An additional post-restart contract all-feature run **PASS**, 52 tests,
-separate from the original 50/50 campaign. No large campaigns were rerun, and no
-builds ran concurrently during the restart audit. Post-restart formatting, path
-validation and diff whitespace checks **PASS**; commands are in the linked ledger.
+Initial read-only inspection had an overbroad directory scan, a zsh loop variable
+that shadowed PATH in that subprocess, and a few guessed nonexistent source/log
+paths. Subsequent reads used discovered paths; these are inspection errors, not
+verification passes. Formatting was applied once with `cargo fmt --all` and
+subsequent formatting checks passed.
 
-No Cargo dependency/lockfile, soak setting/security exception, platform gate, test
-threshold or Linux baseline changed. No public Backend trait revision was needed.
-The source changes are confined to Unix services/files, their tests and benchmarks.
+## Deviations / proposed DESIGN clarifications
 
-The [XNU signal implementation](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_sig.c)
-issues NOTE_SIGNAL before ordinary disposition processing; postsig_locked's default
-branch assumes fatal delivery. The [FreeBSD implementation](https://github.com/freebsd/freebsd-src/blob/main/sys/kern/kern_sig.c)
-also notifies kqueue before ignoring signals. Proposed §7.2 clarification:
-**SIG_IGN for subscribed ordinary signals, SIG_DFL for SIGCHLD**, whose default
-ignores delivery without auto-reaping. DESIGN.md itself is unchanged.
+- Define empty-wait instrumentation to exclude the backend's private timeout
+  mechanism. A timerfd-only expiry is equivalent to a timed wait returning zero;
+  notifier readiness remains native work. Backend and TurnInfo docs now state
+  that normalization. The Backend trait shape and revision remain unchanged.
+- D6 should say production uses the preallocated indexed 4-ary heap, with the
+  allocating BTree variant isolated in the benchmark crate. DESIGN.md is unchanged.
 
-No implementation questions remain. Integrator next steps:
+Read-only reference verification: the [timerfd manual](https://man7.org/linux/man-pages/man2/timerfd_create.2.html)
+documents nanosecond one-shot arming, expiry readiness and counters reset by
+reconfiguration; the [epoll wait manual](https://man7.org/linux/man-pages/man2/epoll_wait.2.html)
+documents event-count returns. These support the accounting diagnosis, not a
+Linux runtime claim. Cargo.lock, dependency/soak settings, the rustls exception,
+no-tokio policy and instruction baseline are unchanged.
 
-1. Integrate the checkpointed implementation and raw measurement artifact; commit
-   the appended restart verification/report entries in the working tree.
-2. Run Linux native contracts, default and all features, and ordinary Callgrind CI.
-   Review a corrected-boundary candidate using
-   `python3 scripts/ci/instructions.py --record .tools/core3-instruction-candidates.json`.
-   Preserve the 3% ceiling, exact control and all declared cases.
-3. Run the unchanged native/first-class platform matrix on its real hosts; keep
-   inherited SQL/browser/provider prerequisites separate from these local passes.
+## Open questions / next steps
+
+No implementation decisions remain open. The integrator should checkpoint the
+final source/report files, run the commands below on Linux x86_64 and arm64, and
+return full output for any failure. In particular, confirm that the supplied
+failure refers to `zero_event_waits` (line 516 in b78d533). If a Linux rerun instead
+fails `os_waits`, that is distinct evidence requiring further investigation.
+Run the required GitHub matrix and unchanged instruction gate before merging;
+Linux completion and performance are not claimed from macOS checks.
+
+## Linux integrator commands (UNRUN here; execute on x86_64 and arm64)
+
+Run serially on each real Linux host, pinned nightly from rust-toolchain.toml.
+Do not drop allocation, native_surface process/signal, or no-spin tests. These
+commands execute the entire contract package in each requested backend mode:
+
+```bash
+cargo test --locked -p turnloop-contract -- --test-threads=1
+cargo test --locked -p turnloop-contract --features turnloop/epoll-timerfd -- --test-threads=1
+cargo test --locked -p turnloop-contract --features turnloop/process-sigchld -- --test-threads=1
+cargo test --locked -p turnloop-contract --features turnloop/epoll-timerfd,turnloop/process-sigchld -- --test-threads=1
+cargo test --locked -p turnloop-contract --features turnloop/executor,turnloop-contract/executor -- --test-threads=1
+cargo test --locked --workspace --all-features --no-fail-fast -- --test-threads=1
+```
+
+The exact CI entry points also run all other workspace tests and enforce positive
+counts independently for every core/protocol/contract package. They cover the
+new epoll unit tests as well as the contract regressions:
+
+```bash
+python3 scripts/ci/feature_modes.py
+python3 scripts/ci/run-tests.py native --mode default
+python3 scripts/ci/run-tests.py native --mode epoll-timerfd
+python3 scripts/ci/run-tests.py native --mode process-sigchld
+python3 scripts/ci/run-tests.py native --mode fallbacks
+python3 scripts/ci/run-tests.py native --mode executor
+python3 scripts/ci/run-tests.py native --mode all-features
+```
+
+Equivalently, `python3 scripts/ci/run-tests.py native` runs all six Linux modes.
+For the per-mode native HTTP/TLS/WebSocket interop legs:
+
+```bash
+for mode in default epoll-timerfd process-sigchld fallbacks executor all-features; do
+  python3 scripts/test-servers.py --services http run python3 scripts/ci/run-tests.py interop --mode "$mode" || exit
+done
+```
+
+Return command exit codes, positive counts, and full failure diagnostics. In
+particular, the old file-backpressure test must retain one OS wait, one zero-event
+wait, `now() >= at`, and zero allocations. Linux runtime remains UNRUN until these
+results arrive; cross-Clippy is never substituted for that evidence.
