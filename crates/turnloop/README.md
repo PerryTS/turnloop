@@ -15,7 +15,7 @@ drives futures-io streams, sleep and timeout from host turns. Perry is the first
 | macOS arm64 | kqueue, TCP/UDP/local IPC, stdio, processes, signals, TTY, timers and shared services | Native contracts, six allocation gates and executor tests |
 | Linux x86_64 / arm64 | epoll, pidfd/SIGCHLD, native services, nanosecond waits and timerfd fallback | Cross-checked locally; native CI required |
 | FreeBSD / Apple mobile / Android | Unix backend paths | Best effort; runtime validation pending |
-| Windows x86_64 | Standalone IOCP spike | Cross-checked; production adapter and native contracts pending |
+| Windows x86_64 | IOCP, TCP/UDP/named pipes, stdio, processes, console signals, timers and shared services | Native Windows 11 contracts and allocation/executor tests; see `spikes/iocp/WINDOWS_RESULTS.md` |
 | WASI 0.2 / 0.3 | Standalone polling / component async spikes | Production adapters and shared contracts pending |
 | Web | Standalone host-callback spike | Production adapter and browser contracts pending |
 

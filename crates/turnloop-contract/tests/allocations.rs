@@ -5,7 +5,8 @@
         target_vendor = "apple",
         target_os = "linux",
         target_os = "android",
-        target_os = "freebsd"
+        target_os = "freebsd",
+        target_os = "windows"
     )
 ))]
 use std::{
@@ -285,7 +286,10 @@ fn cancellation_reserves_survive_a_full_event_backlog() {
 #[test]
 fn ipc_handle_transfer_and_external_waits_allocate_nothing_after_setup() {
     let mut l = Loop::new(Config::default()).expect("loop");
+    #[cfg(unix)]
     let path = std::env::temp_dir().join(format!("tl-alloc-ipc-{}.sock", std::process::id()));
+    #[cfg(windows)]
+    let path = std::path::PathBuf::from(format!(r"\\.\pipe\tl-alloc-ipc-{}", std::process::id()));
     let (_, a, b) = turnloop_contract::native_surface::pipe_pair(&mut l, &PipeName(path.clone()));
     let (_, source, _peer) = turnloop_contract::pair(&mut l);
     let condition = WaitCondition::new(0).expect("wait condition");
@@ -352,15 +356,13 @@ fn ipc_handle_transfer_and_external_waits_allocate_nothing_after_setup() {
         "IPC and external waits steady allocations"
     );
     assert_eq!((transferred, waits), (200, 200));
+    #[cfg(unix)]
     std::fs::remove_file(path).expect("remove socket path");
 }
 
 #[test]
 fn regular_file_jobs_reuse_pool_storage() {
-    use std::{
-        io::{Seek, SeekFrom, Write},
-        os::fd::OwnedFd,
-    };
+    use std::io::{Seek, SeekFrom, Write};
     let path = std::env::temp_dir().join(format!("tl-alloc-file-{}", std::process::id()));
     let mut file = std::fs::OpenOptions::new()
         .read(true)
@@ -370,9 +372,12 @@ fn regular_file_jobs_reuse_pool_storage() {
         .expect("file");
     file.write_all(&[9; 64]).expect("file bytes");
     let mut l = Loop::new(Config::default()).expect("loop");
-    let fd: OwnedFd = file.try_clone().expect("clone file").into();
+    #[cfg(unix)]
+    let transport = Detached::from_fd(file.try_clone().expect("clone file").into());
+    #[cfg(windows)]
+    let transport = Detached::from_handle(file.try_clone().expect("clone file").into());
     let h = l
-        .attach(Detached::from_fd(fd).expect("file transport"), Token(1))
+        .attach(transport.expect("file transport"), Token(1))
         .expect("file attach");
     let mut out = Completions::default();
     let mut count = 0;
@@ -498,6 +503,7 @@ fn executor_steady_io_poll_and_sleep_allocate_nothing() {
     assert_eq!(count, 1001);
 }
 
+#[cfg(unix)]
 #[test]
 fn signal_exit_and_external_notification_delivery_allocate_nothing() {
     let mut l = Loop::new(Config::default()).expect("loop");

@@ -565,7 +565,7 @@ P5–P7 are independent of each other once P1 and P4 have landed, and can run as
 
 1. **Name.** Settled: `turnloop`.
 2. **`sys` layer.** Own thin backends vs building on compio-driver (IOCP and io_uring already done) vs `polling`/mio for Unix. Decided in M1 with instruction numbers.
-3. **Windows timer mechanism.** Alertable GQCSEx + waitable timer APC, or timer-to-port association.
+3. **Windows timer mechanism.** Use a high-resolution waitable timer with dynamically resolved `NtAssociateWaitCompletionPacket` and nonalertable GQCSEx. Windows 11 build 26200 rejected high-resolution APC callbacks with error 87; 100 NT-packet samples at 250 us measured p50/p95/max lateness of 275.2/285.8/380.9 us. See [the Windows results](spikes/iocp/WINDOWS_RESULTS.md); minimum-version and VM precision validation remain separate work.
 4. **Pooled buffer sizing and lease lifetime.** Until the next `turn`, or explicit release only?
 5. **io_uring timing.** When, and whether as the default where available.
 6. **Mobile CI.** iOS (kqueue) and Android (epoll) come almost free from the Unix backends. Which simulators/emulators run in CI.

@@ -76,5 +76,52 @@ After replacing the draft's APC deadline with the measured NT packet route,
 passes all three tests, including zero allocations across 256 measured transfers
 and cancellation before Closed. Formatting and unsafe-aware Clippy pass again.
 
-Production backend integration and shared contracts are in progress. No production
-Windows runtime coverage or green Windows CI is claimed by this initial record.
+The production adapter is integrated at `crates/turnloop/src/backend/iocp/`.
+The Windows pending-contract marker is removed: shared contracts execute natively.
+
+PASS on this host:
+
+- `cargo +nightly-2026-08-20 test -p turnloop-contract --all-features -- --test-threads=1`:
+  47 tests: 30 shared/backend, five allocation, six executor, two isolated-console
+  and four Windows lifetime/imported-handle scenarios.
+- `cargo +nightly-2026-08-20 test -p turnloop-contract --test windows_console -- --nocapture --test-threads=1`:
+  two tests, each spawning an isolated console child; real Ctrl-C/Break fan-out,
+  console input/resize, VT modes and restoration on close/drop.
+- `cargo +nightly-2026-08-20 test -p turnloop-contract --test windows_lifetimes --test windows -- --nocapture --test-threads=1`:
+  34 tests, including GUI timer reset, 128 synchronous cancellation/drop races,
+  and 32 TCP loop lifetimes returning to the native handle-count baseline.
+- `cargo +nightly-2026-08-20 clippy --workspace --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks`.
+
+Intermediate failures fixed without relaxing assertions:
+
+- Shared refused-connect watchdog: Windows retries refused loopback SYNs. Disable
+  SYN retransmission for loopback destinations only; retain administrator settings
+  for network destinations. RtlNtStatusToDosError returns Win32 code 1225, which
+  additionally needs explicit ConnectionRefused mapping (the standard I/O mapping
+  recognizes Winsock's different code).
+- IPC allocation gate: one lazily allocated routed-callback context on first
+  handle transfer. Reserve callback contexts with the operation slab at setup;
+  all five enabled allocation gates pass, including IPC and file-worker I/O.
+- Bounded 12 ms wait: GQCSEx's competing integer timeout could end before 10 ms.
+  Once an NT deadline is armed, use an infinite GQCSEx timeout and let the exact
+  packet provide the deadline. The original bounded/no-spin assertions pass.
+- Initial unsafe-aware lint runs flagged comment placement around multiline
+  assertions. Comments now immediately precede the unsafe expressions.
+- Imported handles need native file-mode classification before using a synchronous
+  worker. Overlapped pipes now route to the receiving loop, including handles
+  already associated with another port. Other overlapped files return Unsupported.
+
+The initial PR CI run's Windows native job failed because Microsoft's bundled
+curl lacks HTTP/2 (`--http2-prior-knowledge`), before production integration was
+pushed. CI now installs checksum-pinned official curl 8.22.0_1 with HTTP/2.
+Interop commands explicitly set child PATH because Rust otherwise searches
+System32 before the inherited PATH. The unchanged HTTP/2 assertions now pass.
+The next full-workspace run exposed CRLF-converted decoder reference fixtures;
+`.gitattributes` now preserves their original bytes. All 68 decoder tests pass
+after restoring the fixtures to their exact committed bytes.
+Latest production CI and full-workspace runtime results are recorded below when
+available; this record does not claim they have passed yet.
+
+Unrun wider gates: ETW syscall traces, CPU-cycle A/B attribution, overnight soak,
+Windows 10 minimum-version coverage, and VM/power-state precision matrices.
+Console resize dispatch currently requires an active console input read.

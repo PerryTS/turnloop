@@ -1741,6 +1741,7 @@ dependencies = [
  "futures-io",
  "libc",
  "loom",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1760,6 +1761,7 @@ dependencies = [
  "futures-io",
  "libc",
  "turnloop",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -55,9 +55,15 @@ mod queue;
 mod sync;
 pub use notifier::{Notifier, PostError, Poster};
 
-#[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
+#[cfg(any(
+    turnloop_backend = "kqueue",
+    turnloop_backend = "epoll",
+    turnloop_backend = "iocp"
+))]
 /// The native driver selected for the compilation target; owned by one thread.
 pub type Loop = Driver<backend::Platform>;
+#[cfg(turnloop_backend = "iocp")]
+pub use backend::iocp::Detached;
 #[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
 pub use backend::unix::Detached;
 

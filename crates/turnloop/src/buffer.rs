@@ -134,7 +134,11 @@ impl BufferPool {
             inner: Rc::new(RefCell::new((0..count).map(|_| vec![0; size]).collect())),
         }
     }
-    #[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
+    #[cfg(any(
+        turnloop_backend = "kqueue",
+        turnloop_backend = "epoll",
+        turnloop_backend = "iocp"
+    ))]
     pub(crate) fn available(&self) -> bool {
         !self.inner.borrow().is_empty()
     }
