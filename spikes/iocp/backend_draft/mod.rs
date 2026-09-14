@@ -112,7 +112,6 @@ enum State {
     Ready,
 }
 struct OpSlot {
-    kernel: UnsafeCell<OVERLAPPED>,
     generation: u64,
     state: State,
     handle: usize,
@@ -151,6 +150,8 @@ impl Notifier {
 pub struct IocpBackend {
     // Slots never move or resize; kernel only sees addresses inside these boxes.
     ops: Box<[OpSlot]>,
+    // Separate kernel storage: never create &mut references to OS-written memory.
+    kernel: Box<[UnsafeCell<OVERLAPPED>]>,
     handles: Box<[HandleSlot]>,
     ready: VecDeque<usize>,
     port: Arc<Port>,
@@ -169,10 +170,14 @@ impl IocpBackend {
         }
         let winsock = Winsock::new()?;
         let port = Arc::new(Port::new()?);
+        let kernel = (0..operation_capacity)
+            .map(|_| {
+                // SAFETY: valid inactive OVERLAPPED, before any submission.
+                UnsafeCell::new(unsafe { std::mem::zeroed() })
+            })
+            .collect();
         let ops = (0..operation_capacity)
             .map(|_| OpSlot {
-                // SAFETY: zeroed OVERLAPPED, inactive and never submitted yet.
-                kernel: UnsafeCell::new(unsafe { std::mem::zeroed() }),
                 generation: 0,
                 state: State::Free,
                 handle: 0,
@@ -197,6 +202,7 @@ impl IocpBackend {
         });
         Ok(Self {
             ops,
+            kernel,
             handles,
             ready: VecDeque::with_capacity(operation_capacity),
             port,
@@ -311,7 +317,7 @@ impl IocpBackend {
             .ok_or_else(|| io::Error::other("operation generation exhausted"))?;
         // SAFETY: free slot; no kernel packet can still reference it.
         unsafe {
-            *op.kernel.get() = std::mem::zeroed();
+            *self.kernel[i].get() = std::mem::zeroed();
         }
         op.handle = h;
         op.token = token;
@@ -332,7 +338,7 @@ impl IocpBackend {
                         1,
                         &mut bytes,
                         &mut flags,
-                        op.kernel.get(),
+                        self.kernel[i].get(),
                         None,
                     ) == 0
                 }
@@ -346,7 +352,7 @@ impl IocpBackend {
                         1,
                         &mut bytes,
                         0,
-                        op.kernel.get(),
+                        self.kernel[i].get(),
                         None,
                     ) == 0
                 }
@@ -360,17 +366,17 @@ impl IocpBackend {
                         1,
                         &mut bytes,
                         &mut flags,
-                        op.kernel.get(),
+                        self.kernel[i].get(),
                         None,
                     ) == 0
                 }
                 Request::Read { buffer, len } => {
-                    ReadFile(raw, buffer, len, &mut bytes, op.kernel.get()) != 0
+                    ReadFile(raw, buffer, len, &mut bytes, self.kernel[i].get()) != 0
                 }
                 Request::Write { buffer, len } => {
-                    WriteFile(raw, buffer, len, &mut bytes, op.kernel.get()) != 0
+                    WriteFile(raw, buffer, len, &mut bytes, self.kernel[i].get()) != 0
                 }
-                Request::PipeConnect => ConnectNamedPipe(raw, op.kernel.get()) != 0,
+                Request::PipeConnect => ConnectNamedPipe(raw, self.kernel[i].get()) != 0,
             }
         };
         let error = if success {
@@ -412,7 +418,7 @@ impl IocpBackend {
                 .ok_or_else(|| io::Error::other("missing handle"))?;
             // SAFETY: stable pending op and resource; cancellation is only a request.
             // https://learn.microsoft.com/en-us/windows/win32/api/ioapiset/nf-ioapiset-cancelioex
-            if unsafe { CancelIoEx(resource.raw(), op.kernel.get()) } == 0 {
+            if unsafe { CancelIoEx(resource.raw(), self.kernel[id.index].get()) } == 0 {
                 let error = io::Error::last_os_error();
                 if error.raw_os_error() != Some(ERROR_NOT_FOUND as i32) {
                     return Err(error);
@@ -526,9 +532,9 @@ impl IocpBackend {
                 continue;
             }
             let Some(i) = self
-                .ops
+                .kernel
                 .iter()
-                .position(|op| op.kernel.get() as usize == entry.overlapped)
+                .position(|kernel| kernel.get() as usize == entry.overlapped)
             else {
                 return Err(io::Error::other("unknown OVERLAPPED"));
             };
@@ -609,13 +615,13 @@ impl Drop for IocpBackend {
     fn drop(&mut self) {
         // Cancel + drain is mandatory even on early exit. Teardown can block and
         // is outside D7's bounded turn. No driver-owned thread in direct mode.
-        for op in &mut self.ops {
+        for (i, op) in self.ops.iter().enumerate() {
             if op.state == State::Pending
                 && let Some(resource) = &self.handles[op.handle].resource
             {
                 // SAFETY: storage/handle retained until packet drain below.
                 unsafe {
-                    CancelIoEx(resource.raw(), op.kernel.get());
+                    CancelIoEx(resource.raw(), self.kernel[i].get());
                 }
             }
         }

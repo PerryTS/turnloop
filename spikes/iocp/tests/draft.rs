@@ -193,3 +193,23 @@ fn notifier_running_fast_path_and_parked_wake() -> io::Result<()> {
     assert_eq!(notifier.syscall_count(), 1);
     Ok(())
 }
+
+#[test]
+fn event_notifier_wakes_before_the_first_turn() -> io::Result<()> {
+    use windows_sys::Win32::{
+        Foundation::WAIT_OBJECT_0, UI::WindowsAndMessaging::MsgWaitForMultipleObjectsEx,
+    };
+    let mut backend = IocpBackend::new(1, 1)?;
+    let notifier = backend.notifier();
+    let event = backend.integration()?;
+    notifier.notify()?;
+    // SAFETY: backend owns the helper/event for the entire wait.
+    let ready = unsafe { MsgWaitForMultipleObjectsEx(1, &event, 2000, 0, 0) };
+    assert_eq!(ready, WAIT_OBJECT_0);
+    let mut out = [Completion::default(); 1];
+    let info = backend.turn(Some(Duration::ZERO), &mut out)?;
+    assert_eq!(info.waits, 0);
+    assert!(info.notified);
+    assert_eq!(notifier.syscall_count(), 1);
+    Ok(())
+}

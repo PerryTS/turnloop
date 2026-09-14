@@ -14,6 +14,9 @@ event helper. No heap allocation on read/write/turn after construction. Capacity
 exhaustion rejects before submission. Windows tests assert actual transfers,
 allocation count, notifier syscall count, and cancellation order; all **UNRUN**.
 
+Kernel OVERLAPPED storage is separate from mutable Rust operation metadata, so
+normal state updates never create exclusive references to memory the OS can write.
+
 AcceptEx/ConnectEx, child process/job/wait, synchronous stdio and console mechanisms
 are implemented in the sibling spike modules and have their own test binaries.
 They are not yet public operations of this draft. The draft is a compile-checked
