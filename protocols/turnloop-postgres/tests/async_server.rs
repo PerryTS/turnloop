@@ -215,7 +215,21 @@ fn real_async_tls_queries_copy_cancel_pool_and_connection_kill() {
             .await
             .expect("terminate backend");
             assert!(killed);
-            assert!(other.query("SELECT 1", at, |_| Ok(())).await.is_err());
+            let failure = other
+                .query("SELECT 1", at, |_| Ok(()))
+                .await
+                .expect_err("terminated session");
+            assert_eq!(failure.kind(), std::io::ErrorKind::ConnectionAborted);
+            let Some(turnloop_postgres::Error::ConnectionAborted(diagnostic)) =
+                failure.get_ref().and_then(|e| e.downcast_ref())
+            else {
+                panic!("missing server diagnostic: {failure:?}");
+            };
+            assert_eq!(diagnostic.server_error().code(), "57P01");
+            assert_eq!(
+                diagnostic.server_error().message(),
+                "terminating connection due to administrator command"
+            );
             assert!(!other.is_reusable());
             let pool = Pool::new(
                 &h,

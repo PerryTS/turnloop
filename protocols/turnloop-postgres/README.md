@@ -183,3 +183,21 @@ the core. For an upgrade, `into_parts` preserves the stream, core and unread byt
 Apply `turnloop_io::deadline` using the core's next deadline. Dropping a pending
 drive future closes the stream and aborts the core; terminal core events remain
 available for draining. See `turnloop-io` for the shared adapter ownership pattern.
+
+### Terminal server failures
+
+`ErrorResponse` with nonlocalized severity `FATAL`/`PANIC` (or `S` when `V` is
+absent) terminates the session immediately. `Connection::next_event()` returns
+`Error::ConnectionAborted(ConnectionFailure)`; its `server_error()` view retains
+SQLSTATE, message and all other fields. Close the transport and drain the core's
+one `Outcome::Aborted` per pending token, followed by `Closed`. EOF/abort does not
+replace the original diagnostic. Startup rejection is terminal too.
+
+The async client closes its stream and returns `io::ErrorKind::ConnectionAborted`
+with the typed `turnloop_postgres::Error` as its inner error. Such a client is not
+reusable. Ordinary statement `ERROR` stays borrowed and becomes
+`Outcome::ServerError` only after `ReadyForQuery`; the session can then continue.
+
+`Error` and `Outcome` are `Clone`, no longer `Copy`. Terminal diagnostics share one
+owned copy of the wire fields; cloning pipeline aborts allocates nothing.
+Successful queries and reusable statement errors retain zero steady allocations.

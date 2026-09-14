@@ -102,3 +102,64 @@ fn warmed_query_row_and_named_execute_allocate_nothing() {
     });
     assert_eq!(count, 0);
 }
+
+#[test]
+fn terminal_diagnostic_allocates_once_and_pipeline_abort_clones_allocate_zero() {
+    assert_eq!(
+        allocation::allocations(|| {
+            std::hint::black_box(Box::new(42));
+        }),
+        1
+    );
+    let mut c = Connection::new(Config::default()).expect("core");
+    c.consume_output(c.output().len()).expect("startup sent");
+    c.receive(b"R\0\0\0\x08\0\0\0\0Z\0\0\0\x05I").expect("auth");
+    assert!(matches!(
+        c.next_event().expect("connected"),
+        Some(Event::Connected)
+    ));
+    for token in 0..64 {
+        c.query(token, "SELECT 1", None).expect("pipeline");
+    }
+    let body = b"SFATAL\0C57P01\0Mterminated by administrator\0\0";
+    let packet = [
+        b"E".as_slice(),
+        &((body.len() + 4) as u32).to_be_bytes(),
+        body,
+    ]
+    .concat();
+    c.receive(&packet).expect("fatal response");
+    let mut diagnostic = None;
+    assert_eq!(
+        allocation::allocations(|| {
+            diagnostic = Some(c.next_event().expect_err("fatal"));
+        }),
+        1,
+        "one shared copy of the terminal fields"
+    );
+    let diagnostic = diagnostic.expect("owned error");
+    assert_eq!(
+        allocation::allocations(|| {
+            c.abort(Error::Transport);
+            for token in 0..64 {
+                match c.next_event().expect("completion") {
+                    Some(Event::Completed {
+                        token: actual,
+                        outcome: Outcome::Aborted(error),
+                        ..
+                    }) => {
+                        assert_eq!(actual, token);
+                        assert_eq!(error, diagnostic);
+                    }
+                    event => panic!("missing pipeline abort: {event:?}"),
+                }
+            }
+            assert!(
+                matches!(c.next_event().expect("close"), Some(Event::Closed { reason }) if reason == diagnostic)
+            );
+            assert!(c.next_event().expect("no duplicate").is_none());
+        }),
+        0
+    );
+    assert_eq!(c.pending_count(), 0);
+}

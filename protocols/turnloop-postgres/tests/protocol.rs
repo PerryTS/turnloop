@@ -590,3 +590,120 @@ fn legacy_tls_acknowledgement_has_no_binding_and_uses_n_gs2_flag() {
     assert_eq!(&packet[5..19], b"SCRAM-SHA-256\0");
     assert!(packet[23..].starts_with(b"n,,"));
 }
+
+#[test]
+fn fatal_errors_abort_every_pending_token_and_preserve_diagnostics_after_eof() {
+    let mut ran = 0;
+    for severity in [
+        b"SFATAL\0".as_slice(),
+        b"SPANIQUE\0VPANIC\0",
+        b"SERREUR\0VFATAL\0",
+    ] {
+        for pending in [0, 3] {
+            let mut c = ready();
+            for token in 1..=pending {
+                c.query(token, "SELECT 1", None).expect("queue query");
+            }
+            let response = frame(
+                b'E',
+                &[
+                    severity,
+                    b"C57P01\0Mterminated by administrator\0Dretained detail\0\0",
+                ]
+                .concat(),
+            );
+            // A fragmented terminal response must not need ReadyForQuery or EOF.
+            for byte in &response[..response.len() - 1] {
+                c.receive(&[*byte]).expect("fragment");
+                assert!(c.next_event().expect("incomplete frame").is_none());
+            }
+            c.receive(&response[response.len() - 1..])
+                .expect("last fragment");
+            let error = c.next_event().expect_err("connection failure");
+            let Error::ConnectionAborted(ref failure) = error else {
+                panic!("lost server failure: {error:?}");
+            };
+            assert_eq!(failure.server_error().code(), "57P01");
+            assert_eq!(
+                failure.server_error().message(),
+                "terminated by administrator"
+            );
+            assert_eq!(failure.server_error().detail(), Some("retained detail"));
+            assert!(!c.is_ready());
+            assert!(c.output().is_empty(), "discard unsent pipeline output");
+            assert!(c.query(99, "SELECT 1", None).is_err());
+            c.abort(Error::Transport); // Scripted peer closes immediately after FATAL.
+            for token in 1..=pending {
+                match c.next_event().expect("terminal completion") {
+                    Some(Event::Completed {
+                        token: actual,
+                        outcome: Outcome::Aborted(reason),
+                        ..
+                    }) => {
+                        assert_eq!(actual, token);
+                        assert_eq!(reason, error);
+                    }
+                    event => panic!("missing aborted token: {event:?}"),
+                }
+            }
+            assert!(
+                matches!(c.next_event().expect("close"), Some(Event::Closed { reason }) if reason == error)
+            );
+            c.abort(Error::Cancelled);
+            assert!(c.next_event().expect("no duplicate").is_none());
+            assert_eq!(c.pending_count(), 0);
+            let io = std::io::Error::from(error);
+            assert_eq!(io.kind(), std::io::ErrorKind::ConnectionAborted);
+            assert!(
+                io.to_string()
+                    .contains("57P01: terminated by administrator")
+            );
+            ran += 1;
+        }
+    }
+    assert_eq!(ran, 6);
+}
+
+#[test]
+fn nonlocalized_severity_controls_statement_error_recovery() {
+    let mut c = ready();
+    c.query(1, "bad", None).expect("query");
+    flush(&mut c);
+    // V is authoritative even if S resembles a terminal severity.
+    c.receive(
+        &[
+            frame(b'E', b"SFATAL\0VERROR\0C42601\0Msyntax error\0\0"),
+            frame(b'Z', b"I"),
+        ]
+        .concat(),
+    )
+    .expect("response");
+    assert!(matches!(
+        c.next_event().expect("statement error"),
+        Some(Event::Error { token: Some(1), .. })
+    ));
+    assert!(matches!(
+        c.next_event().expect("ready"),
+        Some(Event::Completed {
+            outcome: Outcome::ServerError,
+            ..
+        })
+    ));
+    assert!(c.is_ready());
+    c.query(2, "SELECT 1", None).expect("reuse");
+    flush(&mut c);
+    c.receive(&[frame(b'C', b"SELECT 1\0"), frame(b'Z', b"I")].concat())
+        .expect("response");
+    assert!(matches!(
+        c.next_event().expect("tag"),
+        Some(Event::CommandComplete { token: 2, .. })
+    ));
+    assert!(matches!(
+        c.next_event().expect("success"),
+        Some(Event::Completed {
+            token: 2,
+            outcome: Outcome::Success,
+            ..
+        })
+    ));
+}

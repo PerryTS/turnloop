@@ -37,6 +37,7 @@ use turnloop_postgres::{
     asynchronous::{Client, ConnectOptions, Pool},
 };
 const AUTH: &[u8] = b"R\0\0\0\x08\0\0\0\0Z\0\0\0\x05I";
+const STATEMENT_ERROR: &[u8] = b"E\0\0\0\x1fSERROR\0C42601\0Mbad syntax\0\0Z\0\0\0\x05I";
 const RESULT: &[u8] = b"D\0\0\0\x0c\0\x01\0\0\0\x0242C\0\0\0\x0dSELECT 1\0Z\0\0\0\x05I";
 async fn startup_packet<S: Stream>(s: &mut S) {
     let mut length = [0; 4];
@@ -207,10 +208,14 @@ fn warmed_async_pool_queries_allocate_zero_and_idle_waits() {
             for _ in 0..1001 {
                 assert_eq!(query(&mut s).await, b"SELECT 42\0");
                 write_all(&mut s, RESULT).await.expect("reply");
+                assert_eq!(query(&mut s).await, b"bad\0");
+                write_all(&mut s, STATEMENT_ERROR)
+                    .await
+                    .expect("statement error");
             }
             let mut b = [0];
             assert_eq!(read(&mut s, &mut b).await.expect("EOF"), 0);
-            1001
+            2002
         })
         .expect("server");
     let idle = std::rc::Rc::new(std::cell::Cell::new(false));
@@ -262,6 +267,21 @@ fn warmed_async_pool_queries_allocate_zero_and_idle_waits() {
                         .expect("query"),
                         Outcome::Success
                     );
+                    let mut errors = 0;
+                    assert_eq!(
+                        c.query("bad", at, |event| {
+                            if let Event::Error { error, .. } = event {
+                                assert_eq!(error.code(), "42601");
+                                errors += 1;
+                            }
+                            Ok(())
+                        })
+                        .await
+                        .expect("statement failure"),
+                        Outcome::ServerError
+                    );
+                    assert_eq!(errors, 1);
+                    assert!(c.is_reusable(), "ReadyForQuery permits reuse after ERROR");
                     rows
                 })
                 .await;
@@ -296,7 +316,7 @@ fn warmed_async_pool_queries_allocate_zero_and_idle_waits() {
     }
     assert!(waited, "idle pooled connection spun instead of parking");
     drive(&mut ex, &mut client);
-    assert_eq!(drive(&mut ex, &mut server), 1001);
+    assert_eq!(drive(&mut ex, &mut server), 2002);
 }
 
 #[path = "support/scram.rs"]
@@ -616,4 +636,152 @@ fn tls_scram_uses_verified_leaf_override_or_unsupported_and_enforces_required() 
         );
     }
     assert_eq!(ran, 5, "all TLS SCRAM cases must run");
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FatalDuring {
+    Startup,
+    Query,
+    Execute,
+    CopyIn,
+    CopyOut,
+    Notification,
+}
+
+#[test]
+fn fatal_then_eof_is_a_connection_error_for_every_async_reader() {
+    let cases = [
+        FatalDuring::Startup,
+        FatalDuring::Query,
+        FatalDuring::Execute,
+        FatalDuring::CopyIn,
+        FatalDuring::CopyOut,
+        FatalDuring::Notification,
+    ];
+    let mut ran = 0;
+    for during in cases {
+        for severity in ["FATAL", "PANIC"] {
+            let mut ex = LocalExecutor::<Platform>::new(LoopConfig::default()).expect("executor");
+            let h = ex.handle();
+            let listener =
+                Listener::bind(&h, "127.0.0.1:0".parse().expect("address")).expect("listen");
+            let address = listener.local_addr().expect("address");
+            let drops = std::rc::Rc::new(std::cell::Cell::new(0));
+            let client_drops = drops.clone();
+            let mut server = ex.spawn_local(async move {
+                let mut s = listener.accept().await.expect("accept");
+                startup_packet(&mut s).await;
+                if !matches!(during, FatalDuring::Startup) {
+                    write_all(&mut s, AUTH).await.expect("auth");
+                    match during {
+                        FatalDuring::Execute => {
+                            let mut tags = Vec::new();
+                            loop {
+                                let mut header = [0; 5];
+                                exact(&mut s, &mut header).await;
+                                tags.push(header[0]);
+                                let n = u32::from_be_bytes(header[1..].try_into().expect("length")) as usize;
+                                assert!((4..1024).contains(&n));
+                                exact(&mut s, &mut vec![0; n - 4]).await;
+                                if header[0] == b'S' { break; }
+                            }
+                            assert_eq!(tags, b"PBDES");
+                        }
+                        FatalDuring::Notification => {}
+                        _ => { assert_eq!(query(&mut s).await, b"SELECT 1\0"); }
+                    }
+                }
+                let body = format!("SERREUR\0V{severity}\0C57P01\0Mterminated by administrator\0Dretained detail\0\0");
+                let packet = [b"E".as_slice(), &((body.len() + 4) as u32).to_be_bytes(), body.as_bytes()].concat();
+                write_all(&mut s, &packet).await.expect("fatal response");
+                close(&mut s).await.expect("server EOF");
+                1
+            }).expect("server");
+            let mut client = ex
+                .spawn_local(async move {
+                    let at = h.now() + Duration::from_secs(5);
+                    let stream = h
+                        .connect(address, Default::default())
+                        .await
+                        .expect("connect");
+                    let connected = Client::from_stream(
+                        &h,
+                        DropObserved {
+                            stream,
+                            drops: client_drops,
+                        },
+                        Default::default(),
+                        None,
+                        None,
+                        at,
+                    )
+                    .await;
+                    let error = if matches!(during, FatalDuring::Startup) {
+                        match connected {
+                            Err(e) => e,
+                            Ok(_) => panic!("fatal startup accepted"),
+                        }
+                    } else {
+                        let mut c = connected.expect("authenticated");
+                        let result = match during {
+                            FatalDuring::Query => {
+                                c.query("SELECT 1", at, |_| Ok(())).await.map(|_| ())
+                            }
+                            FatalDuring::Execute => c
+                                .execute(
+                                    turnloop_postgres::ExtendedQuery {
+                                        name: "",
+                                        sql: "SELECT 1",
+                                        oids: &[],
+                                        params: &[],
+                                        result_formats: &[],
+                                    },
+                                    at,
+                                    |_| Ok(()),
+                                )
+                                .await
+                                .map(|_| ()),
+                            FatalDuring::CopyIn => c.copy_in("SELECT 1", at).await.map(drop),
+                            FatalDuring::CopyOut => {
+                                c.copy_out("SELECT 1", at, |_| Ok(())).await.map(|_| ())
+                            }
+                            FatalDuring::Notification => c.notification(at).await.map(|_| ()),
+                            FatalDuring::Startup => unreachable!(),
+                        };
+                        let error = result.expect_err("fatal must not be an Outcome");
+                        assert!(!c.is_reusable());
+                        assert!(c.query("SELECT 1", at, |_| Ok(())).await.is_err());
+                        error
+                    };
+                    assert_eq!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionAborted,
+                        "{during:?}"
+                    );
+                    let Some(turnloop_postgres::Error::ConnectionAborted(failure)) =
+                        error.get_ref().and_then(|e| e.downcast_ref())
+                    else {
+                        panic!("missing typed diagnostic: {error:?}");
+                    };
+                    assert_eq!(failure.server_error().code(), "57P01");
+                    assert_eq!(
+                        failure.server_error().message(),
+                        "terminated by administrator"
+                    );
+                    assert_eq!(failure.server_error().get(b'V'), Some(severity));
+                    assert_eq!(failure.server_error().detail(), Some("retained detail"));
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("57P01: terminated by administrator")
+                    );
+                })
+                .expect("client");
+            drive(&mut ex, &mut client);
+            assert_eq!(drive(&mut ex, &mut server), 1);
+            assert_eq!(drops.get(), 1, "fatal reader must drop its transport once");
+            ran += 1;
+        }
+    }
+    assert_eq!(ran, 12);
 }

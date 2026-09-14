@@ -123,7 +123,7 @@ impl<B: Backend, S: Stream> Client<B, S> {
                             Event::Error { error, .. } => {
                                 return Err(io::Error::other(error.message().to_owned()));
                             }
-                            Event::Closed { reason } => return Err(io::Error::other(reason)),
+                            Event::Closed { reason } => return Err(reason.into()),
                             _ => {}
                         }
                         Ok(())
@@ -231,14 +231,18 @@ impl<B: Backend, S: Stream> Client<B, S> {
                 exchange
                     .next(&self.executor, |event| {
                         match &event {
-                            Event::Completed { outcome, .. } => done = Some(*outcome),
+                            Event::Completed {
+                                outcome: Outcome::Aborted(reason),
+                                ..
+                            } => return Err(reason.clone().into()),
+                            Event::Completed { outcome, .. } => done = Some(outcome.clone()),
                             Event::CopyIn { .. } => {
                                 return Err(io::Error::new(
                                     io::ErrorKind::InvalidInput,
                                     "use copy_in for COPY FROM STDIN",
                                 ));
                             }
-                            Event::Closed { reason } => return Err(io::Error::other(*reason)),
+                            Event::Closed { reason } => return Err(reason.clone().into()),
                             _ => {}
                         }
                         receive(event)
@@ -325,7 +329,7 @@ impl<B: Backend, S: Stream> Client<B, S> {
                                     payload: payload.into(),
                                 })
                             }
-                            Event::Closed { reason } => return Err(io::Error::other(reason)),
+                            Event::Closed { reason } => return Err(reason.into()),
                             _ => {}
                         }
                         Ok(())

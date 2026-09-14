@@ -141,6 +141,30 @@ impl ExactSizeIterator for Row<'_> {}
 /// ErrorResponse and NoticeResponse retain every field, including future fields.
 #[derive(Clone, Copy, Debug)]
 pub struct ServerError<'a>(pub(crate) &'a [u8]);
+
+/// Owned terminal server diagnostic. Clones share one copy of all wire fields.
+/// Only connection failure allocates; ordinary statement errors remain borrowed.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ConnectionFailure(std::sync::Arc<[u8]>);
+impl ConnectionFailure {
+    pub(crate) fn new(error: ServerError<'_>) -> Self {
+        Self(error.0.into())
+    }
+    pub fn server_error(&self) -> ServerError<'_> {
+        ServerError(&self.0)
+    }
+}
+impl std::fmt::Display for ConnectionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let error = self.server_error();
+        write!(f, "{}: {}", error.code(), error.message())
+    }
+}
+impl std::fmt::Debug for ConnectionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map().entries(self.server_error().fields()).finish()
+    }
+}
 impl<'a> ServerError<'a> {
     pub(crate) fn parse(body: &'a [u8]) -> Result<Self> {
         let mut c = Cursor(body);

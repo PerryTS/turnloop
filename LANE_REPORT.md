@@ -252,3 +252,84 @@ run `python3 scripts/test-servers.py --services postgres,mysql run python3 scrip
 after sourcing `.tools/wasm-env.sh` (UNRUN: sandbox). Linux/Windows runtime remains
 UNRUN without those hosts; full Windows all-target compilation needs the provider
 merge. Browser runtime is UNRUN; raw PostgreSQL TCP is not a browser capability.
+
+## adb-fix2 — SQL and parallel no-spin fixes complete
+
+Base `9862322`; no commits (`.git` is read-only). Integrator-owned PostgreSQL and
+MySQL servers remained running: sourced `.tools/sql-env.sh`, never used fixture
+start/run/stop or altered `.tools/sql`. No MySQL implementation changes were needed.
+
+### Root causes and fixes
+
+- PostgreSQL already recognized FATAL/PANIC, but replaced the diagnostic with
+  `Transport`; async `complete` accepted `Outcome::Aborted` as success. The core
+  now returns `Error::ConnectionAborted` immediately, retaining every error field
+  in one shared owned copy. It discards unsent output, rejects reuse, and drains
+  exactly one aborted completion per pending token followed by Closed. EOF cannot
+  overwrite the diagnostic. Async readers return `io::ErrorKind::ConnectionAborted`
+  with the typed error and close the stream. Ordinary ERROR remains borrowed and
+  becomes `Outcome::ServerError` only after ReadyForQuery. This agrees with
+  [PostgreSQL termination](https://www.postgresql.org/docs/16/protocol-flow.html#PROTOCOL-FLOW-TERMINATION)
+  and the [nonlocalized severity field](https://www.postgresql.org/docs/16/protocol-error-fields.html).
+- The no-spin failure was SIGCHLD interference: every child registration subscribes
+  to the process-wide signal, so unrelated parallel child exits notify the quiet
+  loop. Controlled 64-child churn reproduced the failure with only this test
+  selected; tracing found zero-timeout waits, no EINTR. Its unchanged 60-expiry
+  contract now runs in a fresh fixture process, with exit-status and exact output
+  checks. Backend code, counters and all numerical bounds are unchanged.
+- Repetition exposed a second fixture collision: two SIGUSR1 fan-out tests could
+  release each other's waiters, restore SIG_DFL, then kill the test process with
+  the other send (exit -30). A test-only mutex isolates those two fixtures. Each
+  still exercises four concurrent loops; stress retains all 256 rounds.
+
+### Coverage and verification
+
+Scripted FATAL/PANIC-then-EOF runs **12 cases across six async readers**, checking
+kind, SQLSTATE/message, retained detail and exactly-once stream drop. Fragmented
+core scripts check severity precedence, pending-token completion and EOF handling.
+The real PostgreSQL kill assertion is strengthened to require 57P01 and the exact
+message. Everything after it is unchanged and now executes successfully, including
+max_uses, pool.end and cancel-future timeout; no later failure was exposed.
+
+The allocation gates retain the original workload and zero thresholds. Added
+1,000 measured successful-query/statement-error pairs require zero allocations;
+one terminal diagnostic allocation is shared by **64 zero-allocation aborts**.
+PG's pure allocation suite is now mandatory on WASI too, using the existing p3
+release workaround. `Error`/`Outcome` are **Clone rather than Copy**, an intentional
+pre-alpha API change documented in the README. No DESIGN.md change is proposed.
+
+**Every invocation, including failures, is in [docs/adb-fix2-commands.md](docs/adb-fix2-commands.md).**
+Raw output, controlled reproducers and repetition commands are in `.tools/adb-fix2/`.
+
+| Verification | Result |
+| --- | --- |
+| Native real PostgreSQL async_server / server, SQL env sourced | PASS **2 / 4**; server includes one scripted startup rejection |
+| Native real MySQL async_server / server, SQL env sourced | PASS **1 / 3** |
+| `protocol-wasi --target wasm32-wasip2 --real-servers --package turnloop-postgres --package turnloop-mysql`, both env files sourced | PASS **24**, including all **3 real async SQL tests**, no ignored tests |
+| `protocol-wasi --target wasm32-wasip3 --package turnloop-postgres`, WASM env sourced | PASS **18** wire/async/allocation tests |
+| `cargo test --locked --workspace` (default parallel threads) | Earlier PASS **248**, 13 ignored; final rerun **FAIL** at unchanged UDP rebind test, detailed below |
+| `cargo test --locked --workspace --all-features` (default parallel threads) | PASS **304**, 20 ignored, including both touched crates and MySQL |
+| Full native_surface, 10 fresh parallel processes each in default/executor/all-feature modes | Final PASS **30/30**, **480 tests**, **1,800 no-spin expiries**; initial campaign FAIL from SIGUSR1 collision after 20 passes |
+| Strict workspace Clippy, default/all features; touched-crate all-target Clippy on Linux x86_64, WASI p2/p3, web | PASS; warnings and undocumented unsafe blocks denied |
+| Windows strict library and PG protocol/server/allocation test Clippy with existing Zig wrapper | PASS; runtime UNRUN |
+| Windows all-target Clippy | FAIL: inherited absent `backend::Platform` IOCP provider. Initial runs without the wrapper also failed on missing C headers |
+| Stable workspace/all-target/all-feature check; fmt; whitespace; path and feature gates | PASS |
+| `bash scripts/ci/no-tokio.sh`; `python3 scripts/ci/soak.py` | PASS: eight targets plus union; **251** locked versions, seven-day policy and sole existing rustls exception unchanged |
+| Source audit against 9862322 | PASS: production core, shared no-spin body, original PG allocation workload, later real-server assertions, lock/policies unchanged; no new unwrap or unsafe |
+
+### Remaining failures / next steps
+
+The final default workspace rerun hit an **independent, unchanged** core test:
+`backend::unix::udp_tests::cancelled_udp_with_cached_events_survives_exact_fd_and_port_reuse`,
+`crates/turnloop/src/backend/unix.rs:1073`, `libc::bind` returned -1 instead of 0.
+The assertion does not record errno, so the cause is **unconfirmed**. That invocation
+ran 10 successful core tests and one failure; subsequent suites were UNRUN in that
+invocation. The earlier complete default run and both all-feature workspace runs
+passed. No retry was used to replace this final FAIL, and no UDP assertion changed.
+Integrator should investigate the bind/reuse fixture separately.
+
+Linux/Windows native runtime and browser runtime are **UNRUN** (hosts unavailable;
+browsers have no raw SQL TCP). Full Windows test checking needs its existing
+provider integration. The integrator should commit this coherent tree and run
+those platforms. No other implementation question remains within adb-fix2; the
+UDP default-workspace failure and Windows provider remain explicit quality limits.
