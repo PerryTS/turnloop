@@ -207,7 +207,7 @@ fn curl_and_node_fetch_against_native_http1() {
         let server = thread::spawn(move || serve_h1(accept(listener)));
         let url = format!("http://{address}/interop");
         let output = if node {
-            Command::new("node").args(["--input-type=module","-e","setTimeout(()=>process.exit(70),10000).unref();const r=await fetch(process.argv[1]);if(r.status!==200)process.exit(2);console.log(await r.text());",&url]).output().unwrap()
+            Command::new("node").args(["--input-type=module","-e","setTimeout(()=>process.exit(70),10000).unref();const r=await fetch(process.argv[1]);if(r.status!==200)process.exit(2);console.log(await r.text());",&url]).output().expect("Node fetch must run")
         } else {
             Command::new("curl")
                 .args([

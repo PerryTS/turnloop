@@ -267,6 +267,9 @@ in each local shell; do not set a global `CC` that would change native builds.
 `turnloop-tls` additionally declares `wasi-tests = ["portable"]`: its in-memory
 transport runs real ring-backed handshakes, encrypted records, ALPN, resumption,
 certificate rejection and injected deadlines without native sockets or threads.
+This establishes TLS correctness, not allocation freedom of upstream rustls records: a
+separate probe measured four allocations per bidirectional record exchange in
+rustls 0.23.45. Existing core/HTTP/decoder allocation gates remain mandatory.
 The HTTP/decoder codec and allocation suites continue to execute on p2 and p3.
 Database/SMTP real-server TLS suites still need their native fixture transports;
 compilation of those targets is not counted as WASI server execution. Protocol

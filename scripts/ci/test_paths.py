@@ -100,6 +100,14 @@ class Paths(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(count, 0)
 
+    def test_conditional_path_keeps_default_module_reference(self):
+        errors, count = self.check({'Cargo.toml': '[package]\nname="p"',
+            'src/lib.rs': '#[cfg_attr(unix, path="unix.rs")] mod portable;',
+            'src/unix.rs': '', 'src/Portable.rs': ''})
+        self.assertEqual(count, 2)
+        self.assertEqual(len(errors), 1)
+        self.assertIn('Git tracks src/Portable.rs', errors[0])
+
     def test_parent_normalization_does_not_hide_wrong_directory_case(self):
         errors, count = self.check({'source.rs': 'include_str!("Data/../README.md");',
                                    'data/fixture.txt': '', 'README.md': ''})

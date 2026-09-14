@@ -123,3 +123,31 @@ hosts); SQL runtime UNRUN (sandbox). Record exact CI follow-ups and Windows excl
 - FAIL (exit 101): `cargo test --workspace -- --test-threads=1`; log `.tools/ci-fix4/1789407890795465000.log`.
 
 - PASS (exit 0): `cargo clippy --workspace --all-targets --all-features --target wasm32-wasip2 -- -D warnings -D clippy::undocumented_unsafe_blocks`; log `.tools/ci-fix4/1789407893177605000.log`.
+
+- PASS (exit 0): `cargo clippy --workspace --all-targets --all-features --target wasm32-unknown-unknown -- -D warnings -D clippy::undocumented_unsafe_blocks`; log `.tools/ci-fix4/1789407927205151000.log`.
+
+- PASS (exit 0): `cargo fmt --all`; log `.tools/ci-fix4/1789407947053317000.log`.
+
+- PASS (exit 0): `cargo test -p turnloop-tls --test portable`; log `.tools/ci-fix4/1789407947569113000.log`.
+
+- PASS (exit 0): `python3 -W error -m unittest discover -s scripts/ci -p 'test_*.py' -v`; log `.tools/ci-fix4/1789407970049827000.log`.
+
+- PASS (exit 0): `python3 scripts/ci/run-tests.py protocol-wasi --target wasm32-wasip2`; log `.tools/ci-fix4/1789407968791800000.log`.
+
+- PASS (exit 0): `python3 scripts/ci/run-tests.py protocol-wasi --target wasm32-wasip3`; log `.tools/ci-fix4/1789407978545291000.log`.
+
+- PASS (exit 0): `python3 -m unittest discover -s scripts/ci -p test_paths.py -v`; log `.tools/ci-fix4/1789408010252153000.log`.
+
+- PASS (exit 0): `cargo test --workspace -- --test-threads=1`; log `.tools/ci-fix4/1789408018254092000.log`.
+
+- PASS (exit 0): `cargo fmt --all`; log `.tools/ci-fix4/1789408067998438000.log`.
+
+- PASS (exit 0): `python3 -m unittest discover -s scripts/ci -p test_paths.py -v`; log `.tools/ci-fix4/1789408143310554000.log`.
+
+- PASS (exit 0): `python3 scripts/ci/check-paths.py`; log `.tools/ci-fix4/1789408143925710000.log`.
+
+- FAIL (exit 1): `python3 scripts/ci/run-tests.py native`; log `.tools/ci-fix4/1789408068446759000.log`.
+
+- PASS (exit 0): `cargo clippy --workspace --all-targets -- -D warnings -D clippy::undocumented_unsafe_blocks`; log `.tools/ci-fix4/1789408198789189000.log`.
+
+- PASS (exit 0): `cargo clippy --workspace --all-targets --target wasm32-wasip2 -- -D warnings`; log `.tools/ci-fix4/1789408199413988000.log`.

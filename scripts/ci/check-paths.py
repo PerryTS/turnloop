@@ -150,13 +150,14 @@ class Check:
                 if prefix not in self.directories:
                     return False
             return True
+        requested = list(candidates)
         valid = [valid_parents(c) for c in candidates]
         candidates = [posixpath.normpath(c) for c in candidates]
         if any(ok and (c in self.tracked or (directory and c in self.directories))
                for c, ok in zip(candidates, valid)):
             return
         hints = [self.folded[c.casefold()] for c in candidates if c.casefold() in self.folded]
-        self.errors.append(f'{origin}: exact case is not tracked: {" or ".join(candidates)}'
+        self.errors.append(f'{origin}: exact case is not tracked: {" or ".join(requested)}'
                            + (f' (Git tracks {", ".join(hints)})' if hints else ''))
 
     def manifest_dir(self, source):
@@ -171,7 +172,7 @@ class Check:
         values = [t.value for t in ts]
         if values == ['env', '!', '(', 'CARGO_MANIFEST_DIR', ')'] and ts[3].string:
             # Preserve spelling; never use case-insensitive Path.resolve here.
-            return str(self.root / self.manifest_dir(source))
+            return (self.root / self.manifest_dir(source)).as_posix()
         if len(ts) >= 4 and values[:3] == ['concat', '!', '('] and values[-1] == ')':
             args = ts[3:-1]
             pieces = []
@@ -208,8 +209,8 @@ class Check:
                     end = matching(items, i + 2)
                     try:
                         ref = self.expression(items[i+3:end], path)
-                        if ref.startswith('/'):
-                            target = posixpath.relpath(ref, str(self.root))
+                        if ref.startswith('/') or re.match(r'^[A-Za-z]:/', ref):
+                            target = posixpath.relpath(ref, self.root.as_posix())
                         else:
                             target = posixpath.join(parent, ref)
                         self.require(origin(token), [target])
@@ -225,16 +226,36 @@ class Check:
                 t = items[i]
                 if not t.string and t.value == '#' and i+1 < len(items) and items[i+1].value == '[':
                     end = matching(items, i+1)
-                    attrs.extend(items[i+2:end])
+                    attrs.append(items[i+2:end])
                     i = end + 1
                 elif not t.string and t.value == 'mod' and i+2 < len(items) and items[i+2].value in (';', '{'):
                     name = items[i+1].value
                     paths = []
-                    for j, attr in enumerate(attrs[:-2]):
-                        if not attr.string and attr.value == 'path' and attrs[j+1].value == '=':
-                            if not attrs[j+2].string:
-                                raise ValueError(f'{origin(attr)}: nonliteral #[path]')
-                            paths.append(posixpath.join(attribute_dir, attrs[j+2].value))
+                    conditions = set()
+                    unconditional = False
+                    for group in attrs:
+                        found = False
+                        for j, attr in enumerate(group[:-2]):
+                            if not attr.string and attr.value == 'path' and group[j+1].value == '=':
+                                if not group[j+2].string:
+                                    raise ValueError(f'{origin(attr)}: nonliteral #[path]')
+                                paths.append(posixpath.join(attribute_dir, group[j+2].value))
+                                found = True
+                        if found:
+                            if group[0].value == 'path':
+                                unconditional = True
+                            elif group[0].value == 'cfg_attr':
+                                end = 2
+                                while end < len(group) and group[end].value != ',':
+                                    if group[end].value in ('(', '[', '{') and not group[end].string:
+                                        end = matching(group, end)
+                                    end += 1
+                                conditions.add(tuple(t.value for t in group[2:end]))
+                    # A conditional path still leaves a default module reference.
+                    # Only unconditional/all() or a predicate and its exact negation
+                    # prove every branch uses #[path]; other cases check the fallback.
+                    covered = unconditional or ('all', '(', ')') in conditions or any(
+                        ('not', '(', *condition, ')') in conditions for condition in conditions)
                     if items[i+2].value == ';':
                         if paths:
                             for ref in paths:
@@ -242,7 +263,7 @@ class Check:
                                 ref = posixpath.normpath(ref)
                                 if ref in self.tracked:
                                     self.pending.append((ref, posixpath.dirname(ref)))
-                        else:
+                        if not paths or not covered:
                             candidates = [posixpath.join(default_dir, name + '.rs'),
                                           posixpath.join(default_dir, name, 'mod.rs')]
                             self.require(origin(t), candidates)
@@ -254,8 +275,9 @@ class Check:
                         i += 3
                     else:
                         end = matching(items, i+2)
-                        for directory in paths or [posixpath.join(default_dir, name)]:
-                            if paths:
+                        directories = paths + ([posixpath.join(default_dir, name)] if not covered else [])
+                        for directory in directories:
+                            if directory in paths:
                                 self.require(origin(t), [directory], directory=True)
                             modules(items[i+3:end], directory, directory)
                         i = end + 1

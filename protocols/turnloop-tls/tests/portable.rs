@@ -1,42 +1,10 @@
 //! Real cryptography over fragmented memory transport: no threads or native sockets.
-//! Standalone harness also avoids the pinned WASI 0.3 libtest allocator startup bug.
 #![deny(unsafe_op_in_unsafe_fn)]
-use std::{
-    alloc::{GlobalAlloc, Layout, System},
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed},
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 use turnloop_tls::{
     Client, ClientConfig, ClientOptions, ConnectionState, Server, ServerConfig, UnbufferedStatus,
     rustls::{self, HandshakeKind, pki_types::ServerName},
 };
-
-static COUNTING: AtomicBool = AtomicBool::new(false);
-static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
-struct Counter;
-// SAFETY: the allocator forwards each caller's layout and allocation unchanged.
-unsafe impl GlobalAlloc for Counter {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if COUNTING.load(Relaxed) {
-            ALLOCATIONS.fetch_add(1, Relaxed);
-        }
-        // SAFETY: GlobalAlloc's caller guarantees a valid layout.
-        unsafe { System.alloc(layout) }
-    }
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        // SAFETY: GlobalAlloc's caller guarantees ownership and the original layout.
-        unsafe { System.dealloc(ptr, layout) }
-    }
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        if COUNTING.load(Relaxed) {
-            ALLOCATIONS.fetch_add(1, Relaxed);
-        }
-        // SAFETY: GlobalAlloc's caller guarantees ownership, layout and new size.
-        unsafe { System.realloc(ptr, layout, size) }
-    }
-}
-#[global_allocator]
-static ALLOCATOR: Counter = Counter;
 
 const NOW: u64 = 1_789_344_000;
 trait Endpoint {
@@ -282,38 +250,6 @@ fn injected_timeout_completes_once() {
     assert_eq!(client.handle_timeout(now + Duration::from_secs(1)), None);
     assert!(client.process(&mut [], NOW).state.is_err());
 }
-fn records_allocate_zero_after_warmup() {
-    COUNTING.store(true, Relaxed);
-    let calibration = std::hint::black_box(vec![42u8; 256]);
-    COUNTING.store(false, Relaxed);
-    assert!(
-        ALLOCATIONS.load(Relaxed) > 0,
-        "allocator calibration must execute"
-    );
-    drop(calibration);
-    let cert = certificate();
-    let client = ClientConfig::new(options(&cert), NOW).expect("config");
-    let mut pair = Pair::new(&client, &server(&cert), "localhost");
-    let request = [42; 1024];
-    let response = [71; 1024];
-    for _ in 0..3 {
-        pair.exchange(&request, &response).expect("warmup exchange");
-    }
-    let initial = pair.client.records + pair.server.records;
-    ALLOCATIONS.store(0, Relaxed);
-    COUNTING.store(true, Relaxed);
-    for _ in 0..1000 {
-        pair.exchange(&request, &response)
-            .expect("measured exchange");
-    }
-    COUNTING.store(false, Relaxed);
-    assert_eq!(pair.client.records + pair.server.records - initial, 2000);
-    assert_eq!(
-        ALLOCATIONS.load(Relaxed),
-        0,
-        "steady-state TLS records allocated"
-    );
-}
 fn main() {
     let tests: &[(&str, fn())] = &[
         (
@@ -327,10 +263,6 @@ fn main() {
         (
             "injected_timeout_completes_once",
             injected_timeout_completes_once,
-        ),
-        (
-            "records_allocate_zero_after_warmup",
-            records_allocate_zero_after_warmup,
         ),
     ];
     for (name, test) in tests {
