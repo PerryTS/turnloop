@@ -9,12 +9,76 @@ use crate::{
     *,
 };
 use std::{
+    collections::VecDeque,
     os::{
         fd::{AsRawFd, OwnedFd},
         unix::process::ExitStatusExt,
     },
     process::Child,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
+
+// One coalesced readiness credit per live handle. The atomic empty fast path
+// avoids both locking and table scans on idle turns. Dispatcher publication and
+// release serialize on the mutex; release removes queued generations before reuse.
+pub(super) struct ReadyQueue {
+    pending: AtomicBool,
+    state: Mutex<ReadyState>,
+}
+struct ReadyState {
+    queue: VecDeque<Handle>,
+    queued: Vec<bool>,
+}
+impl ReadyQueue {
+    fn new(capacity: usize) -> Self {
+        Self {
+            pending: AtomicBool::new(false),
+            state: Mutex::new(ReadyState {
+                queue: VecDeque::with_capacity(capacity),
+                queued: vec![false; capacity],
+            }),
+        }
+    }
+    pub fn push(&self, h: Handle) {
+        let mut s = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !s.queued[h.index()] {
+            s.queued[h.index()] = true;
+            s.queue.push_back(h);
+            self.pending.store(true, Ordering::Release);
+        }
+    }
+    fn pop(&self) -> Option<Handle> {
+        if !self.has_work() {
+            return None;
+        }
+        let mut s = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let h = s.queue.pop_front()?;
+        s.queued[h.index()] = false;
+        self.pending.store(!s.queue.is_empty(), Ordering::Release);
+        Some(h)
+    }
+    fn remove(&self, h: Handle) {
+        let mut s = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        s.queue.retain(|&queued| queued != h);
+        s.queued[h.index()] = false;
+        self.pending.store(!s.queue.is_empty(), Ordering::Release);
+    }
+    fn has_work(&self) -> bool {
+        self.pending.load(Ordering::Acquire)
+    }
+}
 
 struct ChildState {
     child: Child,
@@ -22,17 +86,19 @@ struct ChildState {
     group: bool,
     pidfd: Option<OwnedFd>,
     fallback: Option<Subscription>,
-    ready: bool,
 }
 impl ChildState {
+    fn save_status(&mut self, status: std::process::ExitStatus) {
+        self.status = Some(ExitStatus {
+            code: status.code(),
+            signal: status.signal(),
+        });
+    }
     fn reap(&mut self) -> Result<Option<ExitStatus>> {
         if self.status.is_none()
             && let Some(status) = self.child.try_wait().map_err(Error::from)?
         {
-            self.status = Some(ExitStatus {
-                code: status.code(),
-                signal: status.signal(),
-            });
+            self.save_status(status);
         }
         Ok(self.status)
     }
@@ -74,12 +140,16 @@ struct Entry {
 }
 pub(super) struct Services {
     entries: Vec<Option<Entry>>,
+    operations: Vec<Option<Handle>>,
+    ready: Arc<ReadyQueue>,
     notifier: Option<Notifier>,
 }
 impl Services {
-    pub fn new(capacity: usize) -> Self {
+    pub fn new(config: &Config) -> Self {
         Self {
-            entries: (0..capacity).map(|_| None).collect(),
+            entries: (0..config.max_handles).map(|_| None).collect(),
+            operations: vec![None; config.max_operations],
+            ready: Arc::new(ReadyQueue::new(config.max_handles)),
             notifier: None,
         }
     }
@@ -98,7 +168,7 @@ impl Services {
             .is_some_and(|e| e.handle == h)
     }
     pub fn signal(&mut self, h: Handle, signal: Signal) -> Result<()> {
-        let ticket = signals::subscribe(signal, self.notifier()?)?;
+        let ticket = signals::subscribe(signal, self.notifier()?, h, self.ready.clone())?;
         self.entries[h.index()] = Some(Entry {
             handle: h,
             kind: Kind::Signal(signal, ticket),
@@ -120,15 +190,28 @@ impl Services {
             status: None,
             pidfd: None,
             fallback: None,
-            ready: true,
         };
         // NOTE_EXIT can precede waitpid visibility on a heavily loaded kqueue.
         // A shared SIGCHLD subscription supplies a later reaping opportunity,
         // without polling or a thread per child. Subscribe before the first check.
-        state.fallback = Some(signals::subscribe(Signal::Chld, self.notifier()?)?);
+        state.fallback = Some(signals::subscribe(
+            Signal::Chld,
+            self.notifier()?,
+            h,
+            self.ready.clone(),
+        )?);
         match poller.process(state.child.id(), h.key()) {
             Ok(fd) => state.pidfd = fd,
             Err(e) => {
+                if e.os == Some(libc::ESRCH) {
+                    // Registration can see an exiting task before WNOHANG sees
+                    // its wait status (notably XNU's EVFILT_PROC). It is already
+                    // leaving: wait for this owned PID, retrying EINTR in std,
+                    // and retain the normal exit for the submitted operation.
+                    // This happens during spawn, never inside a loop turn.
+                    let status = state.child.wait().map_err(Error::from)?;
+                    state.save_status(status);
+                }
                 // A child can exit between spawn and kqueue registration. Reap
                 // immediately before interpreting registration failure.
                 if state.reap()?.is_none() {
@@ -171,19 +254,24 @@ impl Services {
         }
         e.op = Some(request.op);
         e.cancelled = false;
+        self.operations[request.op.index()] = Some(request.handle);
+        // The first child probe covers exit during successful registration.
+        if matches!(e.kind, Kind::Child(_)) || matches!(&e.kind, Kind::Signal(_, t) if t.ready()) {
+            self.ready.push(request.handle);
+        }
         Ok(())
     }
     pub fn cancel(&mut self, op: OpId) -> bool {
-        for e in self.entries.iter_mut().flatten() {
-            if e.op == Some(op) {
-                e.cancelled = true;
-                if let Kind::Child(c) = &mut e.kind {
-                    c.ready = true;
-                }
-                return true;
-            }
+        let Some(h) = self.operations.get(op.index()).copied().flatten() else {
+            return false;
+        };
+        let e = self.entries[h.index()].as_mut().expect("service operation");
+        if e.op != Some(op) {
+            return false;
         }
-        false
+        e.cancelled = true;
+        self.ready.push(h);
+        true
     }
     pub fn ready(&mut self, key: u64) -> bool {
         if let Some(e) = self
@@ -192,33 +280,31 @@ impl Services {
             .and_then(Option::as_mut)
             .filter(|e| e.handle.key() == key)
         {
-            if let Kind::Child(state) = &mut e.kind {
-                state.ready = true;
+            if e.op.is_some() {
+                self.ready.push(e.handle);
             }
             return true;
         }
         false
     }
-    fn runnable(e: &Entry) -> bool {
-        e.op.is_some()
-            && match &e.kind {
-                Kind::Child(c) => {
-                    c.ready || c.status.is_some() || c.fallback.as_ref().is_some_and(|s| s.ready())
-                }
-                Kind::Signal(_, ticket) => e.cancelled || ticket.ready(),
-            }
-    }
     pub fn has_work(&self) -> bool {
-        self.entries.iter().flatten().any(Self::runnable)
+        self.ready.has_work()
     }
     pub fn poll(&mut self, events: &mut Vec<Event<Detached>>) {
-        for e in self.entries.iter_mut().flatten() {
+        // Bound work even if a producer continuously replenishes readiness.
+        for _ in 0..events.capacity() {
             if events.len() == events.capacity() {
                 break;
             }
-            if !Self::runnable(e) {
+            let Some(h) = self.ready.pop() else {
+                break;
+            };
+            let Some(e) = self.entries[h.index()]
+                .as_mut()
+                .filter(|e| e.handle == h && e.op.is_some())
+            else {
                 continue;
-            }
+            };
             let (result, terminal) = match &mut e.kind {
                 Kind::Signal(signal, ticket) => {
                     if e.cancelled {
@@ -231,7 +317,6 @@ impl Services {
                     }
                 }
                 Kind::Child(c) => {
-                    c.ready = false;
                     if let Some(ticket) = &c.fallback {
                         ticket.take();
                     }
@@ -252,6 +337,7 @@ impl Services {
             let op = e.op.expect("runnable operation");
             if terminal {
                 e.op = None;
+                self.operations[op.index()] = None;
             }
             events.push(Event {
                 op,
@@ -271,7 +357,7 @@ impl Services {
             if c.reap()?.is_none() {
                 c.kill(Signal::Kill, c.group)?;
             }
-            c.ready = true;
+            self.ready.push(h);
         }
         Ok(())
     }
@@ -298,6 +384,8 @@ impl Services {
                 poller.remove_process(c.child.id(), c.pidfd.as_ref().map(AsRawFd::as_raw_fd));
             }
             self.entries[h.index()] = None;
+            // Dropping the subscription first waits for any dispatcher delivery.
+            self.ready.remove(h);
         }
     }
 }

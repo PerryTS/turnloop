@@ -7,6 +7,7 @@ use crate::{
     *,
 };
 use std::{
+    collections::VecDeque,
     os::fd::{AsRawFd, OwnedFd},
     sync::{
         Arc, Condvar, Mutex,
@@ -89,6 +90,7 @@ struct Active {
     submitted: bool,
     cancelled: bool,
     multishot: bool,
+    awaiting_pool: bool,
 }
 pub(super) struct Files {
     slots: Vec<Arc<Slot>>,
@@ -99,6 +101,8 @@ pub(super) struct Files {
     config: PoolConfig,
     pool: BufferPool,
     leases: Vec<Option<BufLease>>,
+    ready: VecDeque<usize>,
+    awaiting_pool: VecDeque<usize>,
 }
 impl Files {
     pub fn new(config: &Config, pool: BufferPool) -> Self {
@@ -125,6 +129,8 @@ impl Files {
             config: config.blocking_pool,
             pool,
             leases: (0..config.max_operations).map(|_| None).collect(),
+            ready: VecDeque::with_capacity(config.max_handles),
+            awaiting_pool: VecDeque::with_capacity(config.max_handles),
         }
     }
     pub fn set_notifier(&mut self, notifier: Notifier) {
@@ -150,6 +156,7 @@ impl Files {
             self.active[tail].as_mut().expect("file tail").next = Some(op.index());
         } else {
             self.heads[h] = Some(op.index());
+            self.ready.push_back(op.index());
         }
         self.tails[h] = Some(op.index());
         self.active[op.index()] = Some(Active {
@@ -161,6 +168,7 @@ impl Files {
             submitted: false,
             cancelled: false,
             multishot,
+            awaiting_pool: false,
         });
         Ok(())
     }
@@ -174,6 +182,11 @@ impl Files {
             return false;
         };
         active.cancelled = true;
+        if active.awaiting_pool {
+            active.awaiting_pool = false;
+            self.awaiting_pool.retain(|&i| i != op.index());
+            self.ready.push_back(op.index());
+        }
         if active.submitted {
             self.slots[op.index()].cancel.store(true, Ordering::Release);
         }
@@ -181,26 +194,21 @@ impl Files {
     }
     pub fn has_work(&self) -> bool {
         !self.port.results.is_empty()
-            || self.heads.iter().flatten().any(|&i| {
-                let a = self.active[i].as_ref().expect("file head");
-                !a.submitted
-                    && (a.cancelled
-                        || !matches!(
-                            a.request.as_ref().map(|r| &r.operation),
-                            Some(Operation::Read {
-                                buf: ReadBuf::Pooled,
-                                ..
-                            })
-                        )
-                        || self.pool.available())
-            })
+            || !self.ready.is_empty()
+            || (!self.awaiting_pool.is_empty() && self.pool.available())
     }
     fn start(&mut self) {
-        for &i in self.heads.iter().flatten() {
-            let active = self.active[i].as_mut().expect("file head");
-            if active.submitted {
-                continue;
+        // Retry only after a lease is available, never by scanning idle handles
+        // or running jobs. At most one queue credit exists per file head.
+        if !self.awaiting_pool.is_empty() && self.pool.available() {
+            while let Some(i) = self.awaiting_pool.pop_front() {
+                self.active[i].as_mut().expect("pool waiter").awaiting_pool = false;
+                self.ready.push_back(i);
             }
+        }
+        while let Some(i) = self.ready.pop_front() {
+            let active = self.active[i].as_mut().expect("file head");
+            debug_assert!(!active.submitted);
             if active.cancelled {
                 active.submitted = true;
                 active.request = None;
@@ -224,6 +232,8 @@ impl Files {
             );
             if needs_pool {
                 let Some(mut lease) = self.pool.acquire() else {
+                    active.awaiting_pool = true;
+                    self.awaiting_pool.push_back(i);
                     continue;
                 };
                 let bytes = lease.writable();
@@ -306,6 +316,8 @@ impl Files {
                 self.heads[active.handle.index()] = active.next;
                 if active.next.is_none() {
                     self.tails[active.handle.index()] = None;
+                } else if let Some(next) = active.next {
+                    self.ready.push_back(next);
                 }
             } else {
                 active.submitted = false;
@@ -317,6 +329,7 @@ impl Files {
                         multishot: true,
                     },
                 });
+                self.ready.push_back(i);
             }
             events.push(Event {
                 op: event.op,

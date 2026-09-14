@@ -258,7 +258,7 @@ unsafe impl Backend for Unix {
             polled: Vec::with_capacity(config.events_per_turn),
             files: super::files::Files::new(config, pool.clone()),
             pool,
-            services: super::services::Services::new(config.max_handles),
+            services: super::services::Services::new(config),
         })
     }
     fn set_notifier(&mut self, notifier: Notifier) {
