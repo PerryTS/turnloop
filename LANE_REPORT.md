@@ -114,19 +114,19 @@ five fresh processes for each configuration. macOS counters are process-reported
 user-only counts. No baseline subtraction or speedup claim is made.
 
 Raw data: [core-macos-arm64.jsonl](benchmarks/core-macos-arm64.jsonl).
-Source SHA-256: `a0aa1e9a8e896ecc1df4cdc5b75b64b23c41830c3170519f1bce75825457282b` (manifests, lockfile, Rust sources, toolchain and
+Source SHA-256: `46e6c5900426150de0a61b769ec455f8a01f8f7d4d2398932f40ff7981ada7c5` (manifests, lockfile, Rust sources, toolchain and
 Cargo configuration); recomputation matched after final verification.
 
 | Workload | Instructions per operation |
 |---|---:|
-| `control` | [9.01, 9.04] |
-| `idle_turn` | [11,032.67, 11,245.36] |
-| `notify_turn` | [11,057.84, 11,196.78] |
-| `timer_start_cancel_deliver_close` | [1,957.86, 1,975.50] |
-| `timer_start_cancel` | [726.56, 727.89] |
-| `tcp_batch_64` | [44,175.37, 46,785.82] |
-| `tcp_batch_4096` | [51,332.94, 55,440.99] |
-| `accept` | [27,453.22, 27,991.75] |
+| `control` | [9.04, 9.27] |
+| `idle_turn` | [12,586.11, 13,312.10] |
+| `notify_turn` | [12,384.67, 13,115.96] |
+| `timer_start_cancel_deliver_close` | [1,970.52, 1,980.18] |
+| `timer_start_cancel` | [726.58, 730.50] |
+| `tcp_batch_64` | [43,242.92, 51,020.12] |
+| `tcp_batch_4096` | [47,743.46, 58,169.63] |
+| `accept` | [27,513.62, 27,898.75] |
 
 `notify_turn` is a running notify followed by a nonblocking turn, with zero wake
 syscalls asserted. Parked notification is separately exercised by the contract.
@@ -137,22 +137,24 @@ The control performs 1,000,000 iterations; all measured work counters are positi
 
 | Queue size | Operation | Four-ary heap | BTreeMap |
 |---:|---|---:|---:|
-| 10 | insert | [66.35, 66.54] | [191.39, 193.11] |
-| 10 | cancel | [165.47, 165.59] | [180.37, 180.69] |
-| 10 | expire | [217.26, 217.36] | [236.47, 236.47] |
-| 1,000 | insert | [104.98, 105.11] | [440.47, 443.25] |
-| 1,000 | cancel | [126.80, 127.05] | [465.08, 474.67] |
-| 1,000 | expire | [673.36, 676.16] | [398.79, 408.76] |
-| 100,000 | insert | [94.83, 95.21] | [627.95, 634.50] |
-| 100,000 | cancel | [140.92, 142.37] | [679.00, 687.57] |
-| 100,000 | expire | [1,129.94, 1,135.42] | [464.31, 464.36] |
+| 10 | insert | [66.35, 66.55] | [189.81, 194.64] |
+| 10 | cancel | [165.47, 166.61] | [180.49, 183.68] |
+| 10 | expire | [217.27, 217.80] | [236.46, 237.70] |
+| 1,000 | insert | [104.98, 107.81] | [439.27, 444.06] |
+| 1,000 | cancel | [126.80, 128.75] | [463.84, 488.80] |
+| 1,000 | expire | [673.66, 676.41] | [398.81, 402.83] |
+| 100,000 | insert | [93.16, 95.38] | [627.54, 635.37] |
+| 100,000 | cancel | [140.98, 142.03] | [680.89, 690.32] |
+| 100,000 | expire | [1,129.91, 1,132.64] | [464.31, 466.23] |
 
 Each queue workload performs 100,000 counted operations per process. BTreeMap stays
 as a comparison behind `timer-btree`; production uses the heap in all feature
 configurations because the BTree allocation failure is reproducible. These are
 initial baselines, not calibrated regression budgets. The earlier noisy control run
 is preserved in [core-macos-arm64-initial.jsonl](benchmarks/core-macos-arm64-initial.jsonl).
-
+The final control still varies from 9.04 to 9.27 instructions/iteration, and TCP
+ranges are wider. Treat these as observed baselines; tighter regression thresholds
+need a controlled measurement host. No rounds were excluded from the ranges.
 
 ## Deviations, decisions and proposed specification clarifications
 
@@ -429,3 +431,44 @@ cross-checking is not execution of target tests.
   control does 1,000,000 actual iterations to amortize counter/page-fault overhead;
   the final range is recorded in the baseline table above. No samples
   were discarded or thresholds loosened. Other operation ranges remain visible.
+
+### Final backpressure and liveness corrections
+
+- Terminal operation references now persist until output delivery. A queued Closed
+  result also keeps a referenced timer alive; set_ref on closing and completed
+  timers adjusts the queued references. The generic capacity-one regression drains
+  all three ready timer results and both Cancelled/Closed results using alive(),
+  and checks unref/ref while the terminal result is queued.
+- Review found shared event capacity could be consumed before synchronous timer
+  cancellations. Added a counting-allocator regression with a full timer/post
+  backlog before changing the implementation.
+  **FAIL:** `cargo +nightly-2026-08-20 test -p windlass-contract --test allocations cancellation_reserves_survive_a_full_event_backlog`:
+  `cancel/close reserves under backpressure`, `left: 1`, `right: 0`.
+- Core now reserves max_operations terminal slots, max_handles Closed slots, and
+  separate events_per_turn budgets for native multishot events, timer ticks and
+  posts. Credits return only on delivery. Native polling can make nonblocking
+  progress through a timer/post backlog; queued pure-core results need no OS call.
+- **FAIL:** the first `sh scripts/verify-core.sh` after this change found
+  `native::bounded_capacity_and_stale_ids`, os_waits `left: 1`, `right: 0`.
+  The existing assertion was preserved. Tracking native pending operations avoids
+  an unnecessary poll when only core results are queued.
+- **PASS:** the backlog regression now delivers 80 posts, 16 cancellations and 16
+  closes with zero allocations. The shared timer-backlog contract additionally
+  checks 64 actual TCP bytes and one write completion alongside timer/post progress.
+- **PASS:** final `sh scripts/verify-core.sh`: formatting, native all-feature Clippy,
+  both complete 27-test configurations, five loom models, Linux all-feature Clippy
+  and stable locked check. The script now runs the entire all-feature workspace
+  suite, retaining the wide allocation gate.
+- **PASS:** final all-feature cross-Clippy for web/WASI 0.2/Windows common code,
+  locked Rust 1.98 checking, and all-feature Miri (3 pure-core tests), with the
+  exact commands in the final matrix. Separate cfg(loom) Clippy also passes.
+- **PASS:** final five-round benchmark run and JSONL audit: 130 measurements, every
+  workload/round present, positive subject counters and matching source fingerprint.
+  These results replace earlier intermediate measurements in the main baseline file.
+- Read-only process inspection (`pgrep -fl 'benchmark-core|cargo|rustc'`) was unavailable:
+  `sysmon request failed ... sysmond service not found`. This was not a test failure;
+  command completion and persisted logs supplied the final verification evidence.
+- **PASS:** `git diff --check`; `rg -n 'unwrap\(' crates/windlass/src` returned
+  no matches (rg status 1, the expected successful audit outcome). Final Git status
+  showed the report and final raw benchmark JSONL awaiting the integrator's commit;
+  source updates had been externally checkpointed, most recently at `e2eb85c`.
