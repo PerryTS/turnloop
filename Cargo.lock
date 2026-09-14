@@ -1763,7 +1763,7 @@ dependencies = [
 
 [[package]]
 name = "turnloop"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "futures-io",
  "js-sys",
@@ -1776,7 +1776,7 @@ dependencies = [
 
 [[package]]
 name = "turnloop-bench"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "gungraun",
  "libc",
@@ -1786,7 +1786,7 @@ dependencies = [
 
 [[package]]
 name = "turnloop-contract"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "bson",
  "futures-io",
@@ -1802,7 +1802,7 @@ dependencies = [
 
 [[package]]
 name = "turnloop-http"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "base64",
  "brotli",
@@ -1820,7 +1820,7 @@ dependencies = [
 
 [[package]]
 name = "turnloop-mongodb"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "base64",
  "bson",
@@ -1839,7 +1839,7 @@ dependencies = [
 
 [[package]]
 name = "turnloop-mysql"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "bytes",
  "flate2",
@@ -1851,7 +1851,7 @@ dependencies = [
 
 [[package]]
 name = "turnloop-postgres"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "bytes",
  "postgres-protocol",
@@ -1862,14 +1862,14 @@ dependencies = [
 
 [[package]]
 name = "turnloop-redis"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "rustls",
 ]
 
 [[package]]
 name = "turnloop-smtp"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "base64",
  "email-encoding",
@@ -1879,7 +1879,7 @@ dependencies = [
 
 [[package]]
 name = "turnloop-tls"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "rcgen",
  "ring",
@@ -1890,7 +1890,7 @@ dependencies = [
 
 [[package]]
 name = "turnloop-wasi-random"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "getrandom 0.3.4",
  "getrandom 0.4.3",
@@ -1898,7 +1898,7 @@ dependencies = [
 
 [[package]]
 name = "turnloop-websocket"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "base64",
  "bytes",
@@ -1910,7 +1910,7 @@ dependencies = [
 
 [[package]]
 name = "turnloop-zstd-decoder"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "criterion",
  "fastrand",

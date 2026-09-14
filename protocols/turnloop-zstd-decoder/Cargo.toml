@@ -11,6 +11,9 @@ readme = "README.md"
 keywords = ["zstd", "zstandard", "decompression"]
 categories = ["compression"]
 documentation = "https://docs.rs/turnloop-zstd-decoder"
+# The decode/dictionary corpora (~18 MiB) are repository-only test data; keep the published crate small.
+# z000033.zst stays because the decode_all benchmark embeds it.
+exclude = ["/decodecorpus_files/*", "!/decodecorpus_files/z000033.zst", "/dict_tests/", "/fuzz/"]
 
 [features]
 default = ["hash", "std"]
