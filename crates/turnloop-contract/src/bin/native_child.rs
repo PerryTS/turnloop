@@ -62,8 +62,11 @@ fn blocked_signal() {
     );
     // All subscriptions have stopped and the original disposition is restored.
     // The former no-op handler left SIGUSR1 pending here and unblocking killed us.
-    // SAFETY: restore precisely the initial mask on the same thread.
-    assert_eq!(unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut()) }, 0);
+    assert_eq!(
+        // SAFETY: restore precisely the initial mask on the same thread.
+        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut()) },
+        0
+    );
     println!("four deliveries, four stops, four closes; survived unblock");
 }
 #[cfg(any(

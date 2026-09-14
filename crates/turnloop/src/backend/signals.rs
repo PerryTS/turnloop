@@ -225,14 +225,19 @@ pub(super) fn subscribe(
             unsafe { std::mem::zeroed() };
         action.sa_sigaction = handler as *const () as usize;
         #[cfg(turnloop_backend = "kqueue")]
-        if signal != Signal::Chld {
+        {
             // EVFILT_SIGNAL observes generation even for SIG_IGN. A no-op
             // handler instead leaves ordinary delivery pending on another
             // thread: all loops can consume the kevent and restore SIG_DFL
             // before that thread runs, killing the process on the old signal.
-            // SIG_IGN discards that pending delivery. SIGCHLD must stay caught
-            // to preserve child wait status (SIG_IGN would auto-reap children).
-            action.sa_sigaction = libc::SIG_IGN;
+            // SIG_IGN discards that pending delivery. For SIGCHLD, SIG_DFL also
+            // discards ordinary delivery but preserves wait status; SIG_IGN
+            // would auto-reap children. Kqueue observes generation in both cases.
+            action.sa_sigaction = if signal == Signal::Chld {
+                libc::SIG_DFL
+            } else {
+                libc::SIG_IGN
+            };
         }
         action.sa_flags = libc::SA_RESTART
             | if signal == Signal::Chld {

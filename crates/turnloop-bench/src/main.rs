@@ -262,6 +262,16 @@ fn main() {
     } else {
         Counter::new()
     };
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd"
+    ))]
+    if std::env::args().any(|a| a == "--instruction-boundaries") {
+        instruction_boundaries(&counter);
+        return;
+    }
     if std::env::args().any(|a| a == "--timers") {
         timers(&counter);
     } else {
@@ -279,5 +289,62 @@ fn main() {
             target_os = "freebsd"
         )))]
         timers(&counter);
+    }
+}
+
+// Mirror the three Callgrind workloads and expose their teardown separately.
+// Setup and destruction must not be mistaken for steady per-operation work.
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd"
+))]
+fn instruction_boundaries(counter: &Counter) {
+    use turnloop::*;
+    for capacity in [16, 1024, 8192] {
+        for mode in ["idle", "notify", "timer_cancel"] {
+            let mut l = Loop::new(Config {
+                max_handles: capacity,
+                max_operations: capacity * 4,
+                ..Config::default()
+            })
+            .expect("loop");
+            let mut out = Completions::default();
+            let notifier = l.notifier();
+            let before = counter.read().expect("counter");
+            let mut waits = 0;
+            for i in 0..100 {
+                match mode {
+                    "idle" => {
+                        waits += l.turn(Timeout::Now, &mut out).expect("idle").os_waits;
+                        assert!(out.is_empty());
+                    }
+                    "notify" => {
+                        notifier.notify().expect("notify");
+                        l.turn(Timeout::Forever, &mut out).expect("notified turn");
+                        assert!(out.is_empty());
+                    }
+                    "timer_cancel" => {
+                        let h = l
+                            .timer(l.now() + Duration::from_secs(30), None, Token(i))
+                            .expect("timer");
+                        assert!(l.cancel(l.timer_op(h).expect("timer op")));
+                        l.close(h, Token(i)).expect("close");
+                        l.turn(Timeout::Now, &mut out).expect("cancellation");
+                        assert_eq!(out.len(), 2);
+                        assert!(matches!(out[0].result, OpResult::Cancelled));
+                        assert!(matches!(out[1].result, OpResult::Closed));
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            report(&format!("{mode}_{capacity}"), 100, before, counter);
+            assert_eq!(waits, if mode == "idle" { 100 } else { 0 });
+            assert_eq!(notifier.wake_syscalls(), 0);
+            let before = counter.read().expect("counter");
+            drop((notifier, l, out));
+            report(&format!("{mode}_drop_{capacity}"), 1, before, counter);
+        }
     }
 }

@@ -115,11 +115,20 @@ impl Files {
         Self {
             slots: (0..config.max_operations)
                 .map(|_| {
-                    Arc::new(Slot {
+                    let slot = Arc::new(Slot {
                         job: Mutex::new(None),
                         cancel: AtomicBool::new(false),
                         port: port.clone(),
-                    })
+                    });
+                    // Darwin's std mutex allocates its pthread storage on first
+                    // lock. Reserve it now for every op slot, including slots
+                    // first reached later through backpressure/cancellation.
+                    drop(
+                        slot.job
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner),
+                    );
+                    slot
                 })
                 .collect(),
             active: (0..config.max_operations).map(|_| None).collect(),

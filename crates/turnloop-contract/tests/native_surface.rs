@@ -43,8 +43,16 @@ fn pending_signal_cannot_outlive_kqueue_unsubscribe() {
         .arg("blocked-signal")
         .output()
         .expect("signal fixture");
-    assert!(output.status.success(), "blocked signal fixture: {:?}; {}", output.status, String::from_utf8_lossy(&output.stderr));
-    assert_eq!(output.stdout, b"four deliveries, four stops, four closes; survived unblock\n");
+    assert!(
+        output.status.success(),
+        "blocked signal fixture: {:?}; {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.stdout,
+        b"four deliveries, four stops, four closes; survived unblock\n"
+    );
 }
 
 #[test]

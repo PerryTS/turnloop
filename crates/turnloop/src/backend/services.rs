@@ -6,8 +6,13 @@ use super::{
 };
 use crate::{
     backend::{Event, Operation, Outcome, Request},
+    sync::{AtomicBool, Ordering},
     *,
 };
+#[cfg(loom)]
+use loom::sync::Mutex;
+#[cfg(not(loom))]
+use std::sync::Mutex;
 use std::{
     collections::VecDeque,
     os::{
@@ -15,10 +20,7 @@ use std::{
         unix::process::ExitStatusExt,
     },
     process::Child,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::Arc,
 };
 
 // One coalesced readiness credit per live handle. The atomic empty fast path
@@ -28,19 +30,72 @@ pub(super) struct ReadyQueue {
     pending: AtomicBool,
     state: Mutex<ReadyState>,
 }
+
+#[cfg(all(test, loom))]
+mod readiness_models {
+    use super::*;
+
+    #[test]
+    fn publication_coalescing_and_generation_reuse() {
+        loom::model(|| {
+            let ready = loom::sync::Arc::new(ReadyQueue::new(2));
+            let a = Handle {
+                owner: 1,
+                key: 1 << 32,
+            };
+            let b = Handle {
+                owner: 1,
+                key: (1 << 32) | 1,
+            };
+            let producer = ready.clone();
+            let thread = loom::thread::spawn(move || producer.push(a));
+            ready.push(b);
+            let first = ready.pop().expect("published local readiness");
+            thread.join().expect("producer");
+            let second = ready.pop().expect("published peer readiness");
+            assert_ne!(first, second);
+            assert!([first, second].contains(&a));
+            assert!([first, second].contains(&b));
+            assert!(!ready.has_work());
+            ready.push(a);
+            ready.push(a);
+            assert_eq!(ready.pop(), Some(a));
+            assert!(ready.pop().is_none(), "coalesced credit");
+            ready.push(a);
+            // Unsubscribe has joined dispatcher publication before removal.
+            ready.remove(a);
+            let reused = Handle {
+                owner: 1,
+                key: 2 << 32,
+            };
+            ready.push(reused);
+            assert_eq!(ready.pop(), Some(reused));
+            assert!(!ready.has_work());
+        });
+    }
+}
 struct ReadyState {
     queue: VecDeque<Handle>,
     queued: Vec<bool>,
 }
 impl ReadyQueue {
     fn new(capacity: usize) -> Self {
-        Self {
+        let ready = Self {
             pending: AtomicBool::new(false),
             state: Mutex::new(ReadyState {
                 queue: VecDeque::with_capacity(capacity),
                 queued: vec![false; capacity],
             }),
-        }
+        };
+        // Initialize Darwin's lazily allocated pthread mutex during loop setup,
+        // so first dispatcher publication also uses only reserved storage.
+        drop(
+            ready
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        ready
     }
     pub fn push(&self, h: Handle) {
         let mut s = self
@@ -184,6 +239,15 @@ impl Services {
         group: bool,
         poller: &mut P,
     ) -> Result<()> {
+        self.register_child(h, child, group, |pid, key| poller.process(pid, key))
+    }
+    fn register_child(
+        &mut self,
+        h: Handle,
+        child: Child,
+        group: bool,
+        register: impl FnOnce(u32, u64) -> Result<Option<OwnedFd>>,
+    ) -> Result<()> {
         let mut state = ChildState {
             child,
             group,
@@ -200,7 +264,7 @@ impl Services {
             h,
             self.ready.clone(),
         )?);
-        match poller.process(state.child.id(), h.key()) {
+        match register(state.child.id(), h.key()) {
             Ok(fd) => state.pidfd = fd,
             Err(e) => {
                 if e.os == Some(libc::ESRCH) {
@@ -323,7 +387,14 @@ impl Services {
                     match c.reap() {
                         Ok(Some(status)) => {
                             c.fallback = None;
-                            (Ok(if e.cancelled { Outcome::Cancelled } else { Outcome::Exited(status) }), true)
+                            (
+                                Ok(if e.cancelled {
+                                    Outcome::Cancelled
+                                } else {
+                                    Outcome::Exited(status)
+                                }),
+                                true,
+                            )
                         }
                         Ok(None) => continue,
                         Err(error) => (Err(error), true),
@@ -386,5 +457,92 @@ impl Services {
         if self.ready.has_work() {
             self.ready.remove(h);
         }
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn esrch_before_wait_status_is_visible_still_delivers_exit_once() {
+        use std::{
+            io::Write,
+            process::{Command, Stdio},
+            time::Duration,
+        };
+        let driver = crate::Loop::new(Config::default()).expect("notifier loop");
+        let mut services = Services::new(&Config::default());
+        services.set_notifier(driver.notifier());
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "read value; exit 23"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("waiting child");
+        let mut input = child.stdin.take().expect("child input");
+        let pid = child.id();
+        let h = Handle {
+            owner: 1,
+            key: 1 << 32,
+        };
+        let op = OpId {
+            owner: 1,
+            key: 1 << 32,
+        };
+        let mut injected = 0;
+        let mut release = None;
+        let result = services.register_child(h, child, false, |registered, key| {
+            assert_eq!((registered, key), (pid, h.key()));
+            let mut status = 0;
+            assert_eq!(
+                // SAFETY: query this owned fixture PID only, without reaping a live child.
+                unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) },
+                0
+            );
+            injected += 1;
+            // Force the registration error while the wait status is unavailable.
+            // The delayed exit models the kernel gap after EVFILT_PROC/pidfd ESRCH.
+            release = Some(std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                input.write_all(b"exit\n")
+            }));
+            Err(std::io::Error::from_raw_os_error(libc::ESRCH).into())
+        });
+        let released = release
+            .expect("registration hook ran")
+            .join()
+            .expect("exit thread");
+        assert_eq!(injected, 1);
+        result.expect("ESRCH is an exiting owned child");
+        released.expect("child exited normally, not killed during failed setup");
+        services
+            .submit(&Request {
+                op,
+                handle: h,
+                operation: Operation::ProcessExit,
+            })
+            .expect("submit exit");
+        let mut events = Vec::with_capacity(1);
+        services.poll(&mut events);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].op, op);
+        assert!(events[0].terminal);
+        assert!(matches!(
+            events[0].result,
+            Ok(Outcome::Exited(ExitStatus {
+                code: Some(23),
+                signal: None
+            }))
+        ));
+        events.clear();
+        services.poll(&mut events);
+        assert!(events.is_empty(), "no duplicate exit");
+        let mut status = 0;
+        assert_eq!(
+            // SAFETY: WNOHANG query only of the fixture PID; ECHILD proves reaping.
+            unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(last_error().os, Some(libc::ECHILD));
     }
 }
