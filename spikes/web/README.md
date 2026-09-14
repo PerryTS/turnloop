@@ -23,6 +23,7 @@ From the clone root:
 cargo fmt --manifest-path spikes/web/Cargo.toml
 cargo clippy --manifest-path spikes/web/Cargo.toml --all-targets --target wasm32-unknown-unknown --all-features -- -D warnings
 cargo +stable check --manifest-path spikes/web/Cargo.toml --target wasm32-unknown-unknown --locked
+python3 spikes/web/tests/bootstrap.py
 python3 spikes/web/tests/run.py node
 python3 spikes/web/tests/run.py chrome
 node spikes/web/tests/worker-node.mjs
@@ -48,7 +49,8 @@ ChromeDriver 153.0.8010.36 starts, emits `FromSockAddr failed on netmask`, and t
 `driver failed to bind port during startup`. A direct local WebDriver session
 bypasses that runner startup heuristic but also fails: `session not created:
 Chrome instance exited`. A direct headless Chrome invocation exits 134 with no
-output. The browser and isolated Worker contracts are retained unchanged for a
+output. With a separately started driver, the legacy test-runner session path also fails
+with HTTP 404 during navigation. The browser and isolated Worker contracts are retained for a
 host where Chrome launches. Their command failures are in `../verification.jsonl`.
 No Chrome timer precision has been measured. Firefox is UNRUN/not installed.
 
