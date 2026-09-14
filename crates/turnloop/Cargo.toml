@@ -14,7 +14,6 @@ description = "An embeddable event-loop driver, turned by its host"
 [features]
 default = []
 executor = ["dep:futures-io"]
-timer-btree = []
 epoll-timerfd = []
 process-sigchld = []
 

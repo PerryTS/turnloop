@@ -5,7 +5,12 @@ use std::{
     hint::black_box,
     time::{Duration, Instant},
 };
-use turnloop::timer::TimerQueue;
+#[cfg(feature = "timer-btree")]
+mod btree;
+#[cfg(feature = "timer-btree")]
+use btree::Tree as TimerQueue;
+#[cfg(not(feature = "timer-btree"))]
+use turnloop::timer::Heap as TimerQueue;
 
 fn report(name: &str, count: usize, before: u64, counter: &Counter) {
     let delta = counter
@@ -39,6 +44,7 @@ fn timers(counter: &Counter) {
         }
         report(&format!("timer_insert_{n}"), n * batches, before, counter);
         assert!(queues.iter().all(|q| q.len() == n));
+        assert!(queues.iter().all(|q| q.next_deadline() == Some(base)));
         let before = counter.read().expect("counter");
         let mut cancelled = 0;
         for q in &mut queues {

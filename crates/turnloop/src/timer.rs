@@ -1,19 +1,13 @@
-//! Timer comparison harness. The production Driver always uses the indexed heap;
-//! `timer-btree` selects only the benchmark queue alias and its conformance test.
+//! Preallocated indexed timer heap. Allocating comparisons live in turnloop-bench.
 use crate::Instant;
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct Entry {
     at: Instant,
     id: u64,
 }
-#[cfg(feature = "timer-btree")]
-mod btree;
 mod heap;
-#[cfg(feature = "timer-btree")]
-pub use btree::Tree as TimerQueue;
 pub(crate) use heap::Heap as DriverTimerQueue;
 pub use heap::Heap;
-#[cfg(not(feature = "timer-btree"))]
 pub use heap::Heap as TimerQueue;
 #[cfg(test)]
 mod tests {

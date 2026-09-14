@@ -8,7 +8,7 @@ repository.workspace = true
 publish = false
 
 [features]
-timer-btree = ["turnloop/timer-btree"]
+timer-btree = []
 
 [dependencies]
 turnloop.workspace = true
