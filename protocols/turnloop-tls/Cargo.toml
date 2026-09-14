@@ -11,7 +11,12 @@ keywords = ["networking", "sans-io", "tls"]
 categories = ["network-programming"]
 documentation = "https://docs.rs/turnloop-tls"
 
+[features]
+turnloop = ["dep:turnloop-io"]
+
 [dependencies]
+turnloop-io = { workspace = true, optional = true }
+
 rustls.workspace = true
 webpki-roots.workspace = true
 
@@ -28,9 +33,21 @@ workspace = true
 [package.metadata.turnloop-ci]
 role = "protocol"
 service-group = "http"
-integration-tests = ["tls"]
-wasi-tests = ["portable"]
+integration-tests = ["tls", "asynchronous", "async_allocations"]
+wasi-tests = ["asynchronous", "async_allocations", "portable"]
 
 [[test]]
 name = "portable"
 harness = false
+
+[[test]]
+name = "asynchronous"
+required-features = ["turnloop"]
+
+[target.'cfg(all(target_os = "wasi", target_env = "p3"))'.dependencies]
+turnloop-io = { workspace = true, optional = true, features = ["wasi-p3-experimental"] }
+
+[[test]]
+name = "async_allocations"
+harness = false
+required-features = ["turnloop"]

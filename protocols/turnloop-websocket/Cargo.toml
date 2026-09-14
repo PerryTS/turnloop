@@ -11,7 +11,12 @@ keywords = ["networking", "sans-io", "websocket"]
 categories = ["network-programming"]
 documentation = "https://docs.rs/turnloop-websocket"
 
+[features]
+turnloop = ["dep:turnloop-io", "turnloop-http/turnloop"]
+
 [dependencies]
+turnloop-io = { workspace = true, optional = true }
+
 tungstenite.workspace = true
 bytes.workspace = true
 http.workspace = true
@@ -27,4 +32,29 @@ workspace = true
 [package.metadata.turnloop-ci]
 role = "protocol"
 service-group = "http"
-integration-tests = ["websocket"]
+integration-tests = ["websocket", "asynchronous", "async_allocations"]
+wasi-tests = ["asynchronous", "async_allocations"]
+
+[[example]]
+name = "echo_server"
+required-features = ["turnloop"]
+
+[[example]]
+name = "echo_client"
+required-features = ["turnloop"]
+
+[dev-dependencies]
+getrandom.workspace = true
+
+[[test]]
+name = "asynchronous"
+required-features = ["turnloop"]
+
+[[test]]
+name = "async_allocations"
+required-features = ["turnloop"]
+harness = false
+
+[target.'cfg(all(target_os = "wasi", target_env = "p3"))'.dependencies]
+turnloop-wasi-random.workspace = true
+turnloop-io = { workspace = true, optional = true, features = ["wasi-p3-experimental"] }

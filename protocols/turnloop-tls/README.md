@@ -13,3 +13,21 @@ compiler. WASI obtains entropy through its host. No FIPS/PQ guarantee is claimed
 Mozilla roots, host-supplied extra PEM, explicit replacement CAs, SNI and ALPN are
 supported. See public API docs and `tests/tls.rs` for checked handshake examples.
 PEM parsing uses rustls-pki-types through rustls’s maintained re-export.
+
+## Getting started on turnloop
+
+Enable `turnloop-tls/turnloop`. `TlsStream::connect` and `TlsStream::accept` take
+an owned stream, shared TLS configuration, executor handle, absolute handshake
+deadline and host wall time. Await the handshake, inspect `alpn_protocol()`, then
+use `turnloop_io::{read, write_all, close}`. These helpers work on TCP and pipes
+and compose with HTTP/WebSocket adapters. `close` flushes close_notify; dropping
+aborts the transport. Refresh host wall time with `set_unix_seconds` when needed.
+The host continues calling `LocalExecutor::turn` throughout the connection.
+
+The adapter retains ciphertext/plaintext storage and uses rustls's unbuffered
+state machine. rustls 0.23's plaintext record representation still allocates;
+transport scratch allocation freedom is distinct from upstream crypto storage.
+The real-socket allocation gate checks 100 bidirectional records: 400 existing
+rustls allocations and zero adapter overhead. Unread plaintext is bounded to 64 KiB.
+WASI sockets use the same implementation. Browser TLS is managed by host fetch
+or WebSocket and cannot expose raw TLS options.

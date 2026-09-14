@@ -164,12 +164,23 @@ fn node_h1_redirect_compression_trailers_and_socket_reuse() {
     let (_, body, trailers) = response(&mut socket, &mut decoder);
     assert_eq!(body, b"chunk-onechunk-two");
     assert_eq!(trailers, [Header::new("x-check", "verified")]);
+    // The Node fixture is shared by every test binary in a run and numbers
+    // connections globally, so assert reuse (same socket for both requests on
+    // this connection) rather than an absolute connection number.
+    let mut reused: Option<Vec<u8>> = None;
     for _ in 0..2 {
         decoder.reset().unwrap();
         request.url.set_path("/reuse");
         send(&mut socket, &request);
         let (head, body, _) = response(&mut socket, &mut decoder);
-        assert_eq!(head.get("x-socket"), Some(b"1".as_slice()));
+        let id = head
+            .get("x-socket")
+            .expect("fixture reports its socket")
+            .to_vec();
+        match &reused {
+            None => reused = Some(id),
+            Some(first) => assert_eq!(&id, first, "keep-alive request used a different socket"),
+        }
         assert_eq!(body, b"GET /reuse ");
     }
 }

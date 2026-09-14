@@ -126,3 +126,16 @@ WASI builds reexport std::time::Instant. Use one monotonic epoch per connection
 and pool. Map the browser core loop’s Instant through as_duration/from_duration.
 The protocol never calls performance.now or std Instant::now. Browser runtime
 execution is not yet verified; only target compilation has run.
+
+## Getting started on turnloop
+
+Enable the `turnloop` feature and construct `asynchronous::AsyncConnection::new`
+with a connected `turnloop::AsyncIo` (TCP/pipe) or `turnloop_tls::TlsStream` and
+this crate's sans-I/O `Connection`. Submit commands through `core_mut()`, then
+`next(&executor_handle, |event| { /* consume the event */ Ok(()) }).await`.
+Callbacks finish consuming borrowed rows before the next event. Authentication,
+entropy and TLS-upgrade requests are explicit events; acknowledge them through
+the core. For an upgrade, `into_parts` preserves the stream, core and unread bytes.
+Apply `turnloop_io::deadline` using the core's next deadline. Dropping a pending
+drive future closes the stream and aborts the core; terminal core events remain
+available for draining. See `turnloop-io` for the shared adapter ownership pattern.

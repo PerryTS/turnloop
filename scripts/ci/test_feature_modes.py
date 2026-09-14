@@ -1,5 +1,6 @@
 """Negative controls for explicit feature coverage and required native mode arms."""
 import json
+import copy
 import tomllib
 import unittest
 from common import ROOT
@@ -22,31 +23,6 @@ class FeatureModes(unittest.TestCase):
         self.assertEqual(len(native_modes('linux')), 6)
         self.assertEqual(len(native_modes('darwin')), 3)
         self.assertEqual(len(native_modes('win32')), 3)
-
-    def test_target_only_features_are_proven_by_their_target_jobs(self):
-        contract = tomllib.loads((ROOT / 'crates/turnloop-contract/Cargo.toml').read_text())
-        runner = (ROOT / 'scripts/ci/run-tests.py').read_text()
-        self.assertEqual(len(check(self.source, self.manifest, contract, runner)), 18)
-        # The contract crate must forward the feature to turnloop.
-        broken = json.loads(json.dumps(contract))
-        broken['features']['web-worker'] = []
-        with self.assertRaisesRegex(RuntimeError, 'must forward web-worker'):
-            check(self.source, self.manifest, broken, runner)
-        # The web runner must actually enable it.
-        broken = json.loads(json.dumps(contract))
-        broken['package']['metadata']['turnloop-ci']['web-tests-features'] = ['executor']
-        with self.assertRaisesRegex(RuntimeError, 'web-tests-features must include it'):
-            check(self.source, self.manifest, broken, runner)
-        # Dropping the p3 target from the wasi job removes coverage.
-        with self.assertRaisesRegex(RuntimeError, 'wasm32-wasip3'):
-            check(self.source.replace('- target: wasm32-wasip3', '- target: wasm32-wasip9'), self.manifest, contract, runner)
-        # The WASI runner must keep enabling all contract features.
-        with self.assertRaisesRegex(RuntimeError, 'no longer enables all contract features'):
-            check(self.source, self.manifest, contract, runner.replace("features = ['--all-features']", "features = []"))
-        # An unregistered new target-only feature still fails.
-        self.manifest['features']['browser-extra'] = []
-        with self.assertRaisesRegex(RuntimeError, 'without explicit runtime CI arms'):
-            check(self.source, self.manifest, contract, runner)
 
     def test_all_features_does_not_cover_an_unlisted_new_feature(self):
         self.manifest['features']['untested-mode'] = []
@@ -114,6 +90,32 @@ class FeatureModes(unittest.TestCase):
         self.assertNotIn('timer-btree', self.manifest['features'])
         bench = tomllib.loads((ROOT / 'crates/turnloop-bench/Cargo.toml').read_text())
         self.assertEqual(bench['features']['timer-btree'], [])
+
+    def test_backend_features_require_real_platform_jobs(self):
+        contract = tomllib.loads((ROOT / 'crates/turnloop-contract/Cargo.toml').read_text())
+        for old, new in [
+            ('target: wasm32-wasip3', 'target: wasm32-wasip2'),
+            ('python3 scripts/ci/run-tests.py wasi --target "$TARGET"', 'true'),
+            ('python3 scripts/ci/run-tests.py web', 'true'),
+            ('python3 scripts/ci/run-tests.py node', 'true'),
+            (', wasi, web,', ', web,'),
+            (', wasi, web,', ', wasi,'),
+            ('  wasi:\n', '  wasi:\n    if: false\n'),
+            ('  web:\n', '  web:\n    continue-on-error: true\n'),
+        ]:
+            self.assertIn(old, self.source)
+            with self.subTest(old=old), self.assertRaises(RuntimeError):
+                check(self.source.replace(old, new), self.manifest, contract)
+        for key in ['web-tests-features', 'node-tests-features']:
+            broken = copy.deepcopy(contract)
+            broken['package']['metadata']['turnloop-ci'][key].remove('web-worker')
+            with self.subTest(key=key), self.assertRaises(RuntimeError):
+                check(self.source, self.manifest, broken)
+        for feature in ['web-worker', 'wasi-p3-experimental']:
+            broken = copy.deepcopy(contract)
+            broken['features'][feature] = []
+            with self.subTest(feature=feature), self.assertRaises(RuntimeError):
+                check(self.source, self.manifest, broken)
 
 
 if __name__ == '__main__':

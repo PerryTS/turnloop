@@ -12,9 +12,13 @@ categories = ["network-programming"]
 documentation = "https://docs.rs/turnloop-http"
 
 [features]
+turnloop = ["dep:turnloop-io", "turnloop-tls/turnloop"]
+
 pure-rust-zstd = ["dep:turnloop-zstd-decoder"]
 
 [dependencies]
+turnloop-io = { workspace = true, optional = true }
+
 turnloop-zstd-decoder = { workspace = true, optional = true }
 bytes.workspace = true
 http.workspace = true
@@ -41,9 +45,28 @@ workspace = true
 [package.metadata.turnloop-ci]
 role = "protocol"
 service-group = "http"
-integration-tests = ["interop"]
-wasi-tests = ["codecs", "allocations"]
+integration-tests = ["interop", "asynchronous"]
+wasi-tests = ["asynchronous", "codecs", "allocations"]
 
 [[test]]
 name = "allocations"
 harness = false
+
+[[example]]
+name = "h2spec_server"
+required-features = ["turnloop"]
+
+[[example]]
+name = "https_get"
+required-features = ["turnloop"]
+
+[[example]]
+name = "tls_echo"
+required-features = ["turnloop"]
+
+[[test]]
+name = "asynchronous"
+required-features = ["turnloop"]
+
+[target.'cfg(all(target_os = "wasi", target_env = "p3"))'.dependencies]
+turnloop-io = { workspace = true, optional = true, features = ["wasi-p3-experimental"] }

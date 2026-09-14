@@ -1,102 +1,74 @@
-//! Blocking conformance driver only; protocol crate contains no I/O.
-use std::{
-    io::{Read, Write},
-    net::{TcpListener, TcpStream},
-    thread,
-    time::Duration,
-};
-use turnloop_http::{
-    http1::Header,
-    http2::{Connection, Event, Role},
-};
-const BODY: [u8; 16384] = [b'x'; 16384];
-
-fn serve(mut socket: TcpStream) -> std::io::Result<()> {
-    socket.set_read_timeout(Some(Duration::from_secs(5)))?;
-    let mut engine =
-        Connection::new(Role::Server, Default::default()).map_err(std::io::Error::other)?;
-    let mut input = Vec::new();
-    let mut pending: Vec<(u32, usize)> = Vec::new();
-    loop {
-        let step = engine.receive(&input);
-        let mut stop = false;
-        let mut consumed = 0;
-        let mut reply = None;
-        match step {
-            Ok(step) => {
-                consumed = step.consumed;
-                match step.event {
-                    Some(Event::Headers {
-                        stream,
-                        end_stream: true,
-                        ..
-                    }) => reply = Some(stream),
-                    Some(Event::Data {
-                        stream,
-                        bytes,
-                        end_stream,
-                    }) => {
-                        let _ = engine.release_capacity(stream, bytes.len() as u32);
-                        if end_stream {
-                            reply = Some(stream);
+//! Strict conformance server on turnloop's executor, with no blocking socket I/O.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    use turnloop_http::{
+        asynchronous::server::{self, Server},
+        http1::Header,
+        http2::Event,
+    };
+    use turnloop_io::turnloop::{Config, LocalExecutor, Timeout, backend::Platform};
+    const BODY: [u8; 16384] = [b'x'; 16384];
+    let mut executor = LocalExecutor::<Platform>::new(Config::default())?;
+    let mut server = Server::bind(executor.handle(), "127.0.0.1:0".parse()?)?;
+    println!("{}", server.local_addr()?.port());
+    let task = executor.spawn_local(async move {
+        server
+            .run(|stream, signal| async move {
+                let mut pending = Vec::<(u32, usize)>::new();
+                server::http2(stream, signal, move |core, event| {
+                    let mut reply = None;
+                    match event {
+                        Event::Headers {
+                            stream,
+                            end_stream: true,
+                            ..
+                        } => reply = Some(stream),
+                        Event::Data {
+                            stream,
+                            bytes,
+                            end_stream,
+                        } => {
+                            core.release_capacity(stream, bytes.len() as u32)
+                                .map_err(std::io::Error::other)?;
+                            if end_stream {
+                                reply = Some(stream);
+                            }
                         }
+                        _ => {}
                     }
-                    _ => {}
-                }
-            }
-            Err(_) => stop = true,
-        }
-        if let Some(id) = reply {
-            let _ = engine.send_headers(
-                id,
-                &[
-                    Header::new(":status", "200"),
-                    Header::new("content-length", "16384"),
-                ],
-                false,
-            );
-            pending.push((id, 0));
-        }
-        pending.retain_mut(
-            |(id, pos)| match engine.send_data(*id, &BODY[*pos..], true) {
-                Ok(n) => {
-                    *pos += n;
-                    *pos < BODY.len()
-                }
-                Err(_) => false,
-            },
-        );
-        if socket.write_all(engine.output()).is_err() {
-            break;
-        }
-        let n = engine.output().len();
-        engine.consume_output(n).map_err(std::io::Error::other)?;
-        if stop {
-            break;
-        }
-        input.drain(..consumed);
-        if consumed == 0 {
-            let mut bytes = [0; 32768];
-            match socket.read(&mut bytes) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => input.extend_from_slice(&bytes[..n]),
-            }
-        }
+                    if let Some(id) = reply {
+                        core.send_headers(
+                            id,
+                            &[
+                                Header::new(":status", "200"),
+                                Header::new("content-length", "16384"),
+                            ],
+                            false,
+                        )
+                        .map_err(std::io::Error::other)?;
+                        pending.push((id, 0));
+                    }
+                    pending.retain_mut(|(id, offset)| {
+                        match core.send_data(*id, &BODY[*offset..], true) {
+                            Ok(n) => {
+                                *offset += n;
+                                *offset < BODY.len()
+                            }
+                            Err(_) => false,
+                        }
+                    });
+                    Ok(())
+                })
+                .await
+            })
+            .await
+    })?;
+    while !task.is_finished() {
+        executor.turn(Timeout::Forever)?;
     }
-    Ok(())
+    Err("conformance server stopped unexpectedly".into())
 }
-fn main() -> std::io::Result<()> {
-    let listener = TcpListener::bind("127.0.0.1:0")?;
-    println!("{}", listener.local_addr()?.port());
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                thread::spawn(move || {
-                    let _ = serve(stream);
-                });
-            }
-            Err(_) => break,
-        }
-    }
-    Ok(())
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+fn main() {
+    eprintln!("Browser listening sockets are unsupported");
 }
