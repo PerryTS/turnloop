@@ -306,7 +306,7 @@ The all-feature WASI dry run additionally verifies the registry dependency on th
 portable decoder. Neither run used `--no-verify`, and all uploads were explicitly
 aborted. Packaged decoder tests also execute independently of the workspace.
 The decoder's full upstream fixtures produce an approximately 9.6-MiB archive,
-within the registry's default 10-MiB archive limit; preserve the corpus tests.
+within the [registry’s default 10-MiB archive limit](https://github.com/rust-lang/crates.io/blob/main/src/config/server.rs); preserve the corpus tests.
 
 First publications, Trusted Publisher bootstrap, semver comparison against an
 existing release, tags/releases and OIDC exchange remain owner actions from
