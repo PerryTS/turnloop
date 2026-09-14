@@ -1268,13 +1268,19 @@ unsafe impl Backend for Iocp {
                 self.timer.cancel()?;
             }
             match result? {
-                Wait::Entries(n) => (
-                    n,
-                    PollInfo {
-                        waits: 1,
-                        zero_event_waits: 0,
-                    },
-                ),
+                // The private deadline timer packet has the meaning of a timed wait
+                // returning zero (see `PollInfo` in backend/mod.rs, and epoll's timerfd):
+                // it is not native work. Notifier and I/O packets still count.
+                Wait::Entries(n) => {
+                    let timer_only = entries[..n].iter().all(|entry| entry.key == TIMER);
+                    (
+                        n,
+                        PollInfo {
+                            waits: 1,
+                            zero_event_waits: if timer_only { 1 } else { 0 },
+                        },
+                    )
+                }
                 Wait::Timeout | Wait::Apc => (
                     0,
                     PollInfo {
