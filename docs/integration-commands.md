@@ -15,3 +15,79 @@
 - FAIL (exit 5): `env PATH=.tools/bin:/opt/homebrew/bin:/usr/bin:/bin:/Users/amlug/.cargo/bin cargo deny check` — log `.tools/verification/1789400568146303000.log`.
 - PASS (exit 0): `cargo test --workspace` — log `.tools/verification/1789400565811533000.log`.
 - PASS (exit 0): `scripts/test-servers.py --services redis,mongodb,smtp run cargo test -p turnloop-redis -p turnloop-mongodb -p turnloop-smtp -- --include-ignored --test-threads=1` — log `.tools/verification/1789400566980343000.log`.
+- PASS (exit 0): `cargo generate-lockfile` — log `.tools/verification/1789400704588941000.log`.
+- PASS (exit 0): `cargo fmt --all` — log `.tools/verification/1789400705265411000.log`.
+- PASS (exit 0): `cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks` — log `.tools/verification/1789400719173571000.log`.
+- PASS (exit 0): `scripts/ci/no-tokio.sh` — log `.tools/verification/1789400721543595000.log`.
+- FAIL (exit 101): `cargo clippy --workspace --all-targets --all-features --target x86_64-unknown-linux-gnu -- -D warnings -D clippy::undocumented_unsafe_blocks` — log `.tools/verification/1789400720383015000.log`.
+- FAIL (exit 101): `cargo clippy --workspace --all-targets --all-features --target x86_64-pc-windows-msvc -- -D warnings -D clippy::undocumented_unsafe_blocks` — log `.tools/verification/1789400731322556000.log`.
+- FAIL (exit 101): `cargo clippy --workspace --all-targets --all-features --target wasm32-wasip2 -- -D warnings -D clippy::undocumented_unsafe_blocks` — log `.tools/verification/1789400733497707000.log`.
+- FAIL (exit 101): `cargo clippy --workspace --all-targets --all-features --target wasm32-unknown-unknown -- -D warnings -D clippy::undocumented_unsafe_blocks` — log `.tools/verification/1789400739095718000.log`.
+- PASS (exit 0): `cargo fmt --all` — log `.tools/verification/1789400793286650000.log`.
+- PASS (exit 0): `cargo clippy --workspace --all-targets --all-features --target x86_64-unknown-linux-gnu -- -D warnings -D clippy::undocumented_unsafe_blocks` — log `.tools/verification/1789400793653501000.log`.
+- PASS (exit 0): `cargo clippy --workspace --all-targets --all-features --target wasm32-wasip2 -- -D warnings -D clippy::undocumented_unsafe_blocks` — log `.tools/verification/1789400796912981000.log`.
+- FAIL (exit 101): `cargo clippy --workspace --all-targets --all-features --target wasm32-unknown-unknown -- -D warnings -D clippy::undocumented_unsafe_blocks` — log `.tools/verification/1789400799097947000.log`.
+- PASS (exit 0): `cargo clippy --workspace --lib --target x86_64-pc-windows-msvc -- -D warnings` — log `.tools/verification/1789400800821783000.log`.
+- PASS (exit 0): `python3 scripts/ci/soak.py` — log `.tools/verification/1789400794788045000.log`.
+- PASS (exit 0): `python3 -m py_compile scripts/test-servers.py` — log `.tools/verification/1789400924540764000.log`.
+- PASS (exit 0): `env PATH=.tools/bin:/opt/homebrew/bin:/usr/bin:/bin:/Users/amlug/.cargo/bin python3 scripts/ci/lint-workflows.py` — log `.tools/verification/1789400924621898000.log`.
+- PASS (exit 0): `cargo clippy --workspace --all-targets --all-features --target wasm32-unknown-unknown -- -D warnings -D clippy::undocumented_unsafe_blocks` — log `.tools/verification/1789400967532572000.log`.
+- PASS (exit 0): `rustup component add miri rust-src --toolchain nightly-2026-08-20` — log `.tools/verification/1789400969066533000.log`.
+- FAIL (exit 1): `scripts/test-servers.py run cargo test --workspace -- --include-ignored` — log `.tools/verification/1789400969223077000.log`.
+- PASS (exit 0): `python3 scripts/ci/run-tests.py loom` — log `.tools/verification/1789400967894268000.log`.
+- FAIL (exit 1): `python3 scripts/ci/run-tests.py miri` — log `.tools/verification/1789401010610083000.log`.
+- FAIL (exit 1): `env PATH=.tools/bin:/opt/homebrew/bin:/usr/bin:/bin:/Users/amlug/.cargo/bin cargo deny check` — log `.tools/verification/1789401011011923000.log`.
+- PASS (exit 0): `python3 -W error -m unittest discover -s scripts/ci -p 'test_*.py' -v` — log `.tools/verification/1789401012040929000.log`.
+- PASS (exit 0): `cargo +stable check --workspace --all-targets --all-features` — log `.tools/verification/1789401012324433000.log`.
+- PASS (exit 0): `env MIRI_SYSROOT=.tools/miri-sysroot cargo miri setup` — log `.tools/verification/1789401030149963000.log`.
+- PASS (exit 0): `cargo generate-lockfile` — log `.tools/verification/1789401085087141000.log`.
+- FAIL (exit 1): `env MIRI_SYSROOT=.tools/miri-sysroot python3 scripts/ci/run-tests.py miri` — log `.tools/verification/1789401086229687000.log`.
+- PASS (exit 0): `scripts/test-servers.py stop` — log `.tools/verification/1789401122342961000.log`.
+- PASS (exit 0): `scripts/test-servers.py --services smtp start` — log `.tools/verification/1789401122773188000.log`.
+- PASS (exit 0): `scripts/test-servers.py stop` — log `.tools/verification/1789401122944843000.log`.
+- PASS (exit 0): `env PATH=.tools/bin:/opt/homebrew/bin:/usr/bin:/bin:/Users/amlug/.cargo/bin cargo deny check` — log `.tools/verification/1789401158030439000.log`.
+- PASS (exit 0): `cargo clippy --workspace --all-targets --all-features --target x86_64-unknown-linux-gnu -- -D warnings -D clippy::undocumented_unsafe_blocks` — log `.tools/verification/1789401159177394000.log`.
+- PASS (exit 0): `env MIRI_SYSROOT=.tools/miri-sysroot python3 scripts/ci/run-tests.py miri` — log `.tools/verification/1789401156900376000.log`.
+- PASS (exit 0): `cargo publish --dry-run -p turnloop --allow-dirty` — log `.tools/verification/1789401179661221000.log`.
+- FAIL (exit 1): `scripts/test-servers.py run cargo test --workspace -- --include-ignored` — log `.tools/verification/1789401180876615000.log`.
+- PASS (exit 0): `cargo generate-lockfile` — log `.tools/verification/1789401206950165000.log`.
+- PASS (exit 0): `cargo publish --dry-run --locked --allow-dirty -p turnloop-mongodb` — log `.tools/verification/1789401239347990000.log`.
+- PASS (exit 0): `cargo publish --dry-run --locked --allow-dirty -p turnloop-mysql` — log `.tools/verification/1789401246007195000.log`.
+- PASS (exit 0): `python3 scripts/ci/release.py order` — log `.tools/verification/1789401253969626000.log`.
+- PASS (exit 0): `cargo publish --dry-run --locked --allow-dirty -p turnloop-postgres` — log `.tools/verification/1789401252793701000.log`.
+- PASS (exit 0): `env RUSTDOCFLAGS=-Dwarnings cargo doc --workspace --all-features --no-deps` — log `.tools/verification/1789401254159606000.log`.
+- PASS (exit 0): `cargo publish --dry-run --locked --allow-dirty -p turnloop-redis` — log `.tools/verification/1789401254712269000.log`.
+- PASS (exit 0): `cargo publish --dry-run --locked --allow-dirty -p turnloop-smtp` — log `.tools/verification/1789401256497475000.log`.
+- FAIL (exit 1): `scripts/test-servers.py --services mongodb start` — log `.tools/verification/1789401279059953000.log`.
+- FAIL (exit 1): `scripts/test-servers.py --services redis run false` — log `.tools/verification/1789401280222471000.log`.
+- PASS (exit 0): `scripts/test-servers.py --services redis,mongodb,smtp run cargo test -p turnloop-redis -p turnloop-mongodb -p turnloop-smtp -- --include-ignored --test-threads=1` — log `.tools/verification/1789401240482227000.log`.
+- FAIL (exit 1): `scripts/test-servers.py stop` — log `.tools/verification/1789401279173150000.log`.
+- PASS (exit 0): `cargo fmt --all` — log `.tools/verification/1789401341212223000.log`.
+- PASS (exit 0): `cargo fmt --check` — log `.tools/verification/1789401341502197000.log`.
+- PASS (exit 0): `cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks` — log `.tools/verification/1789401343097063000.log`.
+- FAIL (exit 1): `python3 scripts/ci/run-tests.py native` — log `.tools/verification/1789401341828944000.log`.
+- PASS (exit 0): `cargo clippy --workspace --all-targets --all-features --target x86_64-unknown-linux-gnu -- -D warnings -D clippy::undocumented_unsafe_blocks` — log `.tools/verification/1789401345808548000.log`.
+- PASS (exit 0): `cargo clippy --workspace --all-targets --all-features --target wasm32-wasip2 -- -D warnings -D clippy::undocumented_unsafe_blocks` — log `.tools/verification/1789401346880969000.log`.
+- PASS (exit 0): `cargo clippy --workspace --all-targets --all-features --target wasm32-unknown-unknown -- -D warnings -D clippy::undocumented_unsafe_blocks` — log `.tools/verification/1789401347788460000.log`.
+- PASS (exit 0): `cargo +stable check --workspace --all-targets --all-features` — log `.tools/verification/1789401348689400000.log`.
+- FAIL (exit 1): `python3 -W error -m unittest discover -s scripts/ci -p 'test_*.py' -v` — log `.tools/verification/1789401398620998000.log`.
+- PASS (exit 0): `scripts/test-servers.py --services mongodb start` — log `.tools/verification/1789401432742369000.log`.
+- PASS (exit 0): `python3 -W error -m unittest discover -s scripts/ci -p 'test_*.py' -v` — log `.tools/verification/1789401443658233000.log`.
+- PASS (exit 0): `scripts/test-servers.py stop` — log `.tools/verification/1789401434934583000.log`.
+- PASS (exit 0): `python3 scripts/ci/run-tests.py native` — log `.tools/verification/1789401479661952000.log`.
+- PASS (exit 0): `cargo clippy -p turnloop -p turnloop-contract -p turnloop-bench --all-targets --target x86_64-pc-windows-msvc -- -D warnings -D clippy::undocumented_unsafe_blocks` — log `.tools/verification/1789401543061537000.log`.
+- PASS (exit 0): `cargo clippy --workspace --lib --target x86_64-pc-windows-msvc -- -D warnings` — log `.tools/verification/1789401544443064000.log`.
+- FAIL (exit 1): `python3 scripts/ci/instructions.py` — log `.tools/verification/1789401545361805000.log`.
+- PASS (exit 0): `scripts/ci/no-tokio.sh` — log `.tools/verification/1789401544231905000.log`.
+- PASS (exit 0): `cargo clippy --manifest-path spikes/iocp/Cargo.toml --all-targets --target x86_64-pc-windows-msvc -- -D warnings` — log `.tools/verification/1789401545503648000.log`.
+- FAIL (exit 1): `scripts/test-servers.py --services redis run false` — log `.tools/verification/1789401545552418000.log`.
+- PASS (exit 0): `cargo clippy --manifest-path spikes/wasi-p2/Cargo.toml --all-targets --target wasm32-wasip2 -- -D warnings` — log `.tools/verification/1789401547171156000.log`.
+- PASS (exit 0): `cargo +nightly-2026-09-07 clippy --manifest-path spikes/wasi-p3/Cargo.toml --all-targets --target wasm32-wasip3 -- -D warnings` — log `.tools/verification/1789401548458855000.log`.
+- PASS (exit 0): `cargo clippy --manifest-path spikes/web/Cargo.toml --all-targets --all-features --target wasm32-unknown-unknown -- -D warnings` — log `.tools/verification/1789401550224001000.log`.
+- PASS (exit 0): `python3 scripts/ci/soak.py` — log `.tools/verification/1789401546345719000.log`.
+- PASS (exit 0): `env PATH=.tools/bin:/opt/homebrew/bin:/usr/bin:/bin:/Users/amlug/.cargo/bin cargo deny check` — log `.tools/verification/1789401561335844000.log`.
+- PASS (exit 0): `env PATH=.tools/bin:/opt/homebrew/bin:/usr/bin:/bin:/Users/amlug/.cargo/bin python3 scripts/ci/lint-workflows.py` — log `.tools/verification/1789401562351177000.log`.
+- PASS (exit 0): `cargo fmt --check` — log `.tools/verification/1789401599428482000.log`.
+- FAIL (exit 2): `git diff --check` — log `.tools/verification/1789401599715648000.log`.
+- PASS (exit 0): `git diff --check` — log `.tools/verification/1789401647262787000.log`.
+- FAIL (exit 1): `.tools/bin/actionlint -color` — log `.tools/verification/1789401647327519000.log`.

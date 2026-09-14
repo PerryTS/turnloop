@@ -3,10 +3,10 @@
 //! server-selection.md §§ Read Preference, Latency Window, max-staleness.
 use crate::Instant;
 use crate::{
-    uri::{Options, ReadPreference},
     Error, ErrorKind, Result,
+    uri::{Options, ReadPreference},
 };
-use bson::{oid::ObjectId, Document};
+use bson::{Document, oid::ObjectId};
 use std::{
     collections::{BTreeMap, VecDeque},
     time::Duration,
@@ -339,9 +339,10 @@ impl Topology {
                             self.add_hosts(&s.hosts, now);
                             if let Some(primary) = &s.primary
                                 && let Some(p) = self.servers.get_mut(primary)
-                                    && p.kind == ServerType::Unknown {
-                                        p.kind = ServerType::PossiblePrimary;
-                                    }
+                                && p.kind == ServerType::Unknown
+                            {
+                                p.kind = ServerType::PossiblePrimary;
+                            }
                         }
                         if s.me.as_ref().is_some_and(|me| me != &address) {
                             self.remove(&address);
@@ -605,29 +606,29 @@ impl Topology {
                 return false;
             }
             if s.kind == ServerType::RSSecondary
-                && let Some(max) = max_staleness {
-                    let Some(write) = s.last_write_ms else {
+                && let Some(max) = max_staleness
+            {
+                let Some(write) = s.last_write_ms else {
+                    return false;
+                };
+                let stale = if let Some(p) = primary {
+                    let Some(pw) = p.last_write_ms else {
                         return false;
                     };
-                    let stale = if let Some(p) = primary {
-                        let Some(pw) = p.last_write_ms else {
-                            return false;
-                        };
-                        let update_delta = if s.last_update >= p.last_update {
-                            s.last_update.duration_since(p.last_update).as_millis() as i128
-                        } else {
-                            -(p.last_update.duration_since(s.last_update).as_millis() as i128)
-                        };
-                        update_delta + pw as i128 - write as i128
-                            + self.heartbeat.as_millis() as i128
+                    let update_delta = if s.last_update >= p.last_update {
+                        s.last_update.duration_since(p.last_update).as_millis() as i128
                     } else {
-                        max_write.unwrap_or(write) as i128 - write as i128
-                            + self.heartbeat.as_millis() as i128
+                        -(p.last_update.duration_since(s.last_update).as_millis() as i128)
                     };
-                    if stale > max.as_millis() as i128 {
-                        return false;
-                    }
+                    update_delta + pw as i128 - write as i128 + self.heartbeat.as_millis() as i128
+                } else {
+                    max_write.unwrap_or(write) as i128 - write as i128
+                        + self.heartbeat.as_millis() as i128
+                };
+                if stale > max.as_millis() as i128 {
+                    return false;
                 }
+            }
             true
         };
         for (a, s) in &self.servers {

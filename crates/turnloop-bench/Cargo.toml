@@ -22,3 +22,11 @@ workspace = true
 
 [package.metadata.turnloop-ci]
 role = "bench"
+instruction-baseline = "benchmarks/instructions.json"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+gungraun.workspace = true
+
+[[bench]]
+name = "instructions"
+harness = false

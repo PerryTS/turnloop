@@ -5,7 +5,7 @@ fn main() {}
 #[path = "../tests/common/mod.rs"]
 mod common;
 #[cfg(not(target_arch = "wasm32"))]
-use common::{ports, Driver};
+use common::{Driver, ports};
 #[cfg(not(target_arch = "wasm32"))]
 use std::{
     net::TcpStream,
@@ -23,17 +23,17 @@ fn main() {
     if let Some((_, p)) = rs.first()
         && let Ok(mut d) =
             Driver::connect(&format!("mongodb://127.0.0.1:{p}/?directConnection=true"))
-        {
-            let members: Vec<_> = rs
-                .iter()
-                .enumerate()
-                .map(|(i, (_, p))| doc! {"_id":i as i32,"host":format!("127.0.0.1:{p}")})
-                .collect();
-            let _ = d.run(
-                "admin",
-                doc! {"replSetInitiate":{"_id":"turnloop_test","members":members}},
-            );
-        }
+    {
+        let members: Vec<_> = rs
+            .iter()
+            .enumerate()
+            .map(|(i, (_, p))| doc! {"_id":i as i32,"host":format!("127.0.0.1:{p}")})
+            .collect();
+        let _ = d.run(
+            "admin",
+            doc! {"replSetInitiate":{"_id":"turnloop_test","members":members}},
+        );
+    }
     let deadline = Instant::now() + Duration::from_secs(40);
     loop {
         let mut done = false;
@@ -46,11 +46,11 @@ fn main() {
                     .expect("fixture operation must succeed")
                     .get_bool("ismaster")
                     .unwrap_or(false)
-                {
-                    let _=d.run("admin",doc!{"createUser":"lane","pwd":"pencil","roles":[{"role":"root","db":"admin"}]});
-                    done = true;
-                    break;
-                }
+            {
+                let _=d.run("admin",doc!{"createUser":"lane","pwd":"pencil","roles":[{"role":"root","db":"admin"}]});
+                done = true;
+                break;
+            }
         }
         if done || rs.is_empty() {
             break;

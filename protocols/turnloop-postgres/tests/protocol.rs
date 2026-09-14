@@ -1,4 +1,4 @@
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use turnloop_postgres::*;
 fn frame(tag: u8, body: &[u8]) -> Vec<u8> {
     let mut b = vec![tag];
@@ -8,16 +8,26 @@ fn frame(tag: u8, body: &[u8]) -> Vec<u8> {
 }
 fn flush(c: &mut Connection) -> Vec<u8> {
     let b = c.output().to_vec();
-    c.consume_output(b.len()).expect("fixture operation must succeed");
+    c.consume_output(b.len())
+        .expect("fixture operation must succeed");
     b
 }
 fn ready() -> Connection {
     let mut c = Connection::new(Config::default()).expect("fixture operation must succeed");
     flush(&mut c);
-    c.receive(&frame(b'R', &0u32.to_be_bytes())).expect("fixture operation must succeed");
-    assert!(c.next_event().expect("fixture operation must succeed").is_none());
-    c.receive(&frame(b'Z', b"I")).expect("fixture operation must succeed");
-    assert!(matches!(c.next_event().expect("fixture operation must succeed"), Some(Event::Connected)));
+    c.receive(&frame(b'R', &0u32.to_be_bytes()))
+        .expect("fixture operation must succeed");
+    assert!(
+        c.next_event()
+            .expect("fixture operation must succeed")
+            .is_none()
+    );
+    c.receive(&frame(b'Z', b"I"))
+        .expect("fixture operation must succeed");
+    assert!(matches!(
+        c.next_event().expect("fixture operation must succeed"),
+        Some(Event::Connected)
+    ));
     c
 }
 #[test]
@@ -28,8 +38,13 @@ fn cleartext_md5_and_tls_transitions() {
     })
     .expect("fixture operation must succeed");
     assert!(flush(&mut c).windows(9).any(|v| v == b"postgres\0"));
-    c.receive(&frame(b'R', &3u32.to_be_bytes())).expect("fixture operation must succeed");
-    assert!(c.next_event().expect("fixture operation must succeed").is_none());
+    c.receive(&frame(b'R', &3u32.to_be_bytes()))
+        .expect("fixture operation must succeed");
+    assert!(
+        c.next_event()
+            .expect("fixture operation must succeed")
+            .is_none()
+    );
     assert_eq!(flush(&mut c), frame(b'p', b"secret\0"));
     let mut c = Connection::new(Config {
         user: "user".into(),
@@ -38,8 +53,13 @@ fn cleartext_md5_and_tls_transitions() {
     })
     .expect("fixture operation must succeed");
     flush(&mut c);
-    c.receive(&frame(b'R', &[0, 0, 0, 5, 1, 2, 3, 4])).expect("fixture operation must succeed");
-    assert!(c.next_event().expect("fixture operation must succeed").is_none());
+    c.receive(&frame(b'R', &[0, 0, 0, 5, 1, 2, 3, 4]))
+        .expect("fixture operation must succeed");
+    assert!(
+        c.next_event()
+            .expect("fixture operation must succeed")
+            .is_none()
+    );
     assert_eq!(
         flush(&mut c),
         frame(b'p', b"md5fccef98e4f1cf6cbe96b743fad4e8bd0\0")
@@ -51,7 +71,10 @@ fn cleartext_md5_and_tls_transitions() {
     .expect("fixture operation must succeed");
     assert_eq!(flush(&mut c), [0, 0, 0, 8, 4, 210, 22, 47]);
     c.receive(b"S").expect("fixture operation must succeed");
-    assert!(matches!(c.next_event().expect("fixture operation must succeed"), Some(Event::UpgradeTls)));
+    assert!(matches!(
+        c.next_event().expect("fixture operation must succeed"),
+        Some(Event::UpgradeTls)
+    ));
     assert!(c.query(1, "SELECT 1", None).is_err());
     c.tls_established().expect("fixture operation must succeed");
     assert!(!c.output().is_empty());
@@ -67,9 +90,12 @@ fn cleartext_md5_and_tls_transitions() {
 #[test]
 fn fragmented_pipeline_errors_metadata_and_exact_completion() {
     let mut c = ready();
-    c.query(10, "SELECT 42; SELECT 43", None).expect("fixture operation must succeed");
-    c.query(11, "bad", None).expect("fixture operation must succeed");
-    c.query(12, "SELECT 99", None).expect("fixture operation must succeed");
+    c.query(10, "SELECT 42; SELECT 43", None)
+        .expect("fixture operation must succeed");
+    c.query(11, "bad", None)
+        .expect("fixture operation must succeed");
+    c.query(12, "SELECT 99", None)
+        .expect("fixture operation must succeed");
     flush(&mut c);
     let mut fields = vec![0, 1];
     fields.extend_from_slice(b"answer\0");
@@ -86,14 +112,21 @@ fn fragmented_pipeline_errors_metadata_and_exact_completion() {
         while let Some(e) = c.next_event().expect("fixture operation must succeed") {
             match e {
                 Event::Fields { fields, .. } => {
-                    let f = fields.into_iter().next().expect("fixture operation must succeed").expect("fixture operation must succeed");
+                    let f = fields
+                        .into_iter()
+                        .next()
+                        .expect("fixture operation must succeed")
+                        .expect("fixture operation must succeed");
                     assert_eq!(f.name, "answer");
                     assert_eq!(f.data_type_size, 4);
                     descriptions += 1;
                 }
                 Event::Row { token, mut row } => {
                     assert_eq!(
-                        row.next().expect("fixture operation must succeed").expect("fixture operation must succeed").expect("fixture operation must succeed"),
+                        row.next()
+                            .expect("fixture operation must succeed")
+                            .expect("fixture operation must succeed")
+                            .expect("fixture operation must succeed"),
                         if token == 10 { b"42" } else { b"99" }
                     );
                     rows += 1;
@@ -124,10 +157,14 @@ fn fragmented_pipeline_errors_metadata_and_exact_completion() {
         ]
     );
     assert_eq!(c.pending_count(), 0);
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     let now = Instant::now();
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    let now = Instant::from_duration(std::time::Duration::ZERO);
     c.query(13, "slow", Some(now + Duration::from_secs(1)))
         .expect("fixture operation must succeed");
-    c.query(14, "next", None).expect("fixture operation must succeed");
+    c.query(14, "next", None)
+        .expect("fixture operation must succeed");
     c.handle_timeout(now);
     assert_eq!(c.pending_count(), 2);
     c.handle_timeout(now + Duration::from_secs(1));
@@ -140,7 +177,11 @@ fn fragmented_pipeline_errors_metadata_and_exact_completion() {
         c.next_event().expect("fixture operation must succeed"),
         Some(Event::Closed { .. })
     ));
-    assert!(c.next_event().expect("fixture operation must succeed").is_none());
+    assert!(
+        c.next_event()
+            .expect("fixture operation must succeed")
+            .is_none()
+    );
 }
 #[test]
 fn prepared_cache_recovery_and_copy_commands() {
@@ -172,7 +213,11 @@ fn prepared_cache_recovery_and_copy_commands() {
         .concat(),
     )
     .expect("fixture operation must succeed");
-    while c.next_event().expect("fixture operation must succeed").is_some() {}
+    while c
+        .next_event()
+        .expect("fixture operation must succeed")
+        .is_some()
+    {}
     c.execute(
         2,
         ExtendedQuery {
@@ -204,18 +249,26 @@ fn prepared_cache_recovery_and_copy_commands() {
         .is_err()
     );
     c.abort(Error::Cancelled);
-    while c.next_event().expect("fixture operation must succeed").is_some() {}
+    while c
+        .next_event()
+        .expect("fixture operation must succeed")
+        .is_some()
+    {}
     let mut c = ready();
-    c.query(3, "COPY x FROM STDIN", None).expect("fixture operation must succeed");
+    c.query(3, "COPY x FROM STDIN", None)
+        .expect("fixture operation must succeed");
     flush(&mut c);
-    c.receive(&frame(b'G', &[0, 0, 1, 0, 0])).expect("fixture operation must succeed");
+    c.receive(&frame(b'G', &[0, 0, 1, 0, 0]))
+        .expect("fixture operation must succeed");
     assert!(matches!(
         c.next_event().expect("fixture operation must succeed"),
         Some(Event::CopyIn { binary: false, .. })
     ));
-    c.copy_data(b"42\n").expect("fixture operation must succeed");
+    c.copy_data(b"42\n")
+        .expect("fixture operation must succeed");
     assert_eq!(flush(&mut c), frame(b'd', b"42\n"));
-    c.copy_finish(Some("input failed")).expect("fixture operation must succeed");
+    c.copy_finish(Some("input failed"))
+        .expect("fixture operation must succeed");
     assert_eq!(flush(&mut c), frame(b'f', b"input failed\0"));
 }
 #[test]
@@ -224,10 +277,12 @@ fn invalid_input_is_bounded_and_commands_are_atomic() {
     assert!(c.query(1, "SELECT\0oops", None).is_err());
     assert!(c.output().is_empty());
     assert_eq!(c.pending_count(), 0);
-    c.query(1, "SELECT 1", None).expect("fixture operation must succeed");
+    c.query(1, "SELECT 1", None)
+        .expect("fixture operation must succeed");
     assert!(c.query(1, "SELECT 2", None).is_err());
     flush(&mut c);
-    c.receive(&[b'D', 0x7f, 0xff, 0xff, 0xff]).expect("fixture operation must succeed");
+    c.receive(&[b'D', 0x7f, 0xff, 0xff, 0xff])
+        .expect("fixture operation must succeed");
     assert_eq!(c.next_event().unwrap_err(), Error::Limit);
     c.abort(Error::Limit);
     assert!(matches!(
@@ -239,25 +294,18 @@ fn invalid_input_is_bounded_and_commands_are_atomic() {
         })
     ));
     let mut c = ready();
-    c.query(1, "select", None).expect("fixture operation must succeed");
+    c.query(1, "select", None)
+        .expect("fixture operation must succeed");
     c.receive(&frame(b'D', &[0, 1, 255, 255, 255, 254]))
         .expect("fixture operation must succeed");
     assert!(c.next_event().is_err());
 }
 
 fn sha256(b: &[u8]) -> [u8; 32] {
-    let p = rustls::crypto::ring::default_provider();
-    let h = p
-        .cipher_suites
-        .iter()
-        .find(|s| s.suite() == rustls::CipherSuite::TLS13_AES_128_GCM_SHA256)
-        .expect("fixture operation must succeed")
-        .tls13()
-        .expect("fixture operation must succeed")
-        .common
-        .hash_provider;
-    h.hash(b).as_ref().try_into().expect("fixture operation must succeed")
+    use sha2::Digest;
+    sha2::Sha256::digest(b).into()
 }
+
 fn hmac(key: &[u8], message: &[u8]) -> [u8; 32] {
     let mut inner = vec![0x36; 64];
     let mut outer = vec![0x5c; 64];
@@ -309,33 +357,57 @@ fn scram_and_plus_verify_server_signature_and_reject_bad_verifier() {
         flush(&mut c);
         if plus {
             c.receive(b"S").expect("fixture operation must succeed");
-            assert!(matches!(c.next_event().expect("fixture operation must succeed"), Some(Event::UpgradeTls)));
+            assert!(matches!(
+                c.next_event().expect("fixture operation must succeed"),
+                Some(Event::UpgradeTls)
+            ));
             c.tls_established().expect("fixture operation must succeed");
             flush(&mut c);
         }
         let mut mechanisms = 10u32.to_be_bytes().to_vec();
         mechanisms.extend_from_slice(b"SCRAM-SHA-256-PLUS\0SCRAM-SHA-256\0\0");
-        c.receive(&frame(b'R', &mechanisms)).expect("fixture operation must succeed");
-        assert!(matches!(c.next_event().expect("fixture operation must succeed"),Some(Event::ScramNeeded {plus:p}) if p==plus));
+        c.receive(&frame(b'R', &mechanisms))
+            .expect("fixture operation must succeed");
+        assert!(
+            matches!(c.next_event().expect("fixture operation must succeed"),Some(Event::ScramNeeded {plus:p}) if p==plus)
+        );
         let binding = if plus {
             ChannelBinding::tls_server_end_point(vec![7; 32])
         } else {
             ChannelBinding::unsupported()
         };
         let scram = ScramSha256::new(b"secret", binding);
-        let first = std::str::from_utf8(scram.message()).expect("fixture operation must succeed").to_owned();
-        let bare = first.splitn(3, ',').nth(2).expect("fixture operation must succeed");
-        let nonce = bare.split_once("r=").expect("fixture operation must succeed").1;
+        let first = std::str::from_utf8(scram.message())
+            .expect("fixture operation must succeed")
+            .to_owned();
+        let bare = first
+            .splitn(3, ',')
+            .nth(2)
+            .expect("fixture operation must succeed");
+        let nonce = bare
+            .split_once("r=")
+            .expect("fixture operation must succeed")
+            .1;
         let server_first = format!("r={nonce}server,s=c2FsdA==,i=4096");
-        c.start_scram(scram).expect("fixture operation must succeed");
+        c.start_scram(scram)
+            .expect("fixture operation must succeed");
         assert_eq!(flush(&mut c)[0], b'p');
         let mut continuation = 11u32.to_be_bytes().to_vec();
         continuation.extend_from_slice(server_first.as_bytes());
-        c.receive(&frame(b'R', &continuation)).expect("fixture operation must succeed");
-        assert!(c.next_event().expect("fixture operation must succeed").is_none());
+        c.receive(&frame(b'R', &continuation))
+            .expect("fixture operation must succeed");
+        assert!(
+            c.next_event()
+                .expect("fixture operation must succeed")
+                .is_none()
+        );
         let response = flush(&mut c);
-        let client_final = std::str::from_utf8(&response[5..]).expect("fixture operation must succeed");
-        let without_proof = client_final.split_once(",p=").expect("fixture operation must succeed").0;
+        let client_final =
+            std::str::from_utf8(&response[5..]).expect("fixture operation must succeed");
+        let without_proof = client_final
+            .split_once(",p=")
+            .expect("fixture operation must succeed")
+            .0;
         let auth_message = format!("{bare},{server_first},{without_proof}");
         let mut signature = hmac(&hmac(&salted, b"Server Key"), auth_message.as_bytes());
         if !valid {
@@ -343,12 +415,20 @@ fn scram_and_plus_verify_server_signature_and_reject_bad_verifier() {
         }
         let mut final_message = 12u32.to_be_bytes().to_vec();
         final_message.extend_from_slice(format!("v={}", base64(&signature)).as_bytes());
-        c.receive(&frame(b'R', &final_message)).expect("fixture operation must succeed");
+        c.receive(&frame(b'R', &final_message))
+            .expect("fixture operation must succeed");
         if valid {
-            assert!(c.next_event().expect("fixture operation must succeed").is_none());
+            assert!(
+                c.next_event()
+                    .expect("fixture operation must succeed")
+                    .is_none()
+            );
             c.receive(&[frame(b'R', &0u32.to_be_bytes()), frame(b'Z', b"I")].concat())
                 .expect("fixture operation must succeed");
-            assert!(matches!(c.next_event().expect("fixture operation must succeed"), Some(Event::Connected)));
+            assert!(matches!(
+                c.next_event().expect("fixture operation must succeed"),
+                Some(Event::Connected)
+            ));
         } else {
             assert!(c.next_event().is_err());
             assert!(!c.is_ready());
@@ -392,7 +472,8 @@ fn extended_copy_resynchronizes_after_copy_done() {
         c.next_event().expect("fixture operation must succeed"),
         Some(Event::CopyIn { .. })
     ));
-    c.copy_data(b"42\n").expect("fixture operation must succeed");
+    c.copy_data(b"42\n")
+        .expect("fixture operation must succeed");
     c.copy_finish(None).expect("fixture operation must succeed");
     assert_eq!(
         flush(&mut c),

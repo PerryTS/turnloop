@@ -39,9 +39,10 @@ impl Redirect {
 pub fn key_slot(mut key: &[u8]) -> u16 {
     if let Some(open) = key.iter().position(|b| *b == b'{')
         && let Some(close) = key[open + 1..].iter().position(|b| *b == b'}')
-            && close != 0 {
-                key = &key[open + 1..open + 1 + close];
-            }
+        && close != 0
+    {
+        key = &key[open + 1..open + 1 + close];
+    }
     let mut crc = 0u16;
     for byte in key {
         crc ^= u16::from(*byte) << 8;
@@ -283,7 +284,9 @@ fn field<'a>(value: &'a Value, key: &[u8]) -> Result<&'a Value, Error> {
             .find(|(k, _)| k.bytes() == Some(key))
             .map(|(_, v)| v),
         Value::Array(entries) => entries
-            .as_chunks::<2>().0.iter()
+            .as_chunks::<2>()
+            .0
+            .iter()
             .find(|p| p[0].bytes() == Some(key))
             .map(|p| &p[1]),
         _ => None,

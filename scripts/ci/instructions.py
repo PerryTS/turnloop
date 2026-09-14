@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run fresh iai-callgrind processes and compare nonzero Ir counts to reviewed baselines."""
+"""Run fresh gungraun processes and compare nonzero Ir counts to reviewed baselines."""
 import argparse
 import json
 import os
@@ -30,7 +30,7 @@ def read_counts(directory):
             fail(f'{key}: zero/invalid instruction count')
         counts[key] = count
     if not counts:
-        fail('No iai-callgrind summary.json files; benchmark did not run')
+        fail('No gungraun summary.json files; benchmark did not run')
     return counts
 
 
@@ -66,15 +66,15 @@ def main():
     packages = select(data, 'bench')
     for package in packages:
         targets = [t for t in package['targets'] if 'bench' in t['kind']]
-        if not targets or not any(d['name'] == 'iai-callgrind' and d['req'] == '=0.16.1' for d in package['dependencies']):
-            fail(f'{package["name"]}: add an iai-callgrind =0.16.1 benchmark target; timings/perf counters cannot satisfy this gate')
+        if not targets or not any(d['name'] == 'gungraun' and d['req'] == '=0.19.4' for d in package['dependencies']):
+            fail(f'{package["name"]}: add a gungraun =0.19.4 benchmark target; timings/perf counters cannot satisfy this gate')
     if platform.system() != 'Linux' or platform.machine() != 'x86_64':
         fail('Instruction gate requires the ubuntu-24.04 x86_64/Valgrind runner')
     version = run(['valgrind', '--version'], capture=True).strip()
     env = os.environ.copy()
     env.update({'CARGO_PROFILE_BENCH_CODEGEN_UNITS': '1', 'CARGO_PROFILE_RELEASE_CODEGEN_UNITS': '1',
-                'RUSTFLAGS': '-C codegen-units=1', 'IAI_CALLGRIND_SAVE_SUMMARY': 'json',
-                'IAI_CALLGRIND_NOCAPTURE': 'true'})
+                'RUSTFLAGS': '-C codegen-units=1', 'GUNGRAUN_SAVE_SUMMARY': 'json',
+                'GUNGRAUN_NOCAPTURE': 'true'})
     root = Path(data['workspace_root'])
     results = {}
     for package in packages:
@@ -85,7 +85,7 @@ def main():
         for _ in range(3):
             # No cache restore: summaries from another commit can never satisfy execution.
             with tempfile.TemporaryDirectory(prefix='turnloop-iai-') as directory:
-                env['IAI_CALLGRIND_HOME'] = directory
+                env['GUNGRAUN_HOME'] = directory
                 command = cargo(PIN) + ['bench', '--locked', '--manifest-path', package['manifest_path']]
                 for target in package['targets']:
                     if 'bench' in target['kind']:

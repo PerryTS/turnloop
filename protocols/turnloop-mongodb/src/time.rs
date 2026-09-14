@@ -45,7 +45,7 @@ impl Sub for HostInstant {
         self.duration_since(earlier)
     }
 }
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-pub use std::time::Instant;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 pub use HostInstant as Instant;
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub use std::time::Instant;

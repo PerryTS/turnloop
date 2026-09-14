@@ -1,9 +1,7 @@
+#[path = "support/clock.rs"]
+mod clock;
 use serde_json::Value;
-use std::{
-    fs,
-    path::Path,
-    time::{Duration, Instant},
-};
+use std::{fs, path::Path, time::Duration};
 use turnloop_mongodb::{
     bson::{self, Document},
     topology::{ApplicationError, ApplicationErrorKind, Topology, TopologyType},
@@ -107,7 +105,7 @@ fn check(t: &Topology, v: &Value) {
 fn run(path: &Path) -> usize {
     let test: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
     let opts = Options::parse(test["uri"].as_str().unwrap()).unwrap();
-    let now = Instant::now();
+    let now = clock::now();
     let mut t = Topology::new(&opts, now);
     if path.parent().unwrap().ends_with("single")
         && opts.seeds.len() == 1

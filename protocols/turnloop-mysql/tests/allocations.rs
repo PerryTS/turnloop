@@ -24,7 +24,8 @@ fn warm_ping_and_compressed_ping_allocate_nothing() {
     hello.extend_from_slice(&((caps.bits() >> 16) as u16).to_le_bytes());
     hello.extend_from_slice(&[21, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
     hello.extend_from_slice(b"ijklmnopqrst\0mysql_native_password\0");
-    let parsed = HandshakePacket::deserialize((), &mut ParseBuf(&hello)).expect("fixture operation must succeed");
+    let parsed = HandshakePacket::deserialize((), &mut ParseBuf(&hello))
+        .expect("fixture operation must succeed");
     let mut checked = Vec::new();
     parsed.serialize(&mut checked);
     assert_eq!(hello, checked);
@@ -36,13 +37,23 @@ fn warm_ping_and_compressed_ping_allocate_nothing() {
         .expect("fixture operation must succeed");
         let mut server = PacketCodec::default();
         let mut wire = BytesMut::new();
-        server.encode(&mut &hello[..], &mut wire).expect("fixture operation must succeed");
+        server
+            .encode(&mut &hello[..], &mut wire)
+            .expect("fixture operation must succeed");
         c.receive(&wire).expect("fixture operation must succeed");
-        assert!(matches!(c.next_event().expect("fixture operation must succeed"), Some(Event::Progress)));
+        assert!(matches!(
+            c.next_event().expect("fixture operation must succeed"),
+            Some(Event::Progress)
+        ));
         let mut client_bytes = BytesMut::from(c.output());
         let mut auth = Vec::new();
-        assert!(server.decode(&mut client_bytes, &mut auth).expect("fixture operation must succeed"));
-        c.consume_output(c.output().len()).expect("fixture operation must succeed");
+        assert!(
+            server
+                .decode(&mut client_bytes, &mut auth)
+                .expect("fixture operation must succeed")
+        );
+        c.consume_output(c.output().len())
+            .expect("fixture operation must succeed");
         wire.clear();
         server
             .encode(&mut &[0, 0, 0, 2, 0, 0, 0][..], &mut wire)
@@ -60,21 +71,33 @@ fn warm_ping_and_compressed_ping_allocate_nothing() {
         c.ping(1).expect("fixture operation must succeed");
         let mut client_bytes = BytesMut::from(c.output());
         auth.clear();
-        assert!(server.decode(&mut client_bytes, &mut auth).expect("fixture operation must succeed"));
+        assert!(
+            server
+                .decode(&mut client_bytes, &mut auth)
+                .expect("fixture operation must succeed")
+        );
         assert_eq!(auth, [14]);
-        c.consume_output(c.output().len()).expect("fixture operation must succeed");
+        c.consume_output(c.output().len())
+            .expect("fixture operation must succeed");
         wire.clear();
         server
             .encode(&mut &[0, 0, 0, 2, 0, 0, 0][..], &mut wire)
             .expect("fixture operation must succeed");
         let response = wire.to_vec();
-        c.receive(&response).expect("fixture operation must succeed");
-        while c.next_event().expect("fixture operation must succeed").is_some() {}
+        c.receive(&response)
+            .expect("fixture operation must succeed");
+        while c
+            .next_event()
+            .expect("fixture operation must succeed")
+            .is_some()
+        {}
         let mut complete = 0;
         let mut run = || {
             c.ping(2).expect("fixture operation must succeed");
-            c.consume_output(c.output().len()).expect("fixture operation must succeed");
-            c.receive(&response).expect("fixture operation must succeed");
+            c.consume_output(c.output().len())
+                .expect("fixture operation must succeed");
+            c.receive(&response)
+                .expect("fixture operation must succeed");
             while let Some(e) = c.next_event().expect("fixture operation must succeed") {
                 if let Event::Completed { token, outcome } = e {
                     assert_eq!(token, 2);
@@ -96,12 +119,18 @@ fn warm_ping_and_compressed_ping_allocate_nothing() {
         // Rows use metadata and a compressed 512-byte value from the independent
         // upstream encoder, exercising retained decompression state as well.
         server.reset_seq_id();
-        c.query(3, "SELECT REPEAT('x',512)", None).expect("fixture operation must succeed");
+        c.query(3, "SELECT REPEAT('x',512)", None)
+            .expect("fixture operation must succeed");
         let mut request = BytesMut::from(c.output());
         auth.clear();
-        assert!(server.decode(&mut request, &mut auth).expect("fixture operation must succeed"));
+        assert!(
+            server
+                .decode(&mut request, &mut auth)
+                .expect("fixture operation must succeed")
+        );
         assert_eq!(auth[0], 3);
-        c.consume_output(c.output().len()).expect("fixture operation must succeed");
+        c.consume_output(c.output().len())
+            .expect("fixture operation must succeed");
         let mut column = Vec::new();
         mysql_common::packets::Column::new(ColumnType::MYSQL_TYPE_VAR_STRING)
             .with_name(b"value")
@@ -117,21 +146,35 @@ fn warm_ping_and_compressed_ping_allocate_nothing() {
             &row,
             &[0xfe, 0, 0, 2, 0],
         ] {
-            server.encode(&mut &packet[..], &mut wire).expect("fixture operation must succeed");
+            server
+                .encode(&mut &packet[..], &mut wire)
+                .expect("fixture operation must succeed");
         }
         let response = wire.to_vec();
-        c.receive(&response).expect("fixture operation must succeed");
-        while c.next_event().expect("fixture operation must succeed").is_some() {}
+        c.receive(&response)
+            .expect("fixture operation must succeed");
+        while c
+            .next_event()
+            .expect("fixture operation must succeed")
+            .is_some()
+        {}
         let mut rows = 0;
         let mut complete = 0;
         let mut run = || {
-            c.query(3, "SELECT REPEAT('x',512)", None).expect("fixture operation must succeed");
-            c.consume_output(c.output().len()).expect("fixture operation must succeed");
-            c.receive(&response).expect("fixture operation must succeed");
+            c.query(3, "SELECT REPEAT('x',512)", None)
+                .expect("fixture operation must succeed");
+            c.consume_output(c.output().len())
+                .expect("fixture operation must succeed");
+            c.receive(&response)
+                .expect("fixture operation must succeed");
             while let Some(e) = c.next_event().expect("fixture operation must succeed") {
                 match e {
                     Event::Row { mut row, .. } => {
-                        let RawValue::Bytes(bytes) = row.next().expect("fixture operation must succeed").expect("fixture operation must succeed") else {
+                        let RawValue::Bytes(bytes) = row
+                            .next()
+                            .expect("fixture operation must succeed")
+                            .expect("fixture operation must succeed")
+                        else {
                             panic!()
                         };
                         assert_eq!(bytes, &[b'x'; 512]);

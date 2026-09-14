@@ -1,4 +1,4 @@
-use bson::{raw::RawDocument, Document};
+use bson::{Document, raw::RawDocument};
 use std::{borrow::Cow, fmt};
 pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

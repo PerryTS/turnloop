@@ -5,10 +5,10 @@
 //! Input BSON and wire templates are copied into retained buffers once per command.
 use crate::Instant;
 use crate::{
+    Connection, Error, ErrorKind, Result,
     retry::{Retry, RetryKind},
     uri::ReadPreference,
     wire::{self, BsonWriter, Message},
-    Connection, Error, ErrorKind, Result,
 };
 use bson::raw::{RawBsonRef, RawDocument};
 use std::time::Duration;
@@ -298,16 +298,16 @@ impl Operation {
         self.writer.append_fields(message.body, &[])?;
         if let Some(session) = self.options.session
             && capabilities.sessions
-                && !self.policy.in_transaction
-                && message.body.get("lsid").ok().flatten().is_none()
-            {
-                let l = self.writer.start_document("lsid", false)?;
-                self.writer.binary("id", 4, &session.id)?;
-                self.writer.end_document(l)?;
-                if self.policy.kind == RetryKind::Write && self.policy.enabled {
-                    self.writer.int64("txnNumber", session.txn_number)?;
-                }
+            && !self.policy.in_transaction
+            && message.body.get("lsid").ok().flatten().is_none()
+        {
+            let l = self.writer.start_document("lsid", false)?;
+            self.writer.binary("id", 4, &session.id)?;
+            self.writer.end_document(l)?;
+            if self.policy.kind == RetryKind::Write && self.policy.enabled {
+                self.writer.int64("txnNumber", session.txn_number)?;
             }
+        }
         let pref = if capabilities.direct && self.options.read_preference == ReadPreference::Primary
         {
             ReadPreference::PrimaryPreferred

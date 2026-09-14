@@ -3,12 +3,12 @@
 //! yields exactly one Reply, Failed, or Unacknowledged event before reuse.
 use crate::Instant;
 use crate::{
+    Error, ErrorKind, Result,
     auth::{Mechanism, Scram},
     uri::Options,
     wire::{self, Decoder, Message},
-    Error, ErrorKind, Result,
 };
-use bson::{doc, raw::RawDocument, Document};
+use bson::{Document, doc, raw::RawDocument};
 use std::collections::VecDeque;
 #[derive(Debug)]
 pub enum ConnectionEvent {
@@ -325,30 +325,32 @@ impl Connection {
                     .is_some_and(|a| a.iter().any(|b| b.as_str() == Some("zlib")));
             self.hello = Some(d.clone());
             if let Some(c) = &self.options.credential
-                && !d.get_bool("arbiterOnly").unwrap_or(false) {
-                    self.state = State::Auth;
-                    let next = if let Ok(spec) = d.get_document("speculativeAuthenticate") {
-                        self.scram.as_mut().unwrap().receive(spec, &c.source)?
-                    } else {
-                        let mechanism = c.mechanism.unwrap_or_else(|| {
-                            if d.get_array("saslSupportedMechs").ok().is_some_and(|a| {
-                                a.iter().any(|b| b.as_str() == Some("SCRAM-SHA-256"))
-                            }) {
-                                Mechanism::Sha256
-                            } else {
-                                Mechanism::Sha1
-                            }
-                        });
-                        let mut scram = Scram::new(c, mechanism, &self.nonce)?;
-                        let start = scram.start(&c.source, false);
-                        self.scram = Some(scram);
-                        Some(start)
-                    };
-                    if let Some(next) = next {
-                        self.send_document(&next)?;
-                        return Ok(n);
-                    }
+                && !d.get_bool("arbiterOnly").unwrap_or(false)
+            {
+                self.state = State::Auth;
+                let next = if let Ok(spec) = d.get_document("speculativeAuthenticate") {
+                    self.scram.as_mut().unwrap().receive(spec, &c.source)?
+                } else {
+                    let mechanism = c.mechanism.unwrap_or_else(|| {
+                        if d.get_array("saslSupportedMechs")
+                            .ok()
+                            .is_some_and(|a| a.iter().any(|b| b.as_str() == Some("SCRAM-SHA-256")))
+                        {
+                            Mechanism::Sha256
+                        } else {
+                            Mechanism::Sha1
+                        }
+                    });
+                    let mut scram = Scram::new(c, mechanism, &self.nonce)?;
+                    let start = scram.start(&c.source, false);
+                    self.scram = Some(scram);
+                    Some(start)
+                };
+                if let Some(next) = next {
+                    self.send_document(&next)?;
+                    return Ok(n);
                 }
+            }
         } else if self.state == State::Auth {
             let source = &self.options.credential.as_ref().unwrap().source;
             let next = self.scram.as_mut().unwrap().receive(&d, source)?;

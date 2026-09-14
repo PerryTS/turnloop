@@ -14,6 +14,8 @@ description = "Pull-driven SMTP client and MIME message builder"
 [dependencies]
 base64.workspace = true
 lettre.workspace = true
+# Constrain lettre's compatible helper to the workspace's shared base64 version.
+email-encoding.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 rustls.workspace = true

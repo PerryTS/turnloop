@@ -21,6 +21,36 @@ ROOT = Path(__file__).resolve().parents[1]
 TOOLS = ROOT / '.tools'
 STATE = TOOLS / 'test-servers.json'
 SELECTED = set()
+CI_SERVICES = False
+POSTGRES_HBA = """local all all trust
+MYSQL_USERS = """CREATE DATABASE IF NOT EXISTS turnloop_test;
+POSTGRES_USERS = """    DO $$ BEGIN
+     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='scram_user') THEN CREATE ROLE scram_user LOGIN; END IF;
+     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='tls_user') THEN CREATE ROLE tls_user LOGIN; END IF;
+     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='md5_user') THEN CREATE ROLE md5_user LOGIN; END IF;
+     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='clear_user') THEN CREATE ROLE clear_user LOGIN; END IF;
+    END $$;
+    SET password_encryption='scram-sha-256';
+    ALTER ROLE scram_user PASSWORD 'fixture-password';
+    ALTER ROLE tls_user PASSWORD 'fixture-password';
+    ALTER ROLE clear_user PASSWORD 'fixture-password';
+    SET password_encryption='md5';
+    ALTER ROLE md5_user PASSWORD 'fixture-password';
+
+GRANT ALL ON SCHEMA public TO scram_user, tls_user, md5_user, clear_user;
+"""GRANT ALL ON turnloop_test.* TO 'auth_rsa_user'@'127.0.0.1';
+CREATE USER IF NOT EXISTS 'sql_user'@'127.0.0.1' IDENTIFIED WITH caching_sha2_password BY 'fixture-password';
+CREATE USER IF NOT EXISTS 'tls_user'@'127.0.0.1' IDENTIFIED WITH caching_sha2_password BY 'fixture-password' REQUIRE SSL;
+GRANT ALL ON turnloop_test.* TO 'sql_user'@'127.0.0.1';
+GRANT ALL ON turnloop_test.* TO 'tls_user'@'127.0.0.1';
+"""hostnossl all tls_user 127.0.0.1/32 reject
+host all scram_user 127.0.0.1/32 scram-sha-256
+host all md5_user 127.0.0.1/32 md5
+host all clear_user 127.0.0.1/32 password
+host all postgres 127.0.0.1/32 trust
+"""
+MYSQL_USERS = "\nCREATE DATABASE IF NOT EXISTS turnloop_test;\nCREATE USER IF NOT EXISTS 'auth_rsa_user'@'127.0.0.1' IDENTIFIED WITH caching_sha2_password BY 'fixture-password';\nGRANT ALL ON turnloop_test.* TO 'auth_rsa_user'@'127.0.0.1';\nCREATE USER IF NOT EXISTS 'sql_user'@'127.0.0.1' IDENTIFIED WITH caching_sha2_password BY 'fixture-password';\nCREATE USER IF NOT EXISTS 'tls_user'@'127.0.0.1' IDENTIFIED WITH caching_sha2_password BY 'fixture-password' REQUIRE SSL;\nGRANT ALL ON turnloop_test.* TO 'sql_user'@'127.0.0.1';\nGRANT ALL ON turnloop_test.* TO 'tls_user'@'127.0.0.1';\n"
+POSTGRES_USERS = "\n    DO $$ BEGIN\n     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='scram_user') THEN CREATE ROLE scram_user LOGIN; END IF;\n     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='tls_user') THEN CREATE ROLE tls_user LOGIN; END IF;\n     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='md5_user') THEN CREATE ROLE md5_user LOGIN; END IF;\n     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='clear_user') THEN CREATE ROLE clear_user LOGIN; END IF;\n    END $$;\n    SET password_encryption='scram-sha-256';\n    ALTER ROLE scram_user PASSWORD 'fixture-password';\n    ALTER ROLE tls_user PASSWORD 'fixture-password';\n    ALTER ROLE clear_user PASSWORD 'fixture-password';\n    SET password_encryption='md5';\n    ALTER ROLE md5_user PASSWORD 'fixture-password';\n    \nGRANT ALL ON SCHEMA public TO scram_user, tls_user, md5_user, clear_user;\n"
 
 def find_binary(name):
     binary = shutil.which(name)
@@ -38,16 +68,6 @@ class BinaryDirectory:
     def __truediv__(self, name):
         return find_binary(name)
 
-#!/usr/bin/env python3
-"""Private PostgreSQL/MySQL fixtures. run COMMAND always stops both servers."""
-import json
-import os
-from pathlib import Path
-import signal
-import socket
-import subprocess
-import sys
-import time
 
 SQL_ROOT = Path(__file__).resolve().parent.parent
 SQL_TOOLS = SQL_ROOT / '.tools' / 'sql'
@@ -90,18 +110,23 @@ def sql_stop():
     SQL_STATE.unlink()
 
 
-def sql_start():
-    if SQL_STATE.exists():
-        raise RuntimeError('state exists; run stop first')
+def sql_certificates():
     SQL_TOOLS.mkdir(parents=True, exist_ok=True)
     cert = SQL_TOOLS / 'server.crt'
     key = SQL_TOOLS / 'server.key'
-    if not cert.exists():
+    if not cert.exists() or subprocess.run([SQL_BIN / 'openssl', 'x509', '-in', cert, '-checkend', '86400', '-noout'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0:
         sql_command([SQL_BIN / 'openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-sha256', '-days', '7',
                  '-subj', '/CN=localhost', '-addext', 'subjectAltName=DNS:localhost,IP:127.0.0.1',
                  '-addext', 'basicConstraints=critical,CA:FALSE', '-keyout', key, '-out', cert], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         key.chmod(0o600)
         sql_command([SQL_BIN / 'openssl', 'x509', '-in', cert, '-outform', 'DER', '-out', SQL_TOOLS / 'server.der'])
+    return cert, key
+
+
+def sql_start():
+    if SQL_STATE.exists():
+        raise RuntimeError('state exists; run stop first')
+    cert, key = sql_certificates()
     only_mysql = "postgres" not in SELECTED
     pg = SQL_TOOLS / 'pgdata'
     if not only_mysql and not (pg / 'PG_VERSION').exists():
@@ -111,7 +136,7 @@ def sql_start():
     while myport == pgport:
         myport = sql_port()
     if not only_mysql:
-        (pg / 'pg_hba.conf').write_text('local all all trust\nhostssl all tls_user 127.0.0.1/32 scram-sha-256\nhostnossl all tls_user 127.0.0.1/32 reject\nhost all scram_user 127.0.0.1/32 scram-sha-256\nhost all md5_user 127.0.0.1/32 md5\nhost all clear_user 127.0.0.1/32 password\nhost all postgres 127.0.0.1/32 trust\n')
+        (pg / 'pg_hba.conf').write_text(POSTGRES_HBA)
         (pg / 'postgresql.conf').write_text(f"listen_addresses='127.0.0.1'\nport={pgport}\nunix_socket_directories='{SQL_TOOLS}'\nssl=on\nssl_cert_file='{cert}'\nssl_key_file='{key}'\nmax_connections=30\n")
     state = {'servers': [], 'env': {'TURNLOOP_TEST_POSTGRES_PORT': str(pgport), 'TURNLOOP_TEST_MYSQL_PORT': str(myport), 'TURNLOOP_TEST_SQL_TOOLS': str(SQL_TOOLS)}}
     SQL_STATE.write_text(json.dumps(state))
@@ -135,20 +160,7 @@ def sql_start():
             p = spawn('postgres', ['-D', pg], 'postgres.log')
             psql = [SQL_BIN / 'psql', '-h', '127.0.0.1', '-p', pgport, '-U', 'postgres', '-d', 'postgres', '-v', 'ON_ERROR_STOP=1']
             ready(p, [*psql, '-c', 'SELECT 1'])
-            sql_command([*psql], input="""
-    DO $$ BEGIN
-     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='scram_user') THEN CREATE ROLE scram_user LOGIN; END IF;
-     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='tls_user') THEN CREATE ROLE tls_user LOGIN; END IF;
-     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='md5_user') THEN CREATE ROLE md5_user LOGIN; END IF;
-     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='clear_user') THEN CREATE ROLE clear_user LOGIN; END IF;
-    END $$;
-    SET password_encryption='scram-sha-256';
-    ALTER ROLE scram_user PASSWORD 'fixture-password';
-    ALTER ROLE tls_user PASSWORD 'fixture-password';
-    ALTER ROLE clear_user PASSWORD 'fixture-password';
-    SET password_encryption='md5';
-    ALTER ROLE md5_user PASSWORD 'fixture-password';
-    """, text=True, stdout=subprocess.DEVNULL)
+            sql_command([*psql], input=POSTGRES_USERS, text=True, stdout=subprocess.DEVNULL)
         if 'mysql' not in SELECTED:
             return {k:v for k,v in state['env'].items() if not (k == 'TURNLOOP_TEST_MYSQL_PORT' and 'mysql' not in SELECTED) and not (k == 'TURNLOOP_TEST_POSTGRES_PORT' and 'postgres' not in SELECTED)}
         my = SQL_TOOLS / 'mysqldata'
@@ -158,15 +170,7 @@ def sql_start():
         p = spawn('mysqld', ['--no-defaults', f'--datadir={my}', '--bind-address=127.0.0.1', f'--port={myport}', f'--socket={sock}', f'--pid-file={SQL_TOOLS / "mysql.pid"}', '--mysqlx=OFF', '--local-infile=ON', f'--ssl-cert={cert}', f'--ssl-key={key}', f'--ssl-ca={cert}', f'--log-error={SQL_TOOLS / "mysql.log"}'], 'mysqld-console.log')
         mysql = [SQL_BIN / 'mysql', '--no-defaults', f'--socket={sock}', '-u', 'root']
         ready(p, [*mysql, '-e', 'SELECT 1'])
-        sql_command(mysql, input="""
-CREATE DATABASE IF NOT EXISTS turnloop_test;
-CREATE USER IF NOT EXISTS 'auth_rsa_user'@'127.0.0.1' IDENTIFIED WITH caching_sha2_password BY 'fixture-password';
-GRANT ALL ON turnloop_test.* TO 'auth_rsa_user'@'127.0.0.1';
-CREATE USER IF NOT EXISTS 'sql_user'@'127.0.0.1' IDENTIFIED WITH caching_sha2_password BY 'fixture-password';
-CREATE USER IF NOT EXISTS 'tls_user'@'127.0.0.1' IDENTIFIED WITH caching_sha2_password BY 'fixture-password' REQUIRE SSL;
-GRANT ALL ON turnloop_test.* TO 'sql_user'@'127.0.0.1';
-GRANT ALL ON turnloop_test.* TO 'tls_user'@'127.0.0.1';
-""", text=True, stdout=subprocess.DEVNULL)
+        sql_command(mysql, input=MYSQL_USERS, text=True, stdout=subprocess.DEVNULL)
         native = subprocess.run([str(x) for x in mysql] + ['-e', "CREATE USER 'native_user'@'127.0.0.1' IDENTIFIED WITH mysql_native_password BY 'fixture-password'"], capture_output=True, text=True)
         (SQL_TOOLS / 'mysql-native-auth.txt').write_text(native.stdout + native.stderr)
         return {k:v for k,v in state['env'].items() if not (k == 'TURNLOOP_TEST_MYSQL_PORT' and 'mysql' not in SELECTED) and not (k == 'TURNLOOP_TEST_POSTGRES_PORT' and 'postgres' not in SELECTED)}
@@ -176,19 +180,7 @@ GRANT ALL ON turnloop_test.* TO 'tls_user'@'127.0.0.1';
 
 
 
-#!/usr/bin/env python3
-"""Private Redis/cluster/Sentinel lifecycle. Never discovers or touches default servers.
-Usage: python3 scripts/test-servers.py run cargo test --workspace -- --include-ignored|start|stop
-`test` always stops its instances, including on cargo failure or interrupt.
-"""
-import json
-import os
-from pathlib import Path
 import random
-import socket
-import subprocess
-import sys
-import time
 
 REDIS_ROOT = Path(__file__).resolve().parents[1]
 REDIS_DATA = REDIS_ROOT / '.tools' / 'redis'
@@ -321,8 +313,6 @@ def redis_stop():
 
 
 
-#!/usr/bin/env python3
-"""Private lane servers only. start/stop/run; never uses default MongoDB ports."""
 import json, os, pathlib, signal, socket, subprocess, sys, time, secrets
 MONGO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 MONGO_RUN = MONGO_ROOT / '.tools' / 'mongodb'
@@ -411,6 +401,37 @@ def mongo_env():
 
 SMTP_CHILD = None
 
+def smtp_supervisor(directory):
+    """Own smtp-sink and accept authenticated local stop requests across invocations."""
+    config = json.loads((directory / 'control.json').read_text())
+    control = socket.socket(socket.AF_UNIX)
+    control.bind(str(directory / 'control.sock'))
+    control.listen(1)
+    child = subprocess.Popen([find_binary('smtp-sink'), '-4', '-d',
+        str(directory / 'message-%Y%m%d%H%M%S'), f"127.0.0.1:{config['port']}", '10'])
+    try:
+        control.settimeout(0.5)
+        while child.poll() is None:
+            try:
+                request, _ = control.accept()
+            except TimeoutError:
+                continue
+            with request:
+                request.settimeout(2)
+                if request.recv(256).decode() == config['token']:
+                    child.terminate()
+                    child.wait(timeout=10)
+                    request.sendall(b'stopped')
+                    return
+        raise RuntimeError('smtp-sink exited before shutdown')
+    finally:
+        if child.poll() is None:
+            child.terminate()
+        child.wait(timeout=10)
+        control.close()
+        (directory / 'control.sock').unlink(missing_ok=True)
+
+
 def smtp_start():
     global SMTP_CHILD
     directory = TOOLS / 'smtp'
@@ -418,30 +439,33 @@ def smtp_start():
     for old in directory.glob('message-*'):
         old.unlink()
     value = sql_port()
+    config = directory / 'control.json'
+    config.write_text(json.dumps({'port': value, 'token': secrets.token_hex(32)}))
+    config.chmod(0o600)
     with (directory / 'server.log').open('ab') as log:
-        SMTP_CHILD = subprocess.Popen([find_binary('smtp-sink'), '-4', '-d',
-            str(directory / 'message-%Y%m%d%H%M%S'), f'127.0.0.1:{value}', '10'],
-            stdout=log, stderr=log, start_new_session=True)
+        SMTP_CHILD = subprocess.Popen([sys.executable, str(Path(__file__).resolve()),
+            'smtp-supervisor', str(directory)], stdout=log, stderr=log, start_new_session=True)
     redis_wait_port(value, SMTP_CHILD)
     return {'TURNLOOP_TEST_SMTP_PORT': str(value), 'TURNLOOP_TEST_SMTP_TOOLS': str(directory)}
 
+
 def smtp_stop():
+    directory = TOOLS / 'smtp'
+    control = directory / 'control.sock'
+    if control.exists():
+        config = json.loads((directory / 'control.json').read_text())
+        with socket.socket(socket.AF_UNIX) as request:
+            request.settimeout(15)
+            request.connect(str(control))
+            request.sendall(config['token'].encode())
+            if request.recv(32) != b'stopped':
+                raise RuntimeError('SMTP supervisor did not confirm shutdown')
     if SMTP_CHILD is not None:
-        if SMTP_CHILD.poll() is None:
-            SMTP_CHILD.terminate()
-        SMTP_CHILD.wait(timeout=10)
-    elif STATE.exists() and 'smtp' in json.loads(STATE.read_text())['services']:
-        # Separate invocations identify the exact private dump directory before signalling.
-        state = json.loads(STATE.read_text())
-        pid = state['smtp_pid']
-        result = subprocess.run(['ps', '-p', str(pid), '-o', 'command='], capture_output=True, text=True, check=True)
-        if str(TOOLS / 'smtp' / 'message-') not in result.stdout or 'smtp-sink' not in result.stdout:
-            raise RuntimeError('Cannot identify private SMTP process; left untouched')
-        os.kill(pid, signal.SIGTERM)
+        SMTP_CHILD.wait(timeout=15)
 
 def stop_all():
     errors = []
-    for stop in (smtp_stop, mongo_stop, redis_stop, sql_stop):
+    for stop in (smtp_stop, mongo_stop, redis_stop, sql_stop, docker_cleanup):
         try:
             stop()
         except Exception as error:
@@ -459,7 +483,7 @@ def start_all():
     STATE.write_text(json.dumps(state))
     try:
         if SELECTED & {'postgres', 'mysql'}:
-            env.update(sql_start())
+            env.update(sql_ci_start() if CI_SERVICES else sql_start())
         if 'redis' in SELECTED:
             env.update(redis_start())
         if 'mongodb' in SELECTED:
@@ -474,13 +498,17 @@ def start_all():
         raise
 
 def main():
-    global SELECTED
+    global SELECTED, CI_SERVICES
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--ci-services', action='store_true', help='Linux CI: provision PostgreSQL/MySQL service containers; run private Redis/Mongo containers')
     parser.add_argument('--services', default='postgres,mysql,redis,mongodb,smtp')
     parser.add_argument('action', choices=['start', 'stop', 'run'])
     parser.add_argument('command', nargs=argparse.REMAINDER)
     args = parser.parse_args()
     SELECTED = set(args.services.split(','))
+    CI_SERVICES = args.ci_services
+    if CI_SERVICES:
+        prepare_docker_wrappers()
     if SELECTED - {'postgres', 'mysql', 'redis', 'mongodb', 'smtp'}:
         parser.error('unknown service')
     os.chdir(ROOT)
@@ -499,5 +527,102 @@ def main():
             stop_all()
     return 0
 
+
+
+def prepare_docker_wrappers():
+    """Use ordinary fixture commands in isolated, named Linux containers.
+
+    Only the two job-owned SQL service containers are reconfigured. Redis and Mongo
+    use private host-network ports and the same repository paths as native fixtures.
+    Wrappers and their exact container IDs are recorded under .tools.
+    """
+    directory = TOOLS / 'test-bin'
+    directory.mkdir(parents=True, exist_ok=True)
+    wrapper = '''#!/usr/bin/env python3
+import json, os, pathlib, subprocess, sys, uuid
+root = pathlib.Path(__file__).resolve().parents[1]
+name = pathlib.Path(sys.argv[0]).name
+image = 'mongo:8' if name == 'mongod' else 'redis:8'
+container = 'turnloop-fixture-' + uuid.uuid4().hex
+record = root / 'docker-fixtures.json'
+existing = json.loads(record.read_text()) if record.exists() else []
+existing.append(container)
+record.write_text(json.dumps(existing))
+args = ['docker', 'run', '--rm', '--name', container, '--label', 'turnloop.fixture=' + str(root),
+        '--network', 'host', '--volume', str(root.parent) + ':' + str(root.parent),
+        '--workdir', str(root.parent), '--entrypoint', name]
+if 'REDISCLI_AUTH' in os.environ:
+    args += ['--env', 'REDISCLI_AUTH']
+args += [image, *sys.argv[1:]]
+os.execvp(args[0], args)
+'''
+    # Wrapper filenames are fixed and never supplied by test inputs.
+    for name in ('redis-server', 'redis-cli', 'mongod'):
+        path = directory / name
+        path.write_text(wrapper)
+        path.chmod(0o755)
+    os.environ['PATH'] = str(directory) + os.pathsep + os.environ['PATH']
+
+
+def docker_cleanup():
+    record = TOOLS / 'docker-fixtures.json'
+    if not record.exists():
+        return
+    for name in json.loads(record.read_text()):
+        if not name.startswith('turnloop-fixture-'):
+            raise RuntimeError('Invalid private container record')
+        probe = subprocess.run(['docker', 'inspect', '--format', '{{index .Config.Labels "turnloop.fixture"}}', name], capture_output=True, text=True)
+        if probe.returncode:
+            continue  # --rm already removed this exact container.
+        if probe.stdout.strip() != str(TOOLS):
+            raise RuntimeError('Container ownership mismatch; left untouched')
+        subprocess.run(['docker', 'logs', name], check=True)
+        subprocess.run(['docker', 'rm', '--force', name], check=True)
+    record.unlink()
+
+
+def sql_ci_start():
+    """Provision the explicit GitHub SQL containers with the native fixture contract."""
+    pg = os.environ['POSTGRES_CONTAINER']
+    mysql = os.environ['MYSQL_CONTAINER']
+    cert, key = sql_certificates()
+    psql = ['docker', 'exec', '-i', pg, 'psql', '-U', 'turnloop', '-d', 'postgres', '-v', 'ON_ERROR_STOP=1']
+    pgdata = subprocess.check_output([*psql, '-Atc', 'SHOW data_directory'], text=True).strip()
+    for source, name in ((cert, 'server.crt'), (key, 'server.key')):
+        subprocess.run(['docker', 'cp', str(source), pg + ':' + pgdata + '/' + name], check=True)
+    subprocess.run(['docker', 'exec', '--user', 'root', pg, 'chown', 'postgres:postgres', pgdata + '/server.crt', pgdata + '/server.key'], check=True)
+    subprocess.run(['docker', 'exec', '--user', 'root', pg, 'chmod', '600', pgdata + '/server.key'], check=True)
+    hba = SQL_TOOLS / 'pg_hba.conf'
+    hba.write_text(POSTGRES_HBA.replace('127.0.0.1/32', '0.0.0.0/0'))
+    subprocess.run([*psql], input=POSTGRES_USERS + "\nALTER SYSTEM SET ssl='on';\nALTER SYSTEM SET ssl_cert_file='server.crt';\nALTER SYSTEM SET ssl_key_file='server.key';\n", text=True, check=True)
+    subprocess.run(['docker', 'cp', str(hba), pg + ':' + pgdata + '/pg_hba.conf'], check=True)
+    subprocess.run([*psql, '-c', 'SELECT pg_reload_conf()'], check=True)
+    # MySQL's default data-directory certificate names are picked up on restart.
+    for source, name in ((cert, 'ca.pem'), (cert, 'server-cert.pem'), (key, 'server-key.pem')):
+        subprocess.run(['docker', 'cp', str(source), mysql + ':/var/lib/mysql/' + name], check=True)
+    subprocess.run(['docker', 'exec', '--user', 'root', mysql, 'chown', 'mysql:mysql', '/var/lib/mysql/ca.pem', '/var/lib/mysql/server-cert.pem', '/var/lib/mysql/server-key.pem'], check=True)
+    subprocess.run(['docker', 'exec', '--user', 'root', mysql, 'chmod', '600', '/var/lib/mysql/server-key.pem'], check=True)
+    subprocess.run(['docker', 'restart', mysql], check=True)
+    mycli = ['docker', 'exec', '-i', '-e', 'MYSQL_PWD=turnloop-root', mysql, 'mysql', '-uroot']
+    for _ in range(90):
+        if subprocess.run([*mycli, '-e', 'SELECT 1'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+            break
+        time.sleep(1)
+    else:
+        raise RuntimeError('MySQL service did not restart')
+    # Docker NAT's client address differs; these users exist only in this disposable job.
+    subprocess.run(mycli, input=MYSQL_USERS.replace("@'127.0.0.1'", "@'%'") + '\nSET GLOBAL local_infile=ON;\n', text=True, check=True)
+    native = subprocess.run([*mycli, '-e', "CREATE USER 'native_user'@'%' IDENTIFIED WITH mysql_native_password BY 'fixture-password'"], capture_output=True, text=True)
+    (SQL_TOOLS / 'mysql-native-auth.txt').write_text(native.stdout + native.stderr)
+    # Independent verified TLS probes; Rust suites assert protocol results afterward.
+    subprocess.run(['docker', 'exec', '-e', 'PGPASSWORD=fixture-password', pg, 'psql', 'host=localhost hostaddr=127.0.0.1 user=tls_user dbname=postgres sslmode=verify-full sslrootcert=' + pgdata + '/server.crt', '-v', 'ON_ERROR_STOP=1', '-c', 'SELECT 1'], check=True)
+    subprocess.run(['docker', 'exec', '-e', 'MYSQL_PWD=fixture-password', mysql, 'mysql', '-h127.0.0.1', '-utls_user', '--ssl-mode=VERIFY_IDENTITY', '--ssl-ca=/var/lib/mysql/ca.pem', '-e', 'SELECT 1'], check=True)
+    return {'TURNLOOP_TEST_POSTGRES_PORT': '5432', 'TURNLOOP_TEST_MYSQL_PORT': '3306',
+            'TURNLOOP_TEST_SQL_TOOLS': str(SQL_TOOLS)}
+
+
 if __name__ == '__main__':
-    sys.exit(main())
+    if len(sys.argv) == 3 and sys.argv[1] == 'smtp-supervisor':
+        smtp_supervisor(Path(sys.argv[2]))
+    else:
+        sys.exit(main())

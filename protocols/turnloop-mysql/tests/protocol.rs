@@ -10,7 +10,8 @@ fn frame(seq: u8, body: &[u8]) -> Vec<u8> {
 }
 fn flush(c: &mut Connection) -> Vec<u8> {
     let b = c.output().to_vec();
-    c.consume_output(b.len()).expect("fixture operation must succeed");
+    c.consume_output(b.len())
+        .expect("fixture operation must succeed");
     b
 }
 fn handshake(plugin: &str, extra: Caps) -> Vec<u8> {
@@ -61,10 +62,14 @@ fn ready() -> Connection {
     let mut c = Connection::new(Config::default()).expect("fixture operation must succeed");
     c.receive(&handshake("mysql_native_password", Caps::empty()))
         .expect("fixture operation must succeed");
-    assert!(matches!(c.next_event().expect("fixture operation must succeed"), Some(Event::Progress)));
+    assert!(matches!(
+        c.next_event().expect("fixture operation must succeed"),
+        Some(Event::Progress)
+    ));
     let b = flush(&mut c);
     assert_eq!(b[3], 1);
-    c.receive(&ok(2, 0, 2)).expect("fixture operation must succeed");
+    c.receive(&ok(2, 0, 2))
+        .expect("fixture operation must succeed");
     assert!(matches!(
         c.next_event().expect("fixture operation must succeed"),
         Some(Event::Connected { connection_id: 7 })
@@ -89,17 +94,23 @@ fn native_and_caching_fast_full_tls_and_auth_switch() {
         ]));
     let mut switch = vec![0xfe];
     switch.extend_from_slice(b"caching_sha2_password\0abcdefghijklmnopqrst\0");
-    c.receive(&frame(2, &switch)).expect("fixture operation must succeed");
-    assert!(matches!(c.next_event().expect("fixture operation must succeed"), Some(Event::Progress)));
+    c.receive(&frame(2, &switch))
+        .expect("fixture operation must succeed");
+    assert!(matches!(
+        c.next_event().expect("fixture operation must succeed"),
+        Some(Event::Progress)
+    ));
     let b = flush(&mut c);
     assert_eq!(b[3], 3);
     assert_eq!(b.len(), 36);
-    c.receive(&frame(4, &[1, 3])).expect("fixture operation must succeed");
+    c.receive(&frame(4, &[1, 3]))
+        .expect("fixture operation must succeed");
     assert!(matches!(
         c.next_event().expect("fixture operation must succeed"),
         Some(Event::AuthFastSuccess)
     ));
-    c.receive(&ok(5, 0, 2)).expect("fixture operation must succeed");
+    c.receive(&ok(5, 0, 2))
+        .expect("fixture operation must succeed");
     assert!(matches!(
         c.next_event().expect("fixture operation must succeed"),
         Some(Event::Connected { .. })
@@ -112,17 +123,25 @@ fn native_and_caching_fast_full_tls_and_auth_switch() {
     .expect("fixture operation must succeed");
     c.receive(&handshake("caching_sha2_password", Caps::CLIENT_SSL))
         .expect("fixture operation must succeed");
-    assert!(matches!(c.next_event().expect("fixture operation must succeed"), Some(Event::UpgradeTls)));
+    assert!(matches!(
+        c.next_event().expect("fixture operation must succeed"),
+        Some(Event::UpgradeTls)
+    ));
     let ssl = flush(&mut c);
     assert_eq!(ssl.len(), 36);
     assert_eq!(ssl[3], 1);
     assert!(c.query(1, "SELECT 1", None).is_err());
     c.tls_established().expect("fixture operation must succeed");
     assert_eq!(flush(&mut c)[3], 2);
-    c.receive(&frame(3, &[1, 4])).expect("fixture operation must succeed");
-    assert!(matches!(c.next_event().expect("fixture operation must succeed"), Some(Event::AuthFull)));
+    c.receive(&frame(3, &[1, 4]))
+        .expect("fixture operation must succeed");
+    assert!(matches!(
+        c.next_event().expect("fixture operation must succeed"),
+        Some(Event::AuthFull)
+    ));
     assert_eq!(flush(&mut c), frame(4, b"secret\0"));
-    c.receive(&ok(5, 0, 2)).expect("fixture operation must succeed");
+    c.receive(&ok(5, 0, 2))
+        .expect("fixture operation must succeed");
     assert!(matches!(
         c.next_event().expect("fixture operation must succeed"),
         Some(Event::Connected { .. })
@@ -136,14 +155,19 @@ fn native_and_caching_fast_full_tls_and_auth_switch() {
         .expect("fixture operation must succeed");
     c.next_event().expect("fixture operation must succeed");
     flush(&mut c);
-    c.receive(&frame(2, &[1, 4])).expect("fixture operation must succeed");
-    assert!(matches!(c.next_event().expect("fixture operation must succeed"), Some(Event::AuthFull)));
+    c.receive(&frame(2, &[1, 4]))
+        .expect("fixture operation must succeed");
+    assert!(matches!(
+        c.next_event().expect("fixture operation must succeed"),
+        Some(Event::AuthFull)
+    ));
     assert_eq!(flush(&mut c), frame(3, &[2]));
 }
 #[test]
 fn fragmented_multiset_rows_error_and_prepare_binary() {
     let mut c = ready();
-    c.query(1, "SELECT 42; SELECT 99", None).expect("fixture operation must succeed");
+    c.query(1, "SELECT 42; SELECT 99", None)
+        .expect("fixture operation must succeed");
     assert_eq!(&flush(&mut c)[4..], b"\x03SELECT 42; SELECT 99");
     let bytes = [
         frame(1, &[1]),
@@ -189,7 +213,8 @@ fn fragmented_multiset_rows_error_and_prepare_binary() {
     assert_eq!(values, [b"42", b"99"]);
     assert_eq!(columns, 2);
     assert_eq!(completed, 1);
-    c.prepare(2, "SELECT ?", None).expect("fixture operation must succeed");
+    c.prepare(2, "SELECT ?", None)
+        .expect("fixture operation must succeed");
     assert_eq!(flush(&mut c)[4], 0x16);
     let mut prepare = vec![0];
     prepare.extend_from_slice(&17u32.to_le_bytes());
@@ -213,7 +238,8 @@ fn fragmented_multiset_rows_error_and_prepare_binary() {
     }
     let stmt = stmt.expect("fixture operation must succeed");
     assert_eq!(stmt.parameters, 1);
-    c.execute(3, stmt.id, &[Value::Int(42)], None).expect("fixture operation must succeed");
+    c.execute(3, stmt.id, &[Value::Int(42)], None)
+        .expect("fixture operation must succeed");
     let execute = flush(&mut c);
     assert_eq!(
         &execute[4..],
@@ -236,19 +262,32 @@ fn fragmented_multiset_rows_error_and_prepare_binary() {
     while let Some(e) = c.next_event().expect("fixture operation must succeed") {
         if let Event::Row { mut row, .. } = e {
             assert_eq!(
-                row.next().expect("fixture operation must succeed").expect("fixture operation must succeed"),
+                row.next()
+                    .expect("fixture operation must succeed")
+                    .expect("fixture operation must succeed"),
                 RawValue::Scalar(Value::Int(42))
             );
             rows += 1;
         }
     }
     assert_eq!(rows, 1);
-    c.reset_statement(4, stmt.id).expect("fixture operation must succeed");
+    c.reset_statement(4, stmt.id)
+        .expect("fixture operation must succeed");
     assert_eq!(flush(&mut c), frame(0, &[0x1a, 17, 0, 0, 0]));
-    c.receive(&ok(1, 0, 2)).expect("fixture operation must succeed");
-    while c.next_event().expect("fixture operation must succeed").is_some() {}
-    c.close_statement(5, stmt.id).expect("fixture operation must succeed");
-    assert!(c.next_event().expect("fixture operation must succeed").is_none());
+    c.receive(&ok(1, 0, 2))
+        .expect("fixture operation must succeed");
+    while c
+        .next_event()
+        .expect("fixture operation must succeed")
+        .is_some()
+    {}
+    c.close_statement(5, stmt.id)
+        .expect("fixture operation must succeed");
+    assert!(
+        c.next_event()
+            .expect("fixture operation must succeed")
+            .is_none()
+    );
     flush(&mut c);
     assert!(matches!(
         c.next_event().expect("fixture operation must succeed"),
@@ -258,11 +297,13 @@ fn fragmented_multiset_rows_error_and_prepare_binary() {
         })
     ));
     assert!(c.execute(6, stmt.id, &[], None).is_err());
-    c.query(7, "bad", None).expect("fixture operation must succeed");
+    c.query(7, "bad", None)
+        .expect("fixture operation must succeed");
     flush(&mut c);
     c.receive(&frame(1, b"\xff\x28\x04#42000syntax error"))
         .expect("fixture operation must succeed");
-    let Some(Event::Error { error, .. }) = c.next_event().expect("fixture operation must succeed") else {
+    let Some(Event::Error { error, .. }) = c.next_event().expect("fixture operation must succeed")
+    else {
         panic!()
     };
     assert_eq!(error.errno, 1064);
@@ -280,9 +321,11 @@ fn fragmented_multiset_rows_error_and_prepare_binary() {
 #[test]
 fn infile_disabled_timeout_and_bad_sequence() {
     let mut c = ready();
-    c.query(1, "LOAD DATA", None).expect("fixture operation must succeed");
+    c.query(1, "LOAD DATA", None)
+        .expect("fixture operation must succeed");
     flush(&mut c);
-    c.receive(&frame(1, b"\xfb/etc/passwd")).expect("fixture operation must succeed");
+    c.receive(&frame(1, b"\xfb/etc/passwd"))
+        .expect("fixture operation must succeed");
     assert_eq!(c.next_event().unwrap_err(), Error::LocalInfileDisabled);
     assert!(c.output().is_empty());
     assert!(matches!(
@@ -296,10 +339,18 @@ fn infile_disabled_timeout_and_bad_sequence() {
         c.next_event().expect("fixture operation must succeed"),
         Some(Event::Closed { .. })
     ));
-    assert!(c.next_event().expect("fixture operation must succeed").is_none());
+    assert!(
+        c.next_event()
+            .expect("fixture operation must succeed")
+            .is_none()
+    );
     let mut c = ready();
-    let now = std::time::Instant::now();
-    c.query(2, "slow", Some(now)).expect("fixture operation must succeed");
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    let now = Instant::now();
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    let now = Instant::from_duration(std::time::Duration::ZERO);
+    c.query(2, "slow", Some(now))
+        .expect("fixture operation must succeed");
     c.handle_timeout(now);
     assert!(matches!(
         c.next_event().expect("fixture operation must succeed"),
@@ -309,9 +360,11 @@ fn infile_disabled_timeout_and_bad_sequence() {
         })
     ));
     let mut c = ready();
-    c.query(3, "SELECT 1", None).expect("fixture operation must succeed");
+    c.query(3, "SELECT 1", None)
+        .expect("fixture operation must succeed");
     flush(&mut c);
-    c.receive(&ok(99, 0, 2)).expect("fixture operation must succeed");
+    c.receive(&ok(99, 0, 2))
+        .expect("fixture operation must succeed");
     assert!(c.next_event().is_err());
     c.abort(Error::Transport);
     assert!(matches!(
@@ -331,12 +384,17 @@ fn rsa_full_auth_uses_host_seed_and_matches_independent_oaep_vector() {
         .expect("fixture operation must succeed");
     c.next_event().expect("fixture operation must succeed");
     flush(&mut c);
-    c.receive(&frame(2, &[1, 4])).expect("fixture operation must succeed");
-    assert!(matches!(c.next_event().expect("fixture operation must succeed"), Some(Event::AuthFull)));
+    c.receive(&frame(2, &[1, 4]))
+        .expect("fixture operation must succeed");
+    assert!(matches!(
+        c.next_event().expect("fixture operation must succeed"),
+        Some(Event::AuthFull)
+    ));
     assert_eq!(flush(&mut c), frame(3, &[2]));
     let mut key = vec![1];
     key.extend_from_slice(include_bytes!("fixtures/rsa-public.pem"));
-    c.receive(&frame(4, &key)).expect("fixture operation must succeed");
+    c.receive(&frame(4, &key))
+        .expect("fixture operation must succeed");
     assert!(matches!(
         c.next_event().expect("fixture operation must succeed"),
         Some(Event::RsaSeedNeeded)
@@ -351,7 +409,8 @@ fn rsa_full_auth_uses_host_seed_and_matches_independent_oaep_vector() {
         flush(&mut c),
         frame(5, include_bytes!("fixtures/rsa-oaep-expected.bin"))
     );
-    c.receive(&ok(6, 0, 2)).expect("fixture operation must succeed");
+    c.receive(&ok(6, 0, 2))
+        .expect("fixture operation must succeed");
     assert!(matches!(
         c.next_event().expect("fixture operation must succeed"),
         Some(Event::Connected { .. })
@@ -372,24 +431,32 @@ fn local_infile_enabled_is_an_explicit_borrowed_request() {
     .expect("fixture operation must succeed");
     c.next_event().expect("fixture operation must succeed");
     flush(&mut c);
-    c.receive(&ok(2, 0, 2)).expect("fixture operation must succeed");
+    c.receive(&ok(2, 0, 2))
+        .expect("fixture operation must succeed");
     c.next_event().expect("fixture operation must succeed");
     c.query(1, "LOAD DATA LOCAL INFILE 'fixture.tsv'", None)
         .expect("fixture operation must succeed");
     flush(&mut c);
-    c.receive(&frame(1, b"\xfbfixture.tsv")).expect("fixture operation must succeed");
-    let Some(Event::LocalInfile { token, file_name }) = c.next_event().expect("fixture operation must succeed") else {
+    c.receive(&frame(1, b"\xfbfixture.tsv"))
+        .expect("fixture operation must succeed");
+    let Some(Event::LocalInfile { token, file_name }) =
+        c.next_event().expect("fixture operation must succeed")
+    else {
         panic!()
     };
     assert_eq!(token, 1);
     assert_eq!(file_name, b"fixture.tsv");
     assert!(c.output().is_empty());
-    c.local_infile_data(b"42\n").expect("fixture operation must succeed");
+    c.local_infile_data(b"42\n")
+        .expect("fixture operation must succeed");
     assert_eq!(flush(&mut c), frame(2, b"42\n"));
-    c.local_infile_finish().expect("fixture operation must succeed");
+    c.local_infile_finish()
+        .expect("fixture operation must succeed");
     assert_eq!(flush(&mut c), frame(3, b""));
-    c.receive(&ok(4, 1, 2)).expect("fixture operation must succeed");
-    let Some(Event::Ok { packet, .. }) = c.next_event().expect("fixture operation must succeed") else {
+    c.receive(&ok(4, 1, 2))
+        .expect("fixture operation must succeed");
+    let Some(Event::Ok { packet, .. }) = c.next_event().expect("fixture operation must succeed")
+    else {
         panic!()
     };
     assert_eq!(packet.affected_rows(), 1);

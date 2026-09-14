@@ -14,14 +14,18 @@ fn commands_and_fragmented_decoder_allocate_only_result_storage() {
         prefer_resp3: false,
         ..Config::default()
     });
-    c.connect(Instant::now()).expect("fixture operation must succeed");
+    c.connect(Instant::now())
+        .expect("fixture operation must succeed");
     c.poll_event();
-    c.transport_connected().expect("fixture operation must succeed");
+    c.transport_connected()
+        .expect("fixture operation must succeed");
     c.poll_event();
     let operation = |c: &mut Connection| {
-        c.command(1, &[b"INCR", b"counter"], None).expect("fixture operation must succeed");
+        c.command(1, &[b"INCR", b"counter"], None)
+            .expect("fixture operation must succeed");
         c.consume_output(c.output().len());
-        c.receive(b":42\r\n").expect("fixture operation must succeed");
+        c.receive(b":42\r\n")
+            .expect("fixture operation must succeed");
         assert_eq!(
             c.poll_event(),
             Some(Event::Reply {
@@ -43,7 +47,11 @@ fn commands_and_fragmented_decoder_allocate_only_result_storage() {
     assert_eq!(
         alloc::measure(|| {
             for end in 0..frame.len() {
-                assert!(decode(&frame[..end], Limits::default()).expect("fixture operation must succeed").is_none());
+                assert!(
+                    decode(&frame[..end], Limits::default())
+                        .expect("fixture operation must succeed")
+                        .is_none()
+                );
             }
         }),
         0
@@ -67,11 +75,14 @@ fn pubsub_allocates_only_returned_binary_fields() {
         prefer_resp3: false,
         ..Config::default()
     });
-    c.connect(Instant::now()).expect("fixture operation must succeed");
+    c.connect(Instant::now())
+        .expect("fixture operation must succeed");
     c.poll_event();
-    c.transport_connected().expect("fixture operation must succeed");
+    c.transport_connected()
+        .expect("fixture operation must succeed");
     c.poll_event();
-    c.command(1, &[b"SUBSCRIBE", b"news"], None).expect("fixture operation must succeed");
+    c.command(1, &[b"SUBSCRIBE", b"news"], None)
+        .expect("fixture operation must succeed");
     c.consume_output(c.output().len());
     c.receive(b"*3\r\n$9\r\nsubscribe\r\n$4\r\nnews\r\n:1\r\n")
         .expect("fixture operation must succeed");

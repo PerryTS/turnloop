@@ -2,10 +2,10 @@
 //! transactions/transactions.md §§ State Machine, commitTransaction, abortTransaction;
 //! change-streams/change-streams.md §§ Resume Process, Resume Tokens.
 use crate::Instant;
-use crate::{wire::BsonWriter, Error, ErrorKind, Result};
+use crate::{Error, ErrorKind, Result, wire::BsonWriter};
 use bson::{
-    raw::{RawDocument, RawDocumentBuf},
     Document, Timestamp,
+    raw::{RawDocument, RawDocumentBuf},
 };
 use std::time::Duration;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -207,9 +207,10 @@ impl Session {
             w.document("$clusterTime", t)?;
         }
         if name == "commitTransaction"
-            && let Some(ms) = self.max_commit_time_ms {
-                w.int64("maxTimeMS", ms)?;
-            }
+            && let Some(ms) = self.max_commit_time_ms
+        {
+            w.int64("maxTimeMS", ms)?;
+        }
         w.string("$db", "admin")?;
         w.finish()?;
         Ok(())
@@ -218,23 +219,23 @@ impl Session {
         if matches!(
             self.state,
             TransactionState::Starting | TransactionState::InProgress | TransactionState::Committed
-        )
-            && let Ok(token) = reply.get_document("recoveryToken") {
-                self.recovery_token = RawDocumentBuf::try_from(token).ok();
-            }
+        ) && let Ok(token) = reply.get_document("recoveryToken")
+        {
+            self.recovery_token = RawDocumentBuf::try_from(token).ok();
+        }
         if let Ok(t) = reply.get_timestamp("operationTime") {
             self.operation_time = Some(self.operation_time.map_or(t, |old| old.max(t)));
         }
         if let Ok(c) = reply.get_document("$clusterTime")
             && let Ok(t) = c.get_timestamp("clusterTime")
-                && self
-                    .cluster_time
-                    .as_ref()
-                    .and_then(|d| d.get_timestamp("clusterTime").ok())
-                    .is_none_or(|old| t > old)
-                {
-                    self.cluster_time = RawDocumentBuf::try_from(c).ok();
-                }
+            && self
+                .cluster_time
+                .as_ref()
+                .and_then(|d| d.get_timestamp("clusterTime").ok())
+                .is_none_or(|old| t > old)
+        {
+            self.cluster_time = RawDocumentBuf::try_from(c).ok();
+        }
     }
     /// Causal read concern for a non-transaction read. Command must not already
     /// contain readConcern; operationTime came from an earlier server response.

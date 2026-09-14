@@ -1,6 +1,6 @@
 //! connection-string/connection-string-spec.md; initial-dns-seedlist-discovery/
 //! initial-dns-seedlist-discovery.md §§ Seedlist Discovery, DNS Record Validation.
-use crate::{auth::Mechanism, Error, ErrorKind, Result};
+use crate::{Error, ErrorKind, Result, auth::Mechanism};
 use std::{collections::BTreeMap, time::Duration};
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Address {
@@ -145,7 +145,9 @@ impl Options {
         } else if let Some(s) = uri.strip_prefix("mongodb+srv://") {
             (true, s)
         } else {
-            return Err(parse_error("Invalid scheme, expected connection string to start with mongodb:// or mongodb+srv://"));
+            return Err(parse_error(
+                "Invalid scheme, expected connection string to start with mongodb:// or mongodb+srv://",
+            ));
         };
         if rest.contains('#') {
             return Err(parse_error("Unescaped # in connection string"));
@@ -340,7 +342,7 @@ impl Options {
                     return Err(Error::new(
                         ErrorKind::Parse,
                         format!("option {k} is not supported"),
-                    ))
+                    ));
                 }
             }
         }
@@ -435,9 +437,10 @@ impl Options {
             .collect();
         self.apply_options()?;
         if let Some(c) = &mut self.credential
-            && let Some(s) = self.raw.get("authsource") {
-                c.source = s.clone();
-            }
+            && let Some(s) = self.raw.get("authsource")
+        {
+            c.source = s.clone();
+        }
         Ok(())
     }
 }

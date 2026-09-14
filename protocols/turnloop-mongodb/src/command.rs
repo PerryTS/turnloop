@@ -1,10 +1,10 @@
 //! crud/crud.md §§ Read/Write Operations, Write Models and Results.
 //! Builders retain capacity. Inputs and options are borrowed raw BSON; IDs and
 //! wall-clock ObjectId timestamps are supplied by the host (no ObjectId::new()).
-use crate::{wire::BsonWriter, Error, ErrorKind, Result};
+use crate::{Error, ErrorKind, Result, wire::BsonWriter};
 use bson::{
-    raw::{RawArray, RawBsonRef, RawDocument},
     Document,
+    raw::{RawArray, RawBsonRef, RawDocument},
 };
 #[derive(Debug, Default)]
 pub struct Command {
@@ -74,11 +74,11 @@ impl Command {
                     .ok()
                     .flatten()
                     .is_none()
-                {
-                    let rc = self.scratch.start_document("readConcern", false)?;
-                    self.scratch.string("level", level)?;
-                    self.scratch.end_document(rc)?;
-                }
+            {
+                let rc = self.scratch.start_document("readConcern", false)?;
+                self.scratch.string("level", level)?;
+                self.scratch.end_document(rc)?;
+            }
             if options.read_preference != crate::uri::ReadPreference::Primary
                 && self
                     .writer

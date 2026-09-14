@@ -1,14 +1,16 @@
-use std::time::{Duration, Instant};
+#[path = "support/clock.rs"]
+mod clock;
+use std::time::Duration;
 use turnloop_mongodb::{
+    Connection, ConnectionEvent, Error, ErrorKind,
     auth::{Mechanism, Scram},
-    bson::{doc, raw::RawDocumentBuf, Document},
+    bson::{Document, doc, raw::RawDocumentBuf},
     command::{Command, Cursor, CursorBatch},
     pool::{Pool, PoolEvent, PoolOptions},
     retry::{Retry, RetryKind},
     session::{Session, TransactionState},
     uri::{Address, Credential, Options},
     wire::{self, BsonWriter, Decoder, Message},
-    Connection, ConnectionEvent, Error, ErrorKind,
 };
 fn raw(d: &Document) -> RawDocumentBuf {
     RawDocumentBuf::try_from(d).unwrap()
@@ -23,7 +25,7 @@ fn feed(c: &mut Connection, bytes: &[u8]) {
 }
 fn ready() -> Connection {
     let mut c = Connection::new(Options::parse("mongodb://localhost/").unwrap());
-    c.connected(Instant::now(), "").unwrap();
+    c.connected(clock::now(), "").unwrap();
     let req = Message::parse(c.transmit(), wire::DEFAULT_MAX_MESSAGE)
         .unwrap()
         .request_id;
@@ -150,24 +152,70 @@ fn uri_dns_and_option_errors() {
     assert_eq!(o.seeds[0].host, "::1");
     assert_eq!(o.credential.unwrap().username, "u@ser");
     let mut srv = Options::parse("mongodb+srv://a.example.org/").unwrap();
-    assert!(srv
-        .resolve(&[Address::parse("evil-example.org").unwrap()], &[])
-        .is_err());
+    assert!(
+        srv.resolve(&[Address::parse("evil-example.org").unwrap()], &[])
+            .is_err()
+    );
 }
 #[test]
 fn scram_spec_vectors_and_rejections() {
-    use base64::{engine::general_purpose::STANDARD, Engine};
-    for (mechanism,nonce,server,proof,signature) in [
-(Mechanism::Sha1,"fyko+d2lbbFgONRv9qkxdawL","r=fyko+d2lbbFgONRv9qkxdawLHo+Vgk7qvUOKUwuWLIWg4l/9SraGMHEE,s=rQ9ZY3MntBeuP3E1TDVC4w==,i=10000","MC2T8BvbmWRckDw8oWl5IVghwCY=","UMWeI25JD1yNYZRMpZ4VHvhZ9e0="),
-(Mechanism::Sha256,"rOprNGfwEbeRWgbNEkqO","r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096","dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=","6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=")]{let cred=Credential{username:"user".into(),password:"pencil".into(),source:"admin".into(),mechanism:Some(mechanism)};let mut s=Scram::new(&cred,mechanism,nonce).unwrap();let start=s.start("admin",true);assert_eq!(start.get_str("db").unwrap(),"admin");let reply=doc!{"conversationId":7,"done":false,"payload":turnloop_mongodb::bson::Binary{subtype:turnloop_mongodb::bson::spec::BinarySubtype::Generic,bytes:server.as_bytes().to_vec()}};let next=s.receive(&reply,"admin").unwrap().unwrap();assert!(std::str::from_utf8(next.get_binary_generic("payload").unwrap()).unwrap().ends_with(proof));let reply=doc!{"conversationId":7,"done":true,"payload":turnloop_mongodb::bson::Binary{subtype:turnloop_mongodb::bson::spec::BinarySubtype::Generic,bytes:format!("v={signature}").into_bytes()}};assert!(s.receive(&reply,"admin").unwrap().is_none());assert_eq!(STANDARD.decode(signature).unwrap().len(),if mechanism==Mechanism::Sha1{20}else{32});
- for payload in [server.replace("i=4096","i=1").replace("i=10000","i=1"),server.replace("r=","r=bad"),format!("{server},i=4096")]{let mut s=Scram::new(&cred,mechanism,nonce).unwrap();s.start("admin",false);let reply=doc!{"conversationId":1,"done":false,"payload":turnloop_mongodb::bson::Binary{subtype:turnloop_mongodb::bson::spec::BinarySubtype::Generic,bytes:payload.into_bytes()}};assert!(s.receive(&reply,"admin").is_err());}}
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    for (mechanism, nonce, server, proof, signature) in [
+        (
+            Mechanism::Sha1,
+            "fyko+d2lbbFgONRv9qkxdawL",
+            "r=fyko+d2lbbFgONRv9qkxdawLHo+Vgk7qvUOKUwuWLIWg4l/9SraGMHEE,s=rQ9ZY3MntBeuP3E1TDVC4w==,i=10000",
+            "MC2T8BvbmWRckDw8oWl5IVghwCY=",
+            "UMWeI25JD1yNYZRMpZ4VHvhZ9e0=",
+        ),
+        (
+            Mechanism::Sha256,
+            "rOprNGfwEbeRWgbNEkqO",
+            "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096",
+            "dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=",
+            "6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=",
+        ),
+    ] {
+        let cred = Credential {
+            username: "user".into(),
+            password: "pencil".into(),
+            source: "admin".into(),
+            mechanism: Some(mechanism),
+        };
+        let mut s = Scram::new(&cred, mechanism, nonce).unwrap();
+        let start = s.start("admin", true);
+        assert_eq!(start.get_str("db").unwrap(), "admin");
+        let reply = doc! {"conversationId":7,"done":false,"payload":turnloop_mongodb::bson::Binary{subtype:turnloop_mongodb::bson::spec::BinarySubtype::Generic,bytes:server.as_bytes().to_vec()}};
+        let next = s.receive(&reply, "admin").unwrap().unwrap();
+        assert!(
+            std::str::from_utf8(next.get_binary_generic("payload").unwrap())
+                .unwrap()
+                .ends_with(proof)
+        );
+        let reply = doc! {"conversationId":7,"done":true,"payload":turnloop_mongodb::bson::Binary{subtype:turnloop_mongodb::bson::spec::BinarySubtype::Generic,bytes:format!("v={signature}").into_bytes()}};
+        assert!(s.receive(&reply, "admin").unwrap().is_none());
+        assert_eq!(
+            STANDARD.decode(signature).unwrap().len(),
+            if mechanism == Mechanism::Sha1 { 20 } else { 32 }
+        );
+        for payload in [
+            server.replace("i=4096", "i=1").replace("i=10000", "i=1"),
+            server.replace("r=", "r=bad"),
+            format!("{server},i=4096"),
+        ] {
+            let mut s = Scram::new(&cred, mechanism, nonce).unwrap();
+            s.start("admin", false);
+            let reply = doc! {"conversationId":1,"done":false,"payload":turnloop_mongodb::bson::Binary{subtype:turnloop_mongodb::bson::spec::BinarySubtype::Generic,bytes:payload.into_bytes()}};
+            assert!(s.receive(&reply, "admin").is_err());
+        }
+    }
 }
 #[test]
 fn connection_token_close_timeout_and_backpressure() {
     let mut c = ready();
     let body = raw(&doc! {"ping":1,"$db":"admin"});
-    c.command(44, &body, &[], Instant::now()).unwrap();
-    assert!(c.command(45, &body, &[], Instant::now()).is_err());
+    c.command(44, &body, &[], clock::now()).unwrap();
+    assert!(c.command(45, &body, &[], clock::now()).is_err());
     let req = Message::parse(c.transmit(), wire::DEFAULT_MAX_MESSAGE)
         .unwrap()
         .request_id;
@@ -181,9 +229,9 @@ fn connection_token_close_timeout_and_backpressure() {
         Some(ConnectionEvent::Reply { token: 44 })
     ));
     assert_eq!(c.reply().unwrap().get_i32("ok").unwrap(), 1);
-    assert!(c.command(46, &body, &[], Instant::now()).is_err());
+    assert!(c.command(46, &body, &[], clock::now()).is_err());
     c.release_reply().unwrap();
-    c.command(47, &body, &[], Instant::now()).unwrap();
+    c.command(47, &body, &[], clock::now()).unwrap();
     c.close();
     assert!(matches!(
         c.poll_event(),
@@ -195,7 +243,7 @@ fn connection_token_close_timeout_and_backpressure() {
     assert!(matches!(c.poll_event(), Some(ConnectionEvent::Closed)));
     c.close();
     assert!(c.poll_event().is_none());
-    let now = Instant::now();
+    let now = clock::now();
     let mut c =
         Connection::new(Options::parse("mongodb://a/?tls=true&connectTimeoutMS=10").unwrap());
     c.connected(now, "").unwrap();
@@ -210,7 +258,7 @@ fn connection_token_close_timeout_and_backpressure() {
 }
 #[test]
 fn pool_fifo_generation_timeout_and_close() {
-    let now = Instant::now();
+    let now = clock::now();
     let mut pool = Pool::new(PoolOptions {
         max_size: 1,
         min_size: 1,
@@ -312,7 +360,7 @@ fn raw_doc_cursor() -> RawDocumentBuf {
 #[test]
 fn operation_retries_once_with_same_session_and_excludes_multi() {
     use turnloop_mongodb::operation::*;
-    let now = Instant::now();
+    let now = clock::now();
     let mut op = Operation::new();
     let options = OperationOptions {
         token: 9,
@@ -342,11 +390,12 @@ fn operation_retries_once_with_same_session_and_excludes_multi() {
     assert_eq!(m.body.get_i64("txnNumber").unwrap(), 7);
     assert_eq!(m.sequences().next().unwrap().documents().count(), 1);
     op.sent().unwrap();
-    assert!(!op
-        .response(&raw(
+    assert!(
+        !op.response(&raw(
             &doc! {"ok":0,"code":91,"errmsg":"shutdown","errorLabels":["RetryableWriteError"]}
         ))
-        .unwrap());
+        .unwrap()
+    );
     assert!(matches!(
         op.action(),
         OperationAction::Select {
@@ -407,7 +456,7 @@ fn bulk_batch_limits_object_ids_and_unacknowledged_send() {
     let mut c = ready();
     let body =
         raw(&doc! {"insert":"items","documents":[{"x":1}],"writeConcern":{"w":0},"$db":"db"});
-    c.command(20, &body, &[], Instant::now()).unwrap();
+    c.command(20, &body, &[], clock::now()).unwrap();
     assert!(c.poll_event().is_none());
     assert_eq!(
         Message::parse(c.transmit(), 10000).unwrap().flags,
@@ -431,7 +480,7 @@ fn sessions_causal_pool_recovery_and_end_retry() {
         session::{EndAction, EndKind, SessionPool, TransactionEnd},
         time::HostInstant,
     };
-    let now = Instant::now();
+    let now = clock::now();
     let mut s = Session::new([33; 16]);
     s.next_retryable_write().unwrap();
     s.observe(&doc!{"operationTime":Timestamp{time:5,increment:2},"$clusterTime":{"clusterTime":Timestamp{time:5,increment:2},"signature":{"hash":0}}});
@@ -530,7 +579,7 @@ fn raw_wc() -> RawDocumentBuf {
 fn close_preserves_received_reply_and_response_mismatch_completes_once() {
     let mut c = ready();
     let body = raw(&doc! {"ping":1,"$db":"admin"});
-    c.command(80, &body, &[], Instant::now()).unwrap();
+    c.command(80, &body, &[], clock::now()).unwrap();
     let req = wire::i32_at(c.transmit(), 4).unwrap();
     let n = c.transmit().len();
     c.consume_transmit(n).unwrap();
@@ -548,7 +597,7 @@ fn close_preserves_received_reply_and_response_mismatch_completes_once() {
     assert!(!c.is_ready());
     assert!(c.poll_event().is_none());
     let mut c = ready();
-    c.command(81, &body, &[], Instant::now()).unwrap();
+    c.command(81, &body, &[], clock::now()).unwrap();
     let n = c.transmit().len();
     c.consume_transmit(n).unwrap();
     wire::encode(&mut reply, 1, 10000, 0, &raw(&doc! {"ok":1}), &[], 1000).unwrap();
@@ -631,7 +680,7 @@ fn client_option_inheritance_keeps_explicit_command_fields() {
 #[test]
 fn incompatible_handshake_and_change_stream_empty_batch_resume_budget() {
     let mut c = Connection::new(Options::parse("mongodb://a/").unwrap());
-    c.connected(Instant::now(), "").unwrap();
+    c.connected(clock::now(), "").unwrap();
     let req = wire::i32_at(c.transmit(), 4).unwrap();
     let n = c.transmit().len();
     c.consume_transmit(n).unwrap();

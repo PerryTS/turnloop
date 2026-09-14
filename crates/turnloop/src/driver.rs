@@ -723,11 +723,7 @@ impl<B: Backend> Driver<B> {
             && (!queued || self.native_pending != 0 || self.backend.has_work())
         {
             let mut timeout = deadline.map(|d| d.saturating_duration_since(start));
-            if timeout == Some(Duration::ZERO)
-                || queued
-                || notified
-                || !self.notifier.park()
-            {
+            if timeout == Some(Duration::ZERO) || queued || notified || !self.notifier.park() {
                 timeout = Some(Duration::ZERO);
             }
             let poll = self.backend.poll(timeout, &mut self.events);

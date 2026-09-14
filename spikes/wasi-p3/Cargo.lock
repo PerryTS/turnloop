@@ -9,19 +9,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 
 [[package]]
+name = "turnloop-wasi-p3-spike"
+version = "0.1.0"
+dependencies = [
+ "wasip3",
+]
+
+[[package]]
 name = "wasip3"
 version = "0.8.0+wasi-0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42a999271e77c083825863fc85404197523b3f3cebe9b402aece658ebea90065"
 dependencies = [
  "wit-bindgen",
-]
-
-[[package]]
-name = "turnloop-wasi-p3-spike"
-version = "0.1.0"
-dependencies = [
- "wasip3",
 ]
 
 [[package]]

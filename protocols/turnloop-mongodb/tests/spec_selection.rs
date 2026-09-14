@@ -1,10 +1,7 @@
+#[path = "support/clock.rs"]
+mod clock;
 use serde_json::Value;
-use std::{
-    collections::BTreeMap,
-    fs,
-    path::Path,
-    time::{Duration, Instant},
-};
+use std::{collections::BTreeMap, fs, path::Path, time::Duration};
 use turnloop_mongodb::{
     bson::doc,
     topology::{ServerType, Topology, TopologyType},
@@ -36,7 +33,7 @@ fn files(root: &Path, out: &mut Vec<std::path::PathBuf>) {
 }
 fn run(path: &Path) {
     let v: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
-    let now = Instant::now();
+    let now = clock::now();
     let opts = Options::parse("mongodb://a/?directConnection=true").unwrap();
     let mut t = Topology::new(&opts, now);
     t.servers.clear();

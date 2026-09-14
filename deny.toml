@@ -15,9 +15,11 @@ deny = [
   { name = "async-executor" },
 ]
 
+# quoted_printable (lettre's MIME builder) uses the permissive 0BSD license.
+# Keep the license gate; no advisory or runtime exception is allowed.
 [licenses]
 confidence-threshold = 0.95
-allow = ["MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Zlib", "Unicode-3.0", "CC0-1.0"]
+allow = ["MIT", "Apache-2.0", "0BSD", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Zlib", "Unicode-3.0", "CC0-1.0"]
 
 [sources]
 unknown-registry = "deny"

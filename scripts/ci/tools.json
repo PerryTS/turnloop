@@ -143,13 +143,13 @@
       ]
     }
   },
-  "iai-callgrind-runner": {
+  "gungraun-runner": {
     "Linux-x86_64": {
-      "version": "v0.16.1",
-      "url": "https://github.com/gungraun/gungraun/releases/download/v0.16.1/iai-callgrind-runner-v0.16.1-x86_64-unknown-linux-gnu.tar.gz",
-      "sha256": "436feddb83ec916ddaf401dd1cea45aa329745067e8136a774b2fc581de6b448",
+      "version": "v0.19.4",
+      "url": "https://github.com/gungraun/gungraun/releases/download/v0.19.4/gungraun-runner-v0.19.4-x86_64-unknown-linux-gnu.tar.gz",
+      "sha256": "f88194dac725ef0599b2812396518e9bd74aadaf75f5baf78df91ddb9eec67d3",
       "executables": [
-        "iai-callgrind-runner"
+        "gungraun-runner"
       ]
     }
   }

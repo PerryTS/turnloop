@@ -1,15 +1,16 @@
 #![deny(unsafe_op_in_unsafe_fn)]
+#[path = "support/clock.rs"]
+mod clock;
 use std::{
     alloc::{GlobalAlloc, Layout, System},
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
-    time::Instant,
 };
 use turnloop_mongodb::{
+    Connection, ConnectionEvent,
     bson::{doc, raw::RawDocumentBuf},
     command::Command,
     uri::Options,
     wire::{self},
-    Connection, ConnectionEvent,
 };
 struct Counter;
 static COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -45,7 +46,7 @@ fn warmed_command_and_borrowed_reply_allocate_zero() {
     }
 }
 fn measure(compressed: bool, coordinator: bool) {
-    let now = Instant::now();
+    let now = clock::now();
     let mut c = Connection::new(
         Options::parse(if compressed {
             "mongodb://localhost/?compressors=zlib"

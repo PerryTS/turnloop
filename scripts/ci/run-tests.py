@@ -81,12 +81,14 @@ def main():
             for test_filter in filters:
                 checked_tests(base + ['-p', package['name'], '--lib', test_filter, '--', '--test-threads=1'], cwd=root, env=env)
     elif args.suite == 'miri':
+        if 'MIRI_SYSROOT' in env:
+            env['MIRI_SYSROOT'] = str(Path(env['MIRI_SYSROOT']).resolve())
         found = False
         for package in select(data, 'core'):
             for test_filter in settings(package).get('miri-filters', []):
                 found = True
                 checked_tests(cargo(PIN) + ['miri', 'test', '--locked', '--manifest-path',
-                    package['manifest_path'], '--lib', test_filter, '--', '--test-threads=1'], cwd=root)
+                    package['manifest_path'], '--lib', test_filter, '--', '--test-threads=1'], cwd=root, env=env)
         if not found:
             fail('Core must mark pure-Rust tests with package.metadata.turnloop-ci.miri-filters')
     else:

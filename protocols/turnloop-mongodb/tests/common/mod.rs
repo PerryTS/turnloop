@@ -6,12 +6,12 @@ use std::{
     time::{Duration, Instant},
 };
 use turnloop_mongodb::{
+    Connection, ConnectionEvent, Error, ErrorKind, Result,
     bson::{
-        raw::{RawDocument, RawDocumentBuf},
         Document,
+        raw::{RawDocument, RawDocumentBuf},
     },
     uri::Options,
-    Connection, ConnectionEvent, Error, ErrorKind, Result,
 };
 pub fn raw(d: &Document) -> RawDocumentBuf {
     RawDocumentBuf::try_from(d).expect("fixture operation must succeed")
@@ -22,10 +22,18 @@ pub fn tools_dir() -> PathBuf {
         .into()
 }
 pub fn ports() -> Vec<(String, u16)> {
-    let port = |name| std::env::var(name).expect("required private MongoDB port").parse::<u16>().expect("valid port");
-    let mut ports = vec![("standalone".to_owned(), port("TURNLOOP_TEST_MONGODB_PORT")),
-        ("tls".to_owned(), port("TURNLOOP_TEST_MONGODB_TLS_PORT"))];
-    let replicas = std::env::var("TURNLOOP_TEST_MONGODB_REPLICA_PORTS").expect("required replica ports");
+    let port = |name| {
+        std::env::var(name)
+            .expect("required private MongoDB port")
+            .parse::<u16>()
+            .expect("valid port")
+    };
+    let mut ports = vec![
+        ("standalone".to_owned(), port("TURNLOOP_TEST_MONGODB_PORT")),
+        ("tls".to_owned(), port("TURNLOOP_TEST_MONGODB_TLS_PORT")),
+    ];
+    let replicas =
+        std::env::var("TURNLOOP_TEST_MONGODB_REPLICA_PORTS").expect("required replica ports");
     let replicas: Vec<_> = replicas.split(',').collect();
     assert_eq!(replicas.len(), 3, "three replica members must run");
     for (i, value) in replicas.iter().enumerate() {
@@ -55,7 +63,9 @@ impl Driver {
         let mut core = Connection::new(options);
         let mut entropy = [0u8; 24];
         rustls::crypto::ring::default_provider()
-            .secure_random.fill(&mut entropy).expect("test nonce entropy");
+            .secure_random
+            .fill(&mut entropy)
+            .expect("test nonce entropy");
         use base64::Engine;
         let nonce = base64::engine::general_purpose::STANDARD.encode(entropy);
         core.connected(Instant::now(), &nonce)?;
@@ -66,15 +76,22 @@ impl Driver {
             ));
             let mut roots = rustls::RootCertStore::empty();
             let cert = std::fs::read(tools_dir().join("cert.pem")).map_err(network)?;
-            for c in rustls_pemfile::certs(&mut cert.as_slice()) {
-                roots.add(c.expect("fixture operation must succeed")).expect("fixture operation must succeed");
+            use rustls::pki_types::{CertificateDer, pem::PemObject};
+            for c in CertificateDer::pem_slice_iter(&cert) {
+                roots
+                    .add(c.expect("fixture operation must succeed"))
+                    .expect("fixture operation must succeed");
             }
             let cfg = rustls::ClientConfig::builder()
                 .with_root_certificates(roots)
                 .with_no_client_auth();
-            let mut conn =
-                rustls::ClientConnection::new(Arc::new(cfg), "localhost".try_into().expect("fixture operation must succeed"))
-                    .expect("fixture operation must succeed");
+            let mut conn = rustls::ClientConnection::new(
+                Arc::new(cfg),
+                "localhost"
+                    .try_into()
+                    .expect("fixture operation must succeed"),
+            )
+            .expect("fixture operation must succeed");
             let mut socket = socket;
             while conn.is_handshaking() {
                 conn.complete_io(&mut socket).map_err(network)?;

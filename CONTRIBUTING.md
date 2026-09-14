@@ -149,7 +149,7 @@ scripts/test-servers.py --services redis,mongodb,smtp run cargo test \
   -p turnloop-redis -p turnloop-mongodb -p turnloop-smtp -- --include-ignored --test-threads=1
 ```
 
-The runner owns only private instances and data under `.tools/`, always cleans up
+Run one fixture lifecycle command at a time in a checkout. The runner owns only private instances and data under `.tools/`, always cleans up
 on command failure, and fails when a selected capability cannot start. It locates
 installed binaries on PATH (with macOS/PostgreSQL installation fallbacks); it does
 not install or upgrade system software. PostgreSQL supports cleartext, MD5,
@@ -163,6 +163,14 @@ In the managed macOS sandbox PostgreSQL initialization fails at `shmget` and
 MySQL initialization crashes. Those real-server tests are **UNRUN (sandbox)**;
 run the full command outside the sandbox. Do not remove their ignored test bodies
 or treat a failed initializer as a test pass.
+
+CI's PostgreSQL 16/MySQL 9 service containers are provisioned by
+`scripts/test-servers.py --ci-services`. That mode launches the same six-node
+Redis topology and five MongoDB instances using private named Linux containers,
+with the same configurations, auth, certificates and environment variables as the
+native runner. It runs verified SQL TLS probes, then the metadata-selected Rust
+suites. Container identities/ownership labels are checked during cleanup. This
+Docker path is **UNRUN locally** because the development sandbox has no Docker.
 
 ## Pending platform and measurement gates
 
@@ -184,7 +192,15 @@ inputs land. Their commands and the strict `ci-gate` fan-in are retained. No
 
 ## Instruction regression gate
 
-The bench crate must depend on **`iai-callgrind = "=0.16.1"`**, with at least one
+The iai-callgrind instruction gate uses its maintained successor **Gungraun**.
+The previous 0.16.1 pin pulls unmaintained `proc-macro-error2`
+([RUSTSEC-2026-0173](https://rustsec.org/advisories/RUSTSEC-2026-0173)).
+Gungraun 0.19.4 fixes that dependency; the gate still requires actual Callgrind
+counts, three fresh runs, v6 summaries, the same 3% ceiling and exact controls.
+See the [upstream changelog](https://github.com/gungraun/gungraun/blob/v0.19.4/CHANGELOG.md).
+
+
+The bench crate must depend on **`gungraun = "=0.19.4"`**, with at least one
 `[[bench]]` target using `harness = false`. The matching runner is SHA-256 pinned.
 Mark `instruction-baseline = "benchmarks/instructions.json"` relative to its
 manifest. Each measured function must assert its workload counter/bytes; include

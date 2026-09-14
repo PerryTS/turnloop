@@ -6,13 +6,16 @@ use turnloop_redis::{
 };
 fn ready(config: Config) -> Connection {
     let mut c = Connection::new(config);
-    c.connect(Instant::now()).expect("fixture operation must succeed");
+    c.connect(Instant::now())
+        .expect("fixture operation must succeed");
     assert_eq!(c.poll_event(), Some(Event::Connect));
-    c.transport_connected().expect("fixture operation must succeed");
+    c.transport_connected()
+        .expect("fixture operation must succeed");
     if !c.output().is_empty() {
         let n = c.output().len();
         c.consume_output(n);
-        c.receive(b"%1\r\n+proto\r\n:3\r\n").expect("fixture operation must succeed");
+        c.receive(b"%1\r\n+proto\r\n:3\r\n")
+            .expect("fixture operation must succeed");
     }
     assert!(matches!(c.poll_event(), Some(Event::Ready { .. })));
     c
@@ -40,13 +43,17 @@ fn codec_fragments_all_types_and_limits() {
     for frame in frames {
         for end in 0..frame.len() {
             assert_eq!(
-                resp::decode(&frame[..end], Limits::default()).expect("fixture operation must succeed"),
+                resp::decode(&frame[..end], Limits::default())
+                    .expect("fixture operation must succeed"),
                 None,
                 "{frame:?} at {end}"
             );
         }
         assert_eq!(
-            resp::decode(frame, Limits::default()).expect("fixture operation must succeed").expect("fixture operation must succeed").1,
+            resp::decode(frame, Limits::default())
+                .expect("fixture operation must succeed")
+                .expect("fixture operation must succeed")
+                .1,
             frame.len()
         );
     }
@@ -90,26 +97,34 @@ fn fallback_auth_select_name_and_bad_auth() {
         client_name: Some("lane".into()),
         ..Config::default()
     });
-    c.connect(Instant::now()).expect("fixture operation must succeed");
+    c.connect(Instant::now())
+        .expect("fixture operation must succeed");
     c.poll_event();
-    c.transport_connected().expect("fixture operation must succeed");
+    c.transport_connected()
+        .expect("fixture operation must succeed");
     assert!(c.output().windows(5).any(|w| w == b"HELLO"));
     c.consume_output(c.output().len());
-    c.receive(b"-ERR unknown command 'HELLO'\r\n").expect("fixture operation must succeed");
+    c.receive(b"-ERR unknown command 'HELLO'\r\n")
+        .expect("fixture operation must succeed");
     assert_eq!(c.output(), b"*2\r\n$4\r\nAUTH\r\n$2\r\npw\r\n");
     c.consume_output(c.output().len());
-    c.receive(b"+OK\r\n").expect("fixture operation must succeed");
+    c.receive(b"+OK\r\n")
+        .expect("fixture operation must succeed");
     assert!(c.output().windows(6).any(|w| w == b"SELECT"));
     c.consume_output(c.output().len());
-    c.receive(b"+OK\r\n").expect("fixture operation must succeed");
+    c.receive(b"+OK\r\n")
+        .expect("fixture operation must succeed");
     assert!(c.output().windows(7).any(|w| w == b"SETNAME"));
     c.consume_output(c.output().len());
-    c.receive(b"+OK\r\n").expect("fixture operation must succeed");
+    c.receive(b"+OK\r\n")
+        .expect("fixture operation must succeed");
     assert_eq!(c.poll_event(), Some(Event::Ready { resp3: false }));
     let mut c = Connection::new(Config::default());
-    c.connect(Instant::now()).expect("fixture operation must succeed");
+    c.connect(Instant::now())
+        .expect("fixture operation must succeed");
     c.poll_event();
-    c.transport_connected().expect("fixture operation must succeed");
+    c.transport_connected()
+        .expect("fixture operation must succeed");
     c.consume_output(c.output().len());
     c.receive(b"-WRONGPASS invalid username-password pair\r\n")
         .expect("fixture operation must succeed");
@@ -124,7 +139,8 @@ fn ordered_pipeline_timeout_tombstone_and_close() {
     let now = Instant::now();
     c.command(1, &[b"BLPOP", b"queue", b"0"], Some(now))
         .expect("fixture operation must succeed");
-    c.command(2, &[b"INCR", b"counter"], None).expect("fixture operation must succeed");
+    c.command(2, &[b"INCR", b"counter"], None)
+        .expect("fixture operation must succeed");
     c.consume_output(3);
     assert!(!c.output().is_empty());
     c.consume_output(c.output().len());
@@ -133,7 +149,8 @@ fn ordered_pipeline_timeout_tombstone_and_close() {
     assert!(
         matches!(c.poll_event(), Some(Event::Reply { token: 1, result: Err(e) }) if e.message == "Command timed out")
     );
-    c.receive(b"_\r\n:42\r\n").expect("fixture operation must succeed");
+    c.receive(b"_\r\n:42\r\n")
+        .expect("fixture operation must succeed");
     assert_eq!(
         c.poll_event(),
         Some(Event::Reply {
@@ -142,7 +159,8 @@ fn ordered_pipeline_timeout_tombstone_and_close() {
         })
     );
     assert_eq!(c.poll_event(), None);
-    c.command(3, &[b"PING"], None).expect("fixture operation must succeed");
+    c.command(3, &[b"PING"], None)
+        .expect("fixture operation must succeed");
     c.close();
     c.close();
     assert!(matches!(
@@ -160,7 +178,8 @@ fn ordered_pipeline_timeout_tombstone_and_close() {
 fn reconnect_offline_order_resubscribe_and_retry_stop() {
     let now = Instant::now();
     let mut c = ready(Config::default());
-    c.command(1, &[b"SUBSCRIBE", b"news"], None).expect("fixture operation must succeed");
+    c.command(1, &[b"SUBSCRIBE", b"news"], None)
+        .expect("fixture operation must succeed");
     c.consume_output(c.output().len());
     c.receive(b">3\r\n+subscribe\r\n$4\r\nnews\r\n:1\r\n")
         .expect("fixture operation must succeed");
@@ -169,15 +188,18 @@ fn reconnect_offline_order_resubscribe_and_retry_stop() {
     c.transport_lost();
     assert_eq!(c.poll_event(), Some(Event::CloseTransport));
     assert_eq!(c.poll_event(), Some(Event::Retry { attempt: 1 }));
-    c.retry(now, Some(Duration::from_millis(50))).expect("fixture operation must succeed");
+    c.retry(now, Some(Duration::from_millis(50)))
+        .expect("fixture operation must succeed");
     assert_eq!(c.next_timeout(), Some(now + Duration::from_millis(50)));
     c.handle_timeout(now + Duration::from_millis(49));
     assert_eq!(c.poll_event(), None);
     c.handle_timeout(now + Duration::from_millis(50));
     assert_eq!(c.poll_event(), Some(Event::Connect));
-    c.transport_connected().expect("fixture operation must succeed");
+    c.transport_connected()
+        .expect("fixture operation must succeed");
     c.consume_output(c.output().len());
-    c.receive(b"%0\r\n").expect("fixture operation must succeed");
+    c.receive(b"%0\r\n")
+        .expect("fixture operation must succeed");
     assert!(c.output().windows(9).any(|w| w == b"SUBSCRIBE"));
     c.consume_output(c.output().len());
     c.receive(b">3\r\n+subscribe\r\n$4\r\nnews\r\n:1\r\n")
@@ -199,20 +221,26 @@ fn reconnect_offline_order_resubscribe_and_retry_stop() {
     c.retry(now, None).expect("fixture operation must succeed");
     assert_eq!(c.state(), State::Closed);
     let mut c = ready(Config::default());
-    c.command(7, &[b"INCR", b"x"], None).expect("fixture operation must succeed");
+    c.command(7, &[b"INCR", b"x"], None)
+        .expect("fixture operation must succeed");
     c.transport_lost();
     c.poll_event();
     c.poll_event();
-    c.command(8, &[b"GET", b"x"], None).expect("fixture operation must succeed");
-    c.retry(now, Some(Duration::ZERO)).expect("fixture operation must succeed");
+    c.command(8, &[b"GET", b"x"], None)
+        .expect("fixture operation must succeed");
+    c.retry(now, Some(Duration::ZERO))
+        .expect("fixture operation must succeed");
     c.handle_timeout(now);
     c.poll_event();
-    c.transport_connected().expect("fixture operation must succeed");
+    c.transport_connected()
+        .expect("fixture operation must succeed");
     c.consume_output(c.output().len());
-    c.receive(b"%0\r\n").expect("fixture operation must succeed");
+    c.receive(b"%0\r\n")
+        .expect("fixture operation must succeed");
     c.poll_event();
     c.consume_output(c.output().len());
-    c.receive(b":1\r\n$1\r\n1\r\n").expect("fixture operation must succeed");
+    c.receive(b":1\r\n$1\r\n1\r\n")
+        .expect("fixture operation must succeed");
     assert!(matches!(
         c.poll_event(),
         Some(Event::Reply { token: 7, .. })
@@ -228,9 +256,11 @@ fn redis_tls_blocks_all_protocol_bytes() {
         tls: true,
         ..Config::default()
     });
-    c.connect(Instant::now()).expect("fixture operation must succeed");
+    c.connect(Instant::now())
+        .expect("fixture operation must succeed");
     c.poll_event();
-    c.transport_connected().expect("fixture operation must succeed");
+    c.transport_connected()
+        .expect("fixture operation must succeed");
     assert_eq!(c.poll_event(), Some(Event::UpgradeTls));
     assert!(c.output().is_empty());
     assert!(c.receive(b"+OK\r\n").is_err());
@@ -252,8 +282,14 @@ fn cluster_hashes_and_redirects() {
     let redirect = Redirect::parse(&e).expect("fixture operation must succeed");
     assert_eq!(redirect.endpoint.host, "::1");
     let mut map = SlotMap::new();
-    map.apply_redirect(&redirect).expect("fixture operation must succeed");
-    assert_eq!(map.endpoint(123).expect("fixture operation must succeed").port, 32100);
+    map.apply_redirect(&redirect)
+        .expect("fixture operation must succeed");
+    assert_eq!(
+        map.endpoint(123)
+            .expect("fixture operation must succeed")
+            .port,
+        32100
+    );
     let ask = Redirect {
         asking: true,
         endpoint: turnloop_redis::routing::Endpoint {
@@ -262,8 +298,14 @@ fn cluster_hashes_and_redirects() {
         },
         ..redirect
     };
-    map.apply_redirect(&ask).expect("fixture operation must succeed");
-    assert_eq!(map.endpoint(123).expect("fixture operation must succeed").port, 32100);
+    map.apply_redirect(&ask)
+        .expect("fixture operation must succeed");
+    assert_eq!(
+        map.endpoint(123)
+            .expect("fixture operation must succeed")
+            .port,
+        32100
+    );
     assert!(
         map.route_keys(&[b"a", b"b"])
             .unwrap_err()
@@ -276,8 +318,10 @@ fn cluster_hashes_and_redirects() {
 #[test]
 fn pipelined_subscribe_unsubscribe_all_waits_for_every_ack() {
     let mut c = ready(Config::default());
-    c.command(1, &[b"SUBSCRIBE", b"a", b"b"], None).expect("fixture operation must succeed");
-    c.command(2, &[b"UNSUBSCRIBE"], None).expect("fixture operation must succeed");
+    c.command(1, &[b"SUBSCRIBE", b"a", b"b"], None)
+        .expect("fixture operation must succeed");
+    c.command(2, &[b"UNSUBSCRIBE"], None)
+        .expect("fixture operation must succeed");
     c.consume_output(c.output().len());
     c.receive(b">3\r\n+subscribe\r\n+a\r\n:1\r\n>3\r\n+subscribe\r\n+b\r\n:2\r\n>3\r\n+unsubscribe\r\n+a\r\n:1\r\n").expect("fixture operation must succeed");
     assert_eq!(
@@ -289,7 +333,8 @@ fn pipelined_subscribe_unsubscribe_all_waits_for_every_ack() {
     );
     assert_eq!(c.poll_event(), None);
     assert!(c.command(3, &[b"GET", b"a"], None).is_err());
-    c.receive(b">3\r\n+unsubscribe\r\n+b\r\n:0\r\n").expect("fixture operation must succeed");
+    c.receive(b">3\r\n+unsubscribe\r\n+b\r\n:0\r\n")
+        .expect("fixture operation must succeed");
     assert_eq!(
         c.poll_event(),
         Some(Event::Reply {
@@ -297,13 +342,17 @@ fn pipelined_subscribe_unsubscribe_all_waits_for_every_ack() {
             result: Ok(Value::Integer(0))
         })
     );
-    c.command(3, &[b"GET", b"a"], None).expect("fixture operation must succeed");
+    c.command(3, &[b"GET", b"a"], None)
+        .expect("fixture operation must succeed");
     let mut c = ready(Config::default());
-    c.command(4, &[b"SUBSCRIBE"], None).expect("fixture operation must succeed");
+    c.command(4, &[b"SUBSCRIBE"], None)
+        .expect("fixture operation must succeed");
     c.consume_output(c.output().len());
-    c.receive(b"-ERR wrong number of arguments\r\n").expect("fixture operation must succeed");
+    c.receive(b"-ERR wrong number of arguments\r\n")
+        .expect("fixture operation must succeed");
     c.poll_event();
-    c.command(5, &[b"GET", b"a"], None).expect("fixture operation must succeed");
+    c.command(5, &[b"GET", b"a"], None)
+        .expect("fixture operation must succeed");
 }
 #[test]
 fn sentinel_seed_iteration_stale_master_retry_and_redirect_budget() {
@@ -313,12 +362,15 @@ fn sentinel_seed_iteration_stale_master_retry_and_redirect_budget() {
         port: 33333,
     };
     let mut discovery =
-        SentinelDiscovery::new(vec![endpoint.clone(), endpoint.clone()], "group".into()).expect("fixture operation must succeed");
+        SentinelDiscovery::new(vec![endpoint.clone(), endpoint.clone()], "group".into())
+            .expect("fixture operation must succeed");
     assert!(matches!(
         discovery.poll_action(),
         Some(DiscoveryAction::QueryMaster { .. })
     ));
-    discovery.reply(&Value::Null).expect("fixture operation must succeed");
+    discovery
+        .reply(&Value::Null)
+        .expect("fixture operation must succeed");
     assert!(matches!(
         discovery.poll_action(),
         Some(DiscoveryAction::QueryMaster { .. })
@@ -363,7 +415,12 @@ fn sentinel_seed_iteration_stale_master_retry_and_redirect_budget() {
         message: "MOVED 123 localhost:33333".into(),
     };
     let mut map = SlotMap::new();
-    assert!(tracker.follow(&e, &mut map).expect("fixture operation must succeed").is_some());
+    assert!(
+        tracker
+            .follow(&e, &mut map)
+            .expect("fixture operation must succeed")
+            .is_some()
+    );
     assert!(
         tracker
             .follow(&e, &mut map)

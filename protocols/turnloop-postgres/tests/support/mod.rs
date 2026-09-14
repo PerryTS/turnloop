@@ -14,7 +14,8 @@ pub enum Transport {
 }
 impl Transport {
     pub fn connect(port: u16) -> Self {
-        let stream = TcpStream::connect(("127.0.0.1", port)).expect("fixture operation must succeed");
+        let stream =
+            TcpStream::connect(("127.0.0.1", port)).expect("fixture operation must succeed");
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
             .expect("fixture operation must succeed");
@@ -29,17 +30,29 @@ impl Transport {
         };
         let mut roots = RootCertStore::empty();
         roots
-            .add(fs::read(tools().join("server.der")).expect("fixture operation must succeed").into())
+            .add(
+                fs::read(tools().join("server.der"))
+                    .expect("fixture operation must succeed")
+                    .into(),
+            )
             .expect("fixture operation must succeed");
         let config = ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
-        let session =
-            ClientConnection::new(Arc::new(config), ServerName::try_from("localhost").expect("fixture operation must succeed"))
-                .expect("fixture operation must succeed");
-        let mut stream = StreamOwned::new(session, socket.try_clone().expect("fixture operation must succeed"));
+        let session = ClientConnection::new(
+            Arc::new(config),
+            ServerName::try_from("localhost").expect("fixture operation must succeed"),
+        )
+        .expect("fixture operation must succeed");
+        let mut stream = StreamOwned::new(
+            session,
+            socket.try_clone().expect("fixture operation must succeed"),
+        );
         while stream.conn.is_handshaking() {
-            stream.conn.complete_io(&mut stream.sock).expect("fixture operation must succeed");
+            stream
+                .conn
+                .complete_io(&mut stream.sock)
+                .expect("fixture operation must succeed");
         }
         *self = Self::Tls(Box::new(stream));
     }

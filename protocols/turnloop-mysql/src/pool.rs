@@ -457,7 +457,10 @@ mod tests {
     use super::*;
     #[test]
     fn fifo_timeouts_reuse_and_stale_release() {
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         let now = Instant::now();
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        let now = Instant::from_duration(std::time::Duration::ZERO);
         let mut p = Pool::new(Config {
             max: 1,
             min: 0,
@@ -508,7 +511,10 @@ mod tests {
     }
     #[test]
     fn connect_timeout_and_late_success_do_not_acquire() {
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         let now = Instant::now();
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        let now = Instant::from_duration(std::time::Duration::ZERO);
         let mut p = Pool::new(Config::default()).unwrap();
         p.checkout(5, now, Some(now + Duration::from_secs(1)))
             .unwrap();
@@ -531,7 +537,10 @@ mod tests {
     }
     #[test]
     fn min_queue_limit_and_end_semantics() {
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         let now = Instant::now();
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        let now = Instant::from_duration(std::time::Duration::ZERO);
         let mut p = Pool::new(Config {
             max: 2,
             min: 1,

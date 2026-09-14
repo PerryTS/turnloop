@@ -20,8 +20,10 @@ fn plain_ready(pipeline: bool) -> Connection {
         ..Config::default()
     })
     .expect("fixture operation must succeed");
-    c.connected(Instant::now()).expect("fixture operation must succeed");
-    c.receive(b"220 test\r\n", Instant::now()).expect("fixture operation must succeed");
+    c.connected(Instant::now())
+        .expect("fixture operation must succeed");
+    c.receive(b"220 test\r\n", Instant::now())
+        .expect("fixture operation must succeed");
     discard(&mut c);
     c.receive(
         if pipeline {
@@ -66,14 +68,17 @@ fn ehlo_fallback_required_tls_and_deadline() {
     let deadline = c.next_timeout().expect("fixture operation must succeed");
     assert_eq!(deadline, now + Duration::from_secs(30));
     for b in b"220 hi\r\n" {
-        c.receive(&[*b], now).expect("fixture operation must succeed");
+        c.receive(&[*b], now)
+            .expect("fixture operation must succeed");
     }
     assert!(c.output().starts_with(b"EHLO"));
     discard(&mut c);
-    c.receive(b"502 unsupported\r\n", now).expect("fixture operation must succeed");
+    c.receive(b"502 unsupported\r\n", now)
+        .expect("fixture operation must succeed");
     assert!(c.output().starts_with(b"HELO"));
     discard(&mut c);
-    c.receive(b"250 hi\r\n", now).expect("fixture operation must succeed");
+    c.receive(b"250 hi\r\n", now)
+        .expect("fixture operation must succeed");
     assert!(matches!(c.poll_event(), Some(Event::Failed { error, .. }) if error.code == "ETLS"));
     assert_eq!(c.state(), State::Closed);
     let mut c = Connection::new(Config::default()).expect("fixture operation must succeed");
@@ -119,7 +124,8 @@ fn capability_enforcement_all_rejected_and_mail_failure_drain() {
         "EMESSAGE"
     );
     let mut c = plain_ready(true);
-    c.send(2, envelope(), "id".into(), b"body", now).expect("fixture operation must succeed");
+    c.send(2, envelope(), "id".into(), b"body", now)
+        .expect("fixture operation must succeed");
     discard(&mut c);
     c.receive(
         b"550 bad sender\r\n250 would accept\r\n550 bad recipient\r\n",
@@ -131,12 +137,15 @@ fn capability_enforcement_all_rejected_and_mail_failure_drain() {
     );
     assert_eq!(c.output(), b"RSET\r\n");
     discard(&mut c);
-    c.receive(b"250 reset\r\n", now).expect("fixture operation must succeed");
+    c.receive(b"250 reset\r\n", now)
+        .expect("fixture operation must succeed");
     assert_eq!(c.state(), State::Ready);
     assert_eq!(c.poll_event(), None);
-    c.send(3, envelope(), "id".into(), b"body", now).expect("fixture operation must succeed");
+    c.send(3, envelope(), "id".into(), b"body", now)
+        .expect("fixture operation must succeed");
     discard(&mut c);
-    c.receive(b"250 mail\r\n550 no\r\n551 no\r\n", now).expect("fixture operation must succeed");
+    c.receive(b"250 mail\r\n550 no\r\n551 no\r\n", now)
+        .expect("fixture operation must succeed");
     assert!(
         matches!(c.poll_event(), Some(Event::Failed { token: Some(3), error, .. }) if error.message.contains("all recipients"))
     );
@@ -145,10 +154,20 @@ fn capability_enforcement_all_rejected_and_mail_failure_drain() {
 #[test]
 fn mime_builder_supplies_date_id_alternatives_attachments_and_headers() {
     let built = message::build(Mail {
-        from: "Sender <sender@example.test>".parse().expect("fixture operation must succeed"),
-        to: vec!["to@example.test".parse().expect("fixture operation must succeed")],
+        from: "Sender <sender@example.test>"
+            .parse()
+            .expect("fixture operation must succeed"),
+        to: vec![
+            "to@example.test"
+                .parse()
+                .expect("fixture operation must succeed"),
+        ],
         cc: vec![],
-        bcc: vec!["blind@example.test".parse().expect("fixture operation must succeed")],
+        bcc: vec![
+            "blind@example.test"
+                .parse()
+                .expect("fixture operation must succeed"),
+        ],
         subject: "Unicode ✓".into(),
         text: Some("plain text".into()),
         html: Some("<b>HTML</b>".into()),
@@ -182,7 +201,9 @@ fn line(socket: &mut dyn Socket) -> Vec<u8> {
     let mut out = Vec::new();
     loop {
         let mut b = [0];
-        socket.read_exact(&mut b).expect("fixture operation must succeed");
+        socket
+            .read_exact(&mut b)
+            .expect("fixture operation must succeed");
         out.push(b[0]);
         if out.ends_with(b"\r\n") {
             return out;
@@ -228,7 +249,9 @@ enum Mode {
 }
 fn test_socket(mode: Mode) {
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("fixture operation must succeed");
-    let addr = listener.local_addr().expect("fixture operation must succeed");
+    let addr = listener
+        .local_addr()
+        .expect("fixture operation must succeed");
     let server = thread::spawn(move || {
         let (stream, _) = listener.accept().expect("fixture operation must succeed");
         stream
@@ -242,7 +265,9 @@ fn test_socket(mode: Mode) {
             Box::new(server_tls(stream))
         } else if matches!(mode, Mode::StartTls) {
             let mut stream = stream;
-            stream.write_all(b"220 test ESMTP\r\n").expect("fixture operation must succeed");
+            stream
+                .write_all(b"220 test ESMTP\r\n")
+                .expect("fixture operation must succeed");
             let ehlo = line(&mut stream);
             assert!(ehlo.starts_with(b"EHLO "));
             transcript.extend(ehlo);
@@ -252,13 +277,17 @@ fn test_socket(mode: Mode) {
             let start = line(&mut stream);
             assert_eq!(start, b"STARTTLS\r\n");
             transcript.extend(start);
-            stream.write_all(b"220 ready for TLS\r\n").expect("fixture operation must succeed");
+            stream
+                .write_all(b"220 ready for TLS\r\n")
+                .expect("fixture operation must succeed");
             Box::new(server_tls(stream))
         } else {
             Box::new(stream)
         };
         if !matches!(mode, Mode::StartTls) {
-            socket.write_all(b"220 test ESMTP\r\n").expect("fixture operation must succeed");
+            socket
+                .write_all(b"220 test ESMTP\r\n")
+                .expect("fixture operation must succeed");
             socket.flush().expect("fixture operation must succeed");
         }
         let ehlo = line(&mut *socket);
@@ -271,10 +300,14 @@ fn test_socket(mode: Mode) {
         match mode {
             Mode::Login => {
                 assert_eq!(auth, b"AUTH LOGIN\r\n");
-                socket.write_all(b"334 VXNlcm5hbWU6\r\n").expect("fixture operation must succeed");
+                socket
+                    .write_all(b"334 VXNlcm5hbWU6\r\n")
+                    .expect("fixture operation must succeed");
                 socket.flush().expect("fixture operation must succeed");
                 assert_eq!(line(&mut *socket), b"dXNlcg==\r\n");
-                socket.write_all(b"334 UGFzc3dvcmQ6\r\n").expect("fixture operation must succeed");
+                socket
+                    .write_all(b"334 UGFzc3dvcmQ6\r\n")
+                    .expect("fixture operation must succeed");
                 socket.flush().expect("fixture operation must succeed");
                 assert_eq!(line(&mut *socket), b"cGFzcw==\r\n");
             }
@@ -295,7 +328,9 @@ fn test_socket(mode: Mode) {
             socket.flush().expect("fixture operation must succeed");
             return transcript;
         }
-        socket.write_all(b"235 2.7.0 authenticated\r\n").expect("fixture operation must succeed");
+        socket
+            .write_all(b"235 2.7.0 authenticated\r\n")
+            .expect("fixture operation must succeed");
         socket.flush().expect("fixture operation must succeed");
         let mail = line(&mut *socket);
         assert!(mail.starts_with(b"MAIL FROM:<a@example.test> SIZE="));
@@ -312,7 +347,9 @@ fn test_socket(mode: Mode) {
             .expect("fixture operation must succeed");
         socket.flush().expect("fixture operation must succeed");
         assert_eq!(line(&mut *socket), b"DATA\r\n");
-        socket.write_all(b"354 go ahead\r\n").expect("fixture operation must succeed");
+        socket
+            .write_all(b"354 go ahead\r\n")
+            .expect("fixture operation must succeed");
         socket.flush().expect("fixture operation must succeed");
         let mut body = Vec::new();
         loop {
@@ -329,10 +366,14 @@ fn test_socket(mode: Mode) {
             .expect("fixture operation must succeed");
         socket.flush().expect("fixture operation must succeed");
         assert_eq!(line(&mut *socket), b"RSET\r\n");
-        socket.write_all(b"250 reset\r\n").expect("fixture operation must succeed");
+        socket
+            .write_all(b"250 reset\r\n")
+            .expect("fixture operation must succeed");
         socket.flush().expect("fixture operation must succeed");
         assert_eq!(line(&mut *socket), b"QUIT\r\n");
-        socket.write_all(b"221 bye\r\n").expect("fixture operation must succeed");
+        socket
+            .write_all(b"221 bye\r\n")
+            .expect("fixture operation must succeed");
         socket.flush().expect("fixture operation must succeed");
         transcript
     });
@@ -396,7 +437,8 @@ fn test_socket(mode: Mode) {
         }
     }
     let mut wire = Some(Wire::Plain(stream));
-    c.connected(Instant::now()).expect("fixture operation must succeed");
+    c.connected(Instant::now())
+        .expect("fixture operation must succeed");
     let mut sent = false;
     let mut failed = false;
     loop {
@@ -407,15 +449,23 @@ fn test_socket(mode: Mode) {
                         panic!("second TLS upgrade")
                     };
                     let mut tls = rustls::StreamOwned::new(
-                        rustls::ClientConnection::new(roots(), "localhost".try_into().expect("fixture operation must succeed"))
-                            .expect("fixture operation must succeed"),
+                        rustls::ClientConnection::new(
+                            roots(),
+                            "localhost"
+                                .try_into()
+                                .expect("fixture operation must succeed"),
+                        )
+                        .expect("fixture operation must succeed"),
                         stream,
                     );
                     while tls.conn.is_handshaking() {
-                        tls.conn.complete_io(&mut tls.sock).expect("fixture operation must succeed");
+                        tls.conn
+                            .complete_io(&mut tls.sock)
+                            .expect("fixture operation must succeed");
                     }
                     wire = Some(Wire::Tls(Box::new(tls)));
-                    c.tls_established(Instant::now()).expect("fixture operation must succeed");
+                    c.tls_established(Instant::now())
+                        .expect("fixture operation must succeed");
                 }
                 Event::Ready => {
                     assert!(c.capabilities().pipelining);
@@ -438,10 +488,12 @@ fn test_socket(mode: Mode) {
                     assert_eq!(info.envelope, envelope());
                     assert_eq!(info.message_id, "<id@example.test>");
                     sent = true;
-                    c.reset(Instant::now()).expect("fixture operation must succeed");
+                    c.reset(Instant::now())
+                        .expect("fixture operation must succeed");
                 }
                 Event::Reset => {
-                    c.quit(Instant::now()).expect("fixture operation must succeed");
+                    c.quit(Instant::now())
+                        .expect("fixture operation must succeed");
                 }
                 Event::Failed { token, error, .. } => {
                     assert!(matches!(mode, Mode::AuthFail));
@@ -461,13 +513,15 @@ fn test_socket(mode: Mode) {
             continue;
         }
         let w = wire.as_mut().expect("fixture operation must succeed");
-        w.write_all(c.output()).expect("fixture operation must succeed");
+        w.write_all(c.output())
+            .expect("fixture operation must succeed");
         w.flush().expect("fixture operation must succeed");
         discard(&mut c);
         let mut b = [0; 4096];
         let n = w.read(&mut b).expect("fixture operation must succeed");
         assert!(n > 0);
-        c.receive(&b[..n], Instant::now()).expect("fixture operation must succeed");
+        c.receive(&b[..n], Instant::now())
+            .expect("fixture operation must succeed");
     }
     assert_eq!(sent, !matches!(mode, Mode::AuthFail));
     assert_eq!(failed, matches!(mode, Mode::AuthFail));
@@ -500,8 +554,11 @@ fn socket_auth_failure() {
 fn installed_postfix_smtp_sink_records_message() {
     use std::{fs, path::PathBuf};
     let port: u16 = std::env::var("TURNLOOP_TEST_SMTP_PORT")
-        .expect("run scripts/test-servers.py run").parse().expect("SMTP port");
-    let root = PathBuf::from(std::env::var_os("TURNLOOP_TEST_SMTP_TOOLS").expect("SMTP dump directory"));
+        .expect("run scripts/test-servers.py run")
+        .parse()
+        .expect("SMTP port");
+    let root =
+        PathBuf::from(std::env::var_os("TURNLOOP_TEST_SMTP_TOOLS").expect("SMTP dump directory"));
     let mut socket = TcpStream::connect(("127.0.0.1", port)).expect("connect private SMTP sink");
     socket
         .set_read_timeout(Some(Duration::from_secs(5)))
@@ -514,7 +571,8 @@ fn installed_postfix_smtp_sink_records_message() {
         ..Config::default()
     })
     .expect("fixture operation must succeed");
-    c.connected(Instant::now()).expect("fixture operation must succeed");
+    c.connected(Instant::now())
+        .expect("fixture operation must succeed");
     let mut sent = false;
     loop {
         if let Some(event) = c.poll_event() {
@@ -535,7 +593,8 @@ fn installed_postfix_smtp_sink_records_message() {
                     assert_eq!(token, 88);
                     assert_eq!(info.accepted, ["recipient@example.test"]);
                     sent = true;
-                    c.quit(Instant::now()).expect("fixture operation must succeed");
+                    c.quit(Instant::now())
+                        .expect("fixture operation must succeed");
                 }
                 Event::CloseTransport => {}
                 Event::Closed => break,
@@ -543,12 +602,17 @@ fn installed_postfix_smtp_sink_records_message() {
             }
             continue;
         }
-        socket.write_all(c.output()).expect("fixture operation must succeed");
+        socket
+            .write_all(c.output())
+            .expect("fixture operation must succeed");
         discard(&mut c);
         let mut bytes = [0; 4096];
-        let n = socket.read(&mut bytes).expect("fixture operation must succeed");
+        let n = socket
+            .read(&mut bytes)
+            .expect("fixture operation must succeed");
         assert!(n > 0);
-        c.receive(&bytes[..n], Instant::now()).expect("fixture operation must succeed");
+        c.receive(&bytes[..n], Instant::now())
+            .expect("fixture operation must succeed");
     }
     assert!(sent);
     let dumps: Vec<_> = fs::read_dir(&root)
@@ -586,14 +650,17 @@ fn partial_greeting_keeps_deadline_and_data_failure_has_node_error_shape() {
     c.handle_timeout(now + Duration::from_secs(30));
     assert_eq!(c.state(), State::Closed);
     let mut c = plain_ready(true);
-    c.send(9, envelope(), "id".into(), b"body", now).expect("fixture operation must succeed");
+    c.send(9, envelope(), "id".into(), b"body", now)
+        .expect("fixture operation must succeed");
     discard(&mut c);
     c.receive(b"250 mail\r\n250 accepted\r\n550 denied\r\n", now)
         .expect("fixture operation must succeed");
     discard(&mut c);
-    c.receive(b"354 send\r\n", now).expect("fixture operation must succeed");
+    c.receive(b"354 send\r\n", now)
+        .expect("fixture operation must succeed");
     discard(&mut c);
-    c.receive(b"554 content rejected\r\n", now).expect("fixture operation must succeed");
+    c.receive(b"554 content rejected\r\n", now)
+        .expect("fixture operation must succeed");
     assert!(
         matches!(c.poll_event(), Some(Event::Failed { token: Some(9), error, envelope: Some(e), accepted, rejected }) if error.code == "EMESSAGE" && error.command == "DATA" && error.message == "Message failed: 554 content rejected" && e == envelope() && accepted == ["ok@example.test"] && rejected.len() == 1)
     );

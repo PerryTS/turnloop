@@ -927,7 +927,9 @@ pub fn io_and_posts_progress_with_repeating_timers<B: Backend>() {
 pub fn no_spin<B: Backend>() {
     let mut driver = Driver::<B>::new(Config::default()).expect("loop");
     let (_, _sender, receiver) = pair(&mut driver);
-    let read = driver.read(receiver, ReadBuf::Pooled, Token(90)).expect("idle read");
+    let read = driver
+        .read(receiver, ReadBuf::Pooled, Token(90))
+        .expect("idle read");
     let mut out = Completions::default();
     let mut expiries = 0;
     let mut waits = 0;
@@ -940,7 +942,9 @@ pub fn no_spin<B: Backend>() {
             loop {
                 turns += 1;
                 assert!(turns <= 2, "{micros} us deadline spun before expiry");
-                let info = driver.turn(Timeout::Until(deadline), &mut out).expect("turn");
+                let info = driver
+                    .turn(Timeout::Until(deadline), &mut out)
+                    .expect("turn");
                 assert!(info.os_waits <= 1);
                 waits += info.os_waits;
                 zero_events += info.zero_event_waits;
@@ -955,7 +959,9 @@ pub fn no_spin<B: Backend>() {
                     break;
                 }
             }
-            driver.close(timer, Token(92)).expect("release timer handle");
+            driver
+                .close(timer, Token(92))
+                .expect("release timer handle");
             driver.turn(Timeout::Now, &mut out).expect("drain close");
             assert_eq!(out.len(), 1);
             assert!(matches!(out[0].result, OpResult::Closed));
@@ -963,5 +969,8 @@ pub fn no_spin<B: Backend>() {
     }
     assert_eq!(expiries, 60);
     assert!(waits >= 60, "timer waits must actually execute");
-    assert!(driver.cancel(read), "idle socket read remained pending throughout");
+    assert!(
+        driver.cancel(read),
+        "idle socket read remained pending throughout"
+    );
 }

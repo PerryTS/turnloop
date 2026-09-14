@@ -1,4 +1,4 @@
-//! Internal platform contract, revision 1.
+//! Internal platform contract, revision 2 (empty-wait instrumentation).
 //!
 //! Public only so the contract runner and independently developed backends can use
 //! it; not a stable end-user extension API. All identifiers and buffers are core
@@ -39,7 +39,10 @@
 //!   completions. WASI 0.2 polls pollables; 0.3 drives a waitable set; web drains
 //!   callback results and rejects blocking waits on the main thread.
 //! * EINTR ends this poll early; it must not restart the timeout. `PollInfo.waits`
-//!   reports actual wait invocations for the contract tests.
+//!   reports actual wait invocations for the contract tests; `zero_event_waits`
+//!   counts OS waits that returned zero native events, including EINTR.
+//! * Cached readiness ending in EAGAIN with no completion must retain the original
+//!   timeout for the one permitted OS wait. It must not force a zero-timeout turn.
 //! * `has_work` covers queued completions and cached runnable I/O. `wake` is called
 //!   only after the notifier observed PARKED. It must be safe after loop drop:
 //!   the wake object owns its native resource or detects closure, never uses a

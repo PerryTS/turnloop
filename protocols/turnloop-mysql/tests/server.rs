@@ -53,22 +53,32 @@ impl Driver {
         d
     }
     fn flush(&mut self) {
-        self.io.write_all(self.core.output()).expect("fixture operation must succeed");
+        self.io
+            .write_all(self.core.output())
+            .expect("fixture operation must succeed");
         let n = self.core.output().len();
-        self.core.consume_output(n).expect("fixture operation must succeed");
+        self.core
+            .consume_output(n)
+            .expect("fixture operation must succeed");
         self.io.flush().expect("fixture operation must succeed");
     }
     fn step(&mut self, r: &mut Results, infile: Option<&[u8]>) {
         self.flush();
         let mut any = false;
-        while let Some(event) = self.core.next_event().expect("fixture operation must succeed") {
+        while let Some(event) = self
+            .core
+            .next_event()
+            .expect("fixture operation must succeed")
+        {
             any = true;
             match event {
                 Event::Progress | Event::Connected { .. } | Event::ColumnCount { .. } => {}
                 Event::UpgradeTls => {
                     self.flush();
                     self.io.upgrade();
-                    self.core.tls_established().expect("fixture operation must succeed");
+                    self.core
+                        .tls_established()
+                        .expect("fixture operation must succeed");
                     self.tls += 1;
                 }
                 Event::AuthFastSuccess => self.fast += 1,
@@ -79,12 +89,15 @@ impl Driver {
                         .secure_random
                         .fill(&mut seed)
                         .expect("fixture operation must succeed");
-                    self.core.rsa_seed(seed).expect("fixture operation must succeed");
+                    self.core
+                        .rsa_seed(seed)
+                        .expect("fixture operation must succeed");
                     self.rsa += 1;
                 }
-                Event::Column { column, .. } => r
-                    .columns
-                    .push(String::from_utf8(column.name.to_vec()).expect("fixture operation must succeed")),
+                Event::Column { column, .. } => r.columns.push(
+                    String::from_utf8(column.name.to_vec())
+                        .expect("fixture operation must succeed"),
+                ),
                 Event::Row { row, .. } => r.rows.push(
                     row.map(|v| match v.expect("fixture operation must succeed") {
                         RawValue::Null => Value::NULL,
@@ -111,7 +124,9 @@ impl Driver {
                     self.core
                         .local_infile_data(infile.expect("infile fixture required"))
                         .expect("fixture operation must succeed");
-                    self.core.local_infile_finish().expect("fixture operation must succeed");
+                    self.core
+                        .local_infile_finish()
+                        .expect("fixture operation must succeed");
                 }
                 Event::Closed { reason } => panic!("unexpected close: {reason}"),
             }
@@ -119,9 +134,14 @@ impl Driver {
         self.flush();
         if !any {
             let mut b = [0; 4096];
-            let n = self.io.read(&mut b).expect("fixture operation must succeed");
+            let n = self
+                .io
+                .read(&mut b)
+                .expect("fixture operation must succeed");
             assert!(n > 0, "unexpected EOF");
-            self.core.receive(&b[..n]).expect("fixture operation must succeed");
+            self.core
+                .receive(&b[..n])
+                .expect("fixture operation must succeed");
         }
     }
     fn drain(&mut self, infile: Option<&[u8]>) -> Results {
@@ -132,7 +152,9 @@ impl Driver {
         r
     }
     fn query(&mut self, sql: &str) -> Results {
-        self.core.query(1, sql, None).expect("fixture operation must succeed");
+        self.core
+            .query(1, sql, None)
+            .expect("fixture operation must succeed");
         self.drain(None)
     }
 }
@@ -164,7 +186,10 @@ fn auth_prepared_transactions_compression_and_infile() {
             None,
         )
         .expect("fixture operation must succeed");
-    let stmt = d.drain(None).statement.expect("fixture operation must succeed");
+    let stmt = d
+        .drain(None)
+        .statement
+        .expect("fixture operation must succeed");
     assert_eq!(stmt.parameters, 2);
     assert_eq!(stmt.columns, 2);
     d.core
@@ -180,9 +205,13 @@ fn auth_prepared_transactions_compression_and_infile() {
         r.rows,
         vec![vec![Value::Int(42), Value::Bytes(b"hello".to_vec())]]
     );
-    d.core.reset_statement(4, stmt.id).expect("fixture operation must succeed");
+    d.core
+        .reset_statement(4, stmt.id)
+        .expect("fixture operation must succeed");
     assert_eq!(d.drain(None).completed, [Outcome::Success]);
-    d.core.close_statement(5, stmt.id).expect("fixture operation must succeed");
+    d.core
+        .close_statement(5, stmt.id)
+        .expect("fixture operation must succeed");
     assert_eq!(d.drain(None).completed, [Outcome::Success]);
     assert!(d.core.execute(6, stmt.id, &[], None).is_err());
     d.query("START TRANSACTION");
@@ -225,7 +254,9 @@ fn auth_prepared_transactions_compression_and_infile() {
     let mut compressed = Driver::connect("sql_user", false, true, false);
     let r = compressed.query("SELECT REPEAT('x',100000)");
     assert_eq!(r.rows[0][0], Value::Bytes(vec![b'x'; 100000]));
-    d.core.reset_connection(9).expect("fixture operation must succeed");
+    d.core
+        .reset_connection(9)
+        .expect("fixture operation must succeed");
     assert_eq!(d.drain(None).completed, [Outcome::Success]);
     assert_eq!(d.query("SELECT * FROM items").errors[0].0, 1146);
     d.core
@@ -270,8 +301,13 @@ fn common_column_types_and_binary_null_bitmap() {
     d.core
         .prepare(2, "SELECT * FROM types_fixture WHERE id=?", None)
         .expect("fixture operation must succeed");
-    let stmt = d.drain(None).statement.expect("fixture operation must succeed");
-    d.core.execute(3, stmt.id, &[Value::Int(1)], None).expect("fixture operation must succeed");
+    let stmt = d
+        .drain(None)
+        .statement
+        .expect("fixture operation must succeed");
+    d.core
+        .execute(3, stmt.id, &[Value::Int(1)], None)
+        .expect("fixture operation must succeed");
     let r = d.drain(None);
     assert_eq!(r.rows.len(), 1);
     assert_eq!(r.rows[0][0], Value::Int(1));
@@ -284,7 +320,9 @@ fn common_column_types_and_binary_null_bitmap() {
     assert_eq!(r.rows[0][7], Value::Bytes(b"hello".to_vec()));
     assert_eq!(r.rows[0][8], Value::Double(1.25));
     d.query("UPDATE types_fixture SET n=NULL, deci=NULL, d=NULL, dt=NULL, j=NULL, b=NULL, s=NULL, f=NULL");
-    d.core.execute(4, stmt.id, &[Value::Int(1)], None).expect("fixture operation must succeed");
+    d.core
+        .execute(4, stmt.id, &[Value::Int(1)], None)
+        .expect("fixture operation must succeed");
     let r = d.drain(None);
     assert_eq!(r.rows.len(), 1);
     assert!(r.rows[0][1..].iter().all(|v| *v == Value::NULL));
@@ -300,7 +338,8 @@ fn pool_reuses_real_session_and_closes_on_end() {
         ..Config::default()
     })
     .expect("fixture operation must succeed");
-    p.checkout(1, now, None).expect("fixture operation must succeed");
+    p.checkout(1, now, None)
+        .expect("fixture operation must succeed");
     let Some(Event::Connect(id)) = p.next_event() else {
         panic!()
     };
@@ -309,14 +348,17 @@ fn pool_reuses_real_session_and_closes_on_end() {
         connection.query("SET @pooled_value=42").completed,
         [Outcome::Success]
     );
-    p.connected(id, now).expect("fixture operation must succeed");
+    p.connected(id, now)
+        .expect("fixture operation must succeed");
     p.next_event();
     let Some(Event::Acquired(a)) = p.next_event() else {
         panic!()
     };
-    p.checkout(2, now, None).expect("fixture operation must succeed");
+    p.checkout(2, now, None)
+        .expect("fixture operation must succeed");
     assert_eq!(p.waiting_count(), 1);
-    p.checkin(a, now, false).expect("fixture operation must succeed");
+    p.checkin(a, now, false)
+        .expect("fixture operation must succeed");
     p.next_event();
     let Some(Event::Acquired(b)) = p.next_event() else {
         panic!()
@@ -329,10 +371,16 @@ fn pool_reuses_real_session_and_closes_on_end() {
     );
     p.end().expect("fixture operation must succeed");
     assert_eq!(p.next_event(), Some(Event::Close(id)));
-    connection.core.quit().expect("fixture operation must succeed");
+    connection
+        .core
+        .quit()
+        .expect("fixture operation must succeed");
     connection.flush();
     assert!(matches!(
-        connection.core.next_event().expect("fixture operation must succeed"),
+        connection
+            .core
+            .next_event()
+            .expect("fixture operation must succeed"),
         Some(turnloop_mysql::Event::Closed { .. })
     ));
     p.closed(id, now).expect("fixture operation must succeed");

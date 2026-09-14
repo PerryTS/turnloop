@@ -61,8 +61,8 @@ fn wait_external(inner: i32) {
         events: libc::EPOLLIN as u32,
         u64: 42,
     };
-    // SAFETY: initialized input event and two valid epoll descriptors.
     assert_eq!(
+        // SAFETY: initialized input event and two valid epoll descriptors.
         unsafe { libc::epoll_ctl(outer.as_raw_fd(), libc::EPOLL_CTL_ADD, inner, &mut event) },
         0
     );

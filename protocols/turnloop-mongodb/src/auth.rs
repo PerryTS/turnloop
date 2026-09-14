@@ -1,8 +1,8 @@
 //! auth/auth.md §§ SCRAM-SHA-1, SCRAM-SHA-256 and mongodb-handshake/handshake.md
 //! § Speculative Authentication. Entropy is provided by the host, never acquired here.
-use crate::{uri::Credential, Error, ErrorKind, Result};
-use base64::{engine::general_purpose::STANDARD, Engine};
-use bson::{doc, spec::BinarySubtype, Binary, Document};
+use crate::{Error, ErrorKind, Result, uri::Credential};
+use base64::{Engine, engine::general_purpose::STANDARD};
+use bson::{Binary, Document, doc, spec::BinarySubtype};
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Digest;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,13 +49,15 @@ impl Scram {
         let password = match mechanism {
             Mechanism::Sha1 => {
                 use std::fmt::Write;
-                let digest = md5::Md5::digest(format!("{}:mongo:{}", credential.username, credential.password).as_bytes());
+                let digest = md5::Md5::digest(
+                    format!("{}:mongo:{}", credential.username, credential.password).as_bytes(),
+                );
                 let mut hex = String::with_capacity(32);
                 for byte in digest {
                     write!(hex, "{byte:02x}").expect("writing to a String cannot fail");
                 }
                 hex
-            },
+            }
             Mechanism::Sha256 => stringprep::saslprep(&credential.password)
                 .map_err(|_| auth_error("Password cannot be SASLprep normalized"))?
                 .into_owned(),

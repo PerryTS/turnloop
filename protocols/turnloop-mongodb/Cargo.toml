@@ -24,7 +24,6 @@ flate2.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 rustls.workspace = true
-rustls-pemfile.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

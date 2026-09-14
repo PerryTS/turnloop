@@ -62,6 +62,10 @@ jobs:
           cargo +nightly-2026-08-20 metadata --locked --all-features --format-version 1 > /dev/null
           rustup toolchain install stable --profile minimal
           cargo +stable check --locked --workspace --all-targets --all-features
+      - name: Declared MSRV
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal
+          cargo +1.97.1 check --locked --workspace --all-targets --all-features
   lint-wasm:
     strategy:
       fail-fast: false
@@ -217,21 +221,6 @@ jobs:
         options: >-
           --health-cmd "mysql --host=127.0.0.1 --user=turnloop --password=turnloop --execute 'SELECT 1'"
           --health-interval 5s --health-timeout 5s --health-retries 60
-      redis:
-        image: redis:8
-        ports: ['6379:6379']
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 5s --health-timeout 5s --health-retries 30
-      mongo:
-        image: mongo:8
-        env:
-          MONGO_INITDB_ROOT_USERNAME: turnloop
-          MONGO_INITDB_ROOT_PASSWORD: turnloop # zizmor: ignore[hardcoded-container-credentials] -- Disposable CI database credential.
-        ports: ['27017:27017']
-        options: >-
-          --health-cmd "mongosh --quiet --eval 'quit(db.adminCommand({ping:1}).ok ? 0 : 1)'"
-          --health-interval 5s --health-timeout 5s --health-retries 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -241,18 +230,21 @@ jobs:
           python-version: '3.14'
       - name: Install pinned Rust
         run: rustup toolchain install nightly-2026-08-20 --profile minimal --component rustfmt,clippy
-      - name: Bootstrap TLS, Redis cluster, Mongo replica set and test environment
+      - name: Install SMTP sink for private fixture
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo --preserve-env=DEBIAN_FRONTEND apt-get install --yes postfix
+      - name: Required real-server protocol suites with the shared fixture contract
         env:
           POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
           MYSQL_CONTAINER: ${{ job.services.mysql.id }}
-          REDIS_CONTAINER: ${{ job.services.redis.id }}
-          MONGO_CONTAINER: ${{ job.services.mongo.id }}
-        run: bash scripts/ci/bootstrap-services.sh
-      - name: Required real-server protocol suites
-        run: python3 scripts/ci/run-tests.py protocol
+        run: scripts/test-servers.py --ci-services run python3 scripts/ci/run-tests.py protocol
       - name: Fixture logs and cleanup
         if: always()
-        run: bash scripts/ci/cleanup-services.sh
+        run: scripts/test-servers.py --ci-services stop
+
   dependencies:
     runs-on: ubuntu-24.04
     permissions:
@@ -328,11 +320,11 @@ jobs:
           python-version: '3.14'
       - name: Install pinned Rust
         run: rustup toolchain install nightly-2026-08-20 --profile minimal --component rustfmt,clippy
-      - name: Install Valgrind and matching iai-callgrind runner
+      - name: Install Valgrind and matching gungraun runner
         run: |
           sudo apt-get update
           sudo apt-get install --yes valgrind
-          python3 scripts/ci/install-tools.py iai-callgrind-runner
+          python3 scripts/ci/install-tools.py gungraun-runner
       - name: Three fresh-process instruction counts against reviewed baselines
         run: python3 scripts/ci/instructions.py
   ci-gate:
