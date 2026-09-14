@@ -21,4 +21,4 @@ rcgen.workspace = true
 zstd = { version = "0.13", default-features = false }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-ruzstd = { version = "0.8", path = "vendor/ruzstd" }
+ruzstd = "0.8"

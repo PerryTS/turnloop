@@ -4,4 +4,4 @@ Upstream ruzstd 0.8.3, MIT. The downloaded .crate SHA-256 was verified against C
 
 Only protocol implementation changes: `FSETable::build_from_probabilities` clears/extends its existing probability vector; default sequence-table distributions are borrowed slices instead of temporary Vecs. This removes six allocations per default-table zstd frame. No decoding semantics or tests were weakened. Measured by `tests/allocations.rs` on wasm32-wasip2. All other source files are upstream copies. Remove this vendor override when upstream ships equivalent reuse (respecting the 7-day soak).
 
-The normalized manifest omits upstream benchmark/dev-only dependencies; benchmark source and unit tests remain in the source snapshot, but are not workspace targets.
+The normalized manifest adds an independent `[workspace]`; upstream tests and benchmark dependencies are unchanged. The root `[patch.crates-io]` consumes this as an external dependency, not a protocol workspace member. Downstream workspaces must preserve this patch until upstream incorporates the allocation fix.

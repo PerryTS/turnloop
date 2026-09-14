@@ -61,6 +61,10 @@ std = []
 name = "ruzstd"
 path = "src/lib.rs"
 
+[[bench]]
+name = "decode_all"
+path = "benches/decode_all.rs"
+harness = false
 
 [dependencies.alloc]
 version = "1.0.0"
@@ -86,8 +90,15 @@ features = ["xxhash64"]
 optional = true
 default-features = false
 
+[dev-dependencies.criterion]
+version = "0.5"
 
+[dev-dependencies.rand]
+version = "0.8.5"
+features = ["small_rng"]
 
+[dev-dependencies.zstd]
+version = "0.13.2"
 
-# Independent vendored dependency, not a protocol workspace member.
+# Kept outside the protocol workspace; consumed only through the root patch.
 [workspace]
