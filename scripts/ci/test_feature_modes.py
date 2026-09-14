@@ -23,6 +23,31 @@ class FeatureModes(unittest.TestCase):
         self.assertEqual(len(native_modes('darwin')), 3)
         self.assertEqual(len(native_modes('win32')), 3)
 
+    def test_target_only_features_are_proven_by_their_target_jobs(self):
+        contract = tomllib.loads((ROOT / 'crates/turnloop-contract/Cargo.toml').read_text())
+        runner = (ROOT / 'scripts/ci/run-tests.py').read_text()
+        self.assertEqual(len(check(self.source, self.manifest, contract, runner)), 18)
+        # The contract crate must forward the feature to turnloop.
+        broken = json.loads(json.dumps(contract))
+        broken['features']['web-worker'] = []
+        with self.assertRaisesRegex(RuntimeError, 'must forward web-worker'):
+            check(self.source, self.manifest, broken, runner)
+        # The web runner must actually enable it.
+        broken = json.loads(json.dumps(contract))
+        broken['package']['metadata']['turnloop-ci']['web-tests-features'] = ['executor']
+        with self.assertRaisesRegex(RuntimeError, 'web-tests-features must include it'):
+            check(self.source, self.manifest, broken, runner)
+        # Dropping the p3 target from the wasi job removes coverage.
+        with self.assertRaisesRegex(RuntimeError, 'wasm32-wasip3'):
+            check(self.source.replace('- target: wasm32-wasip3', '- target: wasm32-wasip9'), self.manifest, contract, runner)
+        # The WASI runner must keep enabling all contract features.
+        with self.assertRaisesRegex(RuntimeError, 'no longer enables all contract features'):
+            check(self.source, self.manifest, contract, runner.replace("features = ['--all-features']", "features = []"))
+        # An unregistered new target-only feature still fails.
+        self.manifest['features']['browser-extra'] = []
+        with self.assertRaisesRegex(RuntimeError, 'without explicit runtime CI arms'):
+            check(self.source, self.manifest, contract, runner)
+
     def test_all_features_does_not_cover_an_unlisted_new_feature(self):
         self.manifest['features']['untested-mode'] = []
         with self.assertRaisesRegex(RuntimeError, 'without explicit runtime CI arms'):

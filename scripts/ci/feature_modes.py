@@ -74,7 +74,48 @@ def public_features(manifest):
     return set(declared) | (optional - namespaced)
 
 
-def check(source, manifest):
+# Features that only exist on non-native targets are covered by target runtime
+# jobs, not the native matrix. Each entry is verified against the workflow, the
+# contract crate's feature mapping and the runner's actual feature selection; any
+# drift fails closed, so this is a proof of coverage, not a waiver list.
+TARGET_ARMS = {
+    'wasi-p3-experimental': 'wasi',
+    'web-worker': 'web',
+}
+
+
+def contract_forwards(contract, feature):
+    return f'turnloop/{feature}' in contract.get('features', {}).get(feature, [])
+
+
+def target_covered(source, contract, runner, feature):
+    arm = TARGET_ARMS.get(feature)
+    if arm is None:
+        return False
+    if not contract_forwards(contract, feature):
+        fail(f'turnloop-contract must forward {feature} to turnloop/{feature} for its {arm} arm')
+    ci = contract.get('package', {}).get('metadata', {}).get('turnloop-ci', {})
+    block = job_block(source, arm)
+    if arm == 'wasi':
+        if '- target: wasm32-wasip3' not in block or 'run-tests.py wasi' not in block:
+            fail(f'{feature} needs the wasi job to run wasm32-wasip3 through run-tests.py wasi')
+        wasi_branch = runner.split("elif args.suite in ('web', 'node'):")[0]
+        if "select(data, 'contract')" not in wasi_branch or "features = ['--all-features']" not in wasi_branch:
+            fail(f'{feature}: the WASI contract runner no longer enables all contract features')
+        if not ci.get('wasi-tests'):
+            fail(f'{feature}: turnloop-contract declares no wasi-tests')
+    elif arm == 'web':
+        if 'run-tests.py web' not in block:
+            fail(f'{feature} needs the web job to run run-tests.py web')
+        if feature not in ci.get('web-tests-features', []) or not ci.get('web-tests'):
+            fail(f'{feature}: turnloop-contract web-tests-features must include it')
+    needs = re.search(r'^    needs: \[(.+)\]$', job_block(source, 'ci-gate'), re.MULTILINE)
+    if not needs or arm not in needs[1].split(', '):
+        fail(f'ci-gate must require the {arm} job that covers {feature}')
+    return True
+
+
+def check(source, manifest, contract=None, runner=None):
     rows = matrix_rows(source)
     block = job_block(source, 'test-native')
     if re.search(r'^\s*(?:if|continue-on-error|exclude):', block, re.MULTILINE):
@@ -121,6 +162,11 @@ def check(source, manifest):
         for mode, selected in required.items():
             if modes.get(mode) != selected:
                 fail(f'Missing or changed required mode: {os}/{mode} ({selected})')
+    if contract is None:
+        contract = tomllib.loads((ROOT / 'crates/turnloop-contract/Cargo.toml').read_text())
+    if runner is None:
+        runner = (ROOT / 'scripts/ci/run-tests.py').read_text()
+    covered.update(f for f in features - covered if target_covered(source, contract, runner, f))
     if missing := features - covered:
         fail(f'Public turnloop features without explicit runtime CI arms: {sorted(missing)}')
     return rows
