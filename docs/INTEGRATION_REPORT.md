@@ -1,10 +1,80 @@
 # Integration report
 
-Updated 2026-09-14. The wave-1 tree is a coherent pre-alpha workspace. Native
-workspace tests, supported cross-checks, audits and all six publication dry runs
-pass. This is **not a first-release readiness claim**: SQL execution is blocked by
-the sandbox, Windows/WASM production adapters await wave 2, and the Linux
-instruction baseline has not been measured. Required gates remain in place.
+Updated 2026-09-14. HTTP integration produces a twelve-member workspace with ten
+publishable crates. Native and portable protocol checks, strict h2spec, and native
+and WASI packaged dry runs pass. **Release remains blocked:** the newly published
+rustls security fix is still in the mandatory seven-day soak. SQL sandbox and
+production Windows/WASM backend/baseline prerequisites below also remain pending.
+
+## HTTP integration (current)
+
+- Added publication metadata and unified dependencies for `turnloop-tls`,
+  `turnloop-http`, `turnloop-websocket` and `turnloop-zstd-decoder`. All local
+  dependency edges have explicit registry versions. rustls 0.23.44 and ring
+  0.17.14/std/tls12 are shared with every database/SMTP TLS harness. Browser ring
+  entropy/PKI features are explicit; WASI uses host randomness. LLVM supplies the
+  wasm C compiler. rustls defaults/aws-lc are disabled on every target.
+- Selected soaked tungstenite 0.30.0 to share SHA-1 0.11/getrandom 0.4 with the
+  existing workspace; removed the HTTP lane's separate getrandom 0.3 configuration.
+  Remaining incompatible random generations come from upstream BSON/ring and
+  upstream decoder tests, not competing workspace API definitions. Removed
+  rustls-pemfile and used rustls-pki-types PEM parsing. Mozilla trust-anchor data's
+  permissive CDLA license was reviewed and its redistribution text included.
+- Resolved the publication blocker with a separately named MIT decoder fork.
+  Unmodified upstream 0.8.3 reproduces **6000 allocations for 1000 frames**;
+  upstream 0.9.0 still contains the two private allocation sites. Public APIs or
+  hash configuration cannot avoid them. The published fork retains the allocation
+  patch and upstream license/source provenance, 101 ordinary and 207 dictionary
+  frames, and 47 fuzz artifacts verified against upstream Git blobs. No root
+  `[patch]` and no consumer patch requirement remain. Exact upstream submission
+  text is in [docs/upstream/ruzstd.md](upstream/ruzstd.md).
+- The fork runs upstream native tests plus an exact-byte, 1000-frame allocation
+  regression. HTTP's native `pure-rust-zstd` feature exercises the same decoder
+  as wasm. Corpus counts, checksum/byte assertions and zero thresholds are strict.
+  WASM dictionary hash arithmetic was widened from isize to i64 to compile with
+  identical native arithmetic. Native-only C-reference tests remain active on
+  native CI; pure decoder checks build on Windows and both WASM targets.
+- All fixture lifecycle operations now go through `scripts/test-servers.py`.
+  Node HTTP/1 and HTTP/2 expose `TURNLOOP_TEST_HTTP_PORT`/`HTTP2_PORT`, authenticated
+  private shutdown, and closed-listener assertions. Removed the six superseded
+  HTTP lane scripts; the Node fixture implementation lives in `scripts/fixtures/`.
+  Native HTTP/TLS/WebSocket tests run with pinned Node 26.5.1 in the matrix.
+- `scripts/ci/h2spec.py` installs source commit
+  `70ac2294010887f48b18e2d64f5cccd48421fad1` using SHA-256
+  `791b995048c7e2a2895ed2c019eb9abe46015c3a7a6107cb9ea3f5e5f311da39`, originally
+  verified against all 115 Git blobs. Strict JUnit validation rejects missing,
+  duplicate, skipped, failed or inconsistent results. The response is now 16 KiB,
+  so the negative-window test executes: **147 passed, 0 skipped, 0 failed**.
+  Required `h2spec` and `protocol-wasi` jobs feed `ci-gate` without exemptions.
+- WASI 0.2 **and 0.3** each execute 16 HTTP codec tests, three allocation tests,
+  and the decoder allocation regression. The counting gates use standalone test
+  harnesses: every previous function runs unconditionally and allocator calibration
+  proves a known allocation is counted. This avoids pinned p3 libtest's CLI-argument
+  lowering calling a generated custom allocator shim without a valid stack. The
+  initial debug trap is recorded; no test or allocation threshold was removed.
+- Local validation: default workspace suite **190 passed**, CI default/all-feature
+  wrapper **437 passes including repeated contract checks**, HTTP interop **15/15**,
+  non-SQL private-server workspace subset **173 passed, zero ignored**; strict
+  native/Linux/WASI/browser Clippy, stable 1.97.1, rustdoc, workflow lint and
+  18 automation tests pass. All ten native/WASI package builds verify tarballs.
+  The packaged decoder also executes its allocation regression independently.
+  Exact commands, intermediate failures and limits are in [LANE_REPORT.md](../LANE_REPORT.md).
+
+### Current security/soak release blocker
+
+The current RustSec audit rejects shared rustls 0.23.44 for
+[RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285): TLS 1.3
+handshake messages can be accepted across encryption-level boundaries. The fixed
+0.23.45 release was published **2026-09-14 15:11:17.808465 UTC**, making it eligible
+under the unchanged soak on **2026-09-21 15:11:17.808465 UTC**. `cargo deny` remains
+FAIL on this advisory; bans/licenses/sources and the independent 240-version soak
+check pass. No security ignore, fork of rustls, or publish-age override was added.
+After eligibility, update the shared lock with pinned nightly, rerun TLS/interop,
+workspace/target/allocation checks, soak, cargo-deny and package dry runs. Do not
+publish this checkout while its required security gate fails.
+
+The following sections preserve the earlier wave-1 implementation and verification
+evidence; current HTTP additions and audit status above supersede their old counts.
 
 No commits, pushes, remotes, repositories or registry uploads were performed by
 this agent. The integrator checkpoints the working tree. No other lane was
@@ -215,22 +285,34 @@ lettre's quoted_printable dependency; no advisory was ignored.
 All packages currently use **0.1.0**. The metadata-derived order is:
 
 1. `turnloop`
-2. `turnloop-mongodb`
-3. `turnloop-mysql`
-4. `turnloop-postgres`
-5. `turnloop-redis`
-6. `turnloop-smtp`
+2. `turnloop-tls`
+3. `turnloop-zstd-decoder`
+4. `turnloop-http`
+5. `turnloop-mongodb`
+6. `turnloop-mysql`
+7. `turnloop-postgres`
+8. `turnloop-redis`
+9. `turnloop-smtp`
+10. `turnloop-websocket`
 
-The protocol engines currently have no workspace path dependencies, so their
-relative order is interchangeable. Each dry run packaged and rebuilt its library;
-**none used `--no-verify`**. `--allow-dirty` is necessary while the integrator owns
-commits. Neither `turnloop-contract` nor `turnloop-bench` is published.
+This is the current metadata-derived order (`python3 scripts/ci/release.py order`).
+TLS and the decoder precede HTTP; HTTP precedes WebSocket. The independent database
+and SMTP crates may otherwise be reordered. `turnloop-contract` and `turnloop-bench`
+remain private. Every package is version 0.1.0.
 
-Read-only crates.io API checks returned 404 for all six names on 2026-09-14:
-**every name needs the first-publish/Trusted Publisher bootstrap in RELEASING.md**.
-That action, semver comparison against an existing release, actual uploads,
-tags/releases, OIDC exchange and owner/repository settings are UNRUN. The dry runs
-do not claim any of those actions occurred.
+`cargo publish --dry-run --locked --allow-dirty --workspace` stages unpublished
+siblings together, packages each crate and recompiles each packaged library.
+The all-feature WASI dry run additionally verifies the registry dependency on the
+portable decoder. Neither run used `--no-verify`, and all uploads were explicitly
+aborted. Packaged decoder tests also execute independently of the workspace.
+The decoder's full upstream fixtures produce an approximately 9.6-MiB archive,
+within the registry's default 10-MiB archive limit; preserve the corpus tests.
+
+First publications, Trusted Publisher bootstrap, semver comparison against an
+existing release, tags/releases and OIDC exchange remain owner actions from
+RELEASING.md. The current rustls advisory and existing platform/baseline gates
+must be resolved before publication; dry-run success does not establish release
+readiness or claim that any package was uploaded.
 
 ## Pending CI gates and exact follow-ups
 
@@ -286,9 +368,10 @@ No standalone spike or cross-compilation result substitutes for those tests.
 - **CI/release:** FreeBSD nightly, mobile runners, long-duration native churn,
   exact-SHA hosted release/OIDC behavior and owner setup still need execution or
   definitions. No release baseline or first upload exists.
-- **HTTP/TLS/WebSocket:** lane still outstanding; no replacement crates were
-  created here. Merge it later, unify its dependencies/metadata and run these same
-  gates before release.
+- **HTTP/TLS/WebSocket:** integration is implemented above. Resolve the rustls
+  security/soak blocker, run native Windows/Linux CI and browser runtime coverage,
+  then supply the executor/Perry adapters. permessage-deflate and detailed Node
+  error/option parity remain documented protocol-lane gaps.
 
 No DESIGN.md rule was relaxed. The only implementation-driven contract addition
 is the observable empty-wait counter; the fixture convention and maintained

@@ -1,22 +1,53 @@
 //! Count protocol work after warm-up; result head construction is outside the body hot path.
 #![deny(unsafe_op_in_unsafe_fn)]
-use std::{
-    alloc::{GlobalAlloc, Layout, System},
-    cell::Cell,
-};
-thread_local! {static ENABLED:Cell<bool>=const{Cell::new(false)};static ALLOCATIONS:Cell<usize>=const{Cell::new(0)};}
-struct Counter;
-fn count() {
-    ENABLED.with(|enabled| {
-        if enabled.get() {
-            ALLOCATIONS.with(|n| n.set(n.get() + 1));
+use std::alloc::{GlobalAlloc, Layout, System};
+// These standalone WASM tests are single-threaded. Static counters avoid
+// depending on task-local storage during component allocation callbacks.
+#[cfg(target_arch = "wasm32")]
+mod tracking {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+    static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+    pub fn count() {
+        if ENABLED.load(Relaxed) {
+            ALLOCATIONS.fetch_add(1, Relaxed);
         }
-    });
+    }
+    pub fn start() {
+        ALLOCATIONS.store(0, Relaxed);
+        ENABLED.store(true, Relaxed);
+    }
+    pub fn finish() -> usize {
+        ENABLED.store(false, Relaxed);
+        ALLOCATIONS.load(Relaxed)
+    }
 }
+#[cfg(not(target_arch = "wasm32"))]
+mod tracking {
+    use std::cell::Cell;
+    thread_local! {
+        static ENABLED: Cell<bool> = const { Cell::new(false) };
+        static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+    }
+    pub fn count() {
+        if ENABLED.get() {
+            ALLOCATIONS.set(ALLOCATIONS.get() + 1);
+        }
+    }
+    pub fn start() {
+        ALLOCATIONS.set(0);
+        ENABLED.set(true);
+    }
+    pub fn finish() -> usize {
+        ENABLED.set(false);
+        ALLOCATIONS.get()
+    }
+}
+struct Counter;
 // SAFETY: all allocation operations delegate unchanged to the system allocator.
 unsafe impl GlobalAlloc for Counter {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        count();
+        tracking::count();
         // SAFETY: caller provides GlobalAlloc's layout contract.
         unsafe { System.alloc(layout) }
     }
@@ -25,7 +56,7 @@ unsafe impl GlobalAlloc for Counter {
         unsafe { System.dealloc(ptr, layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        count();
+        tracking::count();
         // SAFETY: caller supplies the original allocation and valid new size.
         unsafe { System.realloc(ptr, layout, size) }
     }
@@ -33,13 +64,10 @@ unsafe impl GlobalAlloc for Counter {
 #[global_allocator]
 static GLOBAL: Counter = Counter;
 fn measured(run: impl FnOnce()) -> usize {
-    ALLOCATIONS.with(|n| n.set(0));
-    ENABLED.with(|b| b.set(true));
+    tracking::start();
     run();
-    ENABLED.with(|b| b.set(false));
-    ALLOCATIONS.with(Cell::get)
+    tracking::finish()
 }
-#[test]
 fn reusable_serialization_and_hpack_encoder_allocate_zero() {
     use turnloop_http::{hpack, http1::*};
     let head = Head {
@@ -76,7 +104,6 @@ fn reusable_serialization_and_hpack_encoder_allocate_zero() {
     assert_eq!(allocations, 0);
     assert!(!output.is_empty());
 }
-#[test]
 fn http1_body_and_h2_flow_control_allocate_zero() {
     use turnloop_http::{http1::*, http2};
     let mut decoder = Decoder::new(Mode::Response, Default::default());
@@ -134,7 +161,6 @@ fn http1_body_and_h2_flow_control_allocate_zero() {
     assert_eq!(allocations, 0);
 }
 
-#[test]
 fn streaming_decompressors_reuse_scratch() {
     use std::io::Write;
     use turnloop_http::compression::StreamingDecoder;
@@ -191,4 +217,25 @@ fn streaming_decompressors_reuse_scratch() {
         assert_eq!(allocations, 0, "{name}");
         assert_eq!(count, 105 * body.len());
     }
+}
+
+// A standalone harness avoids libtest's WASI 0.3 CLI-argument lowering, which
+// invokes the compiler-generated custom allocator shim without a valid stack.
+// Each existing test runs unconditionally; a panic fails the test executable.
+fn main() {
+    tracking::start();
+    let probe = std::hint::black_box(Box::new([7_u8; 64]));
+    std::hint::black_box(&probe);
+    drop(probe);
+    assert!(
+        tracking::finish() > 0,
+        "allocation instrumentation must detect work"
+    );
+    reusable_serialization_and_hpack_encoder_allocate_zero();
+    println!("test reusable_serialization_and_hpack_encoder_allocate_zero ... ok");
+    http1_body_and_h2_flow_control_allocate_zero();
+    println!("test http1_body_and_h2_flow_control_allocate_zero ... ok");
+    streaming_decompressors_reuse_scratch();
+    println!("test streaming_decompressors_reuse_scratch ... ok");
+    println!("test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;");
 }

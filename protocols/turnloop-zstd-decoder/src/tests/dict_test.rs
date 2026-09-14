@@ -258,6 +258,9 @@ fn test_dict_decoding() {
         );
     }
 
-    assert!(total_counter >= 207, "complete upstream dictionary corpus must execute");
+    assert!(
+        total_counter >= 207,
+        "complete upstream dictionary corpus must execute"
+    );
     assert!(failed.is_empty());
 }

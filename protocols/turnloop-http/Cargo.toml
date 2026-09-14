@@ -43,3 +43,7 @@ role = "protocol"
 service-group = "http"
 integration-tests = ["interop"]
 wasi-tests = ["codecs", "allocations"]
+
+[[test]]
+name = "allocations"
+harness = false

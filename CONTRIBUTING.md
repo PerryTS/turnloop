@@ -184,7 +184,11 @@ errors or skips, and consistent suite counters. A 16-KiB response ensures the
 negative-window test executes. Go and a native compiler must be installed.
 
 `wasi-tests` metadata names portable test targets; HTTP declares codecs/allocations,
-and the decoder declares its allocation regression. Both WASI 0.2 and 0.3 have a
+and the decoder declares its allocation regression. Allocation targets use standalone,
+unconditionally executed harnesses with positive allocator calibration, preserving
+every test and the zero-allocation thresholds. This avoids pinned WASI 0.3
+libtest CLI-argument lowering calling the generated allocator shim without a
+valid stack; these targets always run their full list, regardless of test filters. Both WASI 0.2 and 0.3 have a
 required protocol job, independent of the pending production backend contracts.
 For ring on macOS, set `CC_wasm32_wasip2` and `CC_wasm32_unknown_unknown` to
 `/opt/homebrew/opt/llvm/bin/clang`, and the corresponding `AR_*` values to

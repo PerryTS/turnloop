@@ -195,3 +195,9 @@ package. Those packaging changes are deliberately absent from the proposed FSE
 patch. `dictionary/frequency.rs` uses i64 instead of isize so its 2654435761
 constant and multiplication compile with identical 64-bit arithmetic on wasm32;
 that independent portability fix should be submitted separately.
+
+The downstream WASI 0.3 counting gates use standalone harnesses to avoid the
+pinned compiler/libtest CLI-argument lowering path, which calls a custom allocator
+shim without a valid stack. The gates invoke every original test unconditionally
+and first assert a known heap allocation is counted. Thresholds remain zero.
+The native upstream regression above can continue using ordinary libtest.

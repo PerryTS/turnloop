@@ -1,23 +1,53 @@
 //! The published decoder must retain its tables across independent frames.
-use std::{
-    alloc::{GlobalAlloc, Layout, System},
-    cell::Cell,
-};
+use std::alloc::{GlobalAlloc, Layout, System};
 use turnloop_zstd_decoder::decoding::FrameDecoder;
-thread_local! {
-    static COUNTING: Cell<bool> = const { Cell::new(false) };
-    static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
-}
-struct Counter;
-fn count() {
-    if COUNTING.get() {
-        ALLOCATIONS.set(ALLOCATIONS.get() + 1);
+// These standalone WASM tests are single-threaded. Static counters avoid
+// depending on task-local storage during component allocation callbacks.
+#[cfg(target_arch = "wasm32")]
+mod tracking {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+    static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+    pub fn count() {
+        if ENABLED.load(Relaxed) {
+            ALLOCATIONS.fetch_add(1, Relaxed);
+        }
+    }
+    pub fn start() {
+        ALLOCATIONS.store(0, Relaxed);
+        ENABLED.store(true, Relaxed);
+    }
+    pub fn finish() -> usize {
+        ENABLED.store(false, Relaxed);
+        ALLOCATIONS.load(Relaxed)
     }
 }
+#[cfg(not(target_arch = "wasm32"))]
+mod tracking {
+    use std::cell::Cell;
+    thread_local! {
+        static ENABLED: Cell<bool> = const { Cell::new(false) };
+        static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+    }
+    pub fn count() {
+        if ENABLED.get() {
+            ALLOCATIONS.set(ALLOCATIONS.get() + 1);
+        }
+    }
+    pub fn start() {
+        ALLOCATIONS.set(0);
+        ENABLED.set(true);
+    }
+    pub fn finish() -> usize {
+        ENABLED.set(false);
+        ALLOCATIONS.get()
+    }
+}
+struct Counter;
 // SAFETY: allocation ownership and layouts are forwarded unchanged to System.
 unsafe impl GlobalAlloc for Counter {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        count();
+        tracking::count();
         // SAFETY: the caller provides a valid nonzero layout.
         unsafe { System.alloc(layout) }
     }
@@ -26,7 +56,7 @@ unsafe impl GlobalAlloc for Counter {
         unsafe { System.dealloc(ptr, layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        count();
+        tracking::count();
         // SAFETY: the caller provides the live allocation, original layout and valid new size.
         unsafe { System.realloc(ptr, layout, size) }
     }
@@ -34,7 +64,6 @@ unsafe impl GlobalAlloc for Counter {
 #[global_allocator]
 static ALLOCATOR: Counter = Counter;
 
-#[test]
 fn default_sequence_tables_reuse_allocations_and_preserve_bytes() {
     let encoded = [
         0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x38, 0xcd, 0x00, 0x00, 0x98, 0x61, 0x6c, 0x6c, 0x6f, 0x63,
@@ -60,16 +89,31 @@ fn default_sequence_tables_reuse_allocations_and_preserve_bytes() {
     for _ in 0..5 {
         decode();
     }
-    ALLOCATIONS.set(0);
-    COUNTING.set(true);
+    tracking::start();
     for _ in 0..1000 {
         decode();
     }
-    COUNTING.set(false);
+    let allocations = tracking::finish();
     assert_eq!(frames, 1005);
     assert_eq!(
-        ALLOCATIONS.get(),
-        0,
+        allocations, 0,
         "a published decoder cannot allocate per frame"
     );
+}
+
+// A standalone harness avoids libtest's WASI 0.3 CLI-argument lowering, which
+// invokes the compiler-generated custom allocator shim without a valid stack.
+// Each existing test runs unconditionally; a panic fails the test executable.
+fn main() {
+    tracking::start();
+    let probe = std::hint::black_box(Box::new([7_u8; 64]));
+    std::hint::black_box(&probe);
+    drop(probe);
+    assert!(
+        tracking::finish() > 0,
+        "allocation instrumentation must detect work"
+    );
+    default_sequence_tables_reuse_allocations_and_preserve_bytes();
+    println!("test default_sequence_tables_reuse_allocations_and_preserve_bytes ... ok");
+    println!("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;");
 }

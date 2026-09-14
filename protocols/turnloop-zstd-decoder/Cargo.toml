@@ -40,3 +40,7 @@ wasi-tests = ["reuse"]
 [[bench]]
 name = "decode_all"
 harness = false
+
+[[test]]
+name = "reuse"
+harness = false
