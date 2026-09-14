@@ -364,7 +364,7 @@ impl Decoder {
 }
 pub struct Encoder {
     table: Table,
-    pending: Option<usize>,
+    pending: Option<(usize, usize)>,
 }
 impl Encoder {
     pub fn new(table_size: usize) -> Self {
@@ -375,11 +375,14 @@ impl Encoder {
     }
     pub fn set_table_size(&mut self, size: usize) {
         self.table.resize(size);
-        self.pending = Some(size);
+        self.pending = Some((self.pending.map_or(size, |(min, _)| min.min(size)), size));
     }
     pub fn encode(&mut self, headers: &[Header], out: &mut Vec<u8>) {
-        if let Some(n) = self.pending.take() {
-            encode_integer(n, 5, 0x20, out);
+        if let Some((min, last)) = self.pending.take() {
+            encode_integer(min, 5, 0x20, out);
+            if last != min {
+                encode_integer(last, 5, 0x20, out);
+            }
         }
         for h in headers {
             let sensitive = matches!(

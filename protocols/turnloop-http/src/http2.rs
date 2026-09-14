@@ -654,6 +654,14 @@ impl Connection {
                 }
                 let n = (u32be(f.payload) & 0x7fffffff) as i64;
                 if n == 0 {
+                    if f.stream != 0 {
+                        self.reset(f.stream, 1)?;
+                        step.event = Some(Event::Reset {
+                            stream: f.stream,
+                            code: 1,
+                        });
+                        return Ok(step);
+                    }
                     return Err(protocol("zero WINDOW_UPDATE"));
                 }
                 let window = if f.stream == 0 {
@@ -663,6 +671,14 @@ impl Connection {
                     &mut self.streams[i].send_window
                 };
                 if *window + n > 0x7fffffff {
+                    if f.stream != 0 {
+                        self.reset(f.stream, 3)?;
+                        step.event = Some(Event::Reset {
+                            stream: f.stream,
+                            code: 3,
+                        });
+                        return Ok(step);
+                    }
                     return Err(error("FLOW_CONTROL_ERROR", "window overflow"));
                 }
                 *window += n;
@@ -777,8 +793,9 @@ fn validate_headers(headers: &[Header], request: bool, trailers: bool) -> Result
             pseudo[index] = true;
         } else {
             regular = true;
-            http::header::HeaderName::from_bytes(h.name.as_bytes())
-                .map_err(|_| protocol("invalid header name"))?;
+            if !crate::http1::valid_token(h.name.as_bytes()) {
+                return Err(protocol("invalid header name"));
+            }
             if matches!(
                 h.name.as_str(),
                 "connection" | "proxy-connection" | "keep-alive" | "transfer-encoding" | "upgrade"

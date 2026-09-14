@@ -445,9 +445,7 @@ impl Encoder {
     pub fn start(head: &Head, body: BodyLength, out: &mut Vec<u8>) -> Result<Self> {
         // Validate everything before mutating the output.
         for h in &head.headers {
-            http::header::HeaderName::from_bytes(h.name.as_bytes())
-                .map_err(|_| invalid("invalid header name"))?;
-            http::HeaderValue::from_bytes(&h.value).map_err(|_| invalid("invalid header value"))?;
+            validate_field(h)?;
         }
         let (cl, te) = lengths(head)?;
         let expect_cl = match body {
@@ -462,8 +460,9 @@ impl Encoder {
             return Err(invalid("body length conflicts with headers"));
         }
         if head.status == 0 {
-            http::Method::from_bytes(head.method.as_bytes())
-                .map_err(|_| invalid("invalid method"))?;
+            if !valid_token(head.method.as_bytes()) {
+                return Err(invalid("invalid method"));
+            }
             if head.target.is_empty() || head.target.bytes().any(|b| b <= 32 || b == 127) {
                 return Err(invalid("invalid request target"));
             }
@@ -544,9 +543,7 @@ impl Encoder {
             ) {
                 return Err(invalid("forbidden trailer"));
             }
-            http::header::HeaderName::from_bytes(h.name.as_bytes())
-                .map_err(|_| invalid("invalid trailer"))?;
-            http::HeaderValue::from_bytes(&h.value).map_err(|_| invalid("invalid trailer"))?;
+            validate_field(h)?;
         }
         if matches!(self.left, BodyLength::Chunked) {
             out.extend_from_slice(b"0\r\n");
@@ -561,4 +558,22 @@ impl Encoder {
         self.finished = true;
         Ok(())
     }
+}
+
+/// RFC token grammar, shared with HPACK field validation without temporary types.
+pub(crate) fn valid_token(value: &[u8]) -> bool {
+    !value.is_empty()
+        && value
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(b))
+}
+fn validate_field(h: &Header) -> Result<()> {
+    if !valid_token(h.name.as_bytes())
+        || h.value
+            .iter()
+            .any(|b| (*b < 32 && *b != b'\t') || *b == 127)
+    {
+        return Err(invalid("invalid header field"));
+    }
+    Ok(())
 }

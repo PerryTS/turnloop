@@ -526,3 +526,76 @@ fn expect_continue_streaming_abort_and_reuse() {
     assert_eq!(connection.poll_completion(), None);
     assert!(!connection.reusable());
 }
+
+#[test]
+fn streaming_compression_fragmented_bounded_and_truncated() {
+    use std::io::Write;
+    let body = b"streamed body streamed body streamed body";
+    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), Default::default());
+    gzip.write_all(body).unwrap();
+    let mut deflate = flate2::write::DeflateEncoder::new(Vec::new(), Default::default());
+    deflate.write_all(body).unwrap();
+    let mut br = Vec::new();
+    {
+        let mut writer = brotli::CompressorWriter::new(&mut br, 4096, 4, 22);
+        writer.write_all(body).unwrap();
+    }
+    let mut cases = vec![
+        ("gzip", gzip.finish().unwrap()),
+        ("deflate", deflate.finish().unwrap()),
+        ("br", br),
+    ];
+    #[cfg(not(target_arch = "wasm32"))]
+    cases.push((
+        "zstd",
+        zstd::stream::encode_all(body.as_slice(), 1).unwrap(),
+    ));
+    for (encoding, wire) in cases {
+        let mut decoder = turnloop_http::compression::StreamingDecoder::new(encoding, 100).unwrap();
+        let mut input = Vec::new();
+        let mut result = Vec::new();
+        let mut done = false;
+        for (i, byte) in wire.iter().enumerate() {
+            input.push(*byte);
+            loop {
+                let mut out = [0; 3];
+                let step = decoder
+                    .process(&input, &mut out, i + 1 == wire.len())
+                    .unwrap();
+                result.extend_from_slice(&out[..step.written]);
+                input.drain(..step.consumed);
+                done = step.finished;
+                if done || step.consumed == 0 && step.written == 0 {
+                    break;
+                }
+            }
+        }
+        if !done {
+            let mut out = [0; 100];
+            let step = decoder.process(&input, &mut out, true).unwrap();
+            result.extend_from_slice(&out[..step.written]);
+            done = step.finished;
+        }
+        assert!(done, "{encoding}");
+        assert_eq!(result, body, "{encoding}");
+        let mut decoder = turnloop_http::compression::StreamingDecoder::new(encoding, 100).unwrap();
+        let mut pos = 0;
+        let mut failure = false;
+        for _ in 0..100 {
+            let mut out = [0; 100];
+            match decoder.process(&wire[pos..wire.len() - 1], &mut out, true) {
+                Ok(step) => {
+                    pos += step.consumed;
+                    if step.finished {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    failure = true;
+                    break;
+                }
+            }
+        }
+        assert!(failure, "truncated {encoding} must fail");
+    }
+}
