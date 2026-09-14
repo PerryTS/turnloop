@@ -59,11 +59,18 @@ def compare(baseline, rounds):
         print(f'PASS {key}: [{min(values)}, {max(values)}] Ir; baseline {expected[key]}')
 
 
-def candidate(package, version, rounds):
+def validate_rounds(package, rounds):
+    if len(rounds) != 3:
+        fail('Instruction gate requires exactly three fresh measurement rounds')
     cases = settings(package).get('instruction-cases', [])
-    controls = settings(package).get('instruction-controls', [])
-    if not cases or any(set(r) != set(cases) for r in rounds):
+    if not cases or len(set(cases)) != len(cases) or any(set(r) != set(cases) for r in rounds):
         fail(f'{package["name"]}: every declared instruction case must execute in every round')
+
+
+def candidate(package, version, rounds):
+    validate_rounds(package, rounds)
+    cases = settings(package)['instruction-cases']
+    controls = settings(package).get('instruction-controls', [])
     baseline = {'toolchain': PIN, 'valgrind': version,
                 'counts': {key: min(r[key] for r in rounds) for key in cases},
                 'controls': controls}
@@ -148,7 +155,7 @@ def main():
                 rounds.append(read_counts(Path(directory)))
         results[package['name']] = {'toolchain': PIN, 'valgrind': version, 'rounds': rounds}
         if not args.record and not bootstrap:
-            candidate(package, version, rounds)
+            validate_rounds(package, rounds)
             baseline = json.loads((root / baseline_relative(package, root)).read_text())
             if baseline['controls'] != settings(package).get('instruction-controls'):
                 fail('Baseline controls differ from declared instruction-controls')

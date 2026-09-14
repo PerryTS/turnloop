@@ -40,7 +40,7 @@ def native_tests(data, base, root, *, windows):
             message = (f'PENDING Windows backend contracts: {package["name"]}. '
                        'IOCP bounded waits/no-spin, socket I/O, cancel/close ordering, '
                        'wake/integration, allocation and lifetime tests await the production provider. '
-                       'See [WINDOWS_HANDOFF.md](WINDOWS_HANDOFF.md), phase 2. '
+                       'See [WINDOWS_HANDOFF.md](https://github.com/PerryTS/turnloop/blob/main/WINDOWS_HANDOFF.md), phase 2. '
                        'Remove windows-contracts-pending metadata when IOCP lands.\n')
             print(message, flush=True)
             if summary := os.environ.get('GITHUB_STEP_SUMMARY'):

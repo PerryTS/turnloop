@@ -32,3 +32,6 @@ pub use blocking::{DnsRequest, PoolConfig};
 
 mod time;
 pub use time::Instant;
+
+#[cfg(all(test, not(loom)))]
+mod portable_tests;
