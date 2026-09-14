@@ -83,10 +83,10 @@ class Paths(unittest.TestCase):
             ''',
             'src/outer.rs': 'mod child; mod inline { #[path="different.rs"] mod local; }',
             'src/outer/child.rs': '', 'src/outer/inline/different.rs': '',
-            'src/chosen.rs': '', 'src/one.rs': '', 'src/two.rs': '', 'src/custom/child.rs': ''}
+            'src/chosen.rs': 'mod child;', 'src/child.rs': '', 'src/one.rs': '', 'src/two.rs': '', 'src/custom/child.rs': ''}
         errors, count = self.check(files)
         self.assertEqual(errors, [])
-        self.assertEqual(count, 14)
+        self.assertEqual(count, 16)
 
     def test_comments_strings_and_characters_are_not_code(self):
         errors, count = self.check({'source.rs': '''
@@ -99,6 +99,12 @@ class Paths(unittest.TestCase):
         '''})
         self.assertEqual(errors, [])
         self.assertEqual(count, 0)
+
+    def test_parent_normalization_does_not_hide_wrong_directory_case(self):
+        errors, count = self.check({'source.rs': 'include_str!("Data/../README.md");',
+                                   'data/fixture.txt': '', 'README.md': ''})
+        self.assertEqual(count, 1)
+        self.assertEqual(len(errors), 1)
 
     def test_untracked_file_and_unresolved_expression_fail_closed(self):
         errors, count = self.check({'source.rs': 'include_bytes!("data.bin");', 'data.bin': ''},

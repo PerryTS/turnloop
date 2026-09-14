@@ -13,6 +13,46 @@ use turnloop_http::{
 };
 #[path = "support/tls.rs"]
 mod tls_support;
+// Probe the same executable used by the tests. Windows' bundled curl commonly
+// has HTTP/1 support but no HTTP2, regardless of its version number.
+fn curl_capability(version: &str, field: &str, capability: &str) -> bool {
+    version.lines().any(|line| {
+        line.strip_prefix(field)
+            .is_some_and(|values| values.split_whitespace().any(|value| value == capability))
+    })
+}
+fn curl_supports(http2: bool) -> bool {
+    match Command::new("curl").arg("-V").output() {
+        Ok(output) => {
+            assert!(
+                output.status.success(),
+                "curl -V failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let version = String::from_utf8(output.stdout).expect("curl -V must emit UTF-8");
+            curl_capability(&version, "Protocols:", "http")
+                && (!http2 || curl_capability(&version, "Features:", "HTTP2"))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => panic!("cannot probe curl: {error}"),
+    }
+}
+#[test]
+fn curl_features_are_tokens_in_the_features_line() {
+    let windows = "curl 8.13.0 (Windows) libcurl/8.13.0 Schannel\r\nProtocols: http https\r\nFeatures: HTTPS-proxy SSL threadsafe\r\n";
+    assert!(curl_capability(windows, "Protocols:", "http"));
+    assert!(!curl_capability(windows, "Features:", "HTTP2"));
+    assert!(curl_capability(
+        "Features: SSL HTTP2 HTTP3\n",
+        "Features:",
+        "HTTP2"
+    ));
+    assert!(!curl_capability(
+        "curl HTTP2\nFeatures: NOHTTP2 HTTP2-extra\n",
+        "Features:",
+        "HTTP2"
+    ));
+}
 fn node_port(mode: &str) -> u16 {
     let key = if mode == "h1" {
         "TURNLOOP_TEST_HTTP_PORT"
@@ -156,13 +196,18 @@ fn serve_h1(mut stream: impl Read + Write) {
 }
 #[test]
 fn curl_and_node_fetch_against_native_http1() {
-    for node in [false, true] {
+    let mut ran = 0;
+    for node in [true, false] {
+        if !node && !curl_supports(false) {
+            eprintln!("HTTP/1 curl leg UNRUN: curl -V does not list the http protocol");
+            continue;
+        }
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || serve_h1(accept(listener)));
         let url = format!("http://{address}/interop");
         let output = if node {
-            Command::new("node").args(["--input-type=module","-e","const r=await fetch(process.argv[1]);if(r.status!==200)process.exit(2);console.log(await r.text());",&url]).output().unwrap()
+            Command::new("node").args(["--input-type=module","-e","setTimeout(()=>process.exit(70),10000).unref();const r=await fetch(process.argv[1]);if(r.status!==200)process.exit(2);console.log(await r.text());",&url]).output().unwrap()
         } else {
             Command::new("curl")
                 .args([
@@ -186,8 +231,16 @@ fn curl_and_node_fetch_against_native_http1() {
             String::from_utf8(output.stdout).unwrap().trim(),
             "native-http"
         );
-        server.join().unwrap();
+        server
+            .join()
+            .expect("HTTP/1 server must verify the request");
+        ran += 1;
+        eprintln!(
+            "HTTP/1 interop ran: {}",
+            if node { "Node fetch" } else { "curl" }
+        );
     }
+    assert!(ran > 0, "neither HTTP/1 interop client ran");
 }
 #[test]
 fn https_over_unbuffered_tls() {
@@ -292,7 +345,20 @@ fn serve_h2(mut socket: TcpStream, total: usize) {
 }
 #[test]
 fn curl_and_node_h2_hundred_streams_against_native_server() {
-    for node in [false, true] {
+    run_h2_clients(|| curl_supports(true));
+}
+#[test]
+fn node_h2_hundred_streams_runs_without_curl_http2() {
+    // Exercise the Windows capability branch on every runner with a real Node peer.
+    assert_eq!(run_h2_clients(|| false), 1);
+}
+fn run_h2_clients(curl_http2: impl Fn() -> bool) -> usize {
+    let mut ran = 0;
+    for node in [true, false] {
+        if !node && !curl_http2() {
+            eprintln!("HTTP/2 curl leg UNRUN: curl -V does not list HTTP2 with the http protocol");
+            continue;
+        }
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || serve_h2(accept(listener), if node { 100 } else { 1 }));
@@ -323,8 +389,21 @@ fn curl_and_node_h2_hundred_streams_against_native_server() {
             String::from_utf8(output.stdout).unwrap().trim(),
             if node { "100 verified" } else { "native-h2" }
         );
-        server.join().unwrap();
+        server
+            .join()
+            .expect("HTTP/2 server must verify every stream");
+        ran += 1;
+        eprintln!(
+            "HTTP/2 interop ran: {}",
+            if node {
+                "Node http2 (100 streams)"
+            } else {
+                "curl (1 stream)"
+            }
+        );
     }
+    assert!(ran > 0, "neither HTTP/2 interop client ran");
+    ran
 }
 #[test]
 #[ignore = "requires the private HTTP fixture from scripts/test-servers.py"]

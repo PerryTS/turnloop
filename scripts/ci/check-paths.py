@@ -111,9 +111,13 @@ class Check:
         self.tracked = set(tracked)
         self.errors = []
         self.references = 0
+        self.visited = set()
+        self.pending = []
         self.folded = {}
+        self.directories = {'.', ''}
         # Directory spelling must agree too, e.g. src/Foo/a.rs and src/foo/b.rs.
         for path in sorted(self.tracked):
+            self.directories.update(map(str, PurePosixPath(path).parents))
             for prefix in [path, *map(str, PurePosixPath(path).parents)]:
                 previous = self.folded.setdefault(prefix.casefold(), prefix)
                 if previous != prefix:
@@ -139,8 +143,17 @@ class Check:
 
     def require(self, origin, candidates, *, directory=False):
         self.references += 1
+        def valid_parents(path):
+            prefix = ''
+            for component in path.split('/')[:-1]:
+                prefix = posixpath.normpath(posixpath.join(prefix, component))
+                if prefix not in self.directories:
+                    return False
+            return True
+        valid = [valid_parents(c) for c in candidates]
         candidates = [posixpath.normpath(c) for c in candidates]
-        if any(c in self.tracked or (directory and c in self.folded.values()) for c in candidates):
+        if any(ok and (c in self.tracked or (directory and c in self.directories))
+               for c, ok in zip(candidates, valid)):
             return
         hints = [self.folded[c.casefold()] for c in candidates if c.casefold() in self.folded]
         self.errors.append(f'{origin}: exact case is not tracked: {" or ".join(candidates)}'
@@ -176,11 +189,15 @@ class Check:
             return ''.join(pieces)
         raise ValueError('cannot statically resolve file reference; use a literal or literal concat!')
 
-    def rust(self, path):
+    def rust(self, path, module_dir=None):
         source = (self.root / path).read_text()
         ts = tokens(source)
         parent = posixpath.dirname(path)
-        module_dir = parent if path in self.roots or posixpath.basename(path) == 'mod.rs' else path[:-3]
+        if module_dir is None:
+            module_dir = parent if path in self.roots or posixpath.basename(path) == 'mod.rs' else path[:-3]
+        if (path, module_dir) in self.visited:
+            return
+        self.visited.add((path, module_dir))
 
         def origin(token):
             return f'{path}:{source.count(chr(10), 0, token.offset) + 1}'
@@ -222,13 +239,24 @@ class Check:
                         if paths:
                             for ref in paths:
                                 self.require(origin(t), [ref])
+                                ref = posixpath.normpath(ref)
+                                if ref in self.tracked:
+                                    self.pending.append((ref, posixpath.dirname(ref)))
                         else:
-                            self.require(origin(t), [posixpath.join(default_dir, name + '.rs'),
-                                                     posixpath.join(default_dir, name, 'mod.rs')])
+                            candidates = [posixpath.join(default_dir, name + '.rs'),
+                                          posixpath.join(default_dir, name, 'mod.rs')]
+                            self.require(origin(t), candidates)
+                            for ref in candidates:
+                                ref = posixpath.normpath(ref)
+                                if ref in self.tracked:
+                                    directory = posixpath.dirname(ref) if ref.endswith('/mod.rs') else ref[:-3]
+                                    self.pending.append((ref, directory))
                         i += 3
                     else:
                         end = matching(items, i+2)
                         for directory in paths or [posixpath.join(default_dir, name)]:
+                            if paths:
+                                self.require(origin(t), [directory], directory=True)
                             modules(items[i+3:end], directory, directory)
                         i = end + 1
                     attrs = []
@@ -256,12 +284,19 @@ class Check:
     def run(self):
         for base, data in self.manifests.items():
             self.cargo(base, data)
-        for path in sorted(self.tracked):
-            if path.endswith('.rs'):
+        self.pending.extend((path, posixpath.dirname(path)) for path in sorted(self.roots))
+        def drain():
+            while self.pending:
+                path, directory = self.pending.pop()
                 try:
-                    self.rust(path)
+                    self.rust(path, directory)
                 except (ValueError, OSError) as error:
                     self.errors.append(f'{path}: {error}')
+        drain()
+        for path in sorted(self.tracked):
+            if path.endswith('.rs') and not any(p == path for p, _ in self.visited):
+                self.pending.append((path, None))
+                drain()
         return sorted(set(self.errors))
 
 
