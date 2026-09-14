@@ -330,7 +330,7 @@ impl<B: Backend> Driver<B> {
     }
     pub fn set_ref(&mut self, h: Handle, referenced: bool) -> Result<()> {
         let r = self.resource(h)?;
-        let weight = r.pending + usize::from(matches!(r.kind, Kind::Socket));
+        let weight = r.pending + usize::from(matches!(r.kind, Kind::Socket) || r.closing.is_some());
         if r.referenced != referenced {
             if referenced {
                 self.refs += weight;
@@ -545,7 +545,13 @@ impl<B: Backend> Driver<B> {
         if r.closing.is_some() {
             return Err(Error::new(ErrorKind::InvalidInput));
         }
-        self.handles.get_mut(h.key).expect("validated").closing = Some(token);
+        let r = self.handles.get_mut(h.key).expect("validated");
+        r.closing = Some(token);
+        // Socket handles already carry a reference. Inactive timer handles do
+        // not, so closing adds one through delivery of the final Closed result.
+        if matches!(r.kind, Kind::Timer { .. }) && r.referenced {
+            self.refs += 1;
+        }
         let mut next = self.resource(h)?.head;
         while let Some(id) = next {
             next = self.ops.get(id.key).and_then(|op| op.next);
@@ -654,9 +660,10 @@ impl<B: Backend> Driver<B> {
             out.entries.push(c);
             if let Some(h) = closed
                 && let Some(r) = self.handles.remove(h.key)
-                && matches!(r.kind, Kind::Socket)
             {
-                self.backend.release(h);
+                if matches!(r.kind, Kind::Socket) {
+                    self.backend.release(h);
+                }
                 if r.referenced {
                     self.refs -= 1;
                 }

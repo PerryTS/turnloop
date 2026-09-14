@@ -3,13 +3,211 @@
 Branch: `lane/core`. Specification: DESIGN.md draft 0.2, read in full with LANES.md.
 Only this clone is modified. No publishing or remote operations.
 
-## Implemented
+## Handoff status
 
-- Step 1: three-crate workspace, stable Rust edition 2024, target-selected backend cfg,
-  release/bench codegen-units=1, shared unsafe lint. Dependency soak remains unchanged.
-- Steps 2–9: in progress.
+The core lane's nine implementation steps are present. macOS execution is verified;
+Linux is cross-checked only. The other lanes' IOCP/WASI/web adapters are not present
+in this clone. There is no Perry integration or performance-comparison claim yet.
 
-## Verification log
+**Git delivery is incomplete:** this session's permissions make `.git` read-only.
+The requested commits and `trait-v0`/`trait-v1` tags failed with `Operation not
+permitted`; escalation is unavailable. External integrator checkpoints appeared
+during the work (including `3398983`), but this session did not create them. The
+integrator must checkpoint remaining files and tag the current revision-1 trait.
+No alternate Git database, permission bypass, push, remote addition or publishing
+was performed. Source files were made available directly in this clone throughout.
+
+## Implemented by requested step
+
+1. Three-crate workspace: `windlass`, `windlass-contract`, `windlass-bench`.
+   Target-selected `windlass_backend` cfg covers the six platform names. Native
+   `Loop` currently selects kqueue/epoll; portable `Driver<B>` is available elsewhere.
+   Stable-compatible edition 2024, cgu=1 measurements, shared unsafe lint, unchanged
+   dependency soak. Runtime dependency is pinned libc; loom is a model-test dependency.
+2. Thoroughly documented backend-neutral unsafe Backend trait, **revision 1** in
+   `crates/windlass/src/backend/mod.rs`. Full generational IDs, operation/buffer
+   ownership, terminal acknowledgement, cancellation, close-release order, capacity,
+   readiness/native/callback completion rules, transfer, injected clock and host
+   deadline scheduling. Tags are blocked as described above.
+3. Preallocated generational handle/op tables, intrusive per-handle op lists,
+   exactly-once terminal completion and Cancelled…Closed ordering, bounded host
+   output, O(1) alive counter, ref/unref including queued terminal results, four-ary
+   indexed timer heap, BTreeMap comparison, Timeout and bounded turn. Independent
+   reserves for native multishot events, repeating timers and posts preserve terminal
+   capacity and progress under output backpressure. No host callback runs in turn.
+4. Atomic RUNNING/PARKED/NOTIFIED notifier (plus CLOSED lifetime state), a wake syscall
+   only on the parked transition, and bounded lock-free per-loop Poster. Five loom
+   models exercise the production atomics/queues, including worker result publication.
+5. Runnable kqueue: EVFILT_USER, EV_CLEAR readiness cached to EAGAIN, ns waits; TCP
+   connect/listen/accept/accept_start, provided/pooled reads/read_start, write/writev,
+   shutdown/cancel/close, reuse-port, owning detach/attach; UDP bind/send_to/recv.
+6. epoll uses the same Unix engine: EPOLLET, eventfd, construction-time epoll_pwait2
+   probe, timerfd fallback and a feature to force that fallback. Cross-Clippy passes;
+   Linux runtime behavior remains **UNRUN**.
+7. Lazy process-wide bounded blocking pool, default four workers, per-loop completion
+   routing, native blocking(f) and getaddrinfo resolution, panic isolation, and started
+   job cancellation acknowledged only after the function returns. No driver thread.
+8. Reusable Backend-generic contract scenarios plus native integration runners and
+   dedicated allocation/lifetime binaries. **27 native tests PASS** (3 pure core,
+   21 shared native scenarios, 2 allocation gates, 1 descriptor-lifetime gate).
+   Required TCP 1/64 echo, UDP, cancellation/error/close, timing/ref, multi-loop load,
+   detach/attach, reuse-port, accept handoff and external-waiter scenarios are covered.
+9. Real macOS ri_instructions counters, Linux perf_event_open instructions:u behind
+   cfg, and explicitly labelled portable nanoseconds fallback. Five fresh-process
+   rounds, rotated workload order, raw JSONL, source SHA-256 and ranges below.
+
+## Final verification matrix
+
+All commands run in this clone. No ignored or filtered tests count toward the 27.
+The script exports `RUSTUP_TOOLCHAIN=nightly-2026-08-20`; rows use explicit `+nightly`
+spelling for reproducibility. In this table `+nightly` means **`+nightly-2026-08-20`**,
+not a moving nightly channel. Earlier verification attempts and failures follow.
+
+| Command | Result |
+|---|---|
+| `sh scripts/verify-core.sh` | PASS, including both complete native feature configurations and the commands below |
+| `cargo +nightly fmt --all -- --check` | PASS; `cargo +nightly fmt --all` also applied |
+| `cargo +nightly clippy --workspace --all-targets --all-features -- -D warnings` | PASS macOS |
+| `cargo +nightly test --workspace` | PASS, 27 tests, all subjects asserted |
+| `cargo +nightly test --workspace --all-features` | PASS, 27 tests; production heap allocation gates plus BTreeMap comparison conformance |
+| `RUSTFLAGS='--cfg loom' cargo +nightly test -p windlass models -- --test-threads=1` | PASS, 5 models |
+| `RUSTFLAGS='--cfg loom' cargo +nightly clippy -p windlass --all-targets -- -D warnings` | PASS |
+| `cargo +nightly clippy --workspace --all-targets --target x86_64-unknown-linux-gnu --all-features -- -D warnings` | PASS, includes forced timerfd code; default epoll_pwait2 path also checked in earlier no-feature command |
+| `cargo +nightly clippy --workspace --all-targets --target wasm32-unknown-unknown --all-features -- -D warnings` | PASS, common core only |
+| `cargo +nightly clippy --workspace --all-targets --target wasm32-wasip2 --all-features -- -D warnings` | PASS, common core only |
+| `cargo +nightly clippy --workspace --all-targets --target x86_64-pc-windows-msvc --all-features -- -D warnings` | PASS, common core only |
+| `cargo +stable check --workspace --locked` | PASS, installed stable is 1.97.1 |
+| `cargo +1.98.0 check --workspace --locked` | PASS; Cargo warns min-publish-age requires the unstable switch. Resolution used pinned nightly under the unchanged soak; this command reused the lockfile |
+| `MIRI_SYSROOT="$PWD/target/miri-sysroot" cargo +nightly miri test -p windlass --lib --all-features` | PASS, 3 pure-core tests; native syscalls are not covered by Miri |
+| `python3 scripts/benchmark-core.py --rounds 5` | PASS, 15 fresh processes; all operation and byte checks passed; source fingerprint verified |
+| `cargo +nightly run --release -p windlass-bench -- --portable --timers` | PASS, nine actual workloads explicitly measured in nanoseconds |
+| Cargo.lock audit, unsafe/I/O source audit, workflow YAML parse | PASS: no Tokio; SAFETY comments checked; no library I/O unwrap(); two configured CI jobs |
+
+The allocation gates verified 128,000 bytes over 2,000 provided/pooled transfers,
+10,000 batched timer cancellations plus 10,000 Closed results, and 100 warmed accepts:
+**zero allocations**. The separate backlog gate delivered all 80 posts and all 16
+Cancelled/16 Closed results while preserving zero allocations under backpressure.
+Multi-loop load delivered 16,000 uniquely identified posts on four owning threads.
+The descriptor test returned to its starting fd count after 32 connected loops,
+including stale notifier/poster use. Timer tests assert no early expiry, individual
+scheduler bounds, and median lateness below 500 us over twenty 250-us timers.
+
+### UNRUN verification
+
+| Command / verification | Status and reason |
+|---|---|
+| `cargo +nightly-2026-08-20 test --workspace --target x86_64-unknown-linux-gnu` | UNRUN: no Linux host/container; every Linux instantiation of the shared contracts and allocation/lifetime gates is unrun |
+| Same command with `--features windlass/epoll-timerfd` | UNRUN: fallback runtime needs real Linux |
+| `cargo +nightly-2026-08-20 run --release -p windlass-bench --target x86_64-unknown-linux-gnu` | UNRUN: Linux perf instruction counter requires Linux and its perf permissions |
+| `.github/workflows/core.yml` native macOS/Linux x86_64/Linux arm64 jobs | UNRUN hosted CI: workflow authored locally, not pushed or executed on hosted runners |
+| Other-lane Windows/WASI 0.2/WASI 0.3/web backend runtime contracts | UNRUN in this lane: adapters belong to other clones; portable checks do not validate their behavior |
+| FreeBSD, iOS, Android native execution; WASI 0.3 compilation | UNRUN: outside local checked-target/runtime coverage |
+| DESIGN long-duration soak, exhaustive fault injection, Perry A/B regression budgets | UNRUN: broader integration milestones; current tests are bounded contracts, not those campaigns |
+| Requested per-step commits and final report commit | UNRUN after the initial permission failure; `.git` stays read-only and escalation is forbidden |
+
+## Instruction baselines (macOS arm64)
+
+Measured on `macOS-26.5-arm64-arm-64bit-Mach-O`, `arm64`, pinned nightly,
+release `codegen-units=1`. Values are min/max **instructions per operation** across
+five fresh processes for each configuration. macOS counters are process-reported
+`proc_pid_rusage(RUSAGE_INFO_V4).ri_instructions`; they are not labelled Linux
+user-only counts. No baseline subtraction or speedup claim is made.
+
+Raw data: [core-macos-arm64.jsonl](benchmarks/core-macos-arm64.jsonl).
+Source SHA-256: `a0aa1e9a8e896ecc1df4cdc5b75b64b23c41830c3170519f1bce75825457282b` (manifests, lockfile, Rust sources, toolchain and
+Cargo configuration); recomputation matched after final verification.
+
+| Workload | Instructions per operation |
+|---|---:|
+| `control` | [9.01, 9.04] |
+| `idle_turn` | [11,032.67, 11,245.36] |
+| `notify_turn` | [11,057.84, 11,196.78] |
+| `timer_start_cancel_deliver_close` | [1,957.86, 1,975.50] |
+| `timer_start_cancel` | [726.56, 727.89] |
+| `tcp_batch_64` | [44,175.37, 46,785.82] |
+| `tcp_batch_4096` | [51,332.94, 55,440.99] |
+| `accept` | [27,453.22, 27,991.75] |
+
+`notify_turn` is a running notify followed by a nonblocking turn, with zero wake
+syscalls asserted. Parked notification is separately exercised by the contract.
+`timer_start_cancel` excludes result delivery/close; the lifecycle row includes
+both. TCP batches verify their 64/4,096 bytes and both operation completions.
+Accept measures 640 server accepts per process, excluding client setup and teardown.
+The control performs 1,000,000 iterations; all measured work counters are positive.
+
+| Queue size | Operation | Four-ary heap | BTreeMap |
+|---:|---|---:|---:|
+| 10 | insert | [66.35, 66.54] | [191.39, 193.11] |
+| 10 | cancel | [165.47, 165.59] | [180.37, 180.69] |
+| 10 | expire | [217.26, 217.36] | [236.47, 236.47] |
+| 1,000 | insert | [104.98, 105.11] | [440.47, 443.25] |
+| 1,000 | cancel | [126.80, 127.05] | [465.08, 474.67] |
+| 1,000 | expire | [673.36, 676.16] | [398.79, 408.76] |
+| 100,000 | insert | [94.83, 95.21] | [627.95, 634.50] |
+| 100,000 | cancel | [140.92, 142.37] | [679.00, 687.57] |
+| 100,000 | expire | [1,129.94, 1,135.42] | [464.31, 464.36] |
+
+Each queue workload performs 100,000 counted operations per process. BTreeMap stays
+as a comparison behind `timer-btree`; production uses the heap in all feature
+configurations because the BTree allocation failure is reproducible. These are
+initial baselines, not calibrated regression budgets. The earlier noisy control run
+is preserved in [core-macos-arm64-initial.jsonl](benchmarks/core-macos-arm64-initial.jsonl).
+
+
+## Deviations, decisions and proposed specification clarifications
+
+- D3/§15.4: pooled leases remain valid across turns until explicit drop/release.
+  Pool exhaustion supplies backpressure. This selects the spec's explicit-release
+  option, avoiding safe references being invalidated by a later turn.
+- D4/§8: terminal operation credits and references persist until host delivery;
+  cancellation results precede Closed, but cancellation IDs need not be ordered
+  among themselves. A fired one-shot timer retains its handle until explicit close.
+- §5a detach: cancellation may require later native acknowledgement, so detach
+  returns WouldBlock until affected completions are delivered. Turn and retry;
+  transfer then owns the resource and attach registers it on the destination.
+- D5/D7: requesting Integration opts into external parking between turns. Without
+  that mode, a running notification uses zero syscalls and cannot make an OS fd
+  readable. External hosts combine the fd with next_deadline, as in D7.
+- D1/§7 web: Backend is unsafe to express its buffer-quiescence obligation; revision
+  1 adds now(), validate_timeout(original timeout) and deadline_changed(). The web
+  clock must be host-supplied because std::time::Instant::now is unsupported there.
+  No synchronous ready result may bypass web main-thread timeout validation.
+- D6: production always uses the indexed four-ary heap. The cfg-selected BTreeMap
+  remains a benchmark candidate, not a production feature: warmed 1,000-timer
+  batches proved it allocates (1,660 allocations/10,000 transactions). Heap wins
+  insert/cancel in measured cases; BTreeMap wins large expiry but fails allocation.
+- D8: this scope implements the requested process-shared pool only; first PoolConfig
+  wins and conflicting later configuration is rejected. Wasm native blocking/resolve
+  return Unsupported. Host async jobs and WASI name-lookup routing need an extension
+  when the other lanes integrate; the native closure queue cannot implement those.
+- Non-normative §6 API: submission is fallible on fixed-capacity exhaustion; Closed
+  and unsolicited posts use op=None; writev owns up to eight inline segments; timer
+  reset operates on an active timer, and repeats coalesce missed intervals. Poster
+  is bounded lock-free without a FIFO promise. A post wake error with payload=None
+  means ownership was accepted, so callers must not retry it.
+- The requested scope excludes processes/signals/TTY/protocols. Unix pipe APIs,
+  explicit file APIs, optional executor/adapters and Perry ABI changes are not
+  implemented by these nine steps; file closures can use the native pool.
+
+## Integrator questions and next steps
+
+1. Preserve the current working files, create the final core commit, and publish the
+   local trait revision tag in a session allowed to write Git metadata. The current
+   contract is revision 1; earlier trait-v0/v1 attempts created no tags here.
+2. Adapt the other backends to unsafe Backend plus the revision-1 clock/scheduler
+   hooks; merge their module declarations, dependencies and Platform/Loop aliases.
+   Reuse the generic contract functions without weakening assertions. Agree on a
+   host-async extension for WASI/web jobs and name lookup.
+3. Run both Linux wait paths and Linux perf measurements on real hosts, followed by
+   other-lane runtime suites. macOS reuse-port accepted [0, 32]; §5a explicitly does
+   not promise macOS balancing. The Linux/FreeBSD test still requires both listeners
+   to accept >0; accept handoff verified four workers each echoed four connections.
+4. Confirm the documented API clarifications, then integrate Perry's turn/notifier/
+   deadline boundary. Collect Perry baselines and set regression budgets; perform
+   long soak/fault tests before claiming production coverage. Review rare native
+   accept errors and transfer during an unfinished connect during that campaign.
+
+## Historical verification log
 
 Commands below are run in this clone. PASS means the command exited successfully;
 cross-checking is not execution of target tests.
@@ -23,18 +221,7 @@ cross-checking is not execution of target tests.
 - PASS: `rustup target list --installed --toolchain nightly-2026-08-20`: includes
   macOS arm64 and Linux/Windows/Wasm targets required by the task.
 
-## Deviations and proposed spec changes
-
-None yet. Public API sketch in §6 is non-normative; contract details will be documented.
-
-## Integrator questions
-
-None yet.
-
-## Next steps
-
-Publish trait-v0; implement and verify steps 3–9 in order. Linux runtime tests will
-be explicitly marked UNRUN because there is no Linux host.
+### Step 1
 - PASS (step 1): `cargo +nightly-2026-08-20 fmt --all`.
 - PASS (step 1): `cargo +nightly-2026-08-20 clippy --workspace --all-targets -- -D warnings`.
 - PASS (step 1): `cargo +stable check --workspace`.
@@ -194,7 +381,7 @@ be explicitly marked UNRUN because there is no Linux host.
 
 - PASS: `sh scripts/verify-core.sh`, including all native tests, five loom models,
   both timer comparison configurations, Linux all-feature cross-Clippy and locked
-  stable checking. Final native count is 24 tests: 3 pure core, 19 shared scenarios,
+  stable checking. At that checkpoint the native count was 24 tests: 3 pure core, 19 shared scenarios,
   1 allocation gate, 1 fd-lifetime gate.
 - PASS: Clippy `--workspace --all-targets` for wasm32-unknown-unknown,
   wasm32-wasip2 and x86_64-pc-windows-msvc, both ordinary and all-feature builds.
@@ -240,5 +427,5 @@ be explicitly marked UNRUN because there is no Linux host.
 - Earlier 10k-iteration control showed noise ([9.59, 11.86] instructions/iteration).
   Preserved those results in `benchmarks/core-macos-arm64-initial.jsonl`. The final
   control does 1,000,000 actual iterations to amortize counter/page-fault overhead;
-  it is stable at 9.01 instructions/iteration at the reported precision. No samples
+  the final range is recorded in the baseline table above. No samples
   were discarded or thresholds loosened. Other operation ranges remain visible.

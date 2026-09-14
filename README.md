@@ -40,7 +40,7 @@ Capacity and ownership are explicit:
 - `Config` reserves handle/operation tables, buffers and posting slots. Exhaustion
   returns `ResourceLimit`/`WouldBlock`; delivery returns operation credits. A small
   `Completions` buffer defers excess results without losing work or allocating.
-- A completed timer stops keeping the loop alive, but its handle remains valid
+- A one-shot timer stops keeping the loop alive when its result is delivered, but its handle remains valid
   until `close`. `timer_reset` changes an active timer. Repeats coalesce missed
   intervals and schedule the next tick relative to the actual expiration turn.
 - `IoBuf`/`IoBufMut` constructors are unsafe: retain stable memory until the terminal
@@ -68,8 +68,9 @@ in separate test binaries. Run `python3 scripts/benchmark-core.py --rounds 5` fo
 interleaved fresh-process instruction measurements at codegen-units=1. The
 `timer-btree` feature selects the BTreeMap benchmark queue and its tests. The
 production Driver always uses the indexed four-ary heap: measured BTreeMap churn
-allocated nodes after warm-up and failed the allocation gate. Linux `epoll-timerfd` forces the old
-kernel fallback for testing. CI runs both Linux wait paths on real Linux runners.
+allocated nodes after warm-up and failed the allocation gate. Linux `epoll-timerfd`
+forces the old kernel fallback for testing. CI is configured to run both Linux
+wait paths on real Linux runners; hosted execution is still pending.
 
 Status and exact verification limits: [LANE_REPORT.md](LANE_REPORT.md).
 Specification: [DESIGN.md](DESIGN.md). Ownership: [LANES.md](LANES.md).

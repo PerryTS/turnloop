@@ -827,6 +827,34 @@ pub fn ready_timer_liveness<B: Backend>() {
     assert_eq!(out[0].handle, Some(pending));
     assert!(matches!(out[0].result, OpResult::Timer));
     assert!(!l.alive());
+
+    let h = l
+        .timer(l.now() + Duration::from_secs(30), None, Token(20))
+        .expect("timer to close");
+    l.close(h, Token(21)).expect("cancel and close");
+    let mut cancelled = 0;
+    let mut closed = 0;
+    while l.alive() {
+        assert!(cancelled + closed < 2);
+        l.turn(Timeout::Now, &mut out).expect("close delivery");
+        assert_eq!(out.len(), 1);
+        match out[0].result {
+            OpResult::Cancelled => {
+                cancelled += 1;
+                assert!(l.alive(), "Closed still retains its reference");
+                l.set_ref(h, false).expect("unref closing timer");
+                assert!(!l.alive());
+                l.set_ref(h, true).expect("ref closing timer");
+                assert!(l.alive());
+            }
+            OpResult::Closed => {
+                assert_eq!(cancelled, 1);
+                closed += 1;
+            }
+            ref other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert_eq!((cancelled, closed), (1, 1));
 }
 pub fn io_and_posts_progress_with_repeating_timers<B: Backend>() {
     let mut l = Driver::<B>::new(Config {
