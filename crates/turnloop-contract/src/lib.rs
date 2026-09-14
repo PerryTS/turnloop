@@ -213,6 +213,10 @@ mod native {
         ref_unref::<B>();
     }
     #[test]
+    fn idle_socket_timers_do_not_spin() {
+        no_spin::<B>();
+    }
+    #[test]
     fn timer_bounds() {
         timer_precision::<B>();
     }
@@ -917,4 +921,47 @@ pub fn io_and_posts_progress_with_repeating_timers<B: Backend>() {
     assert!(received, "posts must progress through a timer backlog");
     assert!(timers > 0);
     assert_eq!((read, wrote), (64, 1));
+}
+
+/// DESIGN §10 rule 4a: an idle registered stream must not turn timers into polling.
+pub fn no_spin<B: Backend>() {
+    let mut driver = Driver::<B>::new(Config::default()).expect("loop");
+    let (_, _sender, receiver) = pair(&mut driver);
+    let read = driver.read(receiver, ReadBuf::Pooled, Token(90)).expect("idle read");
+    let mut out = Completions::default();
+    let mut expiries = 0;
+    let mut waits = 0;
+    for micros in [500, 2_000, 10_000] {
+        for _ in 0..20 {
+            let deadline = driver.now() + Duration::from_micros(micros);
+            let timer = driver.timer(deadline, None, Token(91)).expect("timer");
+            let mut turns = 0;
+            let mut zero_events = 0;
+            loop {
+                turns += 1;
+                assert!(turns <= 2, "{micros} us deadline spun before expiry");
+                let info = driver.turn(Timeout::Until(deadline), &mut out).expect("turn");
+                assert!(info.os_waits <= 1);
+                waits += info.os_waits;
+                zero_events += info.zero_event_waits;
+                assert!(zero_events <= 1, "{micros} us: repeated empty OS waits");
+                if !out.is_empty() {
+                    assert_eq!(out.len(), 1);
+                    assert_eq!(out[0].token, Token(91));
+                    assert_eq!(out[0].handle, Some(timer));
+                    assert!(matches!(out[0].result, OpResult::Timer));
+                    assert!(driver.now() >= deadline, "timer fired early");
+                    expiries += 1;
+                    break;
+                }
+            }
+            driver.close(timer, Token(92)).expect("release timer handle");
+            driver.turn(Timeout::Now, &mut out).expect("drain close");
+            assert_eq!(out.len(), 1);
+            assert!(matches!(out[0].result, OpResult::Closed));
+        }
+    }
+    assert_eq!(expiries, 60);
+    assert!(waits >= 60, "timer waits must actually execute");
+    assert!(driver.cancel(read), "idle socket read remained pending throughout");
 }

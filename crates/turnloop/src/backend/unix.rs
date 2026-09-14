@@ -323,7 +323,7 @@ unsafe impl Backend for Unix {
         // A pending cancellation or a cached EAGAIN attempt consumes this turn.
         // Even if no completion resulted, never hide an additional wait afterward.
         if cached || !events.is_empty() || events.len() == events.capacity() {
-            return Ok(PollInfo { waits: 0 });
+            return Ok(PollInfo::default());
         }
         self.polled.clear();
         let info = self.poller.wait(timeout, &mut self.polled)?;

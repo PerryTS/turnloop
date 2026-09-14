@@ -288,14 +288,11 @@ fn real_standalone_replica_scram_tls() {
             let n = port(&format!("rs{i}"));
             if let Ok(mut d) =
                 Driver::connect(&format!("mongodb://127.0.0.1:{n}/?directConnection=true"))
-            {
-                if let Ok(h) = d.run("admin", doc! {"hello":1}) {
-                    if h.get_bool("isWritablePrimary").unwrap_or(false) {
+                && let Ok(h) = d.run("admin", doc! {"hello":1})
+                    && h.get_bool("isWritablePrimary").unwrap_or(false) {
                         p = Some((n, d));
                         break;
                     }
-                }
-            }
         }
         if let Some(p) = p {
             break p;
@@ -647,8 +644,8 @@ fn failover(d: &mut Driver, old_primary: u16, ports: &[(String, u16)], topology:
             if !name.starts_with("rs") || *port == old_primary {
                 continue;
             }
-            if let Ok(mut peer) = Driver::connect(&uri(*port, "")) {
-                if let Ok(hello) = peer.run("admin", doc! {"hello":1}) {
+            if let Ok(mut peer) = Driver::connect(&uri(*port, ""))
+                && let Ok(hello) = peer.run("admin", doc! {"hello":1}) {
                     topology.update(
                         &format!("127.0.0.1:{port}"),
                         &hello,
@@ -660,7 +657,6 @@ fn failover(d: &mut Driver, old_primary: u16, ports: &[(String, u16)], topology:
                         break;
                     }
                 }
-            }
         }
         if let Some(p) = primary {
             break p;

@@ -60,8 +60,8 @@ impl Addr {
         Self { storage, len }
     }
     pub fn empty() -> Self {
-        // SAFETY: sockaddr_storage can be zero-initialized as output storage.
         Self {
+            // SAFETY: sockaddr_storage can be zero-initialized as output storage.
             storage: unsafe { zeroed() },
             len: size_of::<libc::sockaddr_storage>() as _,
         }

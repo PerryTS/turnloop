@@ -122,6 +122,8 @@ pub enum Outcome<D> {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PollInfo {
     pub waits: u32,
+    /// OS waits returning zero native events (including interrupted waits).
+    pub zero_event_waits: u32,
 }
 
 /// # Safety

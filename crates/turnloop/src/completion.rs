@@ -97,4 +97,6 @@ pub struct TurnInfo {
     pub waited: Duration,
     pub alive: bool,
     pub os_waits: u32,
+    /// Number of OS waits that returned zero native events.
+    pub zero_event_waits: u32,
 }

@@ -434,11 +434,10 @@ impl Options {
             })
             .collect();
         self.apply_options()?;
-        if let Some(c) = &mut self.credential {
-            if let Some(s) = self.raw.get("authsource") {
+        if let Some(c) = &mut self.credential
+            && let Some(s) = self.raw.get("authsource") {
                 c.source = s.clone();
             }
-        }
         Ok(())
     }
 }

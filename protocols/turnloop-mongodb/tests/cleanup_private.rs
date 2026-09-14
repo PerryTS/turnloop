@@ -13,8 +13,8 @@ fn shutdown_private() {
         .iter()
         .filter(|(n, _)| n.starts_with("rs"))
         .collect();
-    if let Some((_, p)) = rs.first() {
-        if let Ok(mut d) =
+    if let Some((_, p)) = rs.first()
+        && let Ok(mut d) =
             Driver::connect(&format!("mongodb://127.0.0.1:{p}/?directConnection=true"))
         {
             let members: Vec<_> = rs
@@ -27,15 +27,13 @@ fn shutdown_private() {
                 doc! {"replSetInitiate":{"_id":"turnloop_test","members":members}},
             );
         }
-    }
     let deadline = Instant::now() + Duration::from_secs(40);
     loop {
         let mut done = false;
         for (_, p) in &rs {
             if let Ok(mut d) =
                 Driver::connect(&format!("mongodb://127.0.0.1:{p}/?directConnection=true"))
-            {
-                if d.core
+                && d.core
                     .hello
                     .as_ref()
                     .unwrap()
@@ -46,7 +44,6 @@ fn shutdown_private() {
                     done = true;
                     break;
                 }
-            }
         }
         if done || rs.is_empty() {
             break;

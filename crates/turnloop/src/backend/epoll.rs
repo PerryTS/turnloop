@@ -214,7 +214,7 @@ impl Poller for Epoll {
         if n < 0 {
             let e = std::io::Error::last_os_error();
             if e.kind() == std::io::ErrorKind::Interrupted {
-                return Ok(PollInfo { waits: 1 });
+                return Ok(PollInfo { waits: 1, zero_event_waits: 1 });
             }
             return Err(e.into());
         }
@@ -237,7 +237,7 @@ impl Poller for Epoll {
                 });
             }
         }
-        Ok(PollInfo { waits: 1 })
+        Ok(PollInfo { waits: 1, zero_event_waits: u32::from(n == 0) })
     }
     fn fd(&self) -> RawFd {
         self.fd.as_raw_fd()

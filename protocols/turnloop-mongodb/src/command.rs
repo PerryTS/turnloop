@@ -66,8 +66,8 @@ impl Command {
             self.scratch.end_document(wc)?;
         }
         if !write {
-            if let Some(level) = options.raw.get("readconcernlevel") {
-                if self
+            if let Some(level) = options.raw.get("readconcernlevel")
+                && self
                     .writer
                     .as_raw()?
                     .get("readConcern")
@@ -79,7 +79,6 @@ impl Command {
                     self.scratch.string("level", level)?;
                     self.scratch.end_document(rc)?;
                 }
-            }
             if options.read_preference != crate::uri::ReadPreference::Primary
                 && self
                     .writer

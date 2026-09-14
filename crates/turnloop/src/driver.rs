@@ -718,6 +718,7 @@ impl<B: Backend> Driver<B> {
         let queued =
             !self.queued.is_empty() || !self.poster.is_empty() || !self.work_port.is_empty();
         let mut waits = 0;
+        let mut zero_event_waits = 0;
         if self.buffered[NATIVE_EVENTS] == 0
             && (!queued || self.native_pending != 0 || self.backend.has_work())
         {
@@ -732,7 +733,9 @@ impl<B: Backend> Driver<B> {
             }
             let poll = self.backend.poll(timeout, &mut self.events);
             self.notifier.running();
-            waits = poll?.waits;
+            let poll = poll?;
+            waits = poll.waits;
+            zero_event_waits = poll.zero_event_waits;
             // Taking/replacing the preallocated vector preserves storage and allows
             // completion handling to mutate the backend when accepting a socket.
             let mut events = std::mem::take(&mut self.events);
@@ -830,6 +833,7 @@ impl<B: Backend> Driver<B> {
             waited: self.backend.now().saturating_duration_since(start),
             alive: self.alive(),
             os_waits: waits,
+            zero_event_waits,
         })
     }
 }

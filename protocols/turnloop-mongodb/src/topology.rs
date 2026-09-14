@@ -337,13 +337,11 @@ impl Topology {
                     } else {
                         if self.kind != TopologyType::ReplicaSetWithPrimary {
                             self.add_hosts(&s.hosts, now);
-                            if let Some(primary) = &s.primary {
-                                if let Some(p) = self.servers.get_mut(primary) {
-                                    if p.kind == ServerType::Unknown {
+                            if let Some(primary) = &s.primary
+                                && let Some(p) = self.servers.get_mut(primary)
+                                    && p.kind == ServerType::Unknown {
                                         p.kind = ServerType::PossiblePrimary;
                                     }
-                                }
-                            }
                         }
                         if s.me.as_ref().is_some_and(|me| me != &address) {
                             self.remove(&address);
@@ -606,8 +604,8 @@ impl Topology {
             if !candidate {
                 return false;
             }
-            if s.kind == ServerType::RSSecondary {
-                if let Some(max) = max_staleness {
+            if s.kind == ServerType::RSSecondary
+                && let Some(max) = max_staleness {
                     let Some(write) = s.last_write_ms else {
                         return false;
                     };
@@ -630,7 +628,6 @@ impl Topology {
                         return false;
                     }
                 }
-            }
             true
         };
         for (a, s) in &self.servers {

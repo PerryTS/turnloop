@@ -206,11 +206,10 @@ impl Session {
         if let Some(t) = &self.cluster_time {
             w.document("$clusterTime", t)?;
         }
-        if name == "commitTransaction" {
-            if let Some(ms) = self.max_commit_time_ms {
+        if name == "commitTransaction"
+            && let Some(ms) = self.max_commit_time_ms {
                 w.int64("maxTimeMS", ms)?;
             }
-        }
         w.string("$db", "admin")?;
         w.finish()?;
         Ok(())
@@ -219,17 +218,16 @@ impl Session {
         if matches!(
             self.state,
             TransactionState::Starting | TransactionState::InProgress | TransactionState::Committed
-        ) {
-            if let Ok(token) = reply.get_document("recoveryToken") {
+        )
+            && let Ok(token) = reply.get_document("recoveryToken") {
                 self.recovery_token = RawDocumentBuf::try_from(token).ok();
             }
-        }
         if let Ok(t) = reply.get_timestamp("operationTime") {
             self.operation_time = Some(self.operation_time.map_or(t, |old| old.max(t)));
         }
-        if let Ok(c) = reply.get_document("$clusterTime") {
-            if let Ok(t) = c.get_timestamp("clusterTime") {
-                if self
+        if let Ok(c) = reply.get_document("$clusterTime")
+            && let Ok(t) = c.get_timestamp("clusterTime")
+                && self
                     .cluster_time
                     .as_ref()
                     .and_then(|d| d.get_timestamp("clusterTime").ok())
@@ -237,8 +235,6 @@ impl Session {
                 {
                     self.cluster_time = RawDocumentBuf::try_from(c).ok();
                 }
-            }
-        }
     }
     /// Causal read concern for a non-transaction read. Command must not already
     /// contain readConcern; operationTime came from an earlier server response.

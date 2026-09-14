@@ -324,8 +324,8 @@ impl Connection {
                     .ok()
                     .is_some_and(|a| a.iter().any(|b| b.as_str() == Some("zlib")));
             self.hello = Some(d.clone());
-            if let Some(c) = &self.options.credential {
-                if !d.get_bool("arbiterOnly").unwrap_or(false) {
+            if let Some(c) = &self.options.credential
+                && !d.get_bool("arbiterOnly").unwrap_or(false) {
                     self.state = State::Auth;
                     let next = if let Ok(spec) = d.get_document("speculativeAuthenticate") {
                         self.scram.as_mut().unwrap().receive(spec, &c.source)?
@@ -349,7 +349,6 @@ impl Connection {
                         return Ok(n);
                     }
                 }
-            }
         } else if self.state == State::Auth {
             let source = &self.options.credential.as_ref().unwrap().source;
             let next = self.scram.as_mut().unwrap().receive(&d, source)?;

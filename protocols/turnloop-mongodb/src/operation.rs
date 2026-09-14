@@ -296,8 +296,8 @@ impl Operation {
         let message = Message::parse(&self.original, wire::DEFAULT_MAX_MESSAGE)?;
         self.writer.clear();
         self.writer.append_fields(message.body, &[])?;
-        if let Some(session) = self.options.session {
-            if capabilities.sessions
+        if let Some(session) = self.options.session
+            && capabilities.sessions
                 && !self.policy.in_transaction
                 && message.body.get("lsid").ok().flatten().is_none()
             {
@@ -308,7 +308,6 @@ impl Operation {
                     self.writer.int64("txnNumber", session.txn_number)?;
                 }
             }
-        }
         let pref = if capabilities.direct && self.options.read_preference == ReadPreference::Primary
         {
             ReadPreference::PrimaryPreferred
