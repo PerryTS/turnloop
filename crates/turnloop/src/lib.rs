@@ -5,7 +5,7 @@
 //! process-wide blocking, signal and external-wait services start only on use.
 //!
 //! ```
-//! # #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android", target_os = "freebsd"))]
+//! # #[cfg(any(windows, target_vendor = "apple", target_os = "linux", target_os = "android", target_os = "freebsd"))]
 //! # fn main() -> turnloop::Result<()> {
 //! use std::time::Duration;
 //! use turnloop::{Completions, Config, Loop, OpResult, Timeout, Token};
@@ -24,7 +24,7 @@
 //! driver.turn(Timeout::Now, &mut completions)?;
 //! assert!(!driver.alive());
 //! # Ok(()) }
-//! # #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android", target_os = "freebsd")))]
+//! # #[cfg(not(any(windows, target_vendor = "apple", target_os = "linux", target_os = "android", target_os = "freebsd")))]
 //! # fn main() {}
 //! ```
 //!

@@ -13,7 +13,9 @@ Issue #4, branch `windows/iocp-backend`, 2026-09-14.
 - `rustc +nightly-2026-08-20 --version`: 1.100.0-nightly
   (f7d782a3b 2026-08-19). MSVC linker and Windows SDK are installed and linked tests.
 - `rustc +stable --version`: 1.96.1 (31fca3adb 2026-06-26).
-- Node v24.21.0 initially installed; HTTP/2 interop is not yet run.
+- Node v24.21.0 initially installed; validation uses official Node v26.5.1 from
+  `.tools/bin`, with the release archive verified against its published SHA-256.
+- Official curl 8.22.0_1 (HTTP/2 enabled), checksum pinned in `scripts/ci/tools.json`.
 - Commands explicitly select the pinned nightly: implicit `cargo`/`rustc`
   attempts to install every cross target from `rust-toolchain.toml`, but the
   existing wasip1-threads component has a rustup installation conflict.
@@ -119,8 +121,30 @@ System32 before the inherited PATH. The unchanged HTTP/2 assertions now pass.
 The next full-workspace run exposed CRLF-converted decoder reference fixtures;
 `.gitattributes` now preserves their original bytes. All 68 decoder tests pass
 after restoring the fixtures to their exact committed bytes.
-Latest production CI and full-workspace runtime results are recorded below when
-available; this record does not claim they have passed yet.
+Further local validation:
+
+- `python scripts/ci/run-tests.py native`: PASS, workspace and individual member
+  runs with default/all features. Workspace passes were 209/224 tests; separate
+  contract passes were 40/47. These counts precede the merge of main's additional
+  HTTP capability and portable TLS tests. Fixture-dependent protocol cases retain
+  their existing ignored status here and run separately through the fixture runner.
+- `python scripts/test-servers.py --services http run python scripts/ci/run-tests.py interop`:
+  PASS after merging main, 17 tests (HTTP 9, TLS 5, WebSocket 3), including real
+  Node 26 and curl HTTP/2 transfers. The additional upstream no-curl capability
+  scenario intentionally logs its curl leg UNRUN while requiring Node's 100 streams.
+- `RUSTDOCFLAGS='-D warnings' cargo +nightly-2026-08-20 doc --locked --workspace --all-features --no-deps`:
+  PASS (set RUSTDOCFLAGS with PowerShell environment syntax on Windows).
+- ZIP installer regression tests: PASS, 3 tests. UTF-8/path guard regression tests:
+  PASS, 9 tests. `python scripts/ci/check-paths.py`: PASS after fixing its implicit
+  Windows code-page decoding to read UTF-8 source and manifests.
+- `cargo +1.97.1 check --locked --workspace --all-targets --all-features`: PASS,
+  using the declared MSRV installed alongside the existing stable toolchain.
+- `cargo +nightly-2026-08-20 test --locked -p turnloop --doc --all-features`:
+  PASS, two tests; the public Loop example now actually executes on Windows.
+
+GitHub CI results and links are tracked in PR #5; local results alone do not
+establish a CI pass. The initial run at `2eee4c8` failed the Windows HTTP/2 setup;
+the production run starts after the current-main merge at `833ebe0`.
 
 Unrun wider gates: ETW syscall traces, CPU-cycle A/B attribution, overnight soak,
 Windows 10 minimum-version coverage, and VM/power-state precision matrices.
