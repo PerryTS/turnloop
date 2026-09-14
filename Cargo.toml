@@ -1,0 +1,14 @@
+[workspace]
+members = ["protocols/turnloop-redis", "protocols/turnloop-smtp"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+
+[workspace.dependencies]
+base64 = "0.22"
+lettre = { version = "0.11.23", default-features = false, features = ["builder"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
