@@ -334,7 +334,10 @@ def redis_stop_record(record):
         # Popen owns this exact child, including a start that never opened a port.
         # Reap crashes before probing ports: a reused port is not our instance.
         if child.poll() is None:
-            child.terminate()
+            try:
+                child.terminate()
+            except ProcessLookupError:
+                pass  # Exited between poll and terminate; still reap it below.
         child.wait(timeout=10)
         REDIS_CHILDREN.pop(record['pid'])
         return

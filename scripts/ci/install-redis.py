@@ -21,7 +21,8 @@ BUILD_FLAGS = ['BUILD_TLS=yes', 'BUILD_WITH_MODULES=no', 'MALLOC=libc', 'USE_SYS
 
 
 def source_archive():
-    with urllib.request.urlopen(URL, timeout=120) as response:
+    request = urllib.request.Request(URL, headers={'User-Agent': 'turnloop-ci'})
+    with urllib.request.urlopen(request, timeout=120) as response:
         archive = response.read()
     digest = hashlib.sha256(archive).hexdigest()
     if digest != SHA256:
@@ -34,7 +35,7 @@ def verify_binaries(directory):
     server = subprocess.check_output([directory / 'redis-server', '--version'], text=True)
     cli = subprocess.check_output([directory / 'redis-cli', '--version'], text=True)
     help_text = subprocess.check_output([directory / 'redis-cli', '--help'], text=True)
-    if f'v={VERSION}' not in server.split() or cli.strip() != f'redis-cli {VERSION}':
+    if f'v={VERSION}' not in server.split() or cli.split()[:2] != ['redis-cli', VERSION]:
         raise RuntimeError(f'Wrong Redis fixture version: {server.strip()}, {cli.strip()}')
     if '--tls' not in help_text.split():
         raise RuntimeError('Redis CLI lacks TLS support')
