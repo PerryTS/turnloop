@@ -360,16 +360,12 @@ impl Options {
             return Err(parse_error("Invalid heartbeat or pool size"));
         }
         if self.read_preference == ReadPreference::Primary
-            && (!self.read_preference_tags.is_empty() || self.max_staleness.is_some())
+            && (self.read_preference_tags.iter().any(|t| !t.is_empty())
+                || self.max_staleness.is_some())
         {
             return Err(parse_error(
                 "Primary read preference cannot be combined with tags or maxStalenessSeconds",
             ));
-        }
-        if self.max_staleness.is_some_and(|d| {
-            d < Duration::from_secs(90) || d < self.heartbeat + Duration::from_secs(10)
-        }) {
-            return Err(parse_error("maxStalenessSeconds is too small"));
         }
         Ok(())
     }

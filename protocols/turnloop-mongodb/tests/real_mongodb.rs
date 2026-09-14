@@ -11,7 +11,16 @@ use turnloop_mongodb::{
     Error,
 };
 fn user(d: &mut Driver) {
-    let write_concern = if d.core.hello.as_ref().is_some_and(|h|h.contains_key("setName")) { 3 } else { 1 };
+    let write_concern = if d
+        .core
+        .hello
+        .as_ref()
+        .is_some_and(|h| h.contains_key("setName"))
+    {
+        3
+    } else {
+        1
+    };
     d.run("admin",doc!{"createUser":"lane","pwd":"pencil","roles":[{"role":"root","db":"admin"}],"mechanisms":["SCRAM-SHA-1","SCRAM-SHA-256"],"writeConcern":{"w":write_concern,"wtimeout":20000}}).unwrap();
 }
 fn uri(port: u16, extra: &str) -> String {
@@ -340,6 +349,7 @@ fn real_standalone_replica_scram_tls() {
     assert_eq!(candidates.len(), 2);
     crud(&mut d);
     transactions_and_changes(&mut d);
+    retry_coordinator(&mut d);
     eprintln!("Verified standalone, 3-member replica set, SCRAM SHA-1/SHA-256/default, TLS, zlib, CRUD, cursors, transactions, retry identity and change stream events");
 }
 fn transactions_and_changes(d: &mut Driver) {
@@ -429,4 +439,163 @@ fn transactions_and_changes(d: &mut Driver) {
     change.finish_batch(batch.post_batch_resume_token).unwrap();
     c.kill_cursor(db, "items", id).unwrap();
     command(d, &c, &[]);
+    let resumed = d
+        .run(
+            db,
+            doc! {"aggregate":"items","pipeline":[change.stage()],"cursor":{"batchSize":1}},
+        )
+        .unwrap();
+    let r = raw(&resumed);
+    let resumed_id = CursorBatch::parse(&r).unwrap().id;
+    assert_ne!(resumed_id, 0);
+    d.run(db, doc! {"insert":"items","documents":[{"_id":4}]})
+        .unwrap();
+    c.get_more(db, "items", resumed_id, Some(1), Some(5000))
+        .unwrap();
+    let reply = command(d, &c, &[]);
+    let r = raw(&reply);
+    let batch = CursorBatch::parse(&r).unwrap();
+    let event = batch.rows().next().expect("resumed event").unwrap();
+    assert_eq!(
+        event
+            .get_document("documentKey")
+            .unwrap()
+            .get_i32("_id")
+            .unwrap(),
+        4
+    );
+    c.kill_cursor(db, "items", resumed_id).unwrap();
+    command(d, &c, &[]);
+}
+
+fn retry_coordinator(d: &mut Driver) {
+    use turnloop_mongodb::{operation::*, ConnectionEvent};
+    let db = "lane_retry";
+    d.run(db, doc! {"dropDatabase":1}).unwrap();
+    d.run(db, doc! {"create":"items"}).unwrap();
+    for kind in [OperationKind::Write, OperationKind::Read] {
+        let name = if kind == OperationKind::Write {
+            "insert"
+        } else {
+            "find"
+        };
+        d.run("admin",doc!{"configureFailPoint":"failCommand","mode":{"times":1},"data":{"failCommands":[name],"errorCode":91,"errorLabels":["RetryableWriteError"]}}).unwrap();
+        let mut op = Operation::new();
+        let body = raw(&if kind == OperationKind::Write {
+            doc! {"insert":"items","$db":db}
+        } else {
+            doc! {"find":"items","filter":{},"$db":db}
+        });
+        let entry = raw(&doc! {"_id":1,"x":1});
+        let refs = [entry.as_ref()];
+        let seq = [("documents", refs.as_slice())];
+        op.begin(
+            &body,
+            if kind == OperationKind::Write {
+                &seq
+            } else {
+                &[]
+            },
+            OperationOptions {
+                token: 505,
+                kind,
+                retry: true,
+                timeout: Some(Duration::from_secs(10)),
+                session: Some(RetrySession {
+                    id: [11; 16],
+                    txn_number: 1,
+                }),
+                ..OperationOptions::default()
+            },
+            Instant::now(),
+        )
+        .unwrap();
+        let mut sends = 0;
+        let mut success = None;
+        loop {
+            match op.action() {
+                OperationAction::Select { .. } => op
+                    .selected(
+                        "private-primary",
+                        ServerCapabilities {
+                            wire_version: 27,
+                            sessions: true,
+                            standalone: false,
+                            direct: false,
+                        },
+                    )
+                    .unwrap(),
+                OperationAction::Checkout { .. } => op.checked_out().unwrap(),
+                OperationAction::Send { .. } => {
+                    op.send(&mut d.core, Instant::now()).unwrap();
+                    sends += 1;
+                }
+                OperationAction::Waiting => {
+                    if let Some(event) = d.core.poll_event() {
+                        match event {
+                            ConnectionEvent::Reply { token } => {
+                                assert_eq!(token, 505);
+                                if op.response(d.core.reply().unwrap()).unwrap() {
+                                    success =
+                                        Some(Document::try_from(d.core.reply().unwrap()).unwrap());
+                                }
+                                d.core.release_reply().unwrap();
+                            }
+                            ConnectionEvent::Failed { error, .. } => op.failed(error),
+                            e => panic!("Unexpected event {e:?}"),
+                        }
+                    } else {
+                        d.turn().unwrap();
+                    }
+                }
+                OperationAction::Complete { token } => {
+                    assert_eq!(token, 505);
+                    break;
+                }
+                a => panic!("Unexpected operation action {a:?}"),
+            }
+        }
+        assert_eq!(sends, 2, "failpoint must force exactly one retry");
+        let reply = success.unwrap();
+        if kind == OperationKind::Write {
+            assert_eq!(reply.get_i32("n").unwrap(), 1);
+        } else {
+            assert_eq!(rows(&reply).len(), 1);
+        }
+    }
+    assert_eq!(
+        d.run(db, doc! {"count":"items"})
+            .unwrap()
+            .get_i32("n")
+            .unwrap(),
+        1
+    );
+    // A transient commit error is retried with majority and identical transaction identity.
+    let mut s = Session::new([19; 16]);
+    s.start_transaction().unwrap();
+    let mut w = BsonWriter::new();
+    w.clear();
+    w.string("insert", "items").unwrap();
+    s.decorate(&mut w, false).unwrap();
+    w.string("$db", db).unwrap();
+    w.finish().unwrap();
+    let item = raw(&doc! {"_id":2});
+    Error::from_response(&raw(&d
+        .raw_command(w.as_raw().unwrap(), &[("documents", &[&item])])
+        .unwrap()))
+    .unwrap();
+    d.run("admin",doc!{"configureFailPoint":"failCommand","mode":{"times":1},"data":{"failCommands":["commitTransaction"],"errorCode":91,"errorLabels":["RetryableWriteError"]}}).unwrap();
+    s.commit(&mut w, false).unwrap();
+    let first = d.raw_command(w.as_raw().unwrap(), &[]).unwrap();
+    let err = Error::from_response(&raw(&first)).unwrap_err();
+    assert!(Session::retry_commit(&err));
+    s.commit(&mut w, true).unwrap();
+    Error::from_response(&raw(&d.raw_command(w.as_raw().unwrap(), &[]).unwrap())).unwrap();
+    assert_eq!(
+        d.run(db, doc! {"count":"items"})
+            .unwrap()
+            .get_i32("n")
+            .unwrap(),
+        2
+    );
 }

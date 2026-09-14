@@ -60,9 +60,15 @@ impl Error {
         let ok = number(raw, "ok").unwrap_or(0.0) != 0.0;
         let write = raw
             .get("writeErrors")
-            .ok().flatten().and_then(|v|v.as_array())
+            .ok()
+            .flatten()
+            .and_then(|v| v.as_array())
             .is_some_and(|a| a.into_iter().next().is_some());
-        let concern = raw.get("writeConcernError").ok().flatten().and_then(|v|v.as_document());
+        let concern = raw
+            .get("writeConcernError")
+            .ok()
+            .flatten()
+            .and_then(|v| v.as_document());
         if ok && !write && concern.is_none() {
             return Ok(());
         }

@@ -144,10 +144,31 @@ impl<'a> Message<'a> {
         })
     }
     /// Replaces only the body; document sequences retain their original bytes/order.
-    pub fn encode_with_body(&self,out:&mut Vec<u8>,body:&RawDocument,max:usize)->Result<()> {
-        encode(out,self.request_id,0,0,body,&[],max)?;
-        let mut at=0;while at<self.sections.len(){let start=at;let kind=self.sections[at];at+=1;let n=i32_at(self.sections,at)? as usize;at+=n;if kind==1{out.extend_from_slice(&self.sections[start..at]);}}
-        if out.len()>max||out.len()>i32::MAX as usize{out.clear();return Err(Error::protocol("Message exceeds maxMessageSizeBytes"));}let n=out.len() as i32;out[..4].copy_from_slice(&n.to_le_bytes());Ok(())
+    pub fn encode_with_body(
+        &self,
+        out: &mut Vec<u8>,
+        body: &RawDocument,
+        max: usize,
+    ) -> Result<()> {
+        encode(out, self.request_id, 0, 0, body, &[], max)?;
+        let mut at = 0;
+        while at < self.sections.len() {
+            let start = at;
+            let kind = self.sections[at];
+            at += 1;
+            let n = i32_at(self.sections, at)? as usize;
+            at += n;
+            if kind == 1 {
+                out.extend_from_slice(&self.sections[start..at]);
+            }
+        }
+        if out.len() > max || out.len() > i32::MAX as usize {
+            out.clear();
+            return Err(Error::protocol("Message exceeds maxMessageSizeBytes"));
+        }
+        let n = out.len() as i32;
+        out[..4].copy_from_slice(&n.to_le_bytes());
+        Ok(())
     }
     pub fn sequences(&self) -> Sequences<'a> {
         Sequences {
@@ -362,6 +383,17 @@ impl BsonWriter {
         self.bytes.extend_from_slice(d.as_bytes());
         Ok(())
     }
+    pub fn object_id(&mut self, key: &str, id: bson::oid::ObjectId) -> Result<()> {
+        self.key(7, key)?;
+        self.bytes.extend_from_slice(&id.bytes());
+        Ok(())
+    }
+    pub fn timestamp(&mut self, key: &str, t: bson::Timestamp) -> Result<()> {
+        self.key(17, key)?;
+        self.bytes.extend_from_slice(&t.increment.to_le_bytes());
+        self.bytes.extend_from_slice(&t.time.to_le_bytes());
+        Ok(())
+    }
     pub fn binary(&mut self, k: &str, subtype: u8, b: &[u8]) -> Result<()> {
         self.key(5, k)?;
         let n = i32::try_from(b.len()).map_err(|_| Error::protocol("Binary too large"))?;
@@ -377,7 +409,7 @@ impl BsonWriter {
         Ok(p)
     }
     pub fn end_document(&mut self, at: usize) -> Result<()> {
-        if at + 4 > self.bytes.len() {
+        if at.checked_add(4).is_none_or(|end| end > self.bytes.len()) {
             return Err(Error::protocol("Invalid BSON builder offset"));
         }
         self.bytes.push(0);

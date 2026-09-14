@@ -213,7 +213,12 @@ impl Pool {
         if self.closed {
             return;
         }
-        while let Some(w)=self.waiters.pop_front(){self.events.push_back(PoolEvent::CheckoutFailed{token:w.token,error:Error::new(ErrorKind::PoolClosed,"Connection pool is closed")});}
+        while let Some(w) = self.waiters.pop_front() {
+            self.events.push_back(PoolEvent::CheckoutFailed {
+                token: w.token,
+                error: Error::new(ErrorKind::PoolClosed, "Connection pool is closed"),
+            });
+        }
         self.clear();
         self.closed = true;
         self.events.push_back(PoolEvent::Closed);

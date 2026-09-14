@@ -23,16 +23,21 @@ impl Retry {
         if !self.enabled || self.attempts >= 1 || self.in_transaction {
             return false;
         }
-        let network = matches!(error.kind, ErrorKind::Network | ErrorKind::Timeout);
+        let network = matches!(
+            error.kind,
+            ErrorKind::Network | ErrorKind::Timeout | ErrorKind::PoolCleared
+        );
         let code = error.code.is_some_and(|c| {
             matches!(
                 c,
-                6 | 7 | 89 | 91 | 189 | 9001 | 10107 | 11600 | 11602 | 13435 | 13436
+                6 | 7 | 89 | 91 | 189 | 262 | 9001 | 10107 | 11600 | 11602 | 13435 | 13436
             )
         });
         match self.kind {
             RetryKind::Never => false,
-            RetryKind::Read => self.wire_version >= 6 && (network || code),
+            RetryKind::Read => {
+                self.wire_version >= 6 && (network || code || error.code == Some(134))
+            }
             RetryKind::Write => {
                 self.sessions_supported
                     && !self.standalone
@@ -40,7 +45,7 @@ impl Retry {
                     && self.wire_version >= 6
                     && (network
                         || error.has_label("RetryableWriteError")
-                        || (self.wire_version < 9 && code))
+                        || (self.wire_version < 9 && error.kind != ErrorKind::BulkWrite && code))
             }
         }
     }

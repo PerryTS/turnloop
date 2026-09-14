@@ -2,7 +2,7 @@
 name = "turnloop-mongodb"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.97"
 license = "MIT"
 description = "Host-driven, sans-IO MongoDB protocol state machines"
 

@@ -139,10 +139,15 @@ impl Connection {
         self.request_id = id;
         self.expected = id;
         self.tx_at = 0;
-        let command = body.iter_elements().next().transpose().map_err(|_|Error::protocol("Invalid command"))?.ok_or_else(||Error::protocol("Empty command"))?;
+        let command = body
+            .iter_elements()
+            .next()
+            .transpose()
+            .map_err(|_| Error::protocol("Invalid command"))?
+            .ok_or_else(|| Error::protocol("Empty command"))?;
         self.compress(command.key().as_str())
     }
-    fn compress(&mut self, command:&str)->Result<()> {
+    fn compress(&mut self, command: &str) -> Result<()> {
         // Compression spec § Commands Not to Compress: includes authentication secrets.
         if self.zlib
             && !matches!(
@@ -203,7 +208,13 @@ impl Connection {
         if self.tx_at == self.tx.len() {
             self.tx.clear();
             self.tx_at = 0;
-            if self.state==State::UnackSending {self.state=State::Ready;self.deadline=None;self.events.push_back(ConnectionEvent::Unacknowledged{token:self.token.take().unwrap()});}
+            if self.state == State::UnackSending {
+                self.state = State::Ready;
+                self.deadline = None;
+                self.events.push_back(ConnectionEvent::Unacknowledged {
+                    token: self.token.take().unwrap(),
+                });
+            }
         }
         Ok(())
     }
@@ -211,7 +222,12 @@ impl Connection {
     pub fn receive(&mut self, input: &[u8]) -> Result<usize> {
         if matches!(
             self.state,
-            State::New | State::Tls | State::Ready | State::UnackSending | State::Reply | State::Closed
+            State::New
+                | State::Tls
+                | State::Ready
+                | State::UnackSending
+                | State::Reply
+                | State::Closed
         ) {
             return Err(Error::protocol("Connection is not expecting a reply"));
         }
@@ -356,19 +372,25 @@ impl Connection {
         }
     }
     pub fn reply(&self) -> Result<&RawDocument> {
-        if self.state != State::Reply && !(self.state==State::Closed&&self.token.is_some()&&self.decoder.complete()) {
+        if self.state != State::Reply
+            && !(self.state == State::Closed && self.token.is_some() && self.decoder.complete())
+        {
             return Err(Error::protocol("No reply available"));
         }
         Ok(Message::parse(self.frame(), self.max_message_size)?.body)
     }
     pub fn release_reply(&mut self) -> Result<()> {
-        if self.state != State::Reply && !(self.state==State::Closed&&self.token.is_some()&&self.decoder.complete()) {
+        if self.state != State::Reply
+            && !(self.state == State::Closed && self.token.is_some() && self.decoder.complete())
+        {
             return Err(Error::protocol("No reply to release"));
         }
         self.token = None;
         self.decoder.clear();
         self.expanded.clear();
-        if self.state!=State::Closed{self.state = State::Ready;}
+        if self.state != State::Closed {
+            self.state = State::Ready;
+        }
         Ok(())
     }
     pub fn poll_event(&mut self) -> Option<ConnectionEvent> {
@@ -399,12 +421,26 @@ impl Connection {
         }
         let unack = body
             .get("writeConcern")
-            .ok().flatten().and_then(|v|v.as_document())
-            .is_some_and(|d| d.get_i32("w").ok() == Some(0));
+            .ok()
+            .flatten()
+            .and_then(|v| v.as_document())
+            .is_some_and(|d| {
+                matches!(
+                    d.get("w"),
+                    Ok(Some(
+                        bson::raw::RawBsonRef::Int32(0) | bson::raw::RawBsonRef::Int64(0)
+                    ))
+                )
+            });
         self.send(body, sequences, if unack { wire::MORE_TO_COME } else { 0 })?;
         if unack {
-            self.token=Some(token);self.state=State::UnackSending;
-            self.deadline=if self.options.socket_timeout.is_zero(){None}else{Some(now+self.options.socket_timeout)};
+            self.token = Some(token);
+            self.state = State::UnackSending;
+            self.deadline = if self.options.socket_timeout.is_zero() {
+                None
+            } else {
+                Some(now + self.options.socket_timeout)
+            };
         } else {
             self.token = Some(token);
             self.state = State::Command;
@@ -418,16 +454,72 @@ impl Connection {
     }
     /// Sends an already encoded OP_MSG template with a fresh wire request id.
     /// Used by Operation to retain sequence storage and session identity on retries.
-    pub fn command_encoded(&mut self,token:u64,frame:&[u8],now:Instant)->Result<()> {
-        if self.state!=State::Ready||!self.tx.is_empty(){return Err(Error::protocol("Connection busy"));}
-        let message=Message::parse(frame,self.max_message_size)?;
-        if message.flags!=0||message.body.get_str("$db").is_err(){return Err(Error::protocol("Operation template requires $db and no wire flags"));}
-        if message.body.as_bytes().len()>self.max_bson_size{return Err(Error::protocol("Command exceeds maxBsonObjectSize"));}
-        for seq in message.sequences(){let mut n=0;for d in seq.documents(){n+=1;if n>self.max_write_batch_size||d.as_bytes().len()>self.max_bson_size{return Err(Error::protocol("Write sequence exceeds server limits"));}}}
-        let command=message.body.iter_elements().next().transpose().map_err(|_|Error::protocol("Invalid command"))?.ok_or_else(||Error::protocol("Empty command"))?;
-        self.tx.clear();self.tx.extend_from_slice(frame);self.request_id=self.request_id.wrapping_add(1).max(1);self.expected=self.request_id;self.tx[4..8].copy_from_slice(&self.request_id.to_le_bytes());self.tx_at=0;
-        if let Err(e)=self.compress(command.key().as_str()){self.tx.clear();return Err(e);}
-        self.token=Some(token);self.state=State::Command;self.deadline=if self.options.socket_timeout.is_zero(){None}else{Some(now+self.options.socket_timeout)};Ok(())
+    pub fn command_encoded(&mut self, token: u64, frame: &[u8], now: Instant) -> Result<()> {
+        if self.state != State::Ready || !self.tx.is_empty() {
+            return Err(Error::protocol("Connection busy"));
+        }
+        let message = Message::parse(frame, self.max_message_size)?;
+        if message.flags != 0 || message.body.get_str("$db").is_err() {
+            return Err(Error::protocol(
+                "Operation template requires $db and no wire flags",
+            ));
+        }
+        if message
+            .body
+            .get("writeConcern")
+            .ok()
+            .flatten()
+            .and_then(|v| v.as_document())
+            .is_some_and(|d| {
+                matches!(
+                    d.get("w"),
+                    Ok(Some(
+                        bson::raw::RawBsonRef::Int32(0) | bson::raw::RawBsonRef::Int64(0)
+                    ))
+                )
+            })
+        {
+            return Err(Error::protocol(
+                "Unacknowledged writes require Connection::command",
+            ));
+        }
+        if message.body.as_bytes().len() > self.max_bson_size {
+            return Err(Error::protocol("Command exceeds maxBsonObjectSize"));
+        }
+        for seq in message.sequences() {
+            let mut n = 0;
+            for d in seq.documents() {
+                n += 1;
+                if n > self.max_write_batch_size || d.as_bytes().len() > self.max_bson_size {
+                    return Err(Error::protocol("Write sequence exceeds server limits"));
+                }
+            }
+        }
+        let command = message
+            .body
+            .iter_elements()
+            .next()
+            .transpose()
+            .map_err(|_| Error::protocol("Invalid command"))?
+            .ok_or_else(|| Error::protocol("Empty command"))?;
+        self.tx.clear();
+        self.tx.extend_from_slice(frame);
+        self.request_id = self.request_id.wrapping_add(1).max(1);
+        self.expected = self.request_id;
+        self.tx[4..8].copy_from_slice(&self.request_id.to_le_bytes());
+        self.tx_at = 0;
+        if let Err(e) = self.compress(command.key().as_str()) {
+            self.tx.clear();
+            return Err(e);
+        }
+        self.token = Some(token);
+        self.state = State::Command;
+        self.deadline = if self.options.socket_timeout.is_zero() {
+            None
+        } else {
+            Some(now + self.options.socket_timeout)
+        };
+        Ok(())
     }
     pub fn next_timeout(&self) -> Option<Instant> {
         self.deadline

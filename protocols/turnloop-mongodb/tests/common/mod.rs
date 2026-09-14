@@ -106,7 +106,7 @@ impl Driver {
         }
         Ok(d)
     }
-    fn turn(&mut self) -> Result<()> {
+    pub fn turn(&mut self) -> Result<()> {
         while !self.core.transmit().is_empty() {
             let n = self.stream.write(self.core.transmit()).map_err(network)?;
             if n == 0 {
