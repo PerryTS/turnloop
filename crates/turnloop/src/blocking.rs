@@ -33,7 +33,6 @@ pub struct DnsRequest {
     pub port: u16,
 }
 pub(crate) enum WorkOutput {
-    #[cfg(not(target_arch = "wasm32"))]
     ExternalWait(crate::WaitResult),
     Blocking(Payload),
     Resolved(Vec<SocketAddr>),
@@ -44,17 +43,13 @@ pub(crate) struct WorkResult {
 }
 pub(crate) struct WorkPort {
     queue: Queue<WorkResult>,
-    #[cfg(not(target_arch = "wasm32"))]
     notifier: Notifier,
     closed: AtomicBool,
 }
 impl WorkPort {
     pub fn new(capacity: usize, notifier: Notifier) -> Arc<Self> {
-        #[cfg(target_arch = "wasm32")]
-        let _ = notifier;
         Arc::new(Self {
             queue: Queue::new(capacity.max(2).next_power_of_two()),
-            #[cfg(not(target_arch = "wasm32"))]
             notifier,
             closed: AtomicBool::new(false),
         })
@@ -68,7 +63,17 @@ impl WorkPort {
     pub fn close(&self) {
         self.closed.store(true, Ordering::Release);
     }
-    #[cfg(not(target_arch = "wasm32"))]
+    // The owning agent is already collecting this result. Do not leave a stale
+    // notification that would turn its next future deadline into a Now poll.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn complete_during_turn(&self, result: WorkResult) {
+        if !self.closed.load(Ordering::Acquire) {
+            assert!(
+                self.queue.push(result).is_ok(),
+                "local completion credit invariant"
+            );
+        }
+    }
     pub(crate) fn complete(&self, result: WorkResult) {
         if self.closed.load(Ordering::Acquire) {
             return;

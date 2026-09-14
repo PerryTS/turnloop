@@ -198,6 +198,29 @@ class Gates(unittest.TestCase):
                     installer.install('test', directory)
             self.assertFalse((directory/'tool').exists())
 
+    def test_web_fixture_rejects_missing_traffic_and_cleans_up(self):
+        import io
+        from web_fixture import WebFixture
+        traffic = {'fetches': 3, 'slow': 1, 'aborted': 1, 'websockets': 4, 'echoed': 6657}
+        fixture = WebFixture(None)
+        fixture.url = 'http://127.0.0.1:1'
+        with patch('web_fixture.urllib.request.urlopen', return_value=io.BytesIO(json.dumps(traffic).encode())):
+            fixture.verify(1)
+        for field in traffic:
+            bad = {**traffic, field: 0}
+            with self.subTest(field=field), patch('web_fixture.urllib.request.urlopen', return_value=io.BytesIO(json.dumps(bad).encode())):
+                with self.assertRaisesRegex(RuntimeError, 'subject did not run'):
+                    fixture.verify(1)
+        # A real fixture with no clients must fail and still be reaped.
+        import shutil
+        if not shutil.which('node'):
+            self.skipTest('real fixture cleanup requires Node; mocked traffic checks ran')
+        with self.assertRaisesRegex(RuntimeError, 'subject did not run'):
+            with WebFixture(ROOT / 'crates/turnloop-contract/tests/web/fixture.mjs') as live:
+                process = live.process
+                live.verify(1)
+        self.assertIsNotNone(process.poll())
+
     def test_queue_is_never_silently_weakened(self):
         lint = module('lint-workflows')
         source = (ROOT/'.github/workflows/ci.yml').read_text()
@@ -208,6 +231,47 @@ class Gates(unittest.TestCase):
             path.write_text(source.replace("'single' || 'max'", "'single' || 'single'"))
             with self.assertRaises(RuntimeError):
                 lint.check_queue(path)
+
+    def test_checked_tests_delivers_stdin_and_requires_execution(self):
+        import sys
+        runner = module('run-tests')
+        command = [sys.executable, '-c',
+                   'import sys; assert sys.stdin.read() == "fixture\\n"; print("test result: ok. 1 passed;")']
+        self.assertEqual(runner.checked_tests(command, cwd=ROOT, input_text='fixture\n'), 1)
+        with self.assertRaisesRegex(RuntimeError, 'positive passed-test count'):
+            runner.checked_tests([sys.executable, '-c', 'import sys; sys.stdin.read(); print("test result: ok. 0 passed;")'],
+                                 cwd=ROOT, input_text='fixture\n')
+
+    def test_wasi_runner_preserves_protocol_and_release_allocation_gates(self):
+        import sys
+        runner = module('run-tests')
+        packages = [package(name) for name in ('core', 'contract', 'http', 'decoder')]
+        for p, kind in zip(packages, ('core', 'contract', 'protocol', 'codec')):
+            p['manifest_path'] = str(ROOT / 'crates' / p['name'] / 'Cargo.toml')
+            p['metadata'] = {'turnloop-ci': {'role': kind, 'wasi-tests': ['subject']}}
+            p['targets'] = [{'name': name, 'kind': ['test']} for name in ('subject', 'allocations')]
+        packages[0]['metadata']['turnloop-ci'] = {'role': 'core', 'wasi-lib-tests': True}
+        packages[1]['metadata']['turnloop-ci']['wasi-allocation-tests'] = ['allocations']
+        data = dict(packages=packages, workspace_members=[p['id'] for p in packages], workspace_root=str(ROOT))
+        for suite in ('wasi', 'protocol-wasi'):
+            commands = []
+            original = runner.checked_tests
+            def execute(command, **kwargs):
+                commands.append((command, kwargs))
+                return original([sys.executable, '-c', 'import sys; sys.stdin.read(); print("test result: ok. 1 passed;")'], **kwargs)
+            with patch.object(sys, 'argv', ['run-tests.py', suite, '--target', 'wasm32-wasip3']), \
+                 patch.object(runner, 'metadata', return_value=data), \
+                 patch.object(runner, 'checked_tests', side_effect=execute):
+                runner.main()
+            names = [c[c.index('-p') + 1] for c, _ in commands]
+            if suite == 'protocol-wasi':
+                self.assertEqual(names, ['http', 'decoder'])
+            else:
+                self.assertEqual(names, ['core', 'contract', 'contract', 'contract'])
+                self.assertTrue(all('--all-features' in c for c, _ in commands))
+                self.assertEqual(['--release' in c for c, _ in commands], [True, False, True, True])
+                self.assertIn('allocations', commands[-1][0])
+                self.assertTrue(all(k['input_text'] == 'turnloop revision two stdin fixture\n' for _, k in commands[1:]))
 
 
 if __name__ == '__main__':

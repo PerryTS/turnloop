@@ -1,6 +1,9 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![forbid(unsafe_code)]
 //! Pull-driven MySQL protocol. The host owns transport, entropy, time and JS conversion.
+#[cfg(all(target_os = "wasi", target_env = "p3"))]
+use turnloop_wasi_random as _;
+
 use bytes::BytesMut;
 use mysql_common::{
     auth::plugins::{

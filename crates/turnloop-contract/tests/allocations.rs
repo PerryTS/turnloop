@@ -1,3 +1,6 @@
+//! On p3, run this binary with --release. The pinned compiler's debug custom
+//! allocator traps in pre-main get-arguments lowering; see docs/wasm.md. CI
+//! requires release allocation counts and runs semantic/no-spin tests in both profiles.
 #![deny(unsafe_op_in_unsafe_fn)]
 #![cfg(all(
     not(loom),
@@ -6,22 +9,68 @@
         target_os = "linux",
         target_os = "android",
         target_os = "freebsd",
-        target_os = "windows"
+        target_os = "windows",
+        all(
+            target_os = "wasi",
+            any(
+                target_env = "p2",
+                all(target_env = "p3", feature = "wasi-p3-experimental")
+            )
+        )
     )
 ))]
 use std::{
     alloc::{GlobalAlloc, Layout, System},
-    cell::Cell,
     time::{Duration, Instant},
 };
 use turnloop::*;
 struct Counting;
+#[cfg(not(target_os = "wasi"))]
+use std::cell::Cell;
+#[cfg(not(target_os = "wasi"))]
 thread_local! { static ACTIVE: Cell<bool> = const { Cell::new(false) }; static ALLOCS: Cell<usize> = const { Cell::new(0) }; }
+#[cfg(not(target_os = "wasi"))]
 fn record() {
     if ACTIVE.try_with(Cell::get).unwrap_or(false) {
         let _ = ALLOCS.try_with(|n| n.set(n.get() + 1));
     }
 }
+// WASI components have one agent. These counters also work before p3 std has
+// initialized its thread-local area, when the harness allocates argument strings.
+#[cfg(target_os = "wasi")]
+mod single_agent_counter {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    pub struct Active(AtomicBool);
+    pub struct Allocations(AtomicUsize);
+    pub static ACTIVE: Active = Active(AtomicBool::new(false));
+    pub static ALLOCS: Allocations = Allocations(AtomicUsize::new(0));
+    impl Active {
+        pub fn with<T>(&self, f: impl FnOnce(&Self) -> T) -> T {
+            f(self)
+        }
+        pub fn set(&self, value: bool) {
+            self.0.store(value, Ordering::Relaxed);
+        }
+    }
+    impl Allocations {
+        pub fn with<T>(&self, f: impl FnOnce(&Self) -> T) -> T {
+            f(self)
+        }
+        pub fn set(&self, value: usize) {
+            self.0.store(value, Ordering::Relaxed);
+        }
+        pub fn get(&self) -> usize {
+            self.0.load(Ordering::Relaxed)
+        }
+    }
+    pub fn record() {
+        if ACTIVE.0.load(Ordering::Relaxed) {
+            ALLOCS.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+#[cfg(target_os = "wasi")]
+use single_agent_counter::{ACTIVE, ALLOCS, record};
 // SAFETY: all allocation calls are forwarded unchanged to System. Counters only
 // access already initialized thread-local Cells and never allocate themselves.
 unsafe impl GlobalAlloc for Counting {
@@ -164,7 +213,7 @@ fn steady_read_write_timer_and_accept_allocate_nothing() {
         bytes += exchange(&mut l, a, b, &mut output, &mut out, true);
     }
     ACTIVE.with(|v| v.set(false));
-    let allocations = ALLOCS.with(Cell::get);
+    let allocations = ALLOCS.with(|n| n.get());
     assert_eq!(bytes, 128_000);
     assert_eq!(allocations, 0, "steady read/write/timer allocations");
     for _ in 0..3 {
@@ -177,7 +226,7 @@ fn steady_read_write_timer_and_accept_allocate_nothing() {
         timers += timer_batch(&mut l, &mut out);
     }
     ACTIVE.with(|v| v.set(false));
-    let allocations = ALLOCS.with(Cell::get);
+    let allocations = ALLOCS.with(|n| n.get());
     assert_eq!(timers, 10_000);
     assert_eq!(
         allocations, 0,
@@ -207,7 +256,7 @@ fn steady_read_write_timer_and_accept_allocate_nothing() {
             }
         }
         ACTIVE.with(|v| v.set(false));
-        let allocations = ALLOCS.with(Cell::get);
+        let allocations = ALLOCS.with(|n| n.get());
         if i > 0 {
             assert_eq!(allocations, 0, "steady accept allocations");
             accepted += 1;
@@ -277,12 +326,241 @@ fn cancellation_reserves_survive_a_full_event_backlog() {
         }
     }
     ACTIVE.with(|v| v.set(false));
-    let allocations = ALLOCS.with(Cell::get);
+    let allocations = ALLOCS.with(|n| n.get());
     assert!(timers > 0);
     assert_eq!((cancelled, closed, posts), (16, 16, 80));
     assert_eq!(allocations, 0, "cancel/close reserves under backpressure");
 }
 
+#[test]
+fn steady_udp_allocate_nothing() {
+    let mut l = Loop::new(Config::default()).expect("loop");
+    let addr = "127.0.0.1:0".parse().expect("address");
+    let a = l.udp_bind(addr, &UdpOpts::default()).expect("UDP a");
+    let b = l.udp_bind(addr, &UdpOpts::default()).expect("UDP b");
+    let to = l.local_addr(b).expect("destination");
+    static BYTES: [u8; 64] = [0x42; 64];
+    let mut out = Completions::default();
+    let mut bytes = 0;
+    let mut total = 0;
+    for i in 0..101 {
+        ALLOCS.with(|n| n.set(0));
+        ACTIVE.with(|v| v.set(i != 0));
+        l.recv(b, ReadBuf::Pooled, Token(1)).expect("receive");
+        // SAFETY: static immutable input stays alive through terminal completion.
+        let input = unsafe { IoBuf::from_raw_parts(BYTES.as_ptr(), BYTES.len()) };
+        l.send_to(a, WriteBuf::Provided(input), to, Token(2))
+            .expect("send");
+        let mut read = 0;
+        let mut wrote = 0;
+        let until = l.now() + Duration::from_secs(2);
+        while read != 64 || wrote != 64 {
+            assert!(l.now() < until);
+            l.turn(Timeout::Until(until), &mut out).expect("turn");
+            for c in out.drain() {
+                match c.result {
+                    OpResult::RecvFrom {
+                        n, lease: Some(b), ..
+                    } => {
+                        assert_eq!(b.as_slice(), BYTES);
+                        read += n;
+                    }
+                    OpResult::Wrote(n) => wrote += n,
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+        }
+        ACTIVE.with(|v| v.set(false));
+        if i != 0 {
+            bytes += read;
+            total += ALLOCS.with(|n| n.get());
+        }
+    }
+    assert_eq!(bytes, 6400, "UDP allocation subject ran");
+    assert_eq!(total, 0, "steady UDP allocations");
+}
+
+#[test]
+fn steady_deadline_poll_allocate_nothing() {
+    let mut l = Loop::new(Config::default()).expect("loop");
+    let mut out = Completions::default();
+    let mut expiries = 0;
+    ALLOCS.with(|n| n.set(0));
+    ACTIVE.with(|v| v.set(true));
+    for _ in 0..20 {
+        let at = l.now() + Duration::from_millis(2);
+        let h = l.timer(at, None, Token(3)).expect("timer");
+        while l.now() < at || expiries == 0 {
+            l.turn(Timeout::Until(at), &mut out).expect("deadline poll");
+            if out.iter().any(|c| matches!(c.result, OpResult::Timer)) {
+                expiries += 1;
+                break;
+            }
+        }
+        // A clock crossing between checks must still deliver the timer.
+        l.turn(Timeout::Now, &mut out).expect("deadline drain");
+        expiries += out
+            .iter()
+            .filter(|c| matches!(c.result, OpResult::Timer))
+            .count();
+        l.close(h, Token(4)).expect("close");
+        l.turn(Timeout::Now, &mut out).expect("close drain");
+    }
+    ACTIVE.with(|v| v.set(false));
+    assert_eq!(expiries, 20);
+    assert_eq!(ALLOCS.with(|n| n.get()), 0, "deadline poll return lists");
+}
+
+#[test]
+fn concurrent_udp_returns_survive_cancellation_and_loop_drop_without_allocating() {
+    const N: usize = 8;
+    const ROUNDS: usize = 20;
+    const LENGTHS: [usize; N] = [0, 1, 7, 64, 513, 2048, 4096, 8192];
+    let config = Config {
+        pooled_buffer_size: 65536,
+        pooled_buffers: 16,
+        ..Config::default()
+    };
+    let mut loops = [
+        Loop::new(config).expect("first loop"),
+        Loop::new(config).expect("second loop"),
+    ];
+    let mut outputs = [[0u8; 65536]; N];
+    // This Mac accepts 8 KiB datagrams and rejects 16 KiB with EMSGSIZE.
+    // The maximum canonical buffer size is exercised separately without the OS.
+    let payload: Vec<u8> = (0..8192).map(|i| (i % 251) as u8).collect();
+    let mut sockets = Vec::new();
+    for l in &mut loops {
+        let mut group = Vec::new();
+        for _ in 0..N {
+            let h = l
+                .udp_bind("[::1]:0".parse().expect("IPv6"), &UdpOpts::default())
+                .expect("UDP");
+            group.push((h, l.local_addr(h).expect("local address")));
+        }
+        sockets.push(group);
+    }
+    let mut out = Completions::with_capacity(1);
+    let mut received = 0;
+    let mut cancelled = 0;
+    let mut allocations = 0;
+    for round in 0..=ROUNDS {
+        ALLOCS.with(|n| n.set(0));
+        ACTIVE.with(|v| v.set(round != 0));
+        for (j, l) in loops.iter_mut().enumerate() {
+            for &(h, _) in &sockets[j] {
+                // Cancel an armed empty receive before queuing its successor.
+                let op = l
+                    .recv(h, ReadBuf::Pooled, Token(100))
+                    .expect("cancel receive");
+                l.turn(Timeout::Now, &mut out).expect("arm receive");
+                assert!(out.is_empty());
+                assert!(l.cancel(op));
+                l.turn(Timeout::Now, &mut out)
+                    .expect("cancel acknowledgement");
+                assert_eq!(out.len(), 1);
+                assert!(matches!(out[0].result, OpResult::Cancelled));
+                cancelled += usize::from(round != 0);
+            }
+            for (i, &(h, to)) in sockets[j].iter().enumerate() {
+                let buf = if j == 0 {
+                    // SAFETY: each receive owns its distinct fixed output until
+                    // all completions are drained below; storage never moves.
+                    ReadBuf::Provided(unsafe {
+                        IoBufMut::from_raw_parts(outputs[i].as_mut_ptr(), outputs[i].len())
+                    })
+                } else {
+                    ReadBuf::Pooled
+                };
+                l.recv(h, buf, Token(i as u64)).expect("receive");
+                // SAFETY: immutable retained payload lives until both loops drop.
+                let input = unsafe { IoBuf::from_raw_parts(payload.as_ptr(), LENGTHS[i]) };
+                l.send_to(h, WriteBuf::Provided(input), to, Token((N + i) as u64))
+                    .expect("send");
+            }
+        }
+        let mut seen = [[false; N * 2]; 2];
+        let mut completed = 0;
+        let until = Instant::now() + Duration::from_secs(5);
+        while completed < N * 4 {
+            assert!(Instant::now() < until, "UDP burst stalled");
+            for (j, l) in loops.iter_mut().enumerate() {
+                l.turn(Timeout::Now, &mut out).expect("interleave loops");
+                for c in out.drain() {
+                    let index = c.token.0 as usize;
+                    assert!(!seen[j][index], "duplicate UDP result");
+                    seen[j][index] = true;
+                    completed += 1;
+                    match c.result {
+                        OpResult::RecvFrom { n, from, lease } => {
+                            assert_eq!(n, LENGTHS[index]);
+                            assert_eq!(from, sockets[j][index].1);
+                            let bytes = lease
+                                .as_ref()
+                                .map_or(&outputs[index][..n], BufLease::as_slice);
+                            assert_eq!(bytes, &payload[..n]);
+                            received += usize::from(round != 0);
+                        }
+                        OpResult::Wrote(n) => assert_eq!(n, LENGTHS[index - N]),
+                        other => panic!("unexpected {other:?}"),
+                    }
+                }
+            }
+        }
+        ACTIVE.with(|v| v.set(false));
+        if round != 0 {
+            allocations += ALLOCS.with(|n| n.get());
+        }
+    }
+    assert_eq!(received, ROUNDS * N * 2);
+    assert_eq!(cancelled, ROUNDS * N * 2);
+    assert_eq!(allocations, 0, "concurrent canonical UDP return storage");
+    // Drop with multiple receives pending, then exercise a surviving/new loop.
+    for (j, l) in loops.iter_mut().enumerate() {
+        for &(h, _) in &sockets[j] {
+            l.recv(h, ReadBuf::Pooled, Token(200))
+                .expect("pending on drop");
+        }
+        l.turn(Timeout::Now, &mut out).expect("arm before drop");
+        assert!(out.is_empty());
+    }
+    let [first, mut second] = loops;
+    drop(first);
+    for &(h, _) in &sockets[1] {
+        second.close(h, Token(201)).expect("close surviving loop");
+    }
+    let mut cancellations = 0;
+    let mut closes = 0;
+    for _ in 0..N * 4 {
+        second.turn(Timeout::Now, &mut out).expect("surviving loop");
+        for c in out.drain() {
+            match c.result {
+                OpResult::Cancelled => cancellations += 1,
+                OpResult::Closed => closes += 1,
+                other => panic!("unexpected teardown {other:?}"),
+            }
+        }
+    }
+    assert_eq!((cancellations, closes), (N, N));
+    steady_udp_allocate_nothing();
+}
+
+#[cfg(target_env = "p3")]
+#[test]
+fn wasi_random_scalar_imports_allocate_nothing() {
+    let mut bytes = [0u8; 257];
+    ALLOCS.with(|n| n.set(0));
+    ACTIVE.with(|v| v.set(true));
+    for _ in 0..100 {
+        turnloop_wasi_random::fill_v03(&mut bytes).expect("entropy 0.3");
+        turnloop_wasi_random::fill_v04(&mut bytes).expect("entropy 0.4");
+        assert!(bytes.windows(2).any(|b| b[0] != b[1]));
+    }
+    ACTIVE.with(|v| v.set(false));
+    assert_eq!(ALLOCS.with(|n| n.get()), 0, "200 real entropy fills");
+}
+
+#[cfg(not(target_os = "wasi"))]
 #[test]
 fn ipc_handle_transfer_and_external_waits_allocate_nothing_after_setup() {
     let mut l = Loop::new(Config::default()).expect("loop");
@@ -351,7 +629,7 @@ fn ipc_handle_transfer_and_external_waits_allocate_nothing_after_setup() {
     }
     ACTIVE.with(|v| v.set(false));
     assert_eq!(
-        ALLOCS.with(Cell::get),
+        ALLOCS.with(|n| n.get()),
         0,
         "IPC and external waits steady allocations"
     );
@@ -360,6 +638,7 @@ fn ipc_handle_transfer_and_external_waits_allocate_nothing_after_setup() {
     std::fs::remove_file(path).expect("remove socket path");
 }
 
+#[cfg(not(target_os = "wasi"))]
 #[test]
 fn regular_file_jobs_reuse_pool_storage() {
     use std::io::{Seek, SeekFrom, Write};
@@ -431,7 +710,7 @@ fn regular_file_jobs_reuse_pool_storage() {
     }
     ACTIVE.with(|v| v.set(false));
     assert_eq!(
-        ALLOCS.with(Cell::get),
+        ALLOCS.with(|n| n.get()),
         0,
         "reusable file jobs allocate nothing"
     );
@@ -625,7 +904,7 @@ fn executor_steady_io_poll_and_sleep_allocate_nothing() {
     }
     ACTIVE.with(|v| v.set(false));
     assert_eq!(
-        ALLOCS.with(Cell::get),
+        ALLOCS.with(|n| n.get()),
         0,
         "executor steady I/O and timer polls allocate nothing"
     );
@@ -702,7 +981,146 @@ fn signal_exit_and_external_notification_delivery_allocate_nothing() {
         }
     }
     ACTIVE.with(|v| v.set(false));
-    assert_eq!(ALLOCS.with(Cell::get), 0, "service completion allocations");
+    assert_eq!(
+        ALLOCS.with(|n| n.get()),
+        0,
+        "service completion allocations"
+    );
     assert_eq!((exits, signals, waits), (16, 200, 200));
     l.signal_stop(signal, Token(4)).expect("stop");
+}
+
+#[cfg(target_os = "wasi")]
+#[test]
+fn single_agent_external_waits_allocate_nothing() {
+    let mut l = Loop::new(Config::default()).expect("loop");
+    let condition = WaitCondition::new(0).expect("condition setup");
+    let mut out = Completions::with_capacity(1);
+    let mut results = 0;
+    ALLOCS.with(|n| n.set(0));
+    ACTIVE.with(|v| v.set(true));
+    for _ in 0..200 {
+        for kind in 0..4 {
+            let op = l
+                .external_wait(&condition, u64::from(kind == 0), Some(l.now()), Token(kind))
+                .expect("wait");
+            if kind == 1 {
+                condition.notify();
+            }
+            if kind == 2 {
+                assert!(l.cancel(op));
+            }
+            l.turn(Timeout::Now, &mut out).expect("completion");
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].op, Some(op));
+            assert!(match kind {
+                0 => matches!(out[0].result, OpResult::ExternalWait(WaitResult::NotEqual)),
+                1 => matches!(out[0].result, OpResult::ExternalWait(WaitResult::Notified)),
+                2 => matches!(out[0].result, OpResult::Cancelled),
+                _ => matches!(out[0].result, OpResult::ExternalWait(WaitResult::TimedOut)),
+            });
+            results += 1;
+        }
+    }
+    ACTIVE.with(|v| v.set(false));
+    assert_eq!(
+        ALLOCS.with(|n| n.get()),
+        0,
+        "single-agent external wait allocations"
+    );
+    assert_eq!(results, 800);
+    assert!(!l.alive());
+}
+
+#[cfg(target_os = "wasi")]
+#[test]
+fn stdio_writes_reuse_stream_storage() {
+    let mut l = Loop::new(Config::default()).expect("loop");
+    let h = l.open_stdio(Stdio::Stderr).expect("stderr setup");
+    let mut out = Completions::with_capacity(1);
+    let mut wrote = 0;
+    let mut allocations = 0;
+    for round in 0..101 {
+        ALLOCS.with(|n| n.set(0));
+        ACTIVE.with(|v| v.set(round != 0));
+        // SAFETY: static input lives until every completion and loop teardown.
+        let bytes = unsafe { IoBuf::from_raw_parts(b".".as_ptr(), 1) };
+        l.write(h, WriteBuf::Provided(bytes), Token(1))
+            .expect("stdio write");
+        let until = l.now() + Duration::from_secs(2);
+        loop {
+            assert!(l.now() < until);
+            l.turn(Timeout::Until(until), &mut out).expect("stdio turn");
+            if !out.is_empty() {
+                assert!(matches!(out[0].result, OpResult::Wrote(1)));
+                break;
+            }
+        }
+        ACTIVE.with(|v| v.set(false));
+        if round != 0 {
+            allocations += ALLOCS.with(|n| n.get());
+            wrote += 1;
+        }
+    }
+    assert_eq!(wrote, 100);
+    assert_eq!(allocations, 0, "steady stdio writes");
+}
+
+#[cfg(target_os = "wasi")]
+#[test]
+fn stdio_reads_reuse_caller_buffers_through_eof() {
+    let mut l = Loop::new(Config::default()).expect("loop");
+    let h = l.open_stdio(Stdio::Stdin).expect("stdin setup");
+    let expected = b"turnloop revision two stdin fixture\n";
+    let mut byte = [0u8; 1];
+    let mut out = Completions::with_capacity(1);
+    let mut allocations = 0;
+    let mut reads = 0;
+    for (i, &value) in expected.iter().enumerate() {
+        ALLOCS.with(|n| n.set(0));
+        ACTIVE.with(|v| v.set(i != 0));
+        // SAFETY: the one-byte caller region remains exclusive and fixed until
+        // the terminal read below; it is only inspected after acknowledgement.
+        let buf = unsafe { IoBufMut::from_raw_parts(byte.as_mut_ptr(), byte.len()) };
+        l.read(h, ReadBuf::Provided(buf), Token(1))
+            .expect("stdin read");
+        let until = l.now() + Duration::from_secs(2);
+        loop {
+            assert!(l.now() < until);
+            l.turn(Timeout::Until(until), &mut out).expect("stdin turn");
+            if !out.is_empty() {
+                assert!(matches!(
+                    out[0].result,
+                    OpResult::Read { n: 1, lease: None }
+                ));
+                break;
+            }
+        }
+        assert_eq!(byte[0], value);
+        ACTIVE.with(|v| v.set(false));
+        if i != 0 {
+            allocations += ALLOCS.with(|n| n.get());
+        }
+        reads += 1;
+    }
+    let mut eofs = 0;
+    ALLOCS.with(|n| n.set(0));
+    ACTIVE.with(|v| v.set(true));
+    for _ in 0..2 {
+        l.read(h, ReadBuf::Pooled, Token(2)).expect("EOF read");
+        let until = l.now() + Duration::from_secs(2);
+        loop {
+            assert!(l.now() < until);
+            l.turn(Timeout::Until(until), &mut out).expect("EOF turn");
+            if !out.is_empty() {
+                assert!(matches!(out[0].result, OpResult::Eof));
+                eofs += 1;
+                break;
+            }
+        }
+    }
+    ACTIVE.with(|v| v.set(false));
+    allocations += ALLOCS.with(|n| n.get());
+    assert_eq!((reads, eofs), (36, 2));
+    assert_eq!(allocations, 0, "stdio reads and repeated CLI EOF results");
 }

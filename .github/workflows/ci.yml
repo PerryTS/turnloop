@@ -163,7 +163,6 @@ jobs:
         run: |
           cargo +nightly-2026-08-20 clippy --locked --workspace --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks
           python3 scripts/ci/run-tests.py native
-  # PENDING wave 2: integrate WASI providers and nonzero shared contracts; retain failing gate.
   wasi:
     strategy:
       fail-fast: false
@@ -193,11 +192,16 @@ jobs:
           bash scripts/ci/install-wasmtime.sh
       - name: Install checksum-pinned wasm C compiler and archiver
         run: python3 scripts/ci/install-wasm-toolchain.py
-      - name: Lint and run actual WASI contracts
+      - name: Lint the complete WASI workspace
         run: |
           cargo +"$TOOLCHAIN" clippy --locked --workspace --all-targets --all-features --target "$TARGET" -- -D warnings -D clippy::undocumented_unsafe_blocks
-          python3 scripts/ci/run-tests.py wasi --target "$TARGET"
-  # PENDING wave 2: add browser/Node contract targets and metadata, then run both browsers.
+          cargo +"$TOOLCHAIN" clippy --locked --workspace --all-targets --all-features --release --target "$TARGET" -- -D warnings -D clippy::undocumented_unsafe_blocks
+      - name: Bare WASI clock measurement (release)
+        run: |
+          CARGO_TARGET_WASM32_WASIP2_RUNNER=scripts/ci/wasmtime-runner.sh CARGO_TARGET_WASM32_WASIP3_RUNNER=scripts/ci/wasmtime-runner.sh cargo +"$TOOLCHAIN" run --locked -p turnloop-contract --release --all-features --target "$TARGET" --example wasi_timer_baseline
+      - name: WASI debug and release contracts; mandatory release allocation gates
+        if: '!cancelled()'
+        run: python3 scripts/ci/run-tests.py wasi --target "$TARGET"
   web:
     runs-on: ubuntu-24.04
     permissions:
@@ -220,13 +224,14 @@ jobs:
         run: |
           rustup target add --toolchain nightly-2026-08-20 wasm32-unknown-unknown
           python3 scripts/ci/install-tools.py wasm-pack
-          google-chrome --version
-          firefox --version
+          python3 scripts/ci/install-web-tools.py
+          python3 scripts/ci/install-browsers.py
       - name: Install checksum-pinned wasm C compiler and archiver
         run: python3 scripts/ci/install-wasm-toolchain.py
       - name: Chrome and Firefox contracts
         run: python3 scripts/ci/run-tests.py web
       - name: Node subset
+        if: '!cancelled()'
         run: python3 scripts/ci/run-tests.py node
   protocol:
     runs-on: ubuntu-24.04

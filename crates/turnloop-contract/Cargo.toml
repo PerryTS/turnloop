@@ -9,6 +9,8 @@ publish = false
 
 [features]
 executor = ["turnloop/executor", "dep:futures-io"]
+wasi-p3-experimental = ["turnloop/wasi-p3-experimental"]
+web-worker = ["turnloop/web-worker"]
 
 [dependencies]
 turnloop.workspace = true
@@ -25,6 +27,35 @@ windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_UI_W
 
 [package.metadata.turnloop-ci]
 role = "contract"
+web-tests = ["browser"]
+node-tests = ["node"]
+web-tests-features = ["web-worker", "executor"]
+node-tests-features = ["web-worker", "executor"]
+web-fixture = "tests/web/fixture.mjs"
+wasi-tests = ["wasi"]
+wasi-allocation-tests = ["allocations"]
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dev-dependencies]
+wasm-bindgen = "=0.2.108"
+js-sys = "=0.3.85"
+wasm-bindgen-test = "=0.3.58"
+wasm-bindgen-futures = "=0.4.58"
+
+[[test]]
+name = "browser"
+path = "tests/web/browser.rs"
+
+[[test]]
+name = "node"
+path = "tests/web/node.rs"
+
+
+[target.'cfg(all(target_os = "wasi", target_env = "p2"))'.dev-dependencies]
+wasip2 = "=1.0.3"
+
+[target.'cfg(all(target_os = "wasi", target_env = "p3"))'.dev-dependencies]
+turnloop-wasi-random.workspace = true
+bson.workspace = true
 
 [[bin]]
 name = "native_child"
