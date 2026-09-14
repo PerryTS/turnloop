@@ -1,0 +1,746 @@
+﻿2026-09-14T16:37:13.6692776Z Current runner version: '2.337.0'
+##[group]Runner Image Provisioner
+Hosted Compute Agent
+Version: 20260828.587
+Commit: abac92662cab4cc7352de4f9f9d2e2419aad9c29
+Build Date: 2026-08-28T16:44:25Z
+Worker ID: {60687912-33ab-450c-9abd-23f92bc5224c}
+Azure Region: westus3
+##[endgroup]
+##[group]Operating System
+Ubuntu
+24.04.5
+LTS
+##[endgroup]
+##[group]Runner Image
+Image: ubuntu-24.04
+Version: 20260907.300.1
+Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260907.300/images/ubuntu/Ubuntu2404-Readme.md
+Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260907.300
+##[endgroup]
+##[group]GITHUB_TOKEN Permissions
+Contents: read
+Metadata: read
+##[endgroup]
+Secret source: Actions
+Cache mode: write
+Prepare workflow directory
+Prepare all required actions
+Getting action download info
+Download action repository 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1' (SHA:3d3c42e5aac5ba805825da76410c181273ba90b1)
+Download action repository 'actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97' (SHA:5fda3b95a4ea91299a34e894583c3862153e4b97)
+Complete job name: protocol
+##[group]Checking docker version
+##[command]/usr/bin/docker version --format '{{.Server.APIVersion}}'
+'1.48'
+Docker daemon API version: '1.48'
+##[command]/usr/bin/docker version --format '{{.Client.APIVersion}}'
+'1.48'
+Docker client API version: '1.48'
+##[endgroup]
+##[group]Clean up resources from previous jobs
+##[command]/usr/bin/docker ps --all --quiet --no-trunc --filter "label=5f7929"
+##[command]/usr/bin/docker network prune --force --filter "label=5f7929"
+##[endgroup]
+##[group]Create local container network
+##[command]/usr/bin/docker network create --label 5f7929 github_network_6d283a320ab64d66b79b1e5ff9bf79ec
+f108bb2d85d0351d5d1a109db31a8bab66d523367222370d9f835874c90728ad
+##[endgroup]
+##[group]Starting postgres service container
+##[command]/usr/bin/docker pull postgres:16
+16: Pulling from library/postgres
+6310eb16bf42: Pulling fs layer
+4d710b756578: Pulling fs layer
+3fa541d8cac9: Pulling fs layer
+b3ffe1fd6e79: Pulling fs layer
+f122bc3261fc: Pulling fs layer
+5322d81b9b21: Pulling fs layer
+9bd242f25e75: Pulling fs layer
+9d1e9c1e61f4: Pulling fs layer
+48dd761b6bfe: Pulling fs layer
+00034b17b963: Pulling fs layer
+8a082189cfe1: Pulling fs layer
+988d57697ad2: Pulling fs layer
+9f809ec5ff35: Pulling fs layer
+af7708f26521: Pulling fs layer
+f122bc3261fc: Waiting
+5322d81b9b21: Waiting
+9bd242f25e75: Waiting
+9d1e9c1e61f4: Waiting
+48dd761b6bfe: Waiting
+00034b17b963: Waiting
+8a082189cfe1: Waiting
+988d57697ad2: Waiting
+9f809ec5ff35: Waiting
+af7708f26521: Waiting
+b3ffe1fd6e79: Waiting
+4d710b756578: Download complete
+3fa541d8cac9: Verifying Checksum
+3fa541d8cac9: Download complete
+6310eb16bf42: Download complete
+b3ffe1fd6e79: Download complete
+f122bc3261fc: Download complete
+5322d81b9b21: Verifying Checksum
+5322d81b9b21: Download complete
+9bd242f25e75: Verifying Checksum
+9bd242f25e75: Download complete
+9d1e9c1e61f4: Verifying Checksum
+9d1e9c1e61f4: Download complete
+00034b17b963: Verifying Checksum
+00034b17b963: Download complete
+8a082189cfe1: Verifying Checksum
+8a082189cfe1: Download complete
+988d57697ad2: Verifying Checksum
+988d57697ad2: Download complete
+9f809ec5ff35: Verifying Checksum
+9f809ec5ff35: Download complete
+48dd761b6bfe: Verifying Checksum
+48dd761b6bfe: Download complete
+af7708f26521: Download complete
+6310eb16bf42: Pull complete
+4d710b756578: Pull complete
+3fa541d8cac9: Pull complete
+b3ffe1fd6e79: Pull complete
+f122bc3261fc: Pull complete
+5322d81b9b21: Pull complete
+9bd242f25e75: Pull complete
+9d1e9c1e61f4: Pull complete
+48dd761b6bfe: Pull complete
+00034b17b963: Pull complete
+8a082189cfe1: Pull complete
+988d57697ad2: Pull complete
+9f809ec5ff35: Pull complete
+af7708f26521: Pull complete
+Digest: sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94
+Status: Downloaded newer image for postgres:16
+docker.io/library/postgres:16
+##[command]/usr/bin/docker create --name dae4fb3ec5bc492b9f7e73ffdb06084b_postgres16_af2c68 --label 5f7929 --network github_network_6d283a320ab64d66b79b1e5ff9bf79ec --network-alias postgres -p 5432:5432 --health-cmd "pg_isready -h 127.0.0.1 -U turnloop -d turnloop" --health-interval 5s --health-timeout 5s --health-retries 30 -e "POSTGRES_DB=turnloop" -e "POSTGRES_USER=turnloop" -e "POSTGRES_PASSWORD=turnloop" -e "POSTGRES_HOST_AUTH_METHOD=scram-sha-256" -e GITHUB_ACTIONS=true -e CI=true postgres:16
+63a4916ccf390861b46210bc84b5222ae81672ee0be2f117f284d8cb9cdaf797
+##[command]/usr/bin/docker start 63a4916ccf390861b46210bc84b5222ae81672ee0be2f117f284d8cb9cdaf797
+63a4916ccf390861b46210bc84b5222ae81672ee0be2f117f284d8cb9cdaf797
+##[command]/usr/bin/docker ps --all --filter id=63a4916ccf390861b46210bc84b5222ae81672ee0be2f117f284d8cb9cdaf797 --filter status=running --no-trunc --format "{{.ID}} {{.Status}}"
+63a4916ccf390861b46210bc84b5222ae81672ee0be2f117f284d8cb9cdaf797 Up Less than a second (health: starting)
+##[command]/usr/bin/docker port 63a4916ccf390861b46210bc84b5222ae81672ee0be2f117f284d8cb9cdaf797
+5432/tcp -> 0.0.0.0:5432
+5432/tcp -> [::]:5432
+##[endgroup]
+##[group]Starting mysql service container
+##[command]/usr/bin/docker pull mysql:9.6.0
+9.6.0: Pulling from library/mysql
+bb5107df7baa: Pulling fs layer
+e639cd467a97: Pulling fs layer
+84e79c47b301: Pulling fs layer
+c28152004afe: Pulling fs layer
+0c97bec1a348: Pulling fs layer
+e885080b838e: Pulling fs layer
+6497d062da4f: Pulling fs layer
+980d6178a910: Pulling fs layer
+664c1f1ffcc8: Pulling fs layer
+8faff6d2a6d2: Pulling fs layer
+e885080b838e: Waiting
+6497d062da4f: Waiting
+980d6178a910: Waiting
+8faff6d2a6d2: Waiting
+664c1f1ffcc8: Waiting
+c28152004afe: Waiting
+0c97bec1a348: Waiting
+e639cd467a97: Verifying Checksum
+e639cd467a97: Download complete
+84e79c47b301: Download complete
+bb5107df7baa: Verifying Checksum
+bb5107df7baa: Download complete
+0c97bec1a348: Download complete
+c28152004afe: Download complete
+e885080b838e: Verifying Checksum
+e885080b838e: Download complete
+980d6178a910: Verifying Checksum
+980d6178a910: Download complete
+6497d062da4f: Verifying Checksum
+6497d062da4f: Download complete
+8faff6d2a6d2: Verifying Checksum
+8faff6d2a6d2: Download complete
+664c1f1ffcc8: Verifying Checksum
+664c1f1ffcc8: Download complete
+bb5107df7baa: Pull complete
+e639cd467a97: Pull complete
+84e79c47b301: Pull complete
+c28152004afe: Pull complete
+0c97bec1a348: Pull complete
+e885080b838e: Pull complete
+6497d062da4f: Pull complete
+980d6178a910: Pull complete
+664c1f1ffcc8: Pull complete
+8faff6d2a6d2: Pull complete
+Digest: sha256:c5df04bee1a42b74a5841c6409e669cf62126cd0416f00c1cea8ab933b9361b9
+Status: Downloaded newer image for mysql:9.6.0
+docker.io/library/mysql:9.6.0
+##[command]/usr/bin/docker create --name dc90fa7b3b484bd4970a6970d77a1883_mysql960_3ff2be --label 5f7929 --network github_network_6d283a320ab64d66b79b1e5ff9bf79ec --network-alias mysql -p 3306:3306 --health-cmd "mysql --host=127.0.0.1 --user=turnloop --*** --execute 'SELECT 1'" --health-interval 5s --health-timeout 5s --health-retries 60 -e "MYSQL_DATABASE=turnloop" -e "MYSQL_USER=turnloop" -e "MYSQL_PASSWORD=turnloop" -e "MYSQL_ROOT_PASSWORD=turnloop-root" -e GITHUB_ACTIONS=true -e CI=true mysql:9.6.0
+af39fcaf90d31ffc45beab5c7cfd9aab6e698e192c5ace94457f24b468333f10
+##[command]/usr/bin/docker start af39fcaf90d31ffc45beab5c7cfd9aab6e698e192c5ace94457f24b468333f10
+af39fcaf90d31ffc45beab5c7cfd9aab6e698e192c5ace94457f24b468333f10
+##[command]/usr/bin/docker ps --all --filter id=af39fcaf90d31ffc45beab5c7cfd9aab6e698e192c5ace94457f24b468333f10 --filter status=running --no-trunc --format "{{.ID}} {{.Status}}"
+af39fcaf90d31ffc45beab5c7cfd9aab6e698e192c5ace94457f24b468333f10 Up Less than a second (health: starting)
+##[command]/usr/bin/docker port af39fcaf90d31ffc45beab5c7cfd9aab6e698e192c5ace94457f24b468333f10
+3306/tcp -> 0.0.0.0:3306
+3306/tcp -> [::]:3306
+##[endgroup]
+##[group]Waiting for all services to be ready
+##[command]/usr/bin/docker inspect --format="{{if .Config.Healthcheck}}{{print .State.Health.Status}}{{end}}" 63a4916ccf390861b46210bc84b5222ae81672ee0be2f117f284d8cb9cdaf797
+healthy
+postgres service is healthy.
+##[command]/usr/bin/docker inspect --format="{{if .Config.Healthcheck}}{{print .State.Health.Status}}{{end}}" af39fcaf90d31ffc45beab5c7cfd9aab6e698e192c5ace94457f24b468333f10
+starting
+mysql service is starting, waiting 2 seconds before checking again.
+##[command]/usr/bin/docker inspect --format="{{if .Config.Healthcheck}}{{print .State.Health.Status}}{{end}}" af39fcaf90d31ffc45beab5c7cfd9aab6e698e192c5ace94457f24b468333f10
+starting
+mysql service is starting, waiting 4 seconds before checking again.
+##[command]/usr/bin/docker inspect --format="{{if .Config.Healthcheck}}{{print .State.Health.Status}}{{end}}" af39fcaf90d31ffc45beab5c7cfd9aab6e698e192c5ace94457f24b468333f10
+starting
+mysql service is starting, waiting 7 seconds before checking again.
+##[command]/usr/bin/docker inspect --format="{{if .Config.Healthcheck}}{{print .State.Health.Status}}{{end}}" af39fcaf90d31ffc45beab5c7cfd9aab6e698e192c5ace94457f24b468333f10
+starting
+mysql service is starting, waiting 15 seconds before checking again.
+##[command]/usr/bin/docker inspect --format="{{if .Config.Healthcheck}}{{print .State.Health.Status}}{{end}}" af39fcaf90d31ffc45beab5c7cfd9aab6e698e192c5ace94457f24b468333f10
+healthy
+mysql service is healthy.
+##[endgroup]
+##[group]Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+with:
+  persist-credentials: false
+  repository: PerryTS/turnloop
+  token: ***
+  ssh-strict: true
+  ssh-user: git
+  clean: true
+  sparse-checkout-cone-mode: true
+  fetch-depth: 1
+  fetch-tags: false
+  show-progress: true
+  lfs: false
+  submodules: false
+  set-safe-directory: true
+  allow-unsafe-pr-checkout: false
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+##[endgroup]
+Syncing repository: PerryTS/turnloop
+##[group]Getting Git version info
+Working directory is '/home/runner/work/turnloop/turnloop'
+[command]/usr/bin/git version
+git version 2.55.0
+##[endgroup]
+Temporarily overriding HOME='/home/runner/work/_temp/3f57f320-3456-4099-92a8-9f20618425c8' before making global git config changes
+Adding repository directory to the temporary git global config as a safe directory
+[command]/usr/bin/git config --global --add safe.directory /home/runner/work/turnloop/turnloop
+Deleting the contents of '/home/runner/work/turnloop/turnloop'
+##[group]Determining repository object format
+##[endgroup]
+##[group]Initializing the repository
+[command]/usr/bin/git init /home/runner/work/turnloop/turnloop
+hint: Using 'master' as the name for the initial branch. This default branch name
+hint: will change to "main" in Git 3.0. To configure the initial branch name
+hint: to use in all of your new repositories, which will suppress this warning,
+hint: call:
+hint:
+hint: 	git config --global init.defaultBranch <name>
+hint:
+hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+hint: 'development'. The just-created branch can be renamed via this command:
+hint:
+hint: 	git branch -m <name>
+hint:
+hint: Disable this message with "git config set advice.defaultBranchName false"
+Initialized empty Git repository in /home/runner/work/turnloop/turnloop/.git/
+[command]/usr/bin/git remote add origin https://github.com/PerryTS/turnloop
+##[endgroup]
+##[group]Disabling automatic garbage collection
+[command]/usr/bin/git config --local gc.auto 0
+##[endgroup]
+##[group]Setting up auth
+Removing SSH command configuration
+[command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+Removing HTTP extra header
+[command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+Removing includeIf entries pointing to credentials config files
+[command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+[command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+[command]/usr/bin/git config --file /home/runner/work/_temp/git-credentials-37cfc75a-24b7-4e6b-a3a3-40e9310c529c.config http.https://github.com/.extraheader AUTHORIZATION: basic ***
+[command]/usr/bin/git config --local includeIf.gitdir:/home/runner/work/turnloop/turnloop/.git.path /home/runner/work/_temp/git-credentials-37cfc75a-24b7-4e6b-a3a3-40e9310c529c.config
+[command]/usr/bin/git config --local includeIf.gitdir:/home/runner/work/turnloop/turnloop/.git/worktrees/*.path /home/runner/work/_temp/git-credentials-37cfc75a-24b7-4e6b-a3a3-40e9310c529c.config
+[command]/usr/bin/git config --local includeIf.gitdir:/github/workspace/.git.path /github/runner_temp/git-credentials-37cfc75a-24b7-4e6b-a3a3-40e9310c529c.config
+[command]/usr/bin/git config --local includeIf.gitdir:/github/workspace/.git/worktrees/*.path /github/runner_temp/git-credentials-37cfc75a-24b7-4e6b-a3a3-40e9310c529c.config
+##[endgroup]
+##[group]Fetching the repository
+[command]/usr/bin/git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 origin +825bd322c215f5482351a9d840029929732f3537:refs/remotes/origin/main
+From https://github.com/PerryTS/turnloop
+ * [new ref]         825bd322c215f5482351a9d840029929732f3537 -> origin/main
+[command]/usr/bin/git branch --list --remote origin/main
+  origin/main
+[command]/usr/bin/git rev-parse refs/remotes/origin/main
+825bd322c215f5482351a9d840029929732f3537
+##[endgroup]
+##[group]Determining the checkout info
+##[endgroup]
+[command]/usr/bin/git sparse-checkout disable
+[command]/usr/bin/git config --local --unset-all extensions.worktreeConfig
+##[group]Checking out the ref
+[command]/usr/bin/git checkout --progress --force -B main refs/remotes/origin/main
+Switched to a new branch 'main'
+branch 'main' set up to track 'origin/main'.
+##[endgroup]
+[command]/usr/bin/git log -1 --format=%H
+825bd322c215f5482351a9d840029929732f3537
+##[group]Removing auth
+Removing SSH command configuration
+[command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+Removing HTTP extra header
+[command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+Removing includeIf entries pointing to credentials config files
+[command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+includeif.gitdir:/home/runner/work/turnloop/turnloop/.git.path
+includeif.gitdir:/home/runner/work/turnloop/turnloop/.git/worktrees/*.path
+includeif.gitdir:/github/workspace/.git.path
+includeif.gitdir:/github/workspace/.git/worktrees/*.path
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/home/runner/work/turnloop/turnloop/.git.path
+/home/runner/work/_temp/git-credentials-37cfc75a-24b7-4e6b-a3a3-40e9310c529c.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/home/runner/work/turnloop/turnloop/.git.path \/home\/runner\/work\/_temp\/git\-credentials\-37cfc75a\-24b7\-4e6b\-a3a3\-40e9310c529c\.config
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/home/runner/work/turnloop/turnloop/.git/worktrees/*.path
+/home/runner/work/_temp/git-credentials-37cfc75a-24b7-4e6b-a3a3-40e9310c529c.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/home/runner/work/turnloop/turnloop/.git/worktrees/*.path \/home\/runner\/work\/_temp\/git\-credentials\-37cfc75a\-24b7\-4e6b\-a3a3\-40e9310c529c\.config
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/github/workspace/.git.path
+/github/runner_temp/git-credentials-37cfc75a-24b7-4e6b-a3a3-40e9310c529c.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/github/workspace/.git.path \/github\/runner_temp\/git\-credentials\-37cfc75a\-24b7\-4e6b\-a3a3\-40e9310c529c\.config
+[command]/usr/bin/git config --local --get-all includeif.gitdir:/github/workspace/.git/worktrees/*.path
+/github/runner_temp/git-credentials-37cfc75a-24b7-4e6b-a3a3-40e9310c529c.config
+[command]/usr/bin/git config --local --unset includeif.gitdir:/github/workspace/.git/worktrees/*.path \/github\/runner_temp\/git\-credentials\-37cfc75a\-24b7\-4e6b\-a3a3\-40e9310c529c\.config
+[command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+Removing credentials config '/home/runner/work/_temp/git-credentials-37cfc75a-24b7-4e6b-a3a3-40e9310c529c.config'
+##[endgroup]
+##[group]Run actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+with:
+  python-version: 3.14
+  check-latest: false
+  token: ***
+  update-environment: true
+  allow-prereleases: false
+  freethreaded: false
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+##[endgroup]
+##[group]Installed versions
+Successfully set up CPython (3.14.7)
+##[endgroup]
+##[group]Run rustup toolchain install nightly-2026-08-20 --profile minimal --component rustfmt,clippy
+rustup toolchain install nightly-2026-08-20 --profile minimal --component rustfmt,clippy
+shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  pythonLocation: /opt/hostedtoolcache/Python/3.14.7/x64
+  PKG_CONFIG_PATH: /opt/hostedtoolcache/Python/3.14.7/x64/lib/pkgconfig
+  Python_ROOT_DIR: /opt/hostedtoolcache/Python/3.14.7/x64
+  Python2_ROOT_DIR: /opt/hostedtoolcache/Python/3.14.7/x64
+  Python3_ROOT_DIR: /opt/hostedtoolcache/Python/3.14.7/x64
+  LD_LIBRARY_PATH: /opt/hostedtoolcache/Python/3.14.7/x64/lib
+##[endgroup]
+info: syncing channel updates for nightly-2026-08-20-x86_64-unknown-linux-gnu
+info: latest update on 2026-08-20 for version 1.100.0-nightly (f7d782a3b 2026-08-19)
+info: downloading 5 components
+
+  nightly-2026-08-20-x86_64-unknown-linux-gnu installed - rustc 1.100.0-nightly (f7d782a3b 2026-08-19)
+
+##[group]Run sudo apt-get update
+sudo apt-get update
+sudo --preserve-env=DEBIAN_FRONTEND apt-get install --yes postfix
+shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  pythonLocation: /opt/hostedtoolcache/Python/3.14.7/x64
+  PKG_CONFIG_PATH: /opt/hostedtoolcache/Python/3.14.7/x64/lib/pkgconfig
+  Python_ROOT_DIR: /opt/hostedtoolcache/Python/3.14.7/x64
+  Python2_ROOT_DIR: /opt/hostedtoolcache/Python/3.14.7/x64
+  Python3_ROOT_DIR: /opt/hostedtoolcache/Python/3.14.7/x64
+  LD_LIBRARY_PATH: /opt/hostedtoolcache/Python/3.14.7/x64/lib
+  DEBIAN_FRONTEND: noninteractive
+##[endgroup]
+Get:1 https://packages.microsoft.com/ubuntu/24.04/prod noble InRelease [3600 B]
+Get:2 file:/etc/apt/apt-mirrors.txt Mirrorlist [144 B]
+Get:7 https://dl.google.com/linux/chrome-stable/deb stable InRelease [2548 B]
+Hit:3 http://azure.archive.ubuntu.com/ubuntu noble InRelease
+Get:4 http://azure.archive.ubuntu.com/ubuntu noble-updates InRelease [126 kB]
+Get:5 http://azure.archive.ubuntu.com/ubuntu noble-backports InRelease [126 kB]
+Get:6 http://azure.archive.ubuntu.com/ubuntu noble-security InRelease [126 kB]
+Get:8 https://packages.microsoft.com/ubuntu/24.04/prod noble/main arm64 Packages [415 kB]
+Get:9 https://packages.microsoft.com/ubuntu/24.04/prod noble/main amd64 Packages [464 kB]
+Get:10 https://dl.google.com/linux/chrome-stable/deb stable/main amd64 Packages [1410 B]
+Get:11 http://azure.archive.ubuntu.com/ubuntu noble-updates/main amd64 Packages [1263 kB]
+Get:12 http://azure.archive.ubuntu.com/ubuntu noble-updates/main Translation-en [292 kB]
+Get:13 http://azure.archive.ubuntu.com/ubuntu noble-updates/main amd64 Components [181 kB]
+Get:14 http://azure.archive.ubuntu.com/ubuntu noble-updates/universe amd64 Packages [1691 kB]
+Get:15 http://azure.archive.ubuntu.com/ubuntu noble-updates/universe Translation-en [339 kB]
+Get:16 http://azure.archive.ubuntu.com/ubuntu noble-updates/universe amd64 Components [388 kB]
+Get:17 http://azure.archive.ubuntu.com/ubuntu noble-updates/restricted amd64 Packages [1544 kB]
+Get:18 http://azure.archive.ubuntu.com/ubuntu noble-updates/restricted Translation-en [354 kB]
+Get:19 http://azure.archive.ubuntu.com/ubuntu noble-updates/multiverse amd64 Components [940 B]
+Get:20 http://azure.archive.ubuntu.com/ubuntu noble-backports/main amd64 Components [5772 B]
+Get:21 http://azure.archive.ubuntu.com/ubuntu noble-backports/universe amd64 Components [12.6 kB]
+Get:22 http://azure.archive.ubuntu.com/ubuntu noble-security/main amd64 Packages [1007 kB]
+Get:23 http://azure.archive.ubuntu.com/ubuntu noble-security/main Translation-en [213 kB]
+Get:24 http://azure.archive.ubuntu.com/ubuntu noble-security/main amd64 Components [46.4 kB]
+Get:25 http://azure.archive.ubuntu.com/ubuntu noble-security/universe amd64 Packages [1207 kB]
+Get:26 http://azure.archive.ubuntu.com/ubuntu noble-security/universe Translation-en [242 kB]
+Get:27 http://azure.archive.ubuntu.com/ubuntu noble-security/universe amd64 Components [76.3 kB]
+Get:28 http://azure.archive.ubuntu.com/ubuntu noble-security/restricted amd64 Packages [1445 kB]
+Get:29 http://azure.archive.ubuntu.com/ubuntu noble-security/restricted Translation-en [336 kB]
+Fetched 11.9 MB in 1s (8154 kB/s)
+Reading package lists...
+Reading package lists...
+Building dependency tree...
+Reading state information...
+The following additional packages will be installed:
+  libnsl2
+Suggested packages:
+  mail-reader postfix-cdb postfix-doc postfix-ldap postfix-lmdb
+  postfix-mta-sts-resolver postfix-mysql postfix-pcre postfix-pgsql
+  postfix-sqlite procmail sasl2-bin | dovecot-common
+The following NEW packages will be installed:
+  libnsl2 postfix
+0 upgraded, 2 newly installed, 0 to remove and 52 not upgraded.
+Need to get 1296 kB of archives.
+After this operation, 4321 kB of additional disk space will be used.
+Get:1 file:/etc/apt/apt-mirrors.txt Mirrorlist [144 B]
+Get:2 http://azure.archive.ubuntu.com/ubuntu noble/main amd64 libnsl2 amd64 1.3.0-3build3 [41.4 kB]
+Get:3 http://azure.archive.ubuntu.com/ubuntu noble-updates/main amd64 postfix amd64 3.8.6-1ubuntu0.1 [1255 kB]
+Preconfiguring packages ...
+Fetched 1296 kB in 0s (8965 kB/s)
+Selecting previously unselected package libnsl2:amd64.
+(Reading database ... 
+(Reading database ... 5%
+(Reading database ... 10%
+(Reading database ... 15%
+(Reading database ... 20%
+(Reading database ... 25%
+(Reading database ... 30%
+(Reading database ... 35%
+(Reading database ... 40%
+(Reading database ... 45%
+(Reading database ... 50%
+(Reading database ... 55%
+(Reading database ... 60%
+(Reading database ... 65%
+(Reading database ... 70%
+(Reading database ... 75%
+(Reading database ... 80%
+(Reading database ... 85%
+(Reading database ... 90%
+(Reading database ... 95%
+(Reading database ... 100%
+(Reading database ... 201818 files and directories currently installed.)
+Preparing to unpack .../libnsl2_1.3.0-3build3_amd64.deb ...
+Unpacking libnsl2:amd64 (1.3.0-3build3) ...
+Selecting previously unselected package postfix.
+Preparing to unpack .../postfix_3.8.6-1ubuntu0.1_amd64.deb ...
+Unpacking postfix (3.8.6-1ubuntu0.1) ...
+Setting up libnsl2:amd64 (1.3.0-3build3) ...
+Setting up postfix (3.8.6-1ubuntu0.1) ...
+info: Selecting GID from range 100 to 999 ...
+info: Adding group `postfix' (GID 119) ...
+info: Selecting UID from range 100 to 999 ...
+
+info: Adding system user `postfix' (UID 113) ...
+info: Adding new user `postfix' (UID 113) with group `postfix' ...
+info: Not creating home directory `/var/spool/postfix'.
+Creating /etc/postfix/dynamicmaps.cf
+info: Selecting GID from range 100 to 999 ...
+info: Adding group `postdrop' (GID 120) ...
+setting myhostname: runnervmlun5p.w5ngvgy0pwqurl50mi0t4kj3xh.phxx.internal.cloudapp.net
+setting alias maps
+setting alias database
+changing /etc/mailname to runnervmlun5p.w5ngvgy0pwqurl50mi0t4kj3xh.phxx.internal.cloudapp.net
+setting myorigin
+setting destinations: $myhostname, runnervmlun5p.w5ngvgy0pwqurl50mi0t4kj3xh.phxx.internal.cloudapp.net, localhost.w5ngvgy0pwqurl50mi0t4kj3xh.phxx.internal.cloudapp.net, , localhost
+setting relayhost: 
+setting mynetworks: 127.0.0.0/8 [::ffff:127.0.0.0]/104 [::1]/128
+setting mailbox_size_limit: 0
+setting recipient_delimiter: +
+setting inet_interfaces: all
+setting inet_protocols: all
+/etc/aliases does not exist, creating it.
+WARNING: /etc/aliases exists, but does not have a root alias.
+
+Postfix (main.cf) is now set up with a default configuration.  If you need to 
+make changes, edit /etc/postfix/main.cf (and others) as needed.  To view 
+Postfix configuration values, see postconf(1).
+
+After modifying main.cf, be sure to run 'systemctl reload postfix'.
+
+Running newaliases
+Created symlink /etc/systemd/system/multi-user.target.wants/postfix.service → /usr/lib/systemd/system/postfix.service.
+
+Processing triggers for rsyslog (8.2312.0-3ubuntu9.3) ...
+Processing triggers for ufw (0.36.2-6) ...
+Processing triggers for man-db (2.12.0-4build2) ...
+Not building database; man-db/auto-update is not 'true'.
+Processing triggers for libc-bin (2.39-0ubuntu8.8) ...
+
+Running kernel seems to be up-to-date.
+
+No services need to be restarted.
+
+No containers need to be restarted.
+
+No user sessions are running outdated binaries.
+
+No VM guests are running outdated hypervisor (qemu) binaries on this host.
+##[group]Run scripts/test-servers.py --ci-services run python3 scripts/ci/run-tests.py protocol
+scripts/test-servers.py --ci-services run python3 scripts/ci/run-tests.py protocol
+shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  pythonLocation: /opt/hostedtoolcache/Python/3.14.7/x64
+  PKG_CONFIG_PATH: /opt/hostedtoolcache/Python/3.14.7/x64/lib/pkgconfig
+  Python_ROOT_DIR: /opt/hostedtoolcache/Python/3.14.7/x64
+  Python2_ROOT_DIR: /opt/hostedtoolcache/Python/3.14.7/x64
+  Python3_ROOT_DIR: /opt/hostedtoolcache/Python/3.14.7/x64
+  LD_LIBRARY_PATH: /opt/hostedtoolcache/Python/3.14.7/x64/lib
+  POSTGRES_CONTAINER: 63a4916ccf390861b46210bc84b5222ae81672ee0be2f117f284d8cb9cdaf797
+  MYSQL_CONTAINER: af39fcaf90d31ffc45beab5c7cfd9aab6e698e192c5ace94457f24b468333f10
+##[endgroup]
+DO
+SET
+ALTER ROLE
+ALTER ROLE
+ALTER ROLE
+SET
+ALTER ROLE
+GRANT
+ALTER SYSTEM
+ALTER SYSTEM
+ALTER SYSTEM
+ pg_reload_conf 
+----------------
+ t
+(1 row)
+
+af39fcaf90d31ffc45beab5c7cfd9aab6e698e192c5ace94457f24b468333f10
+ ?column? 
+----------
+        1
+(1 row)
+
+1
+1
+Traceback (most recent call last):
+  File "/home/runner/work/turnloop/turnloop/scripts/test-servers.py", line 270, in redis_start
+    redis_wait_port(value, process)
+    ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^
+  File "/home/runner/work/turnloop/turnloop/scripts/test-servers.py", line 227, in redis_wait_port
+    raise RuntimeError(f'Redis did not start on {value}')
+RuntimeError: Redis did not start on 40680
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/home/runner/work/turnloop/turnloop/scripts/test-servers.py", line 635, in <module>
+    sys.exit(main())
+             ~~~~^^
+  File "/home/runner/work/turnloop/turnloop/scripts/test-servers.py", line 530, in main
+    env = start_all()
+  File "/home/runner/work/turnloop/turnloop/scripts/test-servers.py", line 495, in start_all
+    env.update(redis_start())
+               ~~~~~~~~~~~^^
+  File "/home/runner/work/turnloop/turnloop/scripts/test-servers.py", line 285, in redis_start
+    redis_stop()
+    ~~~~~~~~~~^^
+  File "/home/runner/work/turnloop/turnloop/scripts/test-servers.py", line 319, in redis_stop
+##[error]    raise RuntimeError('Private Redis did not stop; instance file retained')
+RuntimeError: Private Redis did not stop; instance file retained
+##[error]Process completed with exit code 1.
+##[group]Run scripts/test-servers.py --ci-services stop
+scripts/test-servers.py --ci-services stop
+shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  pythonLocation: /opt/hostedtoolcache/Python/3.14.7/x64
+  PKG_CONFIG_PATH: /opt/hostedtoolcache/Python/3.14.7/x64/lib/pkgconfig
+  Python_ROOT_DIR: /opt/hostedtoolcache/Python/3.14.7/x64
+  Python2_ROOT_DIR: /opt/hostedtoolcache/Python/3.14.7/x64
+  Python3_ROOT_DIR: /opt/hostedtoolcache/Python/3.14.7/x64
+  LD_LIBRARY_PATH: /opt/hostedtoolcache/Python/3.14.7/x64/lib
+##[endgroup]
+Post job cleanup.
+[command]/usr/bin/git version
+git version 2.55.0
+Temporarily overriding HOME='/home/runner/work/_temp/8f2dedd2-c4d1-4ec5-81c4-b230be774f01' before making global git config changes
+Adding repository directory to the temporary git global config as a safe directory
+[command]/usr/bin/git config --global --add safe.directory /home/runner/work/turnloop/turnloop
+Removing SSH command configuration
+[command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+Removing HTTP extra header
+[command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+[command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+Removing includeIf entries pointing to credentials config files
+[command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+[command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+Print service container logs: dae4fb3ec5bc492b9f7e73ffdb06084b_postgres16_af2c68
+##[command]/usr/bin/docker logs --details 63a4916ccf390861b46210bc84b5222ae81672ee0be2f117f284d8cb9cdaf797
+ The files belonging to this database system will be owned by user "postgres".
+ initdb: warning: enabling "trust" authentication for local connections
+ This user must also own the server process.
+ initdb: hint: You can change this by editing pg_hba.conf or using the option -A, or --auth-local and --auth-host, the next time you run initdb.
+ 2026-09-14 16:37:31.149 UTC [1] LOG:  starting PostgreSQL 16.15 (Debian 16.15-1.pgdg13+2) on x86_64-pc-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit
+ 2026-09-14 16:37:31.150 UTC [1] LOG:  listening on IPv4 address "0.0.0.0", port 5432
+ 2026-09-14 16:37:31.150 UTC [1] LOG:  listening on IPv6 address "::", port 5432
+ 2026-09-14 16:37:31.207 UTC [1] LOG:  listening on Unix socket "/var/run/postgresql/.s.PGSQL.5432"
+ 2026-09-14 16:37:31.210 UTC [64] LOG:  database system was shut down at 2026-09-14 16:37:31 UTC
+ 2026-09-14 16:37:31.214 UTC [1] LOG:  database system is ready to accept connections
+ 2026-09-14 16:38:48.773 UTC [1] LOG:  received SIGHUP, reloading configuration files
+ 2026-09-14 16:38:48.774 UTC [1] LOG:  parameter "ssl" changed to "on"
+ 2026-09-14 16:38:50.573 UTC [230] FATAL:  no pg_hba.conf entry for host "127.0.0.1", user "turnloop", database "turnloop", SSL encryption
+ 2026-09-14 16:38:50.576 UTC [231] FATAL:  no pg_hba.conf entry for host "127.0.0.1", user "turnloop", database "turnloop", no encryption
+ 2026-09-14 16:38:55.635 UTC [246] FATAL:  no pg_hba.conf entry for host "127.0.0.1", user "turnloop", database "turnloop", SSL encryption
+ 2026-09-14 16:38:55.636 UTC [247] FATAL:  no pg_hba.conf entry for host "127.0.0.1", user "turnloop", database "turnloop", no encryption
+ 2026-09-14 16:39:00.696 UTC [255] FATAL:  no pg_hba.conf entry for host "127.0.0.1", user "turnloop", database "turnloop", SSL encryption
+ 2026-09-14 16:39:00.697 UTC [256] FATAL:  no pg_hba.conf entry for host "127.0.0.1", user "turnloop", database "turnloop", no encryption
+ 2026-09-14 16:39:05.753 UTC [264] FATAL:  no pg_hba.conf entry for host "127.0.0.1", user "turnloop", database "turnloop", SSL encryption
+ 2026-09-14 16:39:05.754 UTC [265] FATAL:  no pg_hba.conf entry for host "127.0.0.1", user "turnloop", database "turnloop", no encryption
+ 
+ The database cluster will be initialized with locale "en_US.utf8".
+ The default database encoding has accordingly been set to "UTF8".
+ The default text search configuration will be set to "english".
+ 
+ Data page checksums are disabled.
+ 
+ fixing permissions on existing directory /var/lib/postgresql/data ... ok
+ creating subdirectories ... ok
+ selecting dynamic shared memory implementation ... posix
+ selecting default max_connections ... 100
+ selecting default shared_buffers ... 128MB
+ selecting default time zone ... Etc/UTC
+ creating configuration files ... ok
+ running bootstrap script ... ok
+ performing post-bootstrap initialization ... ok
+ syncing data to disk ... ok
+ 
+ 
+ Success. You can now start the database server using:
+ 
+     pg_ctl -D /var/lib/postgresql/data -l logfile start
+ 
+ waiting for server to start....2026-09-14 16:37:30.715 UTC [48] LOG:  starting PostgreSQL 16.15 (Debian 16.15-1.pgdg13+2) on x86_64-pc-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit
+ 2026-09-14 16:37:30.716 UTC [48] LOG:  listening on Unix socket "/var/run/postgresql/.s.PGSQL.5432"
+ 2026-09-14 16:37:30.718 UTC [51] LOG:  database system was shut down at 2026-09-14 16:37:30 UTC
+ 2026-09-14 16:37:30.721 UTC [48] LOG:  database system is ready to accept connections
+  done
+ server started
+ CREATE DATABASE
+ 
+ 
+ /usr/local/bin/docker-entrypoint.sh: ignoring /docker-entrypoint-initdb.d/*
+ 
+ 2026-09-14 16:37:30.897 UTC [48] LOG:  received fast shutdown request
+ waiting for server to shut down....2026-09-14 16:37:30.897 UTC [48] LOG:  aborting any active transactions
+ 2026-09-14 16:37:30.898 UTC [48] LOG:  background worker "logical replication launcher" (PID 54) exited with exit code 1
+ 2026-09-14 16:37:30.899 UTC [49] LOG:  shutting down
+ 2026-09-14 16:37:30.900 UTC [49] LOG:  checkpoint starting: shutdown immediate
+ 2026-09-14 16:37:31.034 UTC [49] LOG:  checkpoint complete: wrote 926 buffers (5.7%); 0 WAL file(s) added, 0 removed, 0 recycled; write=0.090 s, sync=0.044 s, total=0.135 s; sync files=301, longest=0.018 s, average=0.001 s; distance=4273 kB, estimate=4273 kB; lsn=0/191F0F0, redo lsn=0/191F0F0
+ 2026-09-14 16:37:31.042 UTC [48] LOG:  database system is shut down
+  done
+ server stopped
+ 
+ PostgreSQL init process complete; ready for start up.
+ 
+Stop and remove container: dae4fb3ec5bc492b9f7e73ffdb06084b_postgres16_af2c68
+##[command]/usr/bin/docker rm --force 63a4916ccf390861b46210bc84b5222ae81672ee0be2f117f284d8cb9cdaf797
+63a4916ccf390861b46210bc84b5222ae81672ee0be2f117f284d8cb9cdaf797
+Print service container logs: dc90fa7b3b484bd4970a6970d77a1883_mysql960_3ff2be
+##[command]/usr/bin/docker logs --details af39fcaf90d31ffc45beab5c7cfd9aab6e698e192c5ace94457f24b468333f10
+ 2026-09-14T16:37:48.006311Z 0 [System] [MY-015017] [Server] MySQL Server Initialization - start.
+ 2026-09-14T16:37:48.007419Z 0 [System] [MY-013169] [Server] /usr/sbin/mysqld (mysqld 9.6.0) initializing of server in progress as process 80
+ 2026-09-14T16:37:48.011660Z 1 [System] [MY-013576] [InnoDB] InnoDB initialization has started.
+ 2026-09-14 16:37:47+00:00 [Note] [Entrypoint]: Entrypoint script for MySQL Server 9.6.0-1.el9 started.
+ 2026-09-14T16:37:48.593175Z 1 [System] [MY-013577] [InnoDB] InnoDB initialization has ended.
+ 2026-09-14 16:37:47+00:00 [Note] [Entrypoint]: Switching to dedicated user 'mysql'
+ 2026-09-14T16:37:49.648326Z 6 [Warning] [MY-010453] [Server] root@localhost is created with an empty password ! Please consider switching off the --initialize-insecure option.
+ 2026-09-14T16:37:51.379838Z 0 [System] [MY-015018] [Server] MySQL Server Initialization - end.
+ 2026-09-14T16:37:51.423269Z 0 [System] [MY-015015] [Server] MySQL Server - start.
+ 2026-09-14T16:37:51.596197Z 0 [System] [MY-010116] [Server] /usr/sbin/mysqld (mysqld 9.6.0) starting as process 117
+ 2026-09-14T16:37:51.596212Z 0 [System] [MY-015590] [Server] MySQL Server has access to 4 logical CPUs.
+ 2026-09-14T16:37:51.596221Z 0 [System] [MY-015590] [Server] MySQL Server has access to 16766414848 bytes of physical memory.
+ 2026-09-14T16:37:51.604866Z 1 [System] [MY-013576] [InnoDB] InnoDB initialization has started.
+ 2026-09-14T16:37:52.695792Z 1 [System] [MY-013577] [InnoDB] InnoDB initialization has ended.
+ 2026-09-14 16:37:47+00:00 [Note] [Entrypoint]: Entrypoint script for MySQL Server 9.6.0-1.el9 started.
+ 2026-09-14 16:37:47+00:00 [Note] [Entrypoint]: Initializing database files
+ 2026-09-14 16:37:51+00:00 [Note] [Entrypoint]: Database files initialized
+ 2026-09-14 16:37:51+00:00 [Note] [Entrypoint]: Starting temporary server
+ 2026-09-14 16:37:52+00:00 [Note] [Entrypoint]: Temporary server started.
+ '/var/lib/mysql/mysql.sock' -> '/var/run/mysqld/mysqld.sock'
+ 2026-09-14 16:37:54+00:00 [Note] [Entrypoint]: Creating database turnloop
+ 2026-09-14 16:37:54+00:00 [Note] [Entrypoint]: Creating user turnloop
+ 2026-09-14 16:37:54+00:00 [Note] [Entrypoint]: Giving user turnloop access to schema turnloop
+ 
+ 2026-09-14 16:37:54+00:00 [Note] [Entrypoint]: Stopping temporary server
+ 2026-09-14 16:37:56+00:00 [Note] [Entrypoint]: Temporary server stopped
+ 
+ 2026-09-14 16:37:56+00:00 [Note] [Entrypoint]: MySQL init process done. Ready for start up.
+ 
+ 2026-09-14 16:38:50+00:00 [Note] [Entrypoint]: Entrypoint script for MySQL Server 9.6.0-1.el9 started.
+ 2026-09-14 16:38:50+00:00 [Note] [Entrypoint]: Switching to dedicated user 'mysql'
+ 2026-09-14 16:38:50+00:00 [Note] [Entrypoint]: Entrypoint script for MySQL Server 9.6.0-1.el9 started.
+ '/var/lib/mysql/mysql.sock' -> '/var/run/mysqld/mysqld.sock'
+ 2026-09-14T16:37:52.942946Z 0 [Warning] [MY-010068] [Server] CA certificate ca.pem is self signed.
+ 2026-09-14T16:37:52.942978Z 0 [System] [MY-013602] [Server] Channel mysql_main configured to support TLS. Encrypted connections are now supported for this channel.
+ 2026-09-14T16:37:52.964888Z 0 [Warning] [MY-011810] [Server] Insecure configuration for --pid-file: Location '/var/run/mysqld' in the path is accessible to all OS users. Consider choosing a different directory.
+ 2026-09-14T16:37:52.979290Z 0 [System] [MY-011323] [Server] X Plugin ready for connections. Socket: /var/run/mysqld/mysqlx.sock
+ 2026-09-14T16:37:52.979386Z 0 [System] [MY-010931] [Server] /usr/sbin/mysqld: ready for connections. Version: '9.6.0'  socket: '/var/run/mysqld/mysqld.sock'  port: 0  MySQL Community Server - GPL.
+ Warning: Unable to load '/usr/share/zoneinfo/iso3166.tab' as time zone. Skipping it.
+ Warning: Unable to load '/usr/share/zoneinfo/leap-seconds.list' as time zone. Skipping it.
+ Warning: Unable to load '/usr/share/zoneinfo/leapseconds' as time zone. Skipping it.
+ Warning: Unable to load '/usr/share/zoneinfo/tzdata.zi' as time zone. Skipping it.
+ Warning: Unable to load '/usr/share/zoneinfo/zone.tab' as time zone. Skipping it.
+ Warning: Unable to load '/usr/share/zoneinfo/zone1970.tab' as time zone. Skipping it.
+ 2026-09-14T16:37:54.826963Z 14 [System] [MY-013172] [Server] Received SHUTDOWN from user root. Shutting down mysqld (Version: 9.6.0).
+ 2026-09-14T16:37:55.920743Z 0 [System] [MY-010910] [Server] /usr/sbin/mysqld: Shutdown complete (mysqld 9.6.0)  MySQL Community Server - GPL.
+ 2026-09-14T16:37:55.920757Z 0 [System] [MY-015016] [Server] MySQL Server - end.
+ 2026-09-14T16:37:56.843255Z 0 [System] [MY-015015] [Server] MySQL Server - start.
+ 2026-09-14T16:37:57.016607Z 0 [System] [MY-010116] [Server] /usr/sbin/mysqld (mysqld 9.6.0) starting as process 1
+ 2026-09-14T16:37:57.016620Z 0 [System] [MY-015590] [Server] MySQL Server has access to 4 logical CPUs.
+ 2026-09-14T16:37:57.016629Z 0 [System] [MY-015590] [Server] MySQL Server has access to 16766414848 bytes of physical memory.
+ 2026-09-14T16:37:57.021323Z 1 [System] [MY-013576] [InnoDB] InnoDB initialization has started.
+ 2026-09-14T16:37:58.376599Z 1 [System] [MY-013577] [InnoDB] InnoDB initialization has ended.
+ 2026-09-14T16:37:58.824472Z 0 [Warning] [MY-010068] [Server] CA certificate ca.pem is self signed.
+ 2026-09-14T16:37:58.824508Z 0 [System] [MY-013602] [Server] Channel mysql_main configured to support TLS. Encrypted connections are now supported for this channel.
+ 2026-09-14T16:37:58.825897Z 0 [Warning] [MY-011810] [Server] Insecure configuration for --pid-file: Location '/var/run/mysqld' in the path is accessible to all OS users. Consider choosing a different directory.
+ 2026-09-14T16:37:58.844006Z 0 [System] [MY-011323] [Server] X Plugin ready for connections. Bind-address: '::' port: 33060, socket: /var/run/mysqld/mysqlx.sock
+ 2026-09-14T16:37:58.844066Z 0 [System] [MY-010931] [Server] /usr/sbin/mysqld: ready for connections. Version: '9.6.0'  socket: '/var/run/mysqld/mysqld.sock'  port: 3306  MySQL Community Server - GPL.
+ 2026-09-14T16:38:48.919819Z 0 [System] [MY-013172] [Server] Received SHUTDOWN from user <via user signal>. Shutting down mysqld (Version: 9.6.0).
+ 2026-09-14T16:38:50.076262Z 0 [System] [MY-010910] [Server] /usr/sbin/mysqld: Shutdown complete (mysqld 9.6.0)  MySQL Community Server - GPL.
+ 2026-09-14T16:38:50.076276Z 0 [System] [MY-015016] [Server] MySQL Server - end.
+ 2026-09-14T16:38:50.839736Z 0 [System] [MY-015015] [Server] MySQL Server - start.
+ 2026-09-14T16:38:51.006816Z 0 [System] [MY-010116] [Server] /usr/sbin/mysqld (mysqld 9.6.0) starting as process 1
+ 2026-09-14T16:38:51.006827Z 0 [System] [MY-015590] [Server] MySQL Server has access to 4 logical CPUs.
+ 2026-09-14T16:38:51.006837Z 0 [System] [MY-015590] [Server] MySQL Server has access to 16766414848 bytes of physical memory.
+ 2026-09-14T16:38:51.011564Z 1 [System] [MY-013576] [InnoDB] InnoDB initialization has started.
+ 2026-09-14T16:38:52.083999Z 1 [System] [MY-013577] [InnoDB] InnoDB initialization has ended.
+ 2026-09-14T16:38:52.529987Z 0 [Warning] [MY-010068] [Server] CA certificate ca.pem is self signed.
+ 2026-09-14T16:38:52.530018Z 0 [System] [MY-013602] [Server] Channel mysql_main configured to support TLS. Encrypted connections are now supported for this channel.
+ 2026-09-14T16:38:52.531660Z 0 [Warning] [MY-011810] [Server] Insecure configuration for --pid-file: Location '/var/run/mysqld' in the path is accessible to all OS users. Consider choosing a different directory.
+ 2026-09-14T16:38:52.551568Z 0 [System] [MY-011323] [Server] X Plugin ready for connections. Bind-address: '::' port: 33060, socket: /var/run/mysqld/mysqlx.sock
+ 2026-09-14T16:38:52.551894Z 0 [System] [MY-010931] [Server] /usr/sbin/mysqld: ready for connections. Version: '9.6.0'  socket: '/var/run/mysqld/mysqld.sock'  port: 3306  MySQL Community Server - GPL.
+Stop and remove container: dc90fa7b3b484bd4970a6970d77a1883_mysql960_3ff2be
+##[command]/usr/bin/docker rm --force af39fcaf90d31ffc45beab5c7cfd9aab6e698e192c5ace94457f24b468333f10
+af39fcaf90d31ffc45beab5c7cfd9aab6e698e192c5ace94457f24b468333f10
+Remove container network: github_network_6d283a320ab64d66b79b1e5ff9bf79ec
+##[command]/usr/bin/docker network rm github_network_6d283a320ab64d66b79b1e5ff9bf79ec
+github_network_6d283a320ab64d66b79b1e5ff9bf79ec
+Cleaning up orphan processes
