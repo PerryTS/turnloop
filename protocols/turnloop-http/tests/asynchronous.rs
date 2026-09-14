@@ -759,7 +759,8 @@ fn curl_against_async_http1_server() {
             received
         })
         .expect("spawn");
-    let child = Command::new("curl")
+    let curl = std::env::var_os("TURNLOOP_TEST_CURL").unwrap_or_else(|| "curl".into());
+    let mut child = Command::new(curl)
         .args([
             "--http1.1",
             "--silent",
@@ -774,11 +775,20 @@ fn curl_against_async_http1_server() {
             &format!("http://{address}/"),
         ])
         .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("curl required for HTTP/1.1");
     let end = executor.driver().now() + Duration::from_secs(10);
     while !task.is_finished() {
-        assert!(executor.driver().now() < end);
+        if executor.driver().now() >= end {
+            // Tell a hung server (curl exited, its close never delivered) from a hung curl.
+            let exited = child.try_wait();
+            let _ = child.kill();
+            panic!(
+                "server task pending after 10 s; curl before kill: {exited:?}; curl output: {:?}",
+                child.wait_with_output()
+            );
+        }
         executor.turn(Timeout::Until(end)).expect("turn");
     }
     assert_eq!(finish(&mut task), 15);
