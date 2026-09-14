@@ -29,3 +29,6 @@ pub use backend::unix::Detached;
 
 mod blocking;
 pub use blocking::{DnsRequest, PoolConfig};
+
+mod time;
+pub use time::Instant;

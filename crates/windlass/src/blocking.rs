@@ -36,13 +36,17 @@ pub(crate) struct WorkResult {
 }
 pub(crate) struct WorkPort {
     queue: Queue<WorkResult>,
+    #[cfg(not(target_arch = "wasm32"))]
     notifier: Notifier,
     closed: AtomicBool,
 }
 impl WorkPort {
     pub fn new(capacity: usize, notifier: Notifier) -> Arc<Self> {
+        #[cfg(target_arch = "wasm32")]
+        let _ = notifier;
         Arc::new(Self {
             queue: Queue::new(capacity.max(2).next_power_of_two()),
+            #[cfg(not(target_arch = "wasm32"))]
             notifier,
             closed: AtomicBool::new(false),
         })
@@ -56,6 +60,7 @@ impl WorkPort {
     pub fn close(&self) {
         self.closed.store(true, Ordering::Release);
     }
+    #[cfg(not(target_arch = "wasm32"))]
     fn complete(&self, result: WorkResult) {
         if self.closed.load(Ordering::Acquire) {
             return;
@@ -218,4 +223,56 @@ pub(crate) fn resolve(request: DnsRequest) -> Box<dyn FnOnce() -> Result<WorkOut
         }
         Ok(WorkOutput::Resolved(addresses))
     })
+}
+
+#[cfg(all(test, loom))]
+mod models {
+    use super::*;
+    use crate::{
+        backend::Wake,
+        sync::{AtomicUsize, Ordering as ModelOrdering},
+    };
+    struct WakeCounter(AtomicUsize);
+    impl Wake for WakeCounter {
+        fn wake(&self) -> Result<()> {
+            self.0.fetch_add(1, ModelOrdering::Relaxed);
+            Ok(())
+        }
+        fn syscall_count(&self) -> u64 {
+            self.0.load(ModelOrdering::Relaxed) as u64
+        }
+    }
+    #[test]
+    fn pool_result_publication_races_loop_parking() {
+        loom::model(|| {
+            let wake = Arc::new(WakeCounter(AtomicUsize::new(0)));
+            let notifier = Notifier::new(wake.clone());
+            let port = WorkPort::new(2, notifier.clone());
+            let worker = port.clone();
+            let op = OpId {
+                owner: 7,
+                key: 1 << 32,
+            };
+            let t = loom::thread::spawn(move || {
+                worker.complete(WorkResult {
+                    op,
+                    result: Ok(WorkOutput::Blocking(Payload::U64(42))),
+                })
+            });
+            let parked = notifier.park();
+            t.join().expect("pool worker");
+            let completion = port.pop().expect("published completion");
+            assert_eq!(completion.op, op);
+            assert!(matches!(
+                completion.result,
+                Ok(WorkOutput::Blocking(Payload::U64(42)))
+            ));
+            assert!(port.pop().is_none());
+            if parked {
+                assert_eq!(wake.syscall_count(), 1);
+            } else {
+                assert!(notifier.begin());
+            }
+        });
+    }
 }

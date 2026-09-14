@@ -1,7 +1,7 @@
 //! Benchmarkable timer queue: indexed four-way heap, or `timer-btree` comparison.
+use crate::Instant;
 #[cfg(feature = "timer-btree")]
 use std::collections::BTreeMap;
-use std::time::Instant;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct Entry {
@@ -163,7 +163,10 @@ mod tests {
     use std::time::Duration;
     #[test]
     fn cancel_and_expire_match_sorted_reference() {
+        #[cfg(not(windlass_backend = "web"))]
         let base = Instant::now();
+        #[cfg(windlass_backend = "web")]
+        let base = Instant::from_duration(Duration::from_secs(1));
         let mut q = TimerQueue::new(1000);
         let mut reference = Vec::new();
         for i in 0..1000u64 {

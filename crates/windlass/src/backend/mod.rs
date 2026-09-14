@@ -1,4 +1,4 @@
-//! Internal platform contract, revision 0.
+//! Internal platform contract, revision 1.
 //!
 //! Public only so the contract runner and independently developed backends can use
 //! it; not a stable end-user extension API. All identifiers and buffers are core
@@ -120,10 +120,31 @@ pub struct PollInfo {
     pub waits: u32,
 }
 
-pub trait Backend: Sized + 'static {
+/// # Safety
+/// Implementers must uphold the buffer-lifetime and native-quiescence guarantees
+/// above: no native I/O may access a buffer after its terminal Event or Drop.
+/// Core lifetime and handle-release safety relies on those guarantees.
+pub unsafe trait Backend: Sized + 'static {
     type Wake: Wake;
     type Detached: Send + 'static;
     fn new(config: &Config, pool: BufferPool) -> Result<Self>;
+    /// Monotonic, nondecreasing time in a consistent domain across calls. Native
+    /// adapters return std::time::Instant::now(). Web adapters construct
+    /// crate::Instant::from_duration from their monotonic host clock. This method
+    /// must not schedule work, block, or invoke a user callback.
+    fn now(&self) -> crate::Instant;
+    /// Validate the original request even when queued completions eliminate the
+    /// effective wait. Browser main-thread adapters reject every timeout but Now;
+    /// a worker adapter may support blocking. Native adapters use this default.
+    fn validate_timeout(&self, _timeout: crate::Timeout) -> Result<()> {
+        Ok(())
+    }
+    /// The core owns timer semantics. Callback-driven adapters arm one host timer
+    /// for this earliest deadline, whose callback schedules a turn. None disarms
+    /// it. Native pollers need no action: poll receives the effective timeout.
+    /// This is a scheduling import, never a user callback. If host scheduling
+    /// fails, preserve the failure and return it from poll; never fake expiry.
+    fn deadline_changed(&mut self, _deadline: Option<crate::Instant>) {}
     fn waker(&self) -> Arc<Self::Wake>;
     fn open(&mut self, handle: Handle, spec: Open) -> Result<()>;
     fn local_addr(&self, handle: Handle) -> Result<SocketAddr>;

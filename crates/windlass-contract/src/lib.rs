@@ -76,9 +76,9 @@ pub fn pair<B: Backend>(l: &mut Driver<B>) -> (Handle, Handle, Handle) {
     let mut conn = None;
     let mut connected = false;
     let mut out = Completions::default();
-    let until = Instant::now() + Duration::from_secs(3);
+    let until = l.now() + Duration::from_secs(3);
     while conn.is_none() || !connected {
-        assert!(Instant::now() < until, "connect/accept timed out");
+        assert!(l.now() < until, "connect/accept timed out");
         l.turn(Timeout::Until(until), &mut out).expect("turn");
         for c in out.drain() {
             match c.result {
@@ -104,7 +104,7 @@ pub fn tcp_echo<B: Backend>(connections: usize) {
         l.write(a, WriteBuf::Owned(data.to_vec()), Token(1000 + i as u64))
             .expect("write");
     }
-    let until = Instant::now() + Duration::from_secs(5);
+    let until = l.now() + Duration::from_secs(5);
     let mut received = 0;
     let mut wrote = 0;
     let mut echoed = 0;
@@ -113,7 +113,7 @@ pub fn tcp_echo<B: Backend>(connections: usize) {
     let mut out = Completions::default();
     while echoed != connections || wrote != 2 * connections {
         assert!(
-            Instant::now() < until,
+            l.now() < until,
             "echo timed out: received={received} echoed={echoed} wrote={wrote}"
         );
         l.turn(Timeout::Until(until), &mut out).expect("turn");
@@ -176,6 +176,10 @@ pub fn tcp_echo<B: Backend>(connections: usize) {
 mod native {
     use super::*;
     type B = windlass::backend::Platform;
+    #[test]
+    fn retained_pool_lease() {
+        pooled_lease_backpressure::<B>();
+    }
     #[test]
     fn external_waiter() {
         integration_fd::<B>();
@@ -273,9 +277,9 @@ pub fn cancel_close_ordering<B: Backend>() {
     let mut out = Completions::with_capacity(1);
     let mut terminal = Vec::new();
     let mut closed = 0;
-    let until = Instant::now() + Duration::from_secs(2);
+    let until = l.now() + Duration::from_secs(2);
     while closed == 0 {
-        assert!(Instant::now() < until);
+        assert!(l.now() < until);
         let info = l.turn(Timeout::Until(until), &mut out).expect("turn");
         assert!(info.os_waits <= 1);
         for c in out.drain() {
@@ -298,10 +302,10 @@ pub fn cancel_close_ordering<B: Backend>() {
     assert!(!l.cancel(second));
     l.write(a, WriteBuf::Owned(vec![1; 32]), Token(14))
         .expect("write to closed peer");
-    let until = Instant::now() + Duration::from_secs(1);
+    let until = l.now() + Duration::from_secs(1);
     let mut seen = 0;
     while seen == 0 {
-        assert!(Instant::now() < until);
+        assert!(l.now() < until);
         l.turn(Timeout::Until(until), &mut out).expect("turn");
         for c in out.drain() {
             if c.token == Token(14) {
@@ -332,10 +336,10 @@ pub fn refused_connect_once<B: Backend>() {
     let conn = l
         .tcp_connect(addr, &TcpOpts::default(), Token(7))
         .expect("accepted connect op");
-    let until = Instant::now() + Duration::from_secs(2);
+    let until = l.now() + Duration::from_secs(2);
     let mut count = 0;
     while count == 0 {
-        assert!(Instant::now() < until);
+        assert!(l.now() < until);
         l.turn(Timeout::Until(until), &mut out).expect("turn");
         for c in out.drain() {
             assert_eq!(c.token, Token(7));
@@ -360,7 +364,7 @@ pub fn refused_connect_once<B: Backend>() {
 pub fn ref_unref<B: Backend>() {
     let mut l = Driver::<B>::new(Config::default()).expect("loop");
     assert!(!l.alive());
-    let h = l.timer(Instant::now(), None, Token(1)).expect("timer");
+    let h = l.timer(l.now(), None, Token(1)).expect("timer");
     assert!(l.alive());
     l.set_ref(h, false).expect("unref");
     assert!(!l.alive());
@@ -393,7 +397,7 @@ pub fn timer_precision<B: Backend>() {
     let mut out = Completions::default();
     let mut fired = 0;
     for micros in [100, 500, 2000] {
-        let at = Instant::now() + Duration::from_micros(micros);
+        let at = l.now() + Duration::from_micros(micros);
         let h = l.timer(at, None, Token(micros)).expect("timer");
         let until = at + Duration::from_millis(100);
         while fired
@@ -405,34 +409,34 @@ pub fn timer_precision<B: Backend>() {
                 3
             }
         {
-            assert!(Instant::now() < until, "timer missed precision bound");
+            assert!(l.now() < until, "timer missed precision bound");
             l.turn(Timeout::Until(until), &mut out).expect("turn");
             for c in out.drain() {
                 if matches!(c.result, OpResult::Timer) {
                     assert_eq!(c.token, Token(micros));
-                    assert!(Instant::now() >= at, "timer fired early");
+                    assert!(l.now() >= at, "timer fired early");
                     fired += 1;
                 }
             }
         }
-        assert!(Instant::now().duration_since(at) < Duration::from_millis(100));
+        assert!(l.now().duration_since(at) < Duration::from_millis(100));
         l.close(h, Token(0)).expect("close");
         l.turn(Timeout::Now, &mut out).expect("close timer");
     }
     assert_eq!(fired, 3);
     let h = l
         .timer(
-            Instant::now() + Duration::from_secs(1),
+            l.now() + Duration::from_secs(1),
             Some(Duration::from_micros(200)),
             Token(44),
         )
         .expect("repeat");
-    assert!(l.timer_reset(h, Instant::now()));
+    assert!(l.timer_reset(h, l.now()));
     let op = l.timer_op(h).expect("op");
     let mut repeats = 0;
-    let until = Instant::now() + Duration::from_secs(1);
+    let until = l.now() + Duration::from_secs(1);
     while repeats < 3 {
-        assert!(Instant::now() < until);
+        assert!(l.now() < until);
         l.turn(Timeout::Until(until), &mut out).expect("turn");
         for c in out.drain() {
             assert!(!c.terminal);
@@ -459,11 +463,11 @@ pub fn udp_round_trip<B: Backend>() {
     l.send_to(a, WriteBuf::Owned(bytes.to_vec()), ba, Token(2))
         .expect("send");
     let mut out = Completions::default();
-    let until = Instant::now() + Duration::from_secs(2);
+    let until = l.now() + Duration::from_secs(2);
     let mut received = 0;
     let mut writes = 0;
     while received < 2 || writes < 2 {
-        assert!(Instant::now() < until);
+        assert!(l.now() < until);
         l.turn(Timeout::Until(until), &mut out).expect("turn");
         for c in out.drain() {
             match c.result {
@@ -523,10 +527,10 @@ pub fn cross_post<B: Backend>(threads: usize, per_peer: usize) {
             }
             let mut seen = vec![false; threads * per_peer];
             let mut count = 0;
-            let until = Instant::now() + Duration::from_secs(10);
+            let until = l.now() + Duration::from_secs(10);
             let mut out = Completions::default();
             while count < seen.len() {
-                assert!(Instant::now() < until, "post delivery timed out");
+                assert!(l.now() < until, "post delivery timed out");
                 l.turn(Timeout::Until(until), &mut out).expect("turn");
                 for c in out.drain() {
                     assert_eq!(thread::current().id(), owner);
@@ -594,10 +598,10 @@ pub fn writev_and_shutdown<B: Backend>() {
     let mut shutdowns = 0;
     let mut eof = false;
     let mut chunks = 0;
-    let until = Instant::now() + Duration::from_secs(5);
+    let until = l.now() + Duration::from_secs(5);
     let mut out = Completions::default();
     while !eof || writes == 0 || shutdowns == 0 {
-        assert!(Instant::now() < until);
+        assert!(l.now() < until);
         l.turn(Timeout::Until(until), &mut out).expect("turn");
         for c in out.drain() {
             match c.result {
@@ -646,7 +650,7 @@ pub fn capacity_and_stale_ids<B: Backend>() {
     };
     let mut a = Driver::<B>::new(config).expect("a");
     let mut b = Driver::<B>::new(config).expect("b");
-    let at = Instant::now() + Duration::from_secs(30);
+    let at = a.now() + Duration::from_secs(30);
     let h = a.timer(at, None, Token(1)).expect("timer");
     let op = a.timer_op(h).expect("op");
     assert!(a.cancel(op));
@@ -683,4 +687,67 @@ pub fn capacity_and_stale_ids<B: Backend>() {
     assert!(!a.cancel(op));
     assert!(a.cancel(a.timer_op(h3).expect("op")));
     assert_eq!(count, 3);
+}
+
+pub fn pooled_lease_backpressure<B: Backend>() {
+    let mut l = Driver::<B>::new(Config {
+        pooled_buffers: 1,
+        pooled_buffer_size: 1,
+        ..Config::default()
+    })
+    .expect("loop");
+    let (_, a, b) = pair(&mut l);
+    let op = l.read_start(b, Token(1)).expect("read");
+    l.write(a, WriteBuf::Owned(b"ab".to_vec()), Token(2))
+        .expect("write");
+    let mut out = Completions::default();
+    let mut held = None;
+    let mut writes = 0;
+    let until = l.now() + Duration::from_secs(2);
+    while held.is_none() || writes == 0 {
+        assert!(l.now() < until);
+        l.turn(Timeout::Until(until), &mut out).expect("turn");
+        for c in out.drain() {
+            match c.result {
+                OpResult::Read {
+                    n,
+                    lease: Some(data),
+                } => {
+                    assert_eq!(n, 1);
+                    assert_eq!(data.as_slice(), b"a");
+                    assert!(held.is_none());
+                    held = Some(data);
+                }
+                OpResult::Wrote(n) => {
+                    assert_eq!(n, 2);
+                    writes += 1;
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+    for _ in 0..3 {
+        l.turn(Timeout::Now, &mut out).expect("backpressure");
+        assert!(out.is_empty());
+        assert_eq!(held.as_ref().expect("live lease").as_slice(), b"a");
+    }
+    drop(held.take());
+    l.turn(Timeout::Now, &mut out)
+        .expect("resume cached readiness");
+    assert_eq!(out.len(), 1);
+    let c = out.drain().next().expect("resumed read");
+    if let OpResult::Read {
+        n,
+        lease: Some(data),
+    } = c.result
+    {
+        assert_eq!(n, 1);
+        assert_eq!(data.as_slice(), b"b");
+    } else {
+        panic!("expected second byte");
+    }
+    assert!(l.stop(op));
+    l.turn(Timeout::Now, &mut out).expect("stop");
+    assert!(matches!(out[0].result, OpResult::Stopped));
+    assert_eq!(writes, 1);
 }

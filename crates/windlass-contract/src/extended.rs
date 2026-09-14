@@ -29,11 +29,11 @@ pub fn detach_inflight<B: Backend>() {
         let h = l.attach(d, Token(8)).expect("attach");
         l.read(h, ReadBuf::Pooled, Token(9)).expect("read");
         let mut out = Completions::default();
-        let until = Instant::now() + Duration::from_secs(3);
+        let until = l.now() + Duration::from_secs(3);
         let mut bytes = Vec::new();
         let mut wrote = 0;
         while wrote == 0 {
-            assert!(Instant::now() < until);
+            assert!(l.now() < until);
             l.turn(Timeout::Until(until), &mut out).expect("turn");
             for c in out.drain() {
                 match c.result {
@@ -66,9 +66,9 @@ pub fn detach_inflight<B: Backend>() {
         .expect("write");
     source.read(a, ReadBuf::Pooled, Token(7)).expect("read");
     let mut bytes = Vec::new();
-    let until = Instant::now() + Duration::from_secs(3);
+    let until = source.now() + Duration::from_secs(3);
     while bytes.len() < 4 {
-        assert!(Instant::now() < until);
+        assert!(source.now() < until);
         source.turn(Timeout::Until(until), &mut out).expect("turn");
         for c in out.drain() {
             match c.result {
@@ -137,11 +137,11 @@ pub fn pool_and_dns<B: Backend>() {
     assert!(l.cancel(op));
     assert!(!l.cancel(op));
     release_tx.send(()).expect("release");
-    let until = Instant::now() + Duration::from_secs(5);
+    let until = l.now() + Duration::from_secs(5);
     let mut seen = [false; 3];
     let mut out = Completions::default();
     while !seen.iter().all(|v| *v) {
-        assert!(Instant::now() < until);
+        assert!(l.now() < until);
         l.turn(Timeout::Until(until), &mut out).expect("turn");
         for c in out.drain() {
             assert_eq!(thread::current().id(), owner);
@@ -184,9 +184,9 @@ pub fn reuse_port<B: Backend>() {
         .collect();
     let mut count = [0usize; 2];
     let mut out = Completions::default();
-    let until = Instant::now() + Duration::from_secs(3);
+    let until = a.now() + Duration::from_secs(3);
     while count.iter().sum::<usize>() < clients.len() {
-        assert!(Instant::now() < until);
+        assert!(a.now() < until);
         for l in [&mut a, &mut b] {
             l.turn(Timeout::Now, &mut out).expect("turn");
             for c in out.drain() {
@@ -234,10 +234,10 @@ pub fn handoff_distribution<B: Backend>() {
                     .expect("attach");
                 l.read(h, ReadBuf::Pooled, Token(1)).expect("read");
                 let mut out = Completions::default();
-                let until = Instant::now() + Duration::from_secs(5);
+                let until = l.now() + Duration::from_secs(5);
                 let mut wrote = false;
                 while !wrote {
-                    assert!(Instant::now() < until);
+                    assert!(l.now() < until);
                     l.turn(Timeout::Until(until), &mut out).expect("turn");
                     for c in out.drain() {
                         match c.result {
@@ -277,9 +277,9 @@ pub fn handoff_distribution<B: Backend>() {
         .collect();
     let mut accepted = 0;
     let mut out = Completions::default();
-    let until = Instant::now() + Duration::from_secs(5);
+    let until = primary.now() + Duration::from_secs(5);
     while accepted < CONNECTIONS {
-        assert!(Instant::now() < until);
+        assert!(primary.now() < until);
         primary.turn(Timeout::Until(until), &mut out).expect("turn");
         for c in out.drain() {
             if let OpResult::Accepted { conn, .. } = c.result {

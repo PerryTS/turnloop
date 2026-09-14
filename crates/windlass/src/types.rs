@@ -1,6 +1,7 @@
 //! Backend-neutral identifiers, errors, deadlines and socket options.
+use crate::Instant;
 use std::net::SocketAddr;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct Token(pub u64);

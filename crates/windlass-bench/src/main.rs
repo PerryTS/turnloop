@@ -24,7 +24,10 @@ fn timers(counter: &Counter) {
     for n in [10, 1000, 100_000] {
         let batches = 100_000 / n;
         let mut queues: Vec<_> = (0..batches).map(|_| TimerQueue::new(n)).collect();
-        let base = Instant::now();
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        let base = windlass::Instant::now();
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        let base = windlass::Instant::from_duration(Duration::ZERO);
         let times: Vec<_> = (0..n)
             .map(|i| base + Duration::from_nanos(((i * 691) % n) as u64))
             .collect();
@@ -122,6 +125,39 @@ fn baselines(counter: &Counter) {
         counter,
     );
     assert_eq!(cancelled, N);
+    let mut timer_instructions = 0u64;
+    let mut timer_count = 0;
+    let at = Instant::now() + Duration::from_secs(60);
+    for _ in 0..20 {
+        let mut handles = [None; 512];
+        let before = counter.read().expect("counter");
+        for slot in &mut handles {
+            let h = l.timer(at, None, Token(1)).expect("timer");
+            assert!(l.cancel(l.timer_op(h).expect("op")));
+            *slot = Some(h);
+        }
+        timer_instructions += counter.read().expect("counter") - before;
+        timer_count += handles.len();
+        for h in handles {
+            l.close(h.expect("timer"), Token(2)).expect("close");
+        }
+        let mut delivered = 0;
+        while delivered < 1024 {
+            l.turn(Timeout::Now, &mut out).expect("deliver");
+            for c in out.drain() {
+                assert!(matches!(c.result, OpResult::Cancelled | OpResult::Closed));
+                delivered += 1;
+            }
+        }
+        assert_eq!(delivered, 1024);
+    }
+    assert_eq!(timer_count, 10240);
+    assert!(timer_instructions > 0);
+    println!(
+        "{{\"name\":\"timer_start_cancel\",\"operations\":{timer_count},\"total\":{timer_instructions},\"per_operation\":{:.2},\"unit\":\"{}\"}}",
+        timer_instructions as f64 / timer_count as f64,
+        counter.unit()
+    );
     let (_, a, b) = windlass_contract::pair(&mut l);
     let input = [0x71; 4096];
     let mut output = [0u8; 4096];
@@ -221,7 +257,11 @@ fn baselines(counter: &Counter) {
     );
 }
 fn main() {
-    let counter = Counter::new();
+    let counter = if std::env::args().any(|a| a == "--portable") {
+        Counter::Portable(Instant::now())
+    } else {
+        Counter::new()
+    };
     if std::env::args().any(|a| a == "--timers") {
         timers(&counter);
     } else {

@@ -11,7 +11,7 @@ use std::{
     rc::Rc,
     sync::atomic::{AtomicU64, Ordering},
     thread::{self, ThreadId},
-    time::{Duration, Instant},
+    time::Duration,
 };
 static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone, Copy)]
@@ -259,6 +259,10 @@ impl<B: Backend> Driver<B> {
     pub fn alive(&self) -> bool {
         self.refs != 0
     }
+    /// The backend monotonic clock; portable deadline construction starts here.
+    pub fn now(&self) -> Instant {
+        self.backend.now()
+    }
     pub fn next_deadline(&self) -> Option<Instant> {
         self.timers.next_deadline()
     }
@@ -295,6 +299,7 @@ impl<B: Backend> Driver<B> {
             repeat,
         };
         self.timers.insert(h.key, at);
+        self.backend.deadline_changed(self.timers.next_deadline());
         Ok(h)
     }
     pub fn timer_reset(&mut self, h: Handle, at: Instant) -> bool {
@@ -306,6 +311,7 @@ impl<B: Backend> Driver<B> {
         }
         self.timers.cancel(h.key);
         self.timers.insert(h.key, at);
+        self.backend.deadline_changed(self.timers.next_deadline());
         true
     }
     pub fn timer_op(&self, h: Handle) -> Option<OpId> {
@@ -435,6 +441,7 @@ impl<B: Backend> Driver<B> {
         });
         if timer {
             self.timers.cancel(op.handle.expect("timer handle").key);
+            self.backend.deadline_changed(self.timers.next_deadline());
             self.finish(
                 id,
                 if stop {
@@ -609,9 +616,10 @@ impl<B: Backend> Driver<B> {
     }
     pub fn turn(&mut self, timeout: Timeout, out: &mut Completions) -> Result<TurnInfo> {
         self.assert_owner();
+        self.backend.validate_timeout(timeout)?;
         out.clear();
         let notified = self.notifier.begin();
-        let start = Instant::now();
+        let start = self.backend.now();
         let deadline = match (timeout.deadline(start), self.next_deadline()) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -621,7 +629,11 @@ impl<B: Backend> Driver<B> {
         let mut waits = 0;
         if !queued {
             let mut timeout = deadline.map(|d| d.saturating_duration_since(start));
-            if notified || self.backend.has_work() || !self.notifier.park() {
+            if timeout == Some(Duration::ZERO)
+                || notified
+                || self.backend.has_work()
+                || !self.notifier.park()
+            {
                 timeout = Some(Duration::ZERO);
             }
             let poll = self.backend.poll(timeout, &mut self.events);
@@ -635,7 +647,7 @@ impl<B: Backend> Driver<B> {
             }
             self.events = events;
         }
-        let now = Instant::now();
+        let now = self.backend.now();
         for _ in 0..self.config.events_per_turn {
             if self.queued.len() >= self.config.max_operations + self.config.max_handles {
                 break;
@@ -667,6 +679,7 @@ impl<B: Backend> Driver<B> {
                 }
             }
         }
+        self.backend.deadline_changed(self.timers.next_deadline());
         for _ in 0..self.config.events_per_turn {
             if self.queued.len() >= self.config.max_operations + self.config.max_handles {
                 break;
@@ -715,7 +728,7 @@ impl<B: Backend> Driver<B> {
         }
         Ok(TurnInfo {
             completions: out.len(),
-            waited: start.elapsed(),
+            waited: self.backend.now().saturating_duration_since(start),
             alive: self.alive(),
             os_waits: waits,
         })
@@ -727,5 +740,123 @@ impl<B: Backend> Drop for Driver<B> {
         self.work_port.close();
         self.poster.close();
         self.notifier.close();
+    }
+}
+
+#[cfg(all(test, not(loom), not(windlass_backend = "web")))]
+mod clock_contract {
+    use super::*;
+    use crate::backend::{PollInfo, Wake};
+    use std::sync::Arc;
+    struct NoWake;
+    impl Wake for NoWake {
+        fn wake(&self) -> Result<()> {
+            panic!("nonblocking test must not wake")
+        }
+        fn syscall_count(&self) -> u64 {
+            0
+        }
+    }
+    struct Host {
+        now: Instant,
+        deadline: Option<Instant>,
+        changes: usize,
+        polls: usize,
+    }
+    // SAFETY: this test backend accepts no native I/O and owns no user buffers.
+    unsafe impl Backend for Host {
+        type Wake = NoWake;
+        type Detached = ();
+        fn new(_: &Config, _: BufferPool) -> Result<Self> {
+            Ok(Self {
+                now: Instant::now(),
+                deadline: None,
+                changes: 0,
+                polls: 0,
+            })
+        }
+        fn now(&self) -> Instant {
+            self.now
+        }
+        fn waker(&self) -> Arc<NoWake> {
+            Arc::new(NoWake)
+        }
+        fn validate_timeout(&self, timeout: Timeout) -> Result<()> {
+            if matches!(timeout, Timeout::Now) {
+                Ok(())
+            } else {
+                Err(Error::new(ErrorKind::Unsupported))
+            }
+        }
+        fn deadline_changed(&mut self, deadline: Option<Instant>) {
+            self.deadline = deadline;
+            self.changes += 1;
+        }
+        fn open(&mut self, _: Handle, _: Open) -> Result<()> {
+            Err(Error::new(ErrorKind::Unsupported))
+        }
+        fn local_addr(&self, _: Handle) -> Result<SocketAddr> {
+            Err(Error::new(ErrorKind::Unsupported))
+        }
+        fn submit(&mut self, _: Request) -> Result<()> {
+            Err(Error::new(ErrorKind::Unsupported))
+        }
+        fn cancel(&mut self, _: OpId) -> Result<()> {
+            Err(Error::new(ErrorKind::NotFound))
+        }
+        fn has_work(&self) -> bool {
+            false
+        }
+        fn poll(&mut self, timeout: Option<Duration>, _: &mut Vec<Event<()>>) -> Result<PollInfo> {
+            assert_eq!(timeout, Some(Duration::ZERO));
+            self.polls += 1;
+            Ok(PollInfo::default())
+        }
+        fn release(&mut self, _: Handle) {}
+        fn detach(&mut self, _: Handle) -> Result<()> {
+            Err(Error::new(ErrorKind::Unsupported))
+        }
+        fn attach(&mut self, _: Handle, _: ()) -> Result<()> {
+            Err(Error::new(ErrorKind::Unsupported))
+        }
+        fn integration(&mut self) -> Result<Integration> {
+            Ok(Integration::HostCallback)
+        }
+    }
+    #[test]
+    fn host_clock_arms_deadline_and_validates_queued_turns() {
+        let mut l = Driver::<Host>::new(Config::default()).expect("host loop");
+        let at = l.now() + Duration::from_micros(50);
+        let h = l.timer(at, None, Token(1)).expect("timer");
+        assert_eq!(l.backend.deadline, Some(at));
+        assert!(l.backend.changes > 0);
+        let mut out = Completions::default();
+        l.turn(Timeout::Now, &mut out).expect("early turn");
+        assert!(out.is_empty());
+        assert_eq!(l.backend.polls, 1);
+        l.backend.now = at;
+        l.turn(Timeout::Now, &mut out).expect("deadline turn");
+        assert_eq!(out.len(), 1);
+        assert!(matches!(out[0].result, OpResult::Timer));
+        assert_eq!(l.backend.deadline, None);
+        l.close(h, Token(2)).expect("close");
+        assert!(
+            matches!(
+                l.turn(Timeout::Forever, &mut out),
+                Err(Error {
+                    kind: ErrorKind::Unsupported,
+                    ..
+                })
+            ),
+            "queued completions do not bypass timeout validation"
+        );
+        l.turn(Timeout::Now, &mut out).expect("queued close");
+        assert_eq!(out.len(), 1);
+        assert!(matches!(out[0].result, OpResult::Closed));
+        let h = l
+            .timer(at + Duration::from_secs(1), None, Token(3))
+            .expect("timer");
+        assert!(l.cancel(l.timer_op(h).expect("op")));
+        assert_eq!(l.backend.deadline, None);
     }
 }

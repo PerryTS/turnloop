@@ -13,6 +13,10 @@ impl IoBuf {
     /// unmoved and unmodified until the terminal completion is delivered, or until
     /// the driver is dropped (which must quiesce all native I/O before returning).
     pub unsafe fn from_raw_parts(ptr: *const u8, len: usize) -> Self {
+        assert!(
+            len <= isize::MAX as usize,
+            "buffer length fits a Rust slice"
+        );
         Self {
             ptr: NonNull::new(ptr.cast_mut()).expect("non-null buffer pointer"),
             len,
@@ -40,6 +44,10 @@ impl IoBufMut {
     /// alive and unmoved, and no other access is permitted, until delivery of the
     /// terminal completion or return from driver destruction.
     pub unsafe fn from_raw_parts(ptr: *mut u8, len: usize) -> Self {
+        assert!(
+            len <= isize::MAX as usize,
+            "buffer length fits a Rust slice"
+        );
         Self {
             ptr: NonNull::new(ptr).expect("non-null buffer pointer"),
             len,

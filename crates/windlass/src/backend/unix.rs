@@ -185,7 +185,10 @@ impl Unix {
         }
     }
 }
-impl Backend for Unix {
+// SAFETY: all I/O executes synchronously in poll; a terminal event removes its
+// request, and owned descriptors/requests are dropped without outstanding native
+// buffer access. Readiness events contain generation keys, never buffer pointers.
+unsafe impl Backend for Unix {
     #[cfg(windlass_backend = "kqueue")]
     type Wake = super::kqueue::KqueueWake;
     #[cfg(windlass_backend = "epoll")]
@@ -201,6 +204,9 @@ impl Backend for Unix {
             polled: Vec::with_capacity(config.events_per_turn),
             pool,
         })
+    }
+    fn now(&self) -> Instant {
+        Instant::now()
     }
     fn waker(&self) -> Arc<Self::Wake> {
         self.poller.waker()

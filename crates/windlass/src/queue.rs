@@ -110,3 +110,31 @@ mod models {
         });
     }
 }
+
+#[cfg(all(test, loom))]
+mod publication_models {
+    use super::*;
+    use crate::sync::Arc;
+    #[test]
+    fn consumer_races_publication_and_slot_reuse() {
+        loom::model(|| {
+            let q = Arc::new(Queue::new(2));
+            q.push(10).expect("first value");
+            let producer = q.clone();
+            let t = loom::thread::spawn(move || producer.push(20).expect("second value"));
+            let first = q.pop();
+            t.join().expect("producer");
+            let mut sum = first.unwrap_or(0);
+            let mut count = usize::from(first.is_some());
+            while let Some(n) = q.pop() {
+                sum += n;
+                count += 1;
+            }
+            assert_eq!(sum, 30);
+            assert_eq!(count, 2);
+            q.push(30).expect("recycle");
+            assert_eq!(q.pop(), Some(30));
+            assert!(q.is_empty());
+        });
+    }
+}
