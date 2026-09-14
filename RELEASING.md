@@ -36,7 +36,7 @@ from a clean, committed checkout, on a machine that can run its native tests.
    python3 scripts/ci/soak.py
    bash scripts/ci/no-tokio.sh
    cargo +nightly-2026-08-20 test --locked --workspace -- --test-threads=1
-   cargo +nightly-2026-08-20 publish --locked --workspace --dry-run
+   cargo +nightly-2026-08-20 publish --registry crates-io --locked --workspace --dry-run
    ```
 
    The printed order is topological: core and TLS before clients depending on
@@ -52,7 +52,7 @@ from a clean, committed checkout, on a machine that can run its native tests.
    read -r -s -p 'Temporary crates.io bootstrap token: ' CARGO_REGISTRY_TOKEN
    echo
    export CARGO_REGISTRY_TOKEN
-   cargo +nightly-2026-08-20 publish --locked --workspace
+   cargo +nightly-2026-08-20 publish --registry crates-io --locked --workspace
    unset CARGO_REGISTRY_TOKEN
    ```
 
@@ -160,7 +160,9 @@ examples, not a claim that turnloop 0.1.0 has been published.
 
 There is no overwrite or deletion of an uploaded crate version. If a batch stops,
 inspect crates.io and GitHub before rerunning the failed publishing job at the
-**same SHA**. It rechecks gates and recovers same-commit uploads. If all required
+**same SHA**. If a just-published sibling is rejected by the seven-day resolver
+soak during a partial-batch retry, wait for its eligibility; never disable the
+soak to recover a release. It rechecks gates and recovers same-commit uploads. If all required
 versions are already tagged, the operation has no further uploads.
 
 For a defective release, pin Perry back to its previous exact versions and

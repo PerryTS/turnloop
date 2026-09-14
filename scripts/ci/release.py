@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import tarfile
+import time
 import urllib.error
 import urllib.request
 from common import PIN, ROOT, cargo, entrypoint, fail, get_json, metadata, publish_order, run
@@ -87,7 +88,7 @@ def main():
                 '--baseline-version', baseline, '--all-features'], cwd=data['workspace_root'])
         # One invocation checks EACH crate and stages unpublished siblings in a
         # temporary registry. Separate invocations fail for new dependency versions.
-        command = cargo(PIN) + ['publish', '--locked', '--dry-run', '--manifest-path', str(Path(args.manifest_path).resolve())]
+        command = cargo(PIN) + ['publish', '--registry', 'crates-io', '--locked', '--dry-run', '--manifest-path', str(Path(args.manifest_path).resolve())]
         for package in packages:
             command += ['-p', package['name']]
         run(command, cwd=data['workspace_root'])
@@ -101,15 +102,23 @@ def main():
     if plan['sha'] != sha or plan['versions'] != {p['name']: p['version'] for p in packages}:
         fail('Release plan no longer matches the checkout')
     if plan['pending']:
-        command = cargo(PIN) + ['publish', '--locked', '--manifest-path', str(Path(args.manifest_path).resolve())]
+        command = cargo(PIN) + ['publish', '--registry', 'crates-io', '--locked', '--manifest-path', str(Path(args.manifest_path).resolve())]
         for name in plan['pending']:
             command += ['-p', name]
         run(command, cwd=data['workspace_root'])
     for package in packages:
         if package['name'] not in plan['pending'] + plan['recovery']:
             continue
-        record = registry(package['name'])
-        version = next(v for v in record['versions'] if v['num'] == package['version'])
+        version = None
+        for attempt in range(24):
+            record = registry(package['name'])
+            version = next((v for v in record['versions'] if v['num'] == package['version']), None) if record else None
+            if version is not None:
+                break
+            if attempt < 23:
+                time.sleep(5)
+        if version is None:
+            fail(f'{package["name"]}: uploaded version is not visible in the crates.io API after 120s')
         verify_existing(package, version, sha)
         tag = package['name'] + '-v' + package['version']
         changelog = Path(package['manifest_path']).parent / 'CHANGELOG.md'
