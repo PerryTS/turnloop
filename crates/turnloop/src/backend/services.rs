@@ -321,14 +321,10 @@ impl Services {
                         ticket.take();
                     }
                     match c.reap() {
-                        Ok(Some(status)) => (
-                            Ok(if e.cancelled {
-                                Outcome::Cancelled
-                            } else {
-                                Outcome::Exited(status)
-                            }),
-                            true,
-                        ),
+                        Ok(Some(status)) => {
+                            c.fallback = None;
+                            (Ok(if e.cancelled { Outcome::Cancelled } else { Outcome::Exited(status) }), true)
+                        }
                         Ok(None) => continue,
                         Err(error) => (Err(error), true),
                     }
@@ -384,7 +380,10 @@ impl Services {
                 poller.remove_process(c.child.id(), c.pidfd.as_ref().map(AsRawFd::as_raw_fd));
             }
             self.entries[h.index()] = None;
-            // Dropping the subscription first waits for any dispatcher delivery.
+        }
+        // Also clean up failed registrations. Dropping their subscription first
+        // waits for any dispatcher delivery before the handle slot can be reused.
+        if self.ready.has_work() {
             self.ready.remove(h);
         }
     }

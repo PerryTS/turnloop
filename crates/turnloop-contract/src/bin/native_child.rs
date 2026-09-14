@@ -28,6 +28,8 @@ fn main() {
         }
         "stdio" => native_stdio(),
         "handle" => native_handle(args.get(2).expect("pipe path")),
+        #[cfg(any(target_vendor = "apple", target_os = "freebsd"))]
+        "blocked-signal" => blocked_signal(),
         "copy" => {
             let mut bytes = Vec::new();
             std::io::stdin()
@@ -37,6 +39,32 @@ fn main() {
         }
         _ => panic!("unknown fixture mode"),
     }
+}
+
+#[cfg(any(target_vendor = "apple", target_os = "freebsd"))]
+fn blocked_signal() {
+    // Run in a fresh process so every thread (including the lazy dispatcher)
+    // inherits a blocked SIGUSR1. Kqueue still observes signal generation.
+    // SAFETY: initialized sigset storage passed only to the signal-set APIs.
+    let (mut mask, mut old): (libc::sigset_t, libc::sigset_t) = unsafe { std::mem::zeroed() };
+    // SAFETY: valid sets, catchable signal, and this thread's mask only.
+    unsafe {
+        assert_eq!(libc::sigemptyset(&mut mask), 0);
+        assert_eq!(libc::sigaddset(&mut mask, libc::SIGUSR1), 0);
+        assert_eq!(libc::pthread_sigmask(libc::SIG_BLOCK, &mask, &mut old), 0);
+    }
+    turnloop_contract::native_surface::signal_fanout::<turnloop::backend::Platform>(
+        turnloop::Signal::Usr1,
+        || {
+            // SAFETY: all four loops subscribed before sending to this process.
+            assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGUSR1) }, 0);
+        },
+    );
+    // All subscriptions have stopped and the original disposition is restored.
+    // The former no-op handler left SIGUSR1 pending here and unblocking killed us.
+    // SAFETY: restore precisely the initial mask on the same thread.
+    assert_eq!(unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut()) }, 0);
+    println!("four deliveries, four stops, four closes; survived unblock");
 }
 #[cfg(any(
     target_vendor = "apple",
