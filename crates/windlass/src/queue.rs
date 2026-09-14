@@ -1,4 +1,4 @@
-//! Bounded lock-free slot queue. Posts have no FIFO guarantee across producers.
+//! Bounded lock-free slot queue. Posts have no FIFO ordering guarantee.
 //! A stalled producer owns only its own slot; consumers can drain every other
 //! published slot. Scans are bounded by capacity and never wait for a producer.
 use crate::sync::{AtomicUsize, Ordering, UnsafeCell};

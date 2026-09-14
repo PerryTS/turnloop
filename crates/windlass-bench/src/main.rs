@@ -83,10 +83,10 @@ fn baselines(counter: &Counter) {
     }
     let before = counter.read().expect("counter");
     let mut control = 0u64;
-    for i in 0..N {
+    for i in 0..1_000_000 {
         control = black_box(control.wrapping_add(black_box(i as u64))).rotate_left(7);
     }
-    report("control", N, before, counter);
+    report("control", 1_000_000, before, counter);
     black_box(control);
     let before = counter.read().expect("counter");
     let mut waits = 0;

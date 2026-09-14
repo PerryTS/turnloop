@@ -7,7 +7,11 @@
 //! # Ownership and completion rules (D1–D4)
 //!
 //! * `open`/`attach` bind a resource to the supplied generational Handle. On error
-//!   they retain nothing. `submit` accepts ownership of a Request only on Ok; on
+//!   they retain nothing. Open::Tcp creates an unconnected resource; the Connect
+//!   request performs the connection. Once validated/accepted, even a synchronous
+//!   I/O error is queued as a terminal Event. Submit errors reject before acceptance
+//!   (unsupported/invalid operation, capacity/resource setup failure).
+//!   `submit` accepts ownership of a Request only on Ok; on
 //!   Err it must have stopped all access to its buffers before returning.
 //! * Every accepted Request yields one terminal Event, including cancellation and
 //!   errors. Multishot accepts/reads may yield preceding nonterminal Events. Their

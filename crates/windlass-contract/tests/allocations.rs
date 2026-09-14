@@ -115,6 +115,36 @@ fn exchange(
     assert_eq!((read, wrote, cancelled, closed), (64, 1, 1, 1));
     read
 }
+fn timer_batch(l: &mut Loop, out: &mut Completions) -> usize {
+    let mut handles = [None; 1000];
+    let at = Instant::now() + Duration::from_secs(30);
+    for (i, slot) in handles.iter_mut().enumerate() {
+        let h = l
+            .timer(at + Duration::from_nanos(i as u64), None, Token(20))
+            .expect("batch timer");
+        *slot = Some(h);
+    }
+    for h in handles.iter().flatten() {
+        assert!(l.cancel(l.timer_op(*h).expect("batch op")));
+        l.close(*h, Token(21)).expect("close batch timer");
+    }
+    let mut cancelled = 0;
+    let mut closed = 0;
+    while cancelled + closed < 2000 {
+        l.turn(Timeout::Now, out).expect("batch delivery");
+        assert!(!out.is_empty());
+        for c in out.drain() {
+            match c.result {
+                OpResult::Cancelled => cancelled += 1,
+                OpResult::Closed => closed += 1,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+    assert_eq!(cancelled, 1000);
+    assert_eq!(closed, 1000);
+    cancelled
+}
 #[test]
 fn steady_read_write_timer_and_accept_allocate_nothing() {
     let mut l = Loop::new(Config::default()).expect("loop");
@@ -136,6 +166,22 @@ fn steady_read_write_timer_and_accept_allocate_nothing() {
     let allocations = ALLOCS.with(Cell::get);
     assert_eq!(bytes, 128_000);
     assert_eq!(allocations, 0, "steady read/write/timer allocations");
+    for _ in 0..3 {
+        timer_batch(&mut l, &mut out);
+    }
+    ALLOCS.with(|v| v.set(0));
+    ACTIVE.with(|v| v.set(true));
+    let mut timers = 0;
+    for _ in 0..10 {
+        timers += timer_batch(&mut l, &mut out);
+    }
+    ACTIVE.with(|v| v.set(false));
+    let allocations = ALLOCS.with(Cell::get);
+    assert_eq!(timers, 10_000);
+    assert_eq!(
+        allocations, 0,
+        "steady batches of 1000 timers allocate nothing"
+    );
     let listener = l
         .tcp_listen("127.0.0.1:0".parse().expect("addr"), &ListenOpts::default())
         .expect("listen");

@@ -1,7 +1,7 @@
 use crate::{
     backend::{Backend, Event, Operation, Outcome, Request},
     table::Table,
-    timer::TimerQueue,
+    timer::DriverTimerQueue as TimerQueue,
     *,
 };
 use std::{
