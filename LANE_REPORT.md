@@ -1,36 +1,35 @@
-# Integration lane report
+# ci-fix lane report
 
-Updated 2026-09-14. Wave-1 integration and local verification are complete; external
-release prerequisites remain explicitly pending. The integrator makes commits because Git metadata is read-only.
+Updated 2026-09-14. Work in progress; the integrator owns commits and hosted CI.
+Scope: dependency security exception, portable Windows suites, deterministic MySQL
+ authentication, and Linux instruction-baseline bootstrap. WASI/web jobs untouched.
 
-Implemented: full turnloop rename; eight-member workspace (six publishable crates,
-two private helpers); stable 1.97.1 metadata; shared soaked dependencies; private
-start/stop/run server runner and common TURNLOOP_TEST_* ports; consolidated CI with
-explicit pending platform/baseline gates; native and cross-target test fixes;
-no-spin contract and the cached-readiness/EAGAIN core fix.
+Implemented so far:
+- Exact crate/version security exceptions with advisory, reason, checked expiry,
+  checksum verification, active output and rejection of unused/expired entries.
+- rustls 0.23.45 exception until seven-day eligibility, 2026-09-21T15:11:17Z.
+- Native runner independently requires positive core/protocol counts; Windows
+  production contracts remain explicitly pending with WINDOWS_HANDOFF.md summary.
+- MySQL test deliberately warms both auth accounts, acknowledges FLUSH PRIVILEGES
+  through a TLS admin fixture, then asserts full RSA/TLS and subsequent fast auth.
+  CI image is pinned to mysql:9.6.0, matching local 9.6.0.
 
-PASS: default workspace tests, strict native/Linux/WASI/web Clippy, stable
-1.97.1, rustdoc, five loom models, two Miri suites, no-tokio on all eight target
-graphs, seven-day soak, cargo-deny, workflow lint wrapper and 15 automation tests. All six
-publishable crates passed fully verified cargo publish dry runs; no --no-verify
-was needed and nothing was uploaded. Redis (single/ACL/TLS/cluster/Sentinel), MongoDB
-(standalone/replicas/auth/TLS), and SMTP real-server subset passed.
+Verification ledger (updated as commands complete):
+- PASS: required design, contribution, integration and relevant lane reports read;
+  no applicable AGENTS.md or unnecessary cfg(unix) exclusions found.
+- PASS: `env CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE='0 days' cargo +nightly-2026-08-20 update -p rustls --precise 0.23.45`.
+  The pinned Cargo accepts this env form; override applies only to this command.
+- PASS: registry index timestamp/checksum and RustSec advisory inspected; official
+  upload-artifact v7.0.1 commit resolved via GitHub API.
+- UNRUN (pending work): Python gate tests, fmt, native/cross Clippy, stable check,
+  workspace tests, soak, no-tokio, cargo-deny and workflow lint.
+- UNRUN: Windows/Linux execution and Linux Callgrind counts (no runtime here).
+- UNRUN (sandbox): MySQL real-server body; initializer probe still to run.
 
-UNRUN: SQL test bodies (PostgreSQL shmget denied; MySQL initializer crashes in this
-sandbox), Linux/Windows runtime suites, full Windows test-target Clippy (ring needs
-Windows SDK headers), Docker CI fixture path, Windows/WASI/web production contracts,
-and Linux instruction measurements. Their gates have not been weakened or skipped.
+Deviations / proposed DESIGN.md changes: no runtime, allocation, no-spin or soak
+window relaxation. Security-only early lock updates are the user-authorized
+exception to the dependency window. No DESIGN.md edit proposed yet.
 
-Audit changes: removed unmaintained rustls-pemfile; updated the iai-callgrind gate
-to its maintained Gungraun 0.19.4 successor to remove proc-macro-error2; kept all
-thresholds and v6 summary checks. Pinned email-encoding 0.4.1 to share base64 0.22.1.
-Added permissive 0BSD for quoted_printable, with no advisory/runtime exceptions.
-
-The detailed command history, earlier failures and remaining lane questions are in
-[docs/INTEGRATION_REPORT.md](docs/INTEGRATION_REPORT.md) and its linked command log.
-Next: integrator reruns SQL and hosted CI, integrates
-wave-2 backends/HTTP, obtains the Linux baseline and handles first publications.
-
-Earlier failures, including a loaded timer-precision run, remain in the report.
-The unchanged full native gate passed afterward. Raw actionlint still rejects
-GitHub concurrency.queue; the strict validated compatibility wrapper passes.
+Open questions / next steps: finish baseline bootstrap and adversarial tests;
+run local checks, document exact artifact commit procedure, hand the coherent
+working tree to the integrator for hosted CI and MySQL execution outside sandbox.

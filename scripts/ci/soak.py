@@ -1,23 +1,72 @@
 """Enforce the resolver policy AND registry age of every locked registry package."""
 import argparse
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 import json
 from pathlib import Path
 import os
+import re
 import tomllib
 import urllib.request
 from common import PIN, cargo, entrypoint, fail, members, metadata, run
 
 
-def check_age(package, record, now):
+def security_exceptions(policy, now):
+    exceptions = {}
+    for entry in policy.get('security-exceptions', []):
+        if set(entry) != {'crate', 'version', 'advisory', 'reason', 'expires'}:
+            fail('Security exception requires crate, exact version, advisory, reason and expires')
+        for key in ('crate', 'version', 'advisory', 'reason'):
+            if not isinstance(entry[key], str) or not entry[key].strip():
+                fail(f'Security exception has invalid {key}')
+        if not re.fullmatch(r'[A-Za-z0-9_-]+', entry['crate']) or not re.fullmatch(
+                r'\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?', entry['version']):
+            fail('Security exception must name one crate and an exact version')
+        if not re.fullmatch(r'RUSTSEC-\d{4}-\d{4}', entry['advisory']):
+            fail('Security exception requires a RUSTSEC advisory ID')
+        expires = entry['expires']
+        if isinstance(expires, str):
+            expires = date.fromisoformat(expires)
+        if type(expires) is not date:
+            fail('Security exception expires must be a UTC date (YYYY-MM-DD)')
+        key = (entry['crate'], entry['version'])
+        if key in exceptions:
+            fail(f'Duplicate security exception: {key}')
+        if now.date() > expires:
+            fail(f'Expired security exception: {key}; remove it from policy.toml')
+        exceptions[key] = {**entry, 'expires': expires}
+    return exceptions
+
+
+def check_age(package, record, now, exception=None):
     if record['cksum'] != package['checksum']:
         fail(f'Checksum mismatch for {package["name"]}@{package["version"]}')
     published = datetime.fromisoformat(record['pubtime'].replace('Z', '+00:00'))
+    if published.tzinfo is None or published > now:
+        fail(f'Invalid/future publish timestamp for {package["name"]}')
     eligible = published + timedelta(days=7)
+    if exception is not None:
+        if (exception['crate'], exception['version']) != (package['name'], package['version']):
+            fail('Security exception does not match the locked crate/version')
+        if exception['expires'] != eligible.date():
+            fail('Security exception expiry must equal the registry publish date + 7 days')
+        if now >= eligible:
+            fail(f'Unused security exception: {package["name"]}@{package["version"]} '
+                 'has completed its soak; remove it from policy.toml')
+        print(f'ACTIVE security exception: {exception["crate"]}@{exception["version"]}; '
+              f'{exception["advisory"]}; {exception["reason"]}; '
+              f'expires {exception["expires"]} (eligible {eligible.isoformat()})')
+        return True
     if now < eligible:
         fail(f'Supply-chain soak: {package["name"]}@{package["version"]} was published '
              f'{published.isoformat()}; eligible {eligible.isoformat()} (7 days). '
              'Choose an older version; a pre-filled Cargo.lock does not waive the soak.')
+    return False
+
+
+def check_unused(exceptions, used):
+    unused = set(exceptions) - used
+    if unused:
+        fail(f'Unused security exceptions: {sorted(unused)}; remove them from policy.toml')
 
 
 def index_path(name):
@@ -52,6 +101,8 @@ def main():
     count = 0
     cache = {}
     now = datetime.now(timezone.utc)
+    exceptions = security_exceptions(tomllib.loads((root / 'scripts/ci/policy.toml').read_text()), now)
+    used = set()
     for package in lock['package']:
         source = package.get('source', '')
         if not source:
@@ -64,9 +115,12 @@ def main():
             request = urllib.request.Request(url, headers={'User-Agent': 'PerryTS-turnloop-ci'})
             with urllib.request.urlopen(request, timeout=60) as response:
                 cache[name] = {r['vers']: r for r in map(json.loads, response.read().decode().splitlines())}
-        check_age(package, cache[name][package['version']], now)
+        key = (name, package['version'])
+        if check_age(package, cache[name][package['version']], now, exceptions.get(key)):
+            used.add(key)
         count += 1
-    print(f'PASS soak: {count} locked registry versions; pinned resolver policy active')
+    check_unused(exceptions, used)
+    print(f'PASS soak: {count} locked registry versions; {len(used)} security exceptions; pinned resolver policy active')
 
 
 if __name__ == '__main__':
