@@ -8,3 +8,5 @@
 __pycache__/
 **/pkg/
 **/node_modules/
+
+/.tools/
