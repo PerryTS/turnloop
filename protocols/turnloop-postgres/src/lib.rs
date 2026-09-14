@@ -228,6 +228,8 @@ pub struct Connection {
     scram: Option<ScramSha256>,
     auth_ok: bool,
     tls: bool,
+    binding_available: bool,
+    scram_plus: bool,
     copy_in: bool,
     transaction: TransactionStatus,
     key: Option<(i32, i32)>,
@@ -262,6 +264,8 @@ impl Connection {
             scram: None,
             auth_ok: false,
             tls: false,
+            binding_available: false,
+            scram_plus: false,
             copy_in: false,
             transaction: TransactionStatus::Idle,
             key: None,
@@ -320,11 +324,23 @@ impl Connection {
         self.input.extend_from_slice(bytes);
         Ok(())
     }
+    /// Acknowledge TLS without channel-binding data (plain SCRAM fallback).
     pub fn tls_established(&mut self) -> Result<()> {
+        self.tls_established_with_channel_binding(false)
+    }
+    /// Acknowledge verified TLS and whether the host can supply tls-server-end-point
+    /// data to `start_scram`. The core prefers PLUS only when data is available.
+    pub fn tls_established_with_channel_binding(&mut self, available: bool) -> Result<()> {
         if self.state != State::Tls || !self.output().is_empty() {
             return Err(Error::State("TLS transition not ready"));
         }
+        if self.config.channel_binding_required && !available {
+            return Err(Error::State(
+                "channel binding required but certificate binding is unavailable",
+            ));
+        }
         self.tls = true;
+        self.binding_available = available;
         self.startup()
     }
     pub fn start_scram(&mut self, scram: ScramSha256) -> Result<()> {
@@ -662,6 +678,11 @@ impl Connection {
                         if self.scram.is_some() {
                             return Err(Error::Protocol("SCRAM final verification missing"));
                         }
+                        if self.config.channel_binding_required && !self.scram_plus {
+                            return Err(Error::Protocol(
+                                "channel binding required but SCRAM-PLUS was not authenticated",
+                            ));
+                        }
                         self.auth_ok = true;
                     }
                     3 => {
@@ -693,10 +714,16 @@ impl Connection {
                             }
                         }
                         c.end()?;
-                        let plus = self.tls && plus;
-                        if (!plus && !plain) || (self.config.channel_binding_required && !plus) {
+                        let plus = self.tls && self.binding_available && plus;
+                        if self.config.channel_binding_required && !plus {
+                            return Err(Error::Protocol(
+                                "channel binding required but server did not offer SCRAM-SHA-256-PLUS",
+                            ));
+                        }
+                        if !plus && !plain {
                             return Err(Error::Protocol("unsupported SASL mechanisms"));
                         }
+                        self.scram_plus = plus;
                         self.state = State::Scram(plus);
                         return Ok(Some(Event::ScramNeeded { plus }));
                     }

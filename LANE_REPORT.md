@@ -143,3 +143,112 @@ are documented rather than silently simulated.
   `python3 scripts/test-servers.py --services postgres,mysql run python3 scripts/ci/run-tests.py protocol-wasi --target wasm32-wasip2 --real-servers --package turnloop-postgres --package turnloop-mysql`.
 - CI retains `protocol` and `protocol-wasi` in required `ci-gate` dependencies.
   No remote CI, release or publication was performed in this lane.
+
+## adb-fix1 — completed; SQL runtime awaits integrator
+
+### Root cause and fix
+
+TLS alone selected SCRAM-PLUS, but the async client never derived certificate
+binding. It now hashes the verified peer leaf after upgrade, using the shared
+`turnloop_tls::tls_server_end_point` helper and allocation-free peer-chain access.
+The bounds-checked DER reader selects the **outer signature algorithm**: RSA and
+ECDSA SHA-256/384/512, RSA-PSS parameters (including SHA-1 defaults), and RSA
+MD5/SHA-1 mapped to SHA-256. An explicit `ConnectOptions::channel_binding` wins.
+Unknown algorithms/absent certificates use plain SCRAM with `n,,`.
+
+The sans-I/O machine owns mechanism selection through the additive
+`tls_established_with_channel_binding(available)` acknowledgement. The original
+`tls_established()` means no binding available. Required binding fails clearly
+without data or a PLUS offer and cannot be bypassed by bare AuthenticationOk.
+The synchronous driver derives from its actual verified peer certificate and
+uses the same helper and fallback. READMEs describe both paths.
+
+This follows [RFC 5929 §4.1](https://www.rfc-editor.org/rfc/rfc5929.html#section-4.1),
+[RSA-PSS parameters](https://www.rfc-editor.org/rfc/rfc4055.html#section-3.1), and
+[libpq prefer semantics](https://www.postgresql.org/docs/16/libpq-connect.html#LIBPQ-CONNECT-CHANNEL-BINDING).
+No new registry packages or versions: all **251** locked registry versions and
+checksums are unchanged. Existing ring, rcgen and base64 workspace dependencies
+are reused; no soak exception or override was added.
+
+### Tests and verification
+
+**Every verification invocation, including intermediate failures, is recorded in
+[docs/adb-fix1-commands.md](docs/adb-fix1-commands.md)**; raw logs live in
+`.tools/adb-fix1/`. Final results:
+
+| Command / scope | Result |
+| --- | --- |
+| `cargo fmt --all --check`; `git diff --check` | PASS |
+| Strict `cargo clippy --locked --workspace --all-targets`, default/all features, `-D warnings -D clippy::undocumented_unsafe_blocks` | PASS |
+| `cargo +stable check --locked --workspace --all-targets --all-features` | PASS |
+| `cargo test --locked --workspace -- --test-threads=1` | PASS: 245 passed, 13 service tests ignored/UNRUN |
+| Same workspace tests with `--all-features` | PASS: 300 passed, 20 service tests ignored/UNRUN |
+| `cargo test --locked -p turnloop-postgres -p turnloop-tls --all-features -- --test-threads=1` | PASS: final 34 passed, 5 real SQL tests ignored/UNRUN |
+| Strict all-target/all-feature Clippy for both touched crates: WASI p2/p3, web, Linux x86_64 | PASS; p3 uses nightly-2026-09-07 |
+| `python3 scripts/ci/run-tests.py protocol-wasi --target wasm32-wasip2 --package turnloop-postgres --package turnloop-tls` | PASS: 22 tests, six positive-count suites |
+| Same protocol command with `--target wasm32-wasip3` | PASS: 22 tests; existing declared p3 release profile for PG async |
+| Windows strict library Clippy and explicit `channel_binding`, `protocol`, `server` test-target Clippy | PASS; execution UNRUN |
+| Windows strict all-target Clippy | FAIL: inherited missing `backend::Platform` IOCP provider; no cfg exclusion added |
+| `bash scripts/ci/no-tokio.sh`; `python3 scripts/ci/soak.py` | PASS: all policy targets; seven-day policy and existing rustls exception retained |
+| Strict rustdoc for both crates; `python3 scripts/ci/feature_modes.py` | PASS |
+| `python3 scripts/ci/check-paths.py` | FAIL only because new modules are untracked in the read-only Git index. Same unchanged checker over exact working-tree names PASS (233 references); integrator must stage and rerun |
+| Source/lock audit and exact startup-rejection diagnostic test | PASS; original async real-server file preserved byte-for-byte, separate test appended |
+
+Scripted TLS peers execute five cases: rcgen ECDSA P-256 automatic PLUS, explicit
+override, Ed25519 `n,,` fallback, missing required binding, and required PLUS.
+They verify mechanism, GS2 flag, decoded cbind bytes against an independent SHA-256
+of the leaf, client proof, server signature, and a subsequent row. The rejected
+connection must drop its owned stream exactly once and send zero startup bytes.
+Pure wire tests cover offer/data combinations, legacy acknowledgement, required
+binding errors and authentication bypass. Fourteen real OpenSSL certificates
+cover every supported algorithm (including PSS with a different MGF1 hash), plus
+Ed25519; independent hashlib digests, every truncated prefix and malformed DER/
+PSS parameters are checked. These suites are declared for WASI execution.
+
+Allocation gates prove **zero** allocations for 1,000 peer-chain/hash accesses
+and 5 × 1,000 hash/fallback operations. Existing query/pool zero gates and TLS's
+400 upstream allocations per 100 bidirectional records remain unchanged.
+
+Initial new-fixture failures were teardown assertions: native reset and WASI p2
+last-operation-failed do not always report EOF. The final rejection fixture adds
+an independent exactly-once stream-drop probe and still rejects any startup
+bytes and any client error other than the specified binding error. All SCRAM,
+proof, work-count and allocation assertions remain active. No backend/gate was
+changed to handle that platform difference.
+
+### Startup panic and real-server status
+
+The reported panic is **expected**, not a swallowed real-server failure.
+`rejected_startup_reports_server_sqlstate_and_message` catches its synchronous
+test-driver panic, asserts SQLSTATE 28000 and the missing-role message, and joins
+the scripted peer. Its exact `--nocapture` rerun prints that panic and passes one
+test. A comment now explains this behavior. Actual cancellation observers already
+use `scram_user`, not an assumed `postgres` role.
+
+The original `real_async_tls_queries_copy_cancel_pool_and_connection_kill` is
+unchanged. A separate ignored `real_async_required_channel_binding_authenticates_over_ssl`
+uses auto-derived binding with the required policy and asserts one true `pg_stat_ssl`
+row. PostgreSQL 16's `hostssl ... scram-sha-256` fixture offers both mechanisms;
+[pg_stat_ssl](https://www.postgresql.org/docs/16/monitoring-stats.html#MONITORING-PG-STAT-SSL-VIEW)
+reports TLS, not the SCRAM mechanism. No role-level PLUS-only enforcement was
+added; the new test proves PLUS through the client's required/verified policy,
+while scripted peers inspect the actual mechanism and binding bytes.
+
+Attempted integrator reproduction:
+`python3 scripts/test-servers.py --services postgres,mysql run python3 scripts/ci/run-tests.py protocol --package turnloop-postgres --package turnloop-mysql`.
+Fixture command FAIL at PostgreSQL initdb `shmget`, Operation not permitted;
+**both SQL suites UNRUN (sandbox)** in this invocation. MySQL startup was never
+reached. User-supplied pre-fix outside-sandbox results remain: MySQL server/async
+PASS (3 + 1), PostgreSQL sync PASS (4), PostgreSQL async FAIL (binding bug).
+No post-fix real SQL pass is claimed.
+
+### Deviations, open questions and next steps
+
+No DESIGN.md changes proposed; no backend, no-spin rule, existing test threshold,
+dependency version or security/soak policy changed. No implementation question
+remains. Integrator: stage/commit new modules and certificate fixtures, rerun the
+index path gate, and rerun the SQL reproduction above outside the sandbox. Also
+run `python3 scripts/test-servers.py --services postgres,mysql run python3 scripts/ci/run-tests.py protocol-wasi --target wasm32-wasip2 --real-servers --package turnloop-postgres --package turnloop-mysql`
+after sourcing `.tools/wasm-env.sh` (UNRUN: sandbox). Linux/Windows runtime remains
+UNRUN without those hosts; full Windows all-target compilation needs the provider
+merge. Browser runtime is UNRUN; raw PostgreSQL TCP is not a browser capability.

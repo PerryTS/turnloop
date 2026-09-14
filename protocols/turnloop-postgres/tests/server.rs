@@ -28,6 +28,7 @@ struct Driver {
     scram: bool,
     plus: bool,
     parameters: usize,
+    binding: Option<Vec<u8>>,
 }
 impl Driver {
     fn connect(user: &str, ssl: SslMode) -> Self {
@@ -56,6 +57,7 @@ impl Driver {
             scram: false,
             plus: false,
             parameters: 0,
+            binding: None,
         };
         while !d.core.is_ready() {
             d.step(&mut Results::default(), None);
@@ -85,32 +87,21 @@ impl Driver {
             match event {
                 Event::UpgradeTls => {
                     self.io.upgrade();
+                    self.binding = self.io.channel_binding();
                     self.core
-                        .tls_established()
+                        .tls_established_with_channel_binding(self.binding.is_some())
                         .expect("fixture operation must succeed");
                     self.ssl = true;
                 }
                 Event::ScramNeeded { plus } => {
-                    // RFC 5929 tls-server-end-point for the SHA256 fixture certificate.
                     let binding = if plus {
-                        let cert = std::fs::read(support::tools().join("server.der"))
-                            .expect("fixture operation must succeed");
-                        let digest = rustls::crypto::ring::default_provider()
-                            .cipher_suites
-                            .iter()
-                            .find(|suite| {
-                                suite.suite() == rustls::CipherSuite::TLS13_AES_128_GCM_SHA256
-                            })
-                            .and_then(|suite| suite.tls13())
-                            .expect("fixture operation must succeed")
-                            .common
-                            .hash_provider
-                            .hash(&cert);
-                        // First ring TLS1.3 suite uses SHA256 in this provider.
-                        assert_eq!(digest.as_ref().len(), 32);
-                        ChannelBinding::tls_server_end_point(digest.as_ref().to_vec())
+                        ChannelBinding::tls_server_end_point(
+                            self.binding
+                                .clone()
+                                .expect("core selected available binding"),
+                        )
                     } else {
-                        ChannelBinding::unrequested()
+                        ChannelBinding::unsupported()
                     };
                     self.core
                         .start_scram(ScramSha256::new(&self.password, binding))
@@ -216,6 +207,9 @@ fn rejected_startup_reports_server_sqlstate_and_message() {
             .expect("ErrorResponse length");
         io.write_all(body).expect("ErrorResponse body");
     });
+    // This deliberately catches the diagnostic panic from our synchronous test
+    // driver, not a real-server failure. The panic hook prints under --nocapture;
+    // SQLSTATE/message assertions and the joined peer below must still succeed.
     let error = std::panic::catch_unwind(|| Driver::connect_to(port, "postgres", SslMode::Disable))
         .err()
         .expect("missing role must fail startup");

@@ -301,44 +301,9 @@ fn invalid_input_is_bounded_and_commands_are_atomic() {
     assert!(c.next_event().is_err());
 }
 
-fn sha256(b: &[u8]) -> [u8; 32] {
-    use sha2::Digest;
-    sha2::Sha256::digest(b).into()
-}
-
-fn hmac(key: &[u8], message: &[u8]) -> [u8; 32] {
-    let mut inner = vec![0x36; 64];
-    let mut outer = vec![0x5c; 64];
-    for (i, b) in key.iter().enumerate() {
-        inner[i] ^= *b;
-        outer[i] ^= *b;
-    }
-    inner.extend_from_slice(message);
-    outer.extend_from_slice(&sha256(&inner));
-    sha256(&outer)
-}
-fn base64(bytes: &[u8]) -> String {
-    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut s = String::new();
-    for chunk in bytes.chunks(3) {
-        let a = chunk[0] as usize;
-        let b = chunk.get(1).copied().unwrap_or(0) as usize;
-        let c = chunk.get(2).copied().unwrap_or(0) as usize;
-        s.push(alphabet[a >> 2] as char);
-        s.push(alphabet[((a & 3) << 4) | (b >> 4)] as char);
-        s.push(if chunk.len() > 1 {
-            alphabet[((b & 15) << 2) | (c >> 6)] as char
-        } else {
-            '='
-        });
-        s.push(if chunk.len() > 2 {
-            alphabet[c & 63] as char
-        } else {
-            '='
-        });
-    }
-    s
-}
+#[path = "support/scram.rs"]
+mod scram;
+use scram::{base64, hex_salted_password, hmac};
 #[test]
 fn scram_and_plus_verify_server_signature_and_reject_bad_verifier() {
     // PBKDF2-HMAC-SHA256('secret','salt',4096), independently generated with Python hashlib.
@@ -361,7 +326,8 @@ fn scram_and_plus_verify_server_signature_and_reject_bad_verifier() {
                 c.next_event().expect("fixture operation must succeed"),
                 Some(Event::UpgradeTls)
             ));
-            c.tls_established().expect("fixture operation must succeed");
+            c.tls_established_with_channel_binding(true)
+                .expect("fixture operation must succeed");
             flush(&mut c);
         }
         let mut mechanisms = 10u32.to_be_bytes().to_vec();
@@ -435,12 +401,6 @@ fn scram_and_plus_verify_server_signature_and_reject_bad_verifier() {
         }
     }
 }
-fn hex_salted_password() -> [u8; 32] {
-    [
-        96, 154, 98, 181, 182, 135, 186, 101, 146, 177, 42, 85, 44, 121, 254, 59, 241, 158, 78, 20,
-        90, 22, 123, 121, 91, 122, 202, 181, 232, 159, 160, 246,
-    ]
-}
 
 #[test]
 fn extended_copy_resynchronizes_after_copy_done() {
@@ -496,4 +456,137 @@ fn extended_copy_resynchronizes_after_copy_done() {
             ..
         })
     ));
+}
+
+fn tls_authentication(required: bool, available: bool) -> Result<Connection> {
+    let mut c = Connection::new(Config {
+        ssl: SslMode::Require,
+        channel_binding_required: required,
+        ..Default::default()
+    })?;
+    flush(&mut c);
+    c.receive(b"S")?;
+    assert!(matches!(c.next_event()?, Some(Event::UpgradeTls)));
+    c.tls_established_with_channel_binding(available)?;
+    flush(&mut c);
+    Ok(c)
+}
+
+#[test]
+fn scram_preference_is_decided_by_tls_binding_availability_and_server_offer() {
+    let mut ran = 0;
+    for available in [false, true] {
+        for offer in [
+            b"SCRAM-SHA-256-PLUS\0SCRAM-SHA-256\0\0".as_slice(),
+            b"SCRAM-SHA-256\0\0",
+            b"SCRAM-SHA-256-PLUS\0\0",
+        ] {
+            let mut c = tls_authentication(false, available).expect("TLS");
+            c.receive(&frame(
+                b'R',
+                &[10u32.to_be_bytes().as_slice(), offer].concat(),
+            ))
+            .expect("mechanisms");
+            let offers_plus = offer.starts_with(b"SCRAM-SHA-256-PLUS\0");
+            let only_plus = offer == b"SCRAM-SHA-256-PLUS\0\0";
+            if only_plus && !available {
+                assert_eq!(
+                    c.next_event().expect_err("no usable mechanism"),
+                    Error::Protocol("unsupported SASL mechanisms")
+                );
+            } else {
+                let plus = available && offers_plus;
+                assert!(
+                    matches!(c.next_event().expect("selection"), Some(Event::ScramNeeded { plus: selected }) if selected == plus)
+                );
+                let binding = if plus {
+                    ChannelBinding::tls_server_end_point(vec![1; 32])
+                } else {
+                    ChannelBinding::unsupported()
+                };
+                c.start_scram(ScramSha256::new(b"secret", binding))
+                    .expect("SCRAM start");
+                let packet = flush(&mut c);
+                let name = if plus {
+                    b"SCRAM-SHA-256-PLUS\0".as_slice()
+                } else {
+                    b"SCRAM-SHA-256\0"
+                };
+                assert_eq!(&packet[5..5 + name.len()], name);
+                let initial = &packet[5 + name.len() + 4..];
+                assert!(initial.starts_with(if plus {
+                    b"p=tls-server-end-point,,".as_slice()
+                } else {
+                    b"n,,"
+                }));
+            }
+            ran += 1;
+        }
+    }
+    assert_eq!(ran, 6);
+}
+
+#[test]
+fn required_binding_rejects_missing_data_missing_plus_and_authentication_bypass() {
+    assert!(matches!(
+        tls_authentication(true, false),
+        Err(Error::State(
+            "channel binding required but certificate binding is unavailable"
+        ))
+    ));
+    let mut c = tls_authentication(true, true).expect("binding available");
+    c.receive(&frame(
+        b'R',
+        &[10u32.to_be_bytes().as_slice(), b"SCRAM-SHA-256\0\0"].concat(),
+    ))
+    .expect("plain-only offer");
+    assert_eq!(
+        c.next_event().expect_err("PLUS required"),
+        Error::Protocol("channel binding required but server did not offer SCRAM-SHA-256-PLUS")
+    );
+    assert!(c.output().is_empty());
+    let mut c = tls_authentication(true, true).expect("binding available");
+    c.receive(&frame(b'R', &0u32.to_be_bytes()))
+        .expect("AuthenticationOk without SCRAM");
+    assert_eq!(
+        c.next_event()
+            .expect_err("trust cannot satisfy required binding"),
+        Error::Protocol("channel binding required but SCRAM-PLUS was not authenticated")
+    );
+    assert!(!c.is_ready());
+}
+
+#[test]
+fn legacy_tls_acknowledgement_has_no_binding_and_uses_n_gs2_flag() {
+    let mut c = Connection::new(Config {
+        ssl: SslMode::Require,
+        ..Default::default()
+    })
+    .expect("core");
+    flush(&mut c);
+    c.receive(b"S").expect("TLS accepted");
+    assert!(matches!(
+        c.next_event().expect("event"),
+        Some(Event::UpgradeTls)
+    ));
+    c.tls_established().expect("no binding acknowledgement");
+    flush(&mut c);
+    c.receive(&frame(
+        b'R',
+        &[
+            10u32.to_be_bytes().as_slice(),
+            b"SCRAM-SHA-256-PLUS\0SCRAM-SHA-256\0\0",
+        ]
+        .concat(),
+    ))
+    .expect("mechanisms");
+    assert!(matches!(
+        c.next_event().expect("selection"),
+        Some(Event::ScramNeeded { plus: false })
+    ));
+    c.start_scram(ScramSha256::new(b"secret", ChannelBinding::unsupported()))
+        .expect("plain SCRAM");
+    let packet = flush(&mut c);
+    assert_eq!(&packet[5..19], b"SCRAM-SHA-256\0");
+    assert!(packet[23..].starts_with(b"n,,"));
 }

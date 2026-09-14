@@ -24,6 +24,14 @@ and compose with HTTP/WebSocket adapters. `close` flushes close_notify; dropping
 aborts the transport. Refresh host wall time with `set_unix_seconds` when needed.
 The host continues calling `LocalExecutor::turn` throughout the connection.
 
+After a successful handshake, `peer_certificates()` borrows the peer chain,
+leaf first, without copying. `tls_server_end_point(leaf.as_ref())` derives the
+RFC 5929 certificate binding with ring and no heap allocation. It reads the outer
+certificate signature algorithm, supports RSA/ECDSA SHA-256/384/512 and RSA-PSS,
+and maps MD5/SHA-1 to SHA-256. Unsupported algorithms such as Ed25519 return
+`None`. This helper does not verify certificates: verification follows the TLS
+configuration, including any explicitly insecure host option.
+
 The adapter retains ciphertext/plaintext storage and uses rustls's unbuffered
 state machine. rustls 0.23's plaintext record representation still allocates;
 transport scratch allocation freedom is distinct from upstream crypto storage.

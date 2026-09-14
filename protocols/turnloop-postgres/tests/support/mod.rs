@@ -24,6 +24,15 @@ impl Transport {
             .expect("fixture operation must succeed");
         Self::Plain(stream)
     }
+    pub fn channel_binding(&self) -> Option<Vec<u8>> {
+        let Self::Tls(stream) = self else { return None };
+        let leaf = stream.conn.peer_certificates()?.first()?;
+        Some(
+            turnloop_tls::tls_server_end_point(leaf.as_ref())?
+                .as_ref()
+                .to_vec(),
+        )
+    }
     pub fn upgrade(&mut self) {
         let Self::Plain(socket) = self else {
             panic!("duplicate TLS upgrade")

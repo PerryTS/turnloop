@@ -10,7 +10,8 @@ pub struct ConnectOptions {
     pub address: SocketAddr,
     pub protocol: Config,
     pub tls: Option<ClientTls>,
-    /// tls-server-end-point digest for SCRAM-PLUS, computed from the verified leaf.
+    /// Override the tls-server-end-point digest. By default it is derived from
+    /// the verified TLS leaf; unsupported certificate algorithms use plain SCRAM.
     pub channel_binding: Option<Vec<u8>>,
 }
 
@@ -107,6 +108,7 @@ impl<B: Backend, S: Stream> Client<B, S> {
             Transport::Plain(stream),
             crate::Connection::new(config).map_err(io::Error::other)?,
         );
+        let mut derived_binding = None;
         deadline(executor, at, async {
             loop {
                 let mut upgrade = false;
@@ -132,15 +134,25 @@ impl<B: Backend, S: Stream> Client<B, S> {
                         io::Error::new(io::ErrorKind::InvalidInput, "TLS configuration required")
                     })?;
                     driver.upgrade_stream()?.upgrade(tls, executor, at).await?;
+                    if binding.is_none() {
+                        derived_binding = driver
+                            .stream()
+                            .and_then(Transport::peer_certificates)
+                            .and_then(|chain| chain.first())
+                            .and_then(|leaf| turnloop_tls::tls_server_end_point(leaf.as_ref()));
+                    }
                     driver
                         .core_mut()
-                        .tls_established()
+                        .tls_established_with_channel_binding(
+                            binding.is_some() || derived_binding.is_some(),
+                        )
                         .map_err(io::Error::other)?;
                 }
                 if let Some(plus) = scram {
                     let channel = if plus {
                         ChannelBinding::tls_server_end_point(
                             binding
+                                .or_else(|| derived_binding.as_ref().map(|digest| digest.as_ref()))
                                 .ok_or_else(|| {
                                     io::Error::new(
                                         io::ErrorKind::InvalidInput,

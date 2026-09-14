@@ -36,8 +36,12 @@ operation after `LISTEN`; query callbacks also receive interleaved notifications
 `copy_in` lends a chunk writer with `finish`; dropping it closes the session.
 `copy_out` lends each chunk to a callback without buffering the complete transfer.
 `cancel_token().cancel(...)` sends CancelRequest over a separate connection.
-SCRAM-SHA-256-PLUS uses the certificate endpoint digest supplied in
-`ConnectOptions::channel_binding`; plain SCRAM is available without it.
+TLS authentication prefers SCRAM-SHA-256-PLUS. The client derives RFC 5929
+`tls-server-end-point` data from the verified peer leaf; an explicit
+`ConnectOptions::channel_binding` overrides that digest. RSA/ECDSA SHA-256/384/512
+and RSA-PSS are supported; MD5/SHA-1 signatures use SHA-256. Unsupported algorithms
+(such as Ed25519) or absent peer certificates fall back to SCRAM-SHA-256 with the
+`n,,` GS2 header. `Config::channel_binding_required` rejects that fallback.
 
 
 ## Driving a connection
@@ -50,12 +54,16 @@ SCRAM-SHA-256-PLUS uses the certificate endpoint digest supplied in
 3. Feed plaintext with `receive(bytes)`, then repeatedly pull `next_event()` until
    it returns `None`. Flush any newly generated output before reading again.
 4. `UpgradeTls` is a hard boundary. Finish the existing plaintext write, perform
-   and verify TLS in the host, then call `tls_established`. TLS records never go
-   into `receive`. Prefer mode can fall back after `N`; Require cannot.
+   and verify TLS in the host. Derive binding with
+   `turnloop_tls::tls_server_end_point` from the verified peer leaf, then call
+   `tls_established_with_channel_binding(binding.is_some())`. The original
+   `tls_established()` acknowledges TLS without binding data. TLS records never
+   go into `receive`. Prefer mode can fall back after `N`; Require cannot.
 5. For `ScramNeeded`, construct the reexported upstream `ScramSha256` **in the
    host** (its constructor reads entropy), then call `start_scram`. PLUS needs
    `ChannelBinding::tls_server_end_point` containing the certificate digest
-   defined in RFC 5929. The core checks the mechanism/binding selection and
+   defined in RFC 5929. For plain SCRAM use `ChannelBinding::unsupported()`.
+   The core checks the mechanism/binding selection and
    verifies the server signature. Iterations are capped by configuration.
 6. Schedule `next_timeout()` in the host. Call `handle_timeout(now)` with supplied
    monotonic time. No method obtains time implicitly.

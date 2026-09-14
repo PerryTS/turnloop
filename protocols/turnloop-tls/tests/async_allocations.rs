@@ -134,6 +134,25 @@ mod native {
                 )
                 .await
                 .expect("handshake");
+                let expected_leaf = cert.cert.der();
+                let expected_digest = turnloop_tls::tls_server_end_point(expected_leaf)
+                    .expect("ECDSA SHA-256 certificate binding");
+                let mut bindings = 0;
+                assert_eq!(
+                    measure(|| {
+                        for _ in 0..1000 {
+                            let chain = tls.peer_certificates().expect("verified peer chain");
+                            assert_eq!(chain, std::slice::from_ref(expected_leaf));
+                            let digest = turnloop_tls::tls_server_end_point(chain[0].as_ref())
+                                .expect("binding");
+                            assert_eq!(digest.as_ref(), expected_digest.as_ref());
+                            bindings += 1;
+                        }
+                    }),
+                    0,
+                    "peer chain access and binding must allocate zero"
+                );
+                assert_eq!(bindings, 1000);
                 for round in 0..110 {
                     if round == 10 {
                         COUNT.store(0, Ordering::Relaxed);

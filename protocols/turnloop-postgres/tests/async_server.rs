@@ -255,3 +255,59 @@ fn real_async_tls_queries_copy_cancel_pool_and_connection_kill() {
         .expect("spawn");
     drive(&mut ex, &mut task);
 }
+
+#[test]
+#[ignore = "private PostgreSQL fixture; sandbox shmget is UNRUN"]
+fn real_async_required_channel_binding_authenticates_over_ssl() {
+    let ca = std::fs::read(
+        std::path::PathBuf::from(std::env::var_os("TURNLOOP_TEST_SQL_TOOLS").expect("SQL tools"))
+            .join("server.der"),
+    )
+    .expect("CA");
+    let options = ConnectOptions {
+        address: ([127, 0, 0, 1], port("TURNLOOP_TEST_POSTGRES_PORT")).into(),
+        protocol: turnloop_postgres::Config {
+            user: "tls_user".into(),
+            password: b"fixture-password".to_vec(),
+            ssl: SslMode::Require,
+            channel_binding_required: true,
+            ..Default::default()
+        },
+        tls: Some(tls(ca)),
+        channel_binding: None,
+    };
+    let mut ex = LocalExecutor::<Platform>::new(LoopConfig::default()).expect("executor");
+    let h = ex.handle();
+    let mut task = ex
+        .spawn_local(async move {
+            let at = h.now() + Duration::from_secs(10);
+            // The core rejects AuthenticationOk unless SCRAM-PLUS verified. No
+            // override: this must derive binding from the actual server leaf.
+            let mut c = Client::connect(&h, &options, at)
+                .await
+                .expect("required SCRAM-PLUS");
+            let mut rows = 0;
+            assert_eq!(
+                c.query(
+                    "SELECT ssl FROM pg_stat_ssl WHERE pid=pg_backend_pid()",
+                    at,
+                    |event| {
+                        if let Event::Row { mut row, .. } = event {
+                            assert_eq!(
+                                row.next().expect("SSL row").expect("SSL value"),
+                                Some(b"t".as_slice())
+                            );
+                            rows += 1;
+                        }
+                        Ok(())
+                    }
+                )
+                .await
+                .expect("SSL query"),
+                Outcome::Success
+            );
+            assert_eq!(rows, 1);
+        })
+        .expect("spawn");
+    drive(&mut ex, &mut task);
+}

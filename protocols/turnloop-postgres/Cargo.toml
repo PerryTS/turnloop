@@ -29,7 +29,7 @@ workspace = true
 
 [package.metadata.turnloop-ci]
 role = "protocol"
-wasi-tests = ["asynchronous"]
+wasi-tests = ["asynchronous", "protocol"]
 # Pinned p3 compiler: custom allocator traps before main in debug (wasm2 report).
 wasi-p3-release-tests = ["asynchronous"]
 wasi-integration-tests = ["async_server"]
@@ -37,6 +37,9 @@ integration-tests = ["server", "async_server"]
 
 [dev-dependencies]
 sha2.workspace = true
+rcgen.workspace = true
+base64.workspace = true
+turnloop-tls.workspace = true
 
 [target.'cfg(all(target_os = "wasi", target_env = "p3"))'.dependencies]
 turnloop-io = { workspace = true, optional = true, features = ["wasi-p3-experimental"] }

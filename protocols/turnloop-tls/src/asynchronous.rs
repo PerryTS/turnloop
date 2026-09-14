@@ -53,6 +53,13 @@ impl<S: Stream> Transport<S> {
     pub fn is_tls(&self) -> bool {
         matches!(self, Self::Tls(_))
     }
+    /// Handshaken peer chain, leaf first; absent on plaintext/closed transports.
+    pub fn peer_certificates(&self) -> Option<&[rustls::pki_types::CertificateDer<'static>]> {
+        match self {
+            Self::Tls(s) => s.peer_certificates(),
+            Self::Plain(_) | Self::Closed => None,
+        }
+    }
     pub fn get_ref(&self) -> Option<&S> {
         match self {
             Self::Plain(s) => Some(s),
@@ -321,6 +328,14 @@ impl<S: Stream> TlsStream<S> {
         match &self.session {
             Session::Client(c) => c.alpn_protocol(),
             Session::Server(s) => s.alpn_protocol(),
+        }
+    }
+    /// Peer chain from the completed handshake, leaf first. Verification follows
+    /// the configured verifier, including any explicitly insecure host options.
+    pub fn peer_certificates(&self) -> Option<&[rustls::pki_types::CertificateDer<'static>]> {
+        match &self.session {
+            Session::Client(c) => c.peer_certificates(),
+            Session::Server(s) => s.peer_certificates(),
         }
     }
     /// Refresh wall time supplied by the embedding host.

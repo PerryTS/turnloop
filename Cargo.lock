@@ -1867,8 +1867,10 @@ dependencies = [
 name = "turnloop-postgres"
 version = "0.1.0-alpha.1"
 dependencies = [
+ "base64",
  "bytes",
  "postgres-protocol",
+ "rcgen",
  "rustls",
  "sha2",
  "turnloop-io",
