@@ -157,6 +157,7 @@ impl Response {
         if self.encoder.is_some() {
             return Err(io::Error::other("response already started"));
         }
+        let length = super::response_length(head, length);
         self.encoder = Some(
             crate::http1::Encoder::start(head, length, &mut self.output)
                 .map_err(io::Error::other)?,

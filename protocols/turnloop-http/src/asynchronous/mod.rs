@@ -47,8 +47,8 @@ impl<S: Stream> Http1<S> {
         head: &http1::Head,
         length: http1::BodyLength,
     ) -> io::Result<()> {
-        self.encoder =
-            Some(http1::Encoder::start(head, length, &mut self.output).map_err(io::Error::other)?);
+        let length = response_length(head, length);
+        self.encoder = Some(http1::Encoder::start(head, length, &mut self.output).map_err(io::Error::other)?);
         self.flush().await
     }
     pub async fn send_body(&mut self, bytes: &[u8]) -> io::Result<()> {
@@ -127,6 +127,11 @@ impl<S: Stream> Http1<S> {
         if !self.upgraded {
             return Err(io::Error::other("HTTP upgrade boundary not consumed"));
         }
+        Ok((self.stream.take().ok_or_else(closed)?, self.input))
+    }
+    /// Transfer ownership at a caller-validated protocol boundary (for example a
+    /// server accepting an upgrade). Includes all unread bytes without copying.
+    pub fn into_parts(mut self) -> io::Result<(S, Vec<u8>)> {
         Ok((self.stream.take().ok_or_else(closed)?, self.input))
     }
     pub fn into_inner(mut self) -> io::Result<S> {
@@ -244,3 +249,10 @@ impl<S: Stream> Http2<S> {
         self.flush().await
     }
 }
+
+fn response_length(head:&http1::Head,length:http1::BodyLength)->http1::BodyLength {
+    if matches!(length,http1::BodyLength::Empty) && head.status>=200 && !matches!(head.status,204|304){http1::BodyLength::Known(0)}else{length}
+}
+
+#[cfg(all(target_arch="wasm32",target_os="unknown"))]
+pub mod web;

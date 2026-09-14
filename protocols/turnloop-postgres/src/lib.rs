@@ -883,3 +883,6 @@ impl Connection {
         }
     }
 }
+
+#[cfg(feature = "turnloop")]
+pub mod asynchronous;

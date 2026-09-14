@@ -667,3 +667,22 @@ async fn worker_conditions_notify_waiting_loops_and_close() {
     assert_eq!(out[0].op, Some(op));
     assert!(!b.alive());
 }
+
+#[cfg(feature = "executor")]
+#[wasm_bindgen_test(async)]
+async fn executor_fetch_bytes_and_deadline_abort() {
+    use std::{future::Future,pin::Pin,task::{Context,Poll,Waker}};
+    let mut ex=LocalExecutor::<backend::Platform>::new(Config::default()).expect("executor");
+    let h=ex.handle();let url=base().to_owned();
+    let mut task=ex.spawn_local(async move {
+        let bytes=h.fetch(&(url.clone()+"/bytes")).await.expect("fetch");
+        assert_eq!(bytes.len(),257);for (i,byte) in bytes.iter().enumerate(){assert_eq!(*byte,((i*73+19)&255)as u8);}
+        let at=h.now()+Duration::from_millis(30);
+        assert_eq!(h.timeout_at(at,h.fetch(&(url+"/slow"))).await.expect_err("fetch deadline").kind,ErrorKind::TimedOut);
+        bytes.len()
+    }).expect("task");
+    assert_eq!(ex.run_ready(),1);
+    while !task.is_finished(){executor_scheduled(&mut ex).await;}
+    match Pin::new(&mut task).poll(&mut Context::from_waker(Waker::noop())){Poll::Ready(Ok(n))=>assert_eq!(n,257),_=>panic!("fetch task incomplete")}
+    ex.turn(Timeout::Now).expect("cancel and close delivery");
+}

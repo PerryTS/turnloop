@@ -134,3 +134,47 @@ impl<S> Drop for CloseOnDrop<'_, S> {
         }
     }
 }
+
+/// Protocol-core contract used by database and mail adapters. Events can borrow
+/// the core; the callback must finish consuming them before the next drive step.
+pub trait SansIo: Output {
+    type Event<'a> where Self:'a;
+    fn event(&mut self,receive:impl FnMut(Self::Event<'_>)->io::Result<()>)->io::Result<bool>;
+    fn ingest(&mut self,bytes:&[u8],now:Instant)->io::Result<usize>;
+    fn disconnected(&mut self);
+}
+/// A shared sans-I/O driver. Protocol crates only implement SansIo; transport
+/// flushing, partial input, cancellation and read scheduling live here once.
+pub struct Driver<S,C:SansIo>{stream:Option<S>,core:Option<C>,input:[u8;16384],start:usize,end:usize}
+impl<S:Stream,C:SansIo> Driver<S,C>{
+    pub fn new(stream:S,core:C)->Self{Self{stream:Some(stream),core:Some(core),input:[0;16384],start:0,end:0}}
+    pub fn core(&self)->&C{self.core.as_ref().expect("owned core")}
+    pub fn core_mut(&mut self)->&mut C{self.core.as_mut().expect("owned core")}
+    /// Drive until one protocol event is delivered. Wrap this in `deadline` for
+    /// the protocol's advertised timeout; cancellation closes and aborts the core.
+    pub async fn next<B:Backend>(&mut self,executor:&ExecutorHandle<B>,mut receive:impl FnMut(C::Event<'_>)->io::Result<()>)->io::Result<()>{
+        struct CoreGuard<'a,C:SansIo>{core:&'a mut C,done:bool}
+        impl<C:SansIo> Drop for CoreGuard<'_,C>{fn drop(&mut self){if !self.done{self.core.disconnected();}}}
+        let mut core=CoreGuard{core:self.core.as_mut().expect("owned core"),done:false};
+        let mut transport=CloseOnDrop::new(&mut self.stream);
+        loop{
+            if core.core.event(&mut receive)?{core.done=true;transport.commit();return Ok(());}
+            drain(transport.stream()?,core.core).await?;
+            // A completed write can itself produce a terminal event.
+            if core.core.event(&mut receive)?{core.done=true;transport.commit();return Ok(());}
+            if self.start<self.end{
+                let n=core.core.ingest(&self.input[self.start..self.end],executor.now())?;
+                if n==0{return Err(io::Error::other("core input stalled without an event"));}
+                self.start+=n;continue;
+            }
+            self.start=0;self.end=read(transport.stream()?,&mut self.input).await?;
+            if self.end==0{return Err(io::ErrorKind::UnexpectedEof.into());}
+        }
+    }
+    /// Transfer a validated TLS-upgrade boundary, including unread transport data.
+    pub fn into_parts(mut self)->io::Result<(S,C,Vec<u8>)>{
+        let stream=self.stream.take().ok_or_else(||io::Error::from(io::ErrorKind::NotConnected))?;
+        Ok((stream,self.core.take().expect("owned core"),self.input[self.start..self.end].to_vec()))
+    }
+}
+impl<S,C:SansIo> Drop for Driver<S,C>{fn drop(&mut self){if let Some(core)=self.core.as_mut(){core.disconnected();}}}

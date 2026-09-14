@@ -32,7 +32,7 @@ workspace = true
 [package.metadata.turnloop-ci]
 role = "protocol"
 service-group = "http"
-integration-tests = ["websocket"]
+integration-tests = ["websocket", "asynchronous"]
 
 [[example]]
 name = "echo_server"
@@ -44,3 +44,7 @@ required-features = ["turnloop"]
 
 [dev-dependencies]
 getrandom.workspace = true
+
+[[test]]
+name = "asynchronous"
+required-features = ["turnloop"]

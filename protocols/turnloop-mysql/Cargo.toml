@@ -12,6 +12,7 @@ documentation = "https://docs.rs/turnloop-mysql"
 description = "Pull-driven sans-I/O MySQL client protocol"
 
 [dependencies]
+turnloop-io = { workspace = true, optional = true }
 bytes.workspace = true
 mysql_common.workspace = true
 flate2.workspace = true
@@ -32,3 +33,6 @@ integration-tests = ["server"]
 
 [target.'cfg(all(target_os = "wasi", target_env = "p3"))'.dependencies]
 turnloop-wasi-random.workspace = true
+
+[features]
+turnloop = ["dep:turnloop-io"]

@@ -71,7 +71,10 @@ def protocol_tests(packages, base, root, env, features=()):
             try:
                 if target not in available:
                     fail(f'Unknown integration test target: {suite}')
-                count = checked_tests(base + member_features(package, features) + ['-p', name, '--test', target,
+                required = next(t.get('required-features', []) for t in package['targets']
+                                if t['name'] == target and 'test' in t['kind'])
+                target_features = ['--features', ','.join(required)] if required else []
+                count = checked_tests(base + member_features(package, features) + target_features + ['-p', name, '--test', target,
                     '--', '--include-ignored', '--test-threads=1', '--nocapture'], cwd=root, env=env)
             except (RuntimeError, subprocess.CalledProcessError, OSError) as error:
                 print(f'FAIL {suite}: {error}', file=sys.stderr, flush=True)
@@ -117,7 +120,7 @@ def native_tests(data, base, root, *, windows, modes):
         checked_tests(base + ['--workspace'] + features + ['--', '--test-threads=1'], cwd=root)
         # Every portable member must execute independently; another crate's tests
         # cannot hide a cfg-excluded core, protocol codec or fixture suite.
-        for package in select(data, 'core') + select(data, 'protocol') + contracts:
+        for package in select(data, 'core') + select(data, 'protocol') + [p for p in members(data) if role(p) == 'adapter'] + contracts:
             if package['name'] not in pending:
                 checked_tests(base + ['-p', package['name']] + member_features(package, features) + ['--', '--test-threads=1'], cwd=root)
 
@@ -161,8 +164,13 @@ def main():
                 for target in targets:
                     if target not in available:
                         fail(f'Unknown WASI test target: {package["name"]}/{target}')
-                    checked_tests(base + ['-p', package['name'], '--test', target,
-                        '--', '--test-threads=1'], cwd=root, env=env)
+                    required = next(t.get('required-features', []) for t in package['targets']
+                                    if t['name'] == target and 'test' in t['kind'])
+                    target_features = ['--features', ','.join(required)] if required else []
+                    if args.target == 'wasm32-wasip3' and required:
+                        target_features = ['--all-features']
+                    checked_tests(base + ['-p', package['name'], '--test', target] + target_features +
+                        ['--', '--test-threads=1'], cwd=root, env=env)
         else:
             for package in select(data, 'core'):
                 if settings(package).get('wasi-lib-tests'):

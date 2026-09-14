@@ -1843,6 +1843,7 @@ dependencies = [
  "sha1",
  "sha2",
  "stringprep",
+ "turnloop-io",
  "turnloop-wasi-random",
 ]
 
@@ -1855,6 +1856,7 @@ dependencies = [
  "getrandom 0.4.3",
  "mysql_common",
  "rustls",
+ "turnloop-io",
  "turnloop-wasi-random",
 ]
 
@@ -1866,6 +1868,7 @@ dependencies = [
  "postgres-protocol",
  "rustls",
  "sha2",
+ "turnloop-io",
  "turnloop-wasi-random",
 ]
 
@@ -1874,6 +1877,7 @@ name = "turnloop-redis"
 version = "0.1.0-alpha.1"
 dependencies = [
  "rustls",
+ "turnloop-io",
 ]
 
 [[package]]
@@ -1884,6 +1888,7 @@ dependencies = [
  "email-encoding",
  "lettre",
  "rustls",
+ "turnloop-io",
 ]
 
 [[package]]

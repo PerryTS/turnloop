@@ -890,3 +890,6 @@ pub fn encode_data(content: &[u8], out: &mut Vec<u8>) -> usize {
     out.extend_from_slice(b".\r\n");
     size
 }
+
+#[cfg(feature = "turnloop")]
+pub mod asynchronous;

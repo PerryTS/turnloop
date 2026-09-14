@@ -63,7 +63,7 @@ impl<S: Stream> WebSocketStream<S> {
             let request = http.head().await?;
             let (head, protocol) = crate::accept(&request, protocols).map_err(io::Error::other)?;
             http.event(|event| {
-                if matches!(event, Event::Upgrade) {
+                if matches!(event, Event::Upgrade | Event::End) {
                     Ok(())
                 } else {
                     Err(io::Error::other("missing upgrade boundary"))
@@ -72,7 +72,7 @@ impl<S: Stream> WebSocketStream<S> {
             .await?;
             http.send_head(&head, BodyLength::Empty).await?;
             http.finish_body(&[]).await?;
-            let (stream, input) = http.into_upgrade()?;
+            let (stream, input) = http.into_parts()?;
             Ok((
                 Self::from_upgrade(stream, input, Role::Server, Default::default()),
                 protocol,

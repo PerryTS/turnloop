@@ -25,3 +25,6 @@ pub mod uri;
 pub mod wire;
 pub use connection::{Connection, ConnectionEvent};
 pub use error::{Error, ErrorKind, Result};
+
+#[cfg(feature = "turnloop")]
+pub mod asynchronous;

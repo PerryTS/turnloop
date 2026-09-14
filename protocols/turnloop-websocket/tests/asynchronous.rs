@@ -32,5 +32,5 @@ fn node_websocket_against_async_server(){
     }).expect("spawn");
     let mut node=Command::new("node").args(["-e",&format!("const ws=new WebSocket('ws://{address}');let count=0;ws.onopen=()=>ws.send('node async adapter');ws.onmessage=e=>{{if(e.data!=='node async adapter')process.exit(2);count++;ws.close()}};ws.onclose=e=>{{if(count!==1||!e.wasClean)process.exit(3)}};ws.onerror=()=>process.exit(4);setTimeout(()=>process.exit(5),8000).unref();")]).spawn().expect("Node 26 required");
     while !task.is_finished(){assert!(executor.driver().now()<end);executor.turn(Timeout::Until(end)).expect("turn");}
-    assert_eq!(finish(&mut task),1);assert!(node.wait().expect("Node exit").success());
+    assert_eq!(finish(&mut task),1);executor.turn(Timeout::Now).expect("deliver socket close");let status=node.wait().expect("Node exit");assert!(status.success(),"Node status: {status}");
 }

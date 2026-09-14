@@ -12,6 +12,7 @@ documentation = "https://docs.rs/turnloop-smtp"
 description = "Pull-driven SMTP client and MIME message builder"
 
 [dependencies]
+turnloop-io = { workspace = true, optional = true }
 base64.workspace = true
 lettre.workspace = true
 # Constrain lettre's compatible helper to the workspace's shared base64 version.
@@ -26,3 +27,6 @@ workspace = true
 [package.metadata.turnloop-ci]
 role = "protocol"
 integration-tests = ["smtp"]
+
+[features]
+turnloop = ["dep:turnloop-io"]

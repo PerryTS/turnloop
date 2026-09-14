@@ -741,3 +741,6 @@ fn take_bytes(value: Value) -> Result<Vec<u8>, Error> {
         _ => Err(Error::new("Invalid pub/sub message")),
     }
 }
+
+#[cfg(feature = "turnloop")]
+pub mod asynchronous;

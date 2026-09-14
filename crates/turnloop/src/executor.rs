@@ -1050,3 +1050,38 @@ impl<B: Backend> Drop for Accept<B> {
         }
     }
 }
+
+#[cfg(turnloop_backend = "web")]
+impl ExecutorHandle<crate::backend::web::Web> {
+    /// Fetch a complete host response into retained executor storage. The result
+    /// owns its bytes; oversize responses fail rather than truncating. The host
+    /// backend currently exposes GET bodies only (no status/header metadata).
+    pub fn fetch(&self, url: &str) -> Fetch {
+        Fetch { executor: self.clone(), url: url.into(), key: None, handle: None }
+    }
+}
+/// Browser host-fetch future. Dropping aborts the host request and retains native
+/// staging until its exactly-once cancellation completion has been dispatched.
+#[cfg(turnloop_backend = "web")]
+pub struct Fetch { executor:ExecutorHandle<crate::backend::web::Web>,url:String,key:Option<Key>,handle:Option<Handle> }
+#[cfg(turnloop_backend = "web")]
+impl Future for Fetch {
+    type Output = Result<Vec<u8>>;
+    fn poll(self:Pin<&mut Self>,cx:&mut Context<'_>)->Poll<Self::Output>{
+        let this=self.get_mut();let shared=&this.executor.shared;
+        let key=match this.key {Some(key)=>key,None=>{
+            let key=shared.reserve(cx)?;
+            let buf={let mut slots=shared.slots.borrow_mut();let bytes=&mut slots[key.index].bytes;
+                // SAFETY: executor staging remains allocated and inaccessible
+                // until terminal completion, including cancellation and drop.
+                ReadBuf::Provided(unsafe{IoBufMut::from_raw_parts(bytes.as_mut_ptr(),bytes.len())})};
+            let result=shared.driver.borrow_mut().fetch(&this.url,buf,key.token());
+            match result{Ok((handle,op))=>{shared.slots.borrow_mut()[key.index].op=Some(op);this.handle=Some(handle);this.key=Some(key);key},Err(e)=>{shared.free(key);return Poll::Ready(Err(e));}}
+        }};
+        let Some(result)=shared.result(key,cx)else{return Poll::Pending;};
+        let result=match result{OpResult::Read{n,..}=>Ok(shared.slots.borrow()[key.index].bytes[..n].to_vec()),OpResult::Err(e)=>Err(e),_=>Err(Error::new(ErrorKind::Cancelled))};
+        shared.free(key);this.key=None;Poll::Ready(result)
+    }
+}
+#[cfg(turnloop_backend = "web")]
+impl Drop for Fetch{fn drop(&mut self){if let Some(key)=self.key.take(){self.executor.shared.abandon(key);}if let Some(handle)=self.handle.take(){let _=self.executor.driver().close(handle,Token(0));}}}

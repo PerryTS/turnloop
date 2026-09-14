@@ -977,3 +977,6 @@ fn parse_eof(b: &[u8], caps: Caps) -> Result<OkPacket<'_>> {
     }
     Ok(OkPacketDeserializer::<OldEofPacket>::deserialize(caps, &mut ParseBuf(b))?.into_inner())
 }
+
+#[cfg(feature = "turnloop")]
+pub mod asynchronous;

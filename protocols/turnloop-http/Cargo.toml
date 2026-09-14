@@ -45,8 +45,8 @@ workspace = true
 [package.metadata.turnloop-ci]
 role = "protocol"
 service-group = "http"
-integration-tests = ["interop"]
-wasi-tests = ["codecs", "allocations"]
+integration-tests = ["interop", "asynchronous"]
+wasi-tests = ["asynchronous", "codecs", "allocations"]
 
 [[test]]
 name = "allocations"
@@ -62,4 +62,8 @@ required-features = ["turnloop"]
 
 [[example]]
 name = "tls_echo"
+required-features = ["turnloop"]
+
+[[test]]
+name = "asynchronous"
 required-features = ["turnloop"]
