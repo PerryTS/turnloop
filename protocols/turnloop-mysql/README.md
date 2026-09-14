@@ -120,3 +120,9 @@ The private fixture script starts/stops only its own instances and keeps files
 under `.tools`. MySQL 9.6 cannot authenticate mysql_native_password users: that
 plugin was removed in 9.0, so a separate private 8.4 fixture is needed for that
 real-server case. See the root report for actual verification and open gaps.
+
+Browser builds export a host-supplied `Instant::from_duration(ticks)`; native and
+WASI builds reexport std::time::Instant. Use one monotonic epoch per connection
+and pool. Map the browser core loop’s Instant through as_duration/from_duration.
+The protocol never calls performance.now or std Instant::now. Browser runtime
+execution is not yet verified; only target compilation has run.

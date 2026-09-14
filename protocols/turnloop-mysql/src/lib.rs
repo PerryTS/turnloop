@@ -18,13 +18,20 @@ pub use mysql_common::{
     constants::{ColumnFlags, ColumnType, StatusFlags},
     value::Value,
 };
-use std::{fmt, time::Instant};
+use std::fmt;
 mod codec;
 mod wire;
 use codec::PacketCodec;
 pub mod pool;
 pub mod types;
 pub use wire::{Column, ColumnTypeInfo, RawValue, Row, ServerError, error_code};
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+mod host_time;
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+pub use host_time::Instant;
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub use std::time::Instant;
 
 pub type Token = u64;
 pub type Result<T> = std::result::Result<T, Error>;

@@ -361,3 +361,58 @@ fn hex_salted_password() -> [u8; 32] {
         90, 22, 123, 121, 91, 122, 202, 181, 232, 159, 160, 246,
     ]
 }
+
+#[test]
+fn extended_copy_resynchronizes_after_copy_done() {
+    let mut c = ready();
+    c.execute(
+        1,
+        ExtendedQuery {
+            name: "",
+            sql: "COPY t FROM STDIN",
+            oids: &[],
+            params: &[],
+            result_formats: &[],
+        },
+        None,
+    )
+    .unwrap();
+    flush(&mut c);
+    c.receive(
+        &[
+            frame(b'1', b""),
+            frame(b'2', b""),
+            frame(b'n', b""),
+            frame(b'G', &[0, 0, 1, 0, 0]),
+        ]
+        .concat(),
+    )
+    .unwrap();
+    assert!(matches!(
+        c.next_event().unwrap(),
+        Some(Event::CopyIn { .. })
+    ));
+    c.copy_data(b"42\n").unwrap();
+    c.copy_finish(None).unwrap();
+    assert_eq!(
+        flush(&mut c),
+        [frame(b'd', b"42\n"), frame(b'c', b""), frame(b'S', b"")].concat()
+    );
+    c.receive(&[frame(b'C', b"COPY 1\0"), frame(b'Z', b"I")].concat())
+        .unwrap();
+    assert!(matches!(
+        c.next_event().unwrap(),
+        Some(Event::CommandComplete {
+            row_count: Some(1),
+            ..
+        })
+    ));
+    assert!(matches!(
+        c.next_event().unwrap(),
+        Some(Event::Completed {
+            token: 1,
+            outcome: Outcome::Success,
+            ..
+        })
+    ));
+}

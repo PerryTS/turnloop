@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parent.parent
 TOOLS = ROOT / '.tools'
 BIN = Path('/opt/homebrew/bin')
 STATE = TOOLS / 'sql-servers.json'
+CHILDREN = {}
 
 
 def command(args, **kw):
@@ -30,21 +31,23 @@ def stop():
         return
     state = json.loads(STATE.read_text())
     for item in state.get('servers', []):
-        pid = item['pid']
-        # Check command line against our absolute data directory before signaling.
-        info = subprocess.run(['ps', '-p', str(pid), '-o', 'command='], capture_output=True, text=True).stdout
-        if str(TOOLS) in info and item['binary'] in info:
-            os.kill(pid, signal.SIGTERM)
-    for _ in range(200):
-        alive = False
-        for item in state.get('servers', []):
-            info = subprocess.run(['ps', '-p', str(item['pid']), '-o', 'command='], capture_output=True, text=True).stdout
-            alive |= str(TOOLS) in info and item['binary'] in info
-        if not alive:
-            STATE.unlink()
-            return
-        time.sleep(.1)
-    raise RuntimeError('private server did not stop; see .tools logs')
+        child = CHILDREN.get(item['pid'])
+        if child is not None:
+            # Popen still owns this child: an unreaped child's PID cannot be reused.
+            if child.poll() is None:
+                child.send_signal(signal.SIGINT if item['binary'] == 'postgres' else signal.SIGTERM)
+                child.wait(timeout=30)
+            continue
+        # Separate start/stop invocations address only our explicit data/socket
+        # paths. No ps (sandbox blocks it), default instance, or arbitrary PID kill.
+        if item['binary'] == 'postgres':
+            command([BIN / 'pg_ctl', '-D', TOOLS / 'pgdata', '-m', 'fast', '-w', '-t', '20', 'stop'])
+        elif item['binary'] == 'mysqld':
+            command([BIN / 'mysqladmin', '--no-defaults', '--connect-timeout=3',
+                     f'--socket={TOOLS / "mysql.sock"}', '-u', 'root', 'shutdown'])
+        else:
+            raise RuntimeError('unknown private server in state file')
+    STATE.unlink()
 
 
 def start():
@@ -75,6 +78,7 @@ def start():
     def spawn(binary, args, log):
         with open(TOOLS / log, 'ab') as f:
             p = subprocess.Popen([str(BIN / binary), *[str(x) for x in args]], stdout=f, stderr=f, start_new_session=True)
+        CHILDREN[p.pid] = p
         state['servers'].append({'pid': p.pid, 'binary': binary})
         STATE.write_text(json.dumps(state))
         return p

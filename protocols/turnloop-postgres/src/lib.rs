@@ -13,12 +13,19 @@ use postgres_protocol::{
     authentication::md5_hash,
     message::{backend::Header, frontend},
 };
-use std::{collections::VecDeque, fmt, time::Instant};
+use std::{collections::VecDeque, fmt};
 pub mod pool;
 pub mod types;
 mod wire;
 use wire::Cursor;
 pub use wire::{Field, Fields, Row, ServerError};
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+mod host_time;
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+pub use host_time::Instant;
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub use std::time::Instant;
 
 pub type Token = u64;
 pub type Result<T> = std::result::Result<T, Error>;
@@ -173,6 +180,7 @@ struct Pending {
     token: Token,
     deadline: Option<Instant>,
     failed: bool,
+    extended: bool,
     parse: Option<usize>,
 }
 struct Statement {
@@ -348,6 +356,7 @@ impl Connection {
         parse: Option<usize>,
         before: usize,
         result: Result<()>,
+        extended: bool,
     ) -> Result<()> {
         if let Err(e) = result {
             self.output.truncate(before);
@@ -361,6 +370,7 @@ impl Connection {
             token,
             deadline,
             failed: false,
+            extended,
             parse,
         });
         Ok(())
@@ -372,7 +382,7 @@ impl Connection {
         }
         let before = self.output.len();
         let result = frontend::query(sql, &mut self.output).map_err(Error::from);
-        self.finish_command(token, deadline, None, before, result)
+        self.finish_command(token, deadline, None, before, result, false)
     }
     /// Every operation ends in Sync, so an error cannot discard a later token.
     pub fn execute(
@@ -470,7 +480,7 @@ impl Connection {
         } else {
             None
         };
-        self.finish_command(token, deadline, new_index, before, result)
+        self.finish_command(token, deadline, new_index, before, result, true)
     }
     pub fn copy_data(&mut self, bytes: &[u8]) -> Result<()> {
         if !self.copy_in {
@@ -494,6 +504,11 @@ impl Connection {
             frontend::copy_done(&mut self.output);
             Ok(())
         };
+        // The earlier Sync is ignored by the server inside COPY IN.
+        // Extended protocol needs a fresh Sync after CopyDone/CopyFail.
+        if result.is_ok() && self.pending.front().is_some_and(|p| p.extended) {
+            frontend::sync(&mut self.output);
+        }
         if result.is_err() || self.output.len() > self.config.max_buffer {
             self.output.truncate(before);
             return Err(Error::Limit);
@@ -832,6 +847,9 @@ impl Connection {
                     c.end()?;
                     let token = self.token()?;
                     if header.tag() == b'G' {
+                        if self.pending.len() != 1 {
+                            return Err(Error::Protocol("COPY IN requires an exclusive query"));
+                        }
                         self.copy_in = true;
                         return Ok(Some(Event::CopyIn {
                             token,

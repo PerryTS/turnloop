@@ -1,9 +1,7 @@
 //! Sans-I/O pool: the host executes Connect/Close requests, then reports their
 //! completion. Checkout events are FIFO; idle reuse is LIFO, as in pg/mysql2.
-use std::{
-    collections::VecDeque,
-    time::{Duration, Instant},
-};
+use crate::Instant;
+use std::{collections::VecDeque, time::Duration};
 const MYSQL: bool = true;
 #[derive(Debug, Clone)]
 pub struct Config {

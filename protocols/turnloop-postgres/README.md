@@ -120,3 +120,9 @@ python3 scripts/sql-servers.py run cargo test -p turnloop-postgres --test server
 The script creates private data/certificates/logs under `.tools`, uses random
 loopback ports, and stops its own servers in a finally block. `start`/`stop` are
 also available. See `LANE_REPORT.md` for actual results and server blockers.
+
+Browser builds export a host-supplied `Instant::from_duration(ticks)`; native and
+WASI builds reexport std::time::Instant. Use one monotonic epoch per connection
+and pool. Map the browser core loop’s Instant through as_duration/from_duration.
+The protocol never calls performance.now or std Instant::now. Browser runtime
+execution is not yet verified; only target compilation has run.
