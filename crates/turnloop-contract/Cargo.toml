@@ -22,3 +22,9 @@ libc.workspace = true
 
 [package.metadata.turnloop-ci]
 role = "contract"
+
+[[bin]]
+name = "native_child"
+path = "src/bin/native_child.rs"
+test = false
+bench = false

@@ -988,6 +988,7 @@ impl<B: Backend> Driver<B> {
                 }
             } else {
                 match work.result {
+                    #[cfg(not(target_arch = "wasm32"))]
                     Ok(crate::blocking::WorkOutput::ExternalWait(r)) => OpResult::ExternalWait(r),
                     Ok(crate::blocking::WorkOutput::Blocking(p)) => OpResult::Blocking(p),
                     Ok(crate::blocking::WorkOutput::Resolved(a)) => OpResult::Resolved(a),

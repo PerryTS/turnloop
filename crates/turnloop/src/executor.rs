@@ -5,6 +5,27 @@
 //! polls and warmed I/O/timer operations use fixed tables and retained buffers.
 //! Borrowed futures-io buffers are copied into/from executor-owned staging memory,
 //! so Pending never extends a caller buffer's lifetime.
+//!
+//! ```
+//! # #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android", target_os = "freebsd"))]
+//! # fn main() -> turnloop::Result<()> {
+//! use std::time::Duration;
+//! use turnloop::{backend::Platform, Config, LocalExecutor, Timeout};
+//! let mut executor = LocalExecutor::<Platform>::new(Config::default())?;
+//! let handle = executor.handle();
+//! let task = executor.spawn_local(async move {
+//!     handle.sleep(Duration::from_millis(2)).await.expect("timer");
+//!     42
+//! })?;
+//! while !task.is_finished() {
+//!     executor.turn(Timeout::After(Duration::from_secs(1)))?;
+//! }
+//! // A host can poll the JoinHandle, or await it from another local task.
+//! assert!(task.is_finished());
+//! # Ok(()) }
+//! # #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android", target_os = "freebsd")))]
+//! # fn main() {}
+//! ```
 use crate::{backend::Backend, *};
 use futures_io::{AsyncRead, AsyncWrite};
 use std::{
@@ -403,12 +424,13 @@ impl<B: Backend> ExecutorHandle<B> {
             value: None,
             waker: None,
             finished: false,
+            cancelled: false,
         }));
-        let output = result.clone();
+        let output = JoinGuard(result.clone());
         let wrapped = async move {
             let value = future.await;
             let waker = {
-                let mut result = output.borrow_mut();
+                let mut result = output.0.borrow_mut();
                 result.value = Some(value);
                 result.finished = true;
                 result.waker.take()
@@ -429,6 +451,30 @@ struct JoinState<T> {
     value: Option<T>,
     waker: Option<Waker>,
     finished: bool,
+    cancelled: bool,
+}
+struct JoinGuard<T>(Rc<RefCell<JoinState<T>>>);
+impl<T> Drop for JoinGuard<T> {
+    fn drop(&mut self) {
+        let waker = {
+            let mut state = self.0.borrow_mut();
+            if state.finished {
+                return;
+            }
+            state.cancelled = true;
+            state.finished = true;
+            state.waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+}
+/// A task ended before producing its result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JoinError {
+    /// The join handle requested cancellation, or its executor was dropped.
+    Cancelled,
 }
 /// Future yielding a task's result. Dropping it cancels the task on the next pass;
 /// that pass drops the task's futures and cancels their pending I/O.
@@ -448,11 +494,13 @@ impl<T> JoinHandle<T> {
     }
 }
 impl<T> Future for JoinHandle<T> {
-    type Output = T;
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
+    type Output = std::result::Result<T, JoinError>;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut state = self.result.borrow_mut();
         if let Some(value) = state.value.take() {
-            Poll::Ready(value)
+            Poll::Ready(Ok(value))
+        } else if state.cancelled {
+            Poll::Ready(Err(JoinError::Cancelled))
         } else {
             if state
                 .waker

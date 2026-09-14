@@ -11,7 +11,7 @@ macro_rules! id {
     ($name:ident) => {
         #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
         /// Loop-scoped generational identity; stale or foreign IDs never address a reused resource.
-pub struct $name {
+        pub struct $name {
             pub(crate) owner: u64,
             pub(crate) key: u64,
         }

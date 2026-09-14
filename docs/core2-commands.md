@@ -31,3 +31,6 @@ Cross-compilation is not runtime execution. Raw outputs: `.tools/core2/`.
 - **PASS** `cargo +stable check --workspace --all-targets --all-features --locked` (exit 0; log 1789404837-9402).
 - **FAIL** `cargo clippy -p turnloop -p turnloop-contract -p turnloop-bench --all-targets --all-features --target x86_64-pc-windows-msvc -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 101; log 1789404837-933909).
 - **FAIL** `cargo clippy --workspace --all-targets --all-features --target wasm32-wasip2 -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 101; log 1789404837-928928).
+- **PASS** `cargo test -p turnloop -p turnloop-contract --all-features -- --test-threads=1` (exit 0; log 1789404940-217297).
+- **PASS** `cargo test -p turnloop-contract --all-features --test executor -- --test-threads=1` (exit 0; log 1789405001-509178).
+- **FAIL** `cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks` (exit 101; log 1789405096-46428).

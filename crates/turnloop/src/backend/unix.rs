@@ -61,7 +61,7 @@ impl Detached {
     }
     /// Adopt an owned Unix descriptor, classifying stream/file/TTY or socket.
     /// The descriptor must have no concurrent I/O users. Status flags and terminal
-    /// settings are restored when this transport is closed, detached or dropped.
+    /// settings are restored when this transport is closed or dropped.
     pub fn from_fd(fd: OwnedFd) -> Result<Self> {
         super::ipc::classify(fd)
     }

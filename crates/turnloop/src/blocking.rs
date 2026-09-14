@@ -33,6 +33,7 @@ pub struct DnsRequest {
     pub port: u16,
 }
 pub(crate) enum WorkOutput {
+    #[cfg(not(target_arch = "wasm32"))]
     ExternalWait(crate::WaitResult),
     Blocking(Payload),
     Resolved(Vec<SocketAddr>),
@@ -144,6 +145,9 @@ mod native {
                             }
                             jobs.pop_front().expect("nonempty job queue")
                         };
+                        #[cfg(not(any(turnloop_backend = "kqueue", turnloop_backend = "epoll")))]
+                        let Task::Boxed(job) = job;
+                        #[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
                         let job = match job {
                             Task::Boxed(job) => job,
                             #[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
