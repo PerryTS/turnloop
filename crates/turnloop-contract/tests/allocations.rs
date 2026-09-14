@@ -439,6 +439,135 @@ fn regular_file_jobs_reuse_pool_storage() {
     std::fs::remove_file(path).expect("remove file");
 }
 
+#[test]
+fn file_readiness_survives_pool_backpressure_without_allocations_or_spin() {
+    use std::io::Write;
+    let path = std::env::temp_dir().join(format!("tl-file-backpressure-{}", std::process::id()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .expect("fixture");
+    file.write_all(&[37; 64]).expect("fixture bytes");
+    let mut l = Loop::new(Config {
+        pooled_buffers: 1,
+        pooled_buffer_size: 64,
+        ..Config::default()
+    })
+    .expect("loop");
+    let mut handles = [None; 3];
+    for h in &mut handles {
+        let file = std::fs::File::open(&path).expect("independent file offset");
+        #[cfg(unix)]
+        let detached = Detached::from_fd(file.into()).expect("file");
+        #[cfg(windows)]
+        let detached = Detached::from_handle(file.into()).expect("file");
+        *h = Some(l.attach(detached, Token(0)).expect("attach"));
+    }
+    let mut out = Completions::with_capacity(1);
+    l.read(handles[0].expect("first"), ReadBuf::Pooled, Token(1))
+        .expect("first read");
+    let until = l.now() + Duration::from_secs(5);
+    let lease = loop {
+        assert!(l.now() < until);
+        l.turn(Timeout::Until(until), &mut out)
+            .expect("warm file job");
+        if let Some(c) = out.drain().next() {
+            let OpResult::Read {
+                n: 64,
+                lease: Some(b),
+            } = c.result
+            else {
+                panic!("first read did not execute");
+            };
+            assert_eq!(b.as_slice(), [37; 64]);
+            break b;
+        }
+    };
+    // The worker publishes bytes before sending its wake. Finish that warm-up
+    // wake before the quiet deadline measurement (while retaining the lease).
+    let warm = l
+        .timer(l.now() + Duration::from_millis(10), None, Token(0))
+        .expect("warm timer");
+    loop {
+        assert!(l.now() < until);
+        l.turn(Timeout::Until(until), &mut out)
+            .expect("settle warm-up wake");
+        if !out.is_empty() {
+            assert_eq!(out.len(), 1);
+            assert!(matches!(out[0].result, OpResult::Timer));
+            break;
+        }
+    }
+    l.close(warm, Token(0)).expect("close warm timer");
+    l.turn(Timeout::Now, &mut out).expect("drain warm close");
+    assert_eq!(out.len(), 1);
+    assert!(matches!(out[0].result, OpResult::Closed));
+    ALLOCS.with(|v| v.set(0));
+    ACTIVE.with(|v| v.set(true));
+    let cancelled = l
+        .read(handles[1].expect("second"), ReadBuf::Pooled, Token(2))
+        .expect("blocked read");
+    l.read(handles[2].expect("third"), ReadBuf::Pooled, Token(3))
+        .expect("surviving read");
+    let at = l.now() + Duration::from_millis(2);
+    let timer = l.timer(at, None, Token(4)).expect("timer");
+    assert_eq!(ALLOCS.with(Cell::get), 0, "file submission storage");
+    let info = l
+        .turn(Timeout::Until(at), &mut out)
+        .expect("pool exhaustion wait");
+    assert_eq!(info.os_waits, 1);
+    #[cfg(unix)]
+    assert_eq!(info.zero_event_waits, 1);
+    // IOCP deadlines arrive as real NT completion packets, rather than an empty wait.
+    #[cfg(windows)]
+    assert_eq!(info.zero_event_waits, 0);
+    assert!(l.now() >= at);
+    assert_eq!(out.len(), 1);
+    assert!(matches!(out[0].result, OpResult::Timer));
+    assert_eq!(ALLOCS.with(Cell::get), 0, "pool-blocked parking storage");
+    assert!(l.cancel(cancelled));
+    l.turn(Timeout::Now, &mut out)
+        .expect("cancel without a lease");
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].op, Some(cancelled));
+    assert!(matches!(out[0].result, OpResult::Cancelled));
+    assert_eq!(
+        ALLOCS.with(Cell::get),
+        0,
+        "pool-blocked cancellation storage"
+    );
+    drop(lease);
+    assert_eq!(ALLOCS.with(Cell::get), 0, "lease return storage");
+    let mut reads = 0;
+    while reads == 0 {
+        assert!(l.now() < until);
+        l.turn(Timeout::Until(until), &mut out)
+            .expect("resume after lease release");
+        for c in out.drain() {
+            assert_eq!(c.token, Token(3));
+            let OpResult::Read {
+                n: 64,
+                lease: Some(b),
+            } = c.result
+            else {
+                panic!("surviving read did not execute");
+            };
+            assert_eq!(b.as_slice(), [37; 64]);
+            reads += 1;
+        }
+    }
+    ACTIVE.with(|v| v.set(false));
+    assert_eq!(reads, 1);
+    assert_eq!(
+        ALLOCS.with(Cell::get),
+        0,
+        "ready and pool-blocked file queues allocate nothing"
+    );
+    l.close(timer, Token(5)).expect("close timer");
+    std::fs::remove_file(path).expect("remove fixture");
+}
+
 #[cfg(feature = "executor")]
 #[test]
 fn executor_steady_io_poll_and_sleep_allocate_nothing() {

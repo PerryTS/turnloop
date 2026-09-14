@@ -1,4 +1,4 @@
-//! One on-demand worker per synchronous stdio handle. Requests retain their caller
+//! One worker per explicitly adopted synchronous handle. Requests retain their caller
 //! buffers until the worker's completion packet; cancellation joins buffer access.
 use super::{
     Detached, Kind, Native, bool_result, os_error, port::Port, process, signals, unsupported,

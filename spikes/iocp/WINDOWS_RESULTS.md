@@ -84,7 +84,7 @@ The Windows pending-contract marker is removed: shared contracts execute nativel
 PASS on this host:
 
 - `cargo +nightly-2026-08-20 test -p turnloop-contract --all-features -- --test-threads=1`:
-  47 tests: 30 shared/backend, five allocation, six executor, two isolated-console
+  48 tests: 30 shared/backend, six allocation, six executor, two isolated-console
   and four Windows lifetime/imported-handle scenarios.
 - `cargo +nightly-2026-08-20 test -p turnloop-contract --test windows_console -- --nocapture --test-threads=1`:
   two tests, each spawning an isolated console child; real Ctrl-C/Break fan-out,
@@ -156,6 +156,14 @@ and transfers use that path; a missing or incapable explicit binary fails instea
 of skipping. Local positive verification ran Node's 100 streams and curl's stream;
 a deliberately missing explicit path failed at capability probing as required.
 This final CI correction needs its own hosted result, linked from the PR.
+
+The subsequent merge of main's `b78d533` retains its repository-wide byte-preserving
+attributes and core fixes. Its new file backpressure/allocation test now executes
+on Windows as well: synchronous workers are reserved at handle adoption, before
+the allocation measurement, and pool return starts the first read without allocating.
+The test asserts an actual NT timer packet on Windows (zero empty waits), versus
+an empty timed wait on Unix. All 48 all-feature contracts, including six allocation
+gates, pass after this merge; existing timing and allocation bounds are unchanged.
 
 Unrun wider gates: ETW syscall traces, CPU-cycle A/B attribution, overnight soak,
 Windows 10 minimum-version coverage, and VM/power-state precision matrices.

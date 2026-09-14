@@ -32,7 +32,8 @@ I/O before releasing caller memory.
   owned children, then acknowledges exit before Closed. uid/gid and non-Kill
   process signals return Unsupported; console signal subscriptions are separate.
 - Standard streams are duplicated, preserving the host originals. Synchronous
-  files/pipes use one lazy worker per handle; operations on a handle are FIFO.
+  files/pipes reserve one worker at adoption; operations on a handle are FIFO,
+  with no worker allocation needed when the first read receives a buffer lease.
   Imported handles are classified by native file mode before submission;
   overlapped pipes use routed I/O, and other overlapped files are unsupported.
   One process-wide cancellation helper handles the race before a worker enters

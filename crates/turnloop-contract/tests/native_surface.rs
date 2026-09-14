@@ -36,6 +36,36 @@ fn signals_reach_four_loops_on_four_threads() {
         assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGUSR1) }, 0);
     });
 }
+#[cfg(any(target_vendor = "apple", target_os = "freebsd"))]
+#[test]
+fn pending_signal_cannot_outlive_kqueue_unsubscribe() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_native_child"))
+        .arg("blocked-signal")
+        .output()
+        .expect("signal fixture");
+    assert!(
+        output.status.success(),
+        "blocked signal fixture: {:?}; {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.stdout,
+        b"four deliveries, four stops, four closes; survived unblock\n"
+    );
+}
+
+#[test]
+fn signal_subscribe_raise_unsubscribe_stress() {
+    // Each round proves delivery and Stopped/Closed on all four owning threads;
+    // the next round exercises restoration followed by fresh subscriptions.
+    for _ in 0..256 {
+        turnloop_contract::native_surface::signal_fanout::<backend::Platform>(Signal::Usr1, || {
+            // SAFETY: the fan-out barrier proves all four subscriptions exist.
+            assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGUSR1) }, 0);
+        });
+    }
+}
 #[test]
 fn shared_external_wait_service_routes_and_cancels() {
     turnloop_contract::native_surface::external_waits::<backend::Platform>();

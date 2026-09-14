@@ -225,6 +225,11 @@ impl Iocp {
                 skip = unsafe { SetFileCompletionNotificationModes(raw, 1) } != 0;
             }
         }
+        if transport.kind == Kind::Sync {
+            // Adoption is resource setup. Reserve the worker here so even the
+            // first read after pooled-buffer backpressure needs no allocation.
+            self.workers[h.index()] = Some(sync_io::Worker::new(raw, Arc::clone(&self.port))?);
+        }
         self.resources[h.index()] = Some(Resource {
             handle: h,
             transport,
@@ -531,9 +536,6 @@ impl Iocp {
                 }
             };
             let index = p.request.handle.index();
-            if self.workers[index].is_none() {
-                self.workers[index] = Some(sync_io::Worker::new(raw, Arc::clone(&self.port))?);
-            }
             self.workers[index].as_ref().expect("stdio worker").start(
                 buffer,
                 len,
