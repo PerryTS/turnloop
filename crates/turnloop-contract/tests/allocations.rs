@@ -24,52 +24,13 @@ use std::{
 };
 use turnloop::*;
 struct Counting;
-#[cfg(not(target_os = "wasi"))]
 use std::cell::Cell;
-#[cfg(not(target_os = "wasi"))]
 thread_local! { static ACTIVE: Cell<bool> = const { Cell::new(false) }; static ALLOCS: Cell<usize> = const { Cell::new(0) }; }
-#[cfg(not(target_os = "wasi"))]
 fn record() {
     if ACTIVE.try_with(Cell::get).unwrap_or(false) {
         let _ = ALLOCS.try_with(|n| n.set(n.get() + 1));
     }
 }
-// WASI components have one agent. These counters also work before p3 std has
-// initialized its thread-local area, when the harness allocates argument strings.
-#[cfg(target_os = "wasi")]
-mod single_agent_counter {
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    pub struct Active(AtomicBool);
-    pub struct Allocations(AtomicUsize);
-    pub static ACTIVE: Active = Active(AtomicBool::new(false));
-    pub static ALLOCS: Allocations = Allocations(AtomicUsize::new(0));
-    impl Active {
-        pub fn with<T>(&self, f: impl FnOnce(&Self) -> T) -> T {
-            f(self)
-        }
-        pub fn set(&self, value: bool) {
-            self.0.store(value, Ordering::Relaxed);
-        }
-    }
-    impl Allocations {
-        pub fn with<T>(&self, f: impl FnOnce(&Self) -> T) -> T {
-            f(self)
-        }
-        pub fn set(&self, value: usize) {
-            self.0.store(value, Ordering::Relaxed);
-        }
-        pub fn get(&self) -> usize {
-            self.0.load(Ordering::Relaxed)
-        }
-    }
-    pub fn record() {
-        if ACTIVE.0.load(Ordering::Relaxed) {
-            ALLOCS.0.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-}
-#[cfg(target_os = "wasi")]
-use single_agent_counter::{ACTIVE, ALLOCS, record};
 // SAFETY: all allocation calls are forwarded unchanged to System. Counters only
 // access already initialized thread-local Cells and never allocate themselves.
 unsafe impl GlobalAlloc for Counting {
