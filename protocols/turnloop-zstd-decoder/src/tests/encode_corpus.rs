@@ -53,6 +53,7 @@ fn test_encode_corpus_files_uncompressed_our_decompressor() {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn test_encode_corpus_files_uncompressed_original_decompressor() {
     extern crate std;
@@ -170,6 +171,7 @@ fn test_encode_corpus_files_compressed_our_decompressor() {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn test_encode_corpus_files_compressed_original_decompressor() {
     extern crate std;

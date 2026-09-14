@@ -307,6 +307,7 @@ mod tests {
         compressor.compress();
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn very_simple_compress() {
         let mut mock_data = vec![0; 1 << 17];
@@ -347,6 +348,7 @@ mod tests {
         assert_eq!(mock_data, decoded);
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn aaa_compress() {
         let mock_data = vec![0, 1, 3, 4, 5];
@@ -432,6 +434,7 @@ mod tests {
     }
 
     #[cfg(feature = "std")]
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn fuzz_targets() {
         use std::io::Read;

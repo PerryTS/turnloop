@@ -185,5 +185,9 @@ fn test_decode_corpus_files() {
         );
     }
 
+    assert!(
+        total_counter >= 101,
+        "complete upstream corpus must execute"
+    );
     assert!(failed.is_empty());
 }

@@ -33,6 +33,10 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.14'
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '26.5.1'
+          package-manager-cache: false
       - name: Install checksum-pinned linters
         run: python3 scripts/ci/install-tools.py actionlint zizmor shellcheck
       - name: Lint automation and exercise gate failures
@@ -120,6 +124,8 @@ jobs:
         run: rustup toolchain install nightly-2026-08-20 --profile minimal --component rustfmt,clippy
       - name: Workspace and single-threaded contracts, default and all features
         run: python3 scripts/ci/run-tests.py native
+      - name: HTTP, TLS and WebSocket Node/curl interop
+        run: python3 scripts/test-servers.py --services http run python3 scripts/ci/run-tests.py interop
       - name: Portable timer benchmark with workload assertions
         run: cargo +nightly-2026-08-20 run --release -p turnloop-bench --locked -- --portable --timers
   self-hosted-windows:

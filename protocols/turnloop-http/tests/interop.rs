@@ -11,7 +11,7 @@ use turnloop_http::{
     http1::{self, Head, Header},
     http2,
 };
-#[path = "../../turnloop-tls/tests/support/mod.rs"]
+#[path = "support/tls.rs"]
 mod tls_support;
 fn node_port(mode: &str) -> u16 {
     let key = if mode == "h1" {

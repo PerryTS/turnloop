@@ -1,6 +1,6 @@
 # http-integrate lane report
 
-Updated 2026-09-14. Integration in progress; no commits or uploads (integrator owns Git).
+Updated 2026-09-14. Implementation complete; final verification in progress. No commits or uploads (integrator owns Git).
 
 ## Implemented
 
@@ -17,8 +17,29 @@ Updated 2026-09-14. Integration in progress; no commits or uploads (integrator o
 
 PASS: complete required design/contribution/integration and relevant lane report reads;
 upstream 0.9.0 archive SHA-256 verified against registry metadata and allocation
-sites inspected. Workspace lock regeneration and initial strict Clippy are running.
-All final gates, server tests, h2spec and packaged dry runs are currently UNRUN.
+sites inspected. PASS: soaked lock regeneration (240 registry versions); strict native/Linux/WASI/web
+Clippy; stable 1.97.1; no-tokio on eight targets plus union, default/all features;
+18 automation tests; workflow lint; 15 HTTP/TLS/WebSocket interop tests; strict
+h2spec 147/147 with zero skips; 20 executed WASI tests including decoder reuse;
+all ten package dry runs (packaged tarball verification, no --no-verify).
+
+FAIL release gate: RUSTSEC-2026-0285 affects shared rustls 0.23.44. Fixed 0.23.45
+was published 2026-09-14 15:11:17.808465 UTC and is ineligible until
+**2026-09-21 15:11:17.808465 UTC**. No advisory exception or soak override added.
+
+UNRUN: SQL real-server bodies (full runner fails at PostgreSQL shmget; MySQL
+initializer separately exits 2 in sandbox), Windows runtime/test-target Clippy
+(missing SDK headers for ring/zstd), Linux/Docker runtime. Native non-SQL full
+suite rerun pending after correcting a new corpus-count assertion: the upstream
+snapshot contains 101 ordinary frames and 207 dictionary frames, not 301 ordinary
+frames. Existing byte/checksum/corpus assertions remain unchanged.
+
+Expected FAIL: unmodified upstream ruzstd allocation repro sees exactly 6000
+allocations for 1000 frames; identical test passes at zero with the published fork.
+Earlier corrected failures: workspace unsafe/lint errors in newly active upstream
+source; wasm dictionary isize overflow (changed to i64); h2spec report identity
+needed package+classname; ci-gate job-name parser needed digits; reserved upstream
+Cargo.toml.orig filename renamed; Mozilla data license reviewed and included.
 
 ## Deviations / DESIGN proposals
 

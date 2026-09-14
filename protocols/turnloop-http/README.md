@@ -11,6 +11,6 @@ Own HTTP/1.1 and HTTP/2 wire engines, with no runtime or transport dependency.
 
 No engine samples a clock. The host passes `Instant` deadlines and invokes timeout handlers. Hold output storage stable until a completion-shaped write finishes: do not mutate the engine while an I/O operation borrows its output. Error codes are transport causes; Perry creates the JS error objects and detailed OS diagnostics.
 
-The WASM zstd implementation uses the root workspace patch for ruzstd. Preserve that patch in a consuming workspace until the two upstream allocation fixes ship. See `vendor/ruzstd/TURNLOOP_PATCH.md`.
+WASM uses the published `turnloop-zstd-decoder` fork of ruzstd 0.8.3 with retained sequence tables. Consumers need no workspace patch. Native builds use the reference zstd decoder by default; `pure-rust-zstd` selects the same decoder as WASM, including its allocation gates. See the decoder crate’s `UPSTREAM.md`.
 
 Tests use private ephemeral loopback servers, Node 26, curl, generated TLS certificates, RFC vectors and a vendored HPACK corpus. `examples/h2spec_server.rs` is a blocking conformance driver, not the future turnloop adapter. Exact commands and limitations are in the root `LANE_REPORT.md`.

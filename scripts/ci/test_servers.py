@@ -40,6 +40,36 @@ class Fixtures(unittest.TestCase):
                 redis_stop.assert_called_once()
                 mongo_stop.assert_called_once()
 
+    def test_http_lifecycle_authenticates_and_closes_both_listeners(self):
+        import socket
+        import urllib.error
+        import urllib.request
+        fixtures = runner()
+        with tempfile.TemporaryDirectory() as folder, patch.object(fixtures, 'TOOLS', Path(folder)):
+            env = fixtures.http_start()
+            ports = [int(env[key]) for key in ('TURNLOOP_TEST_HTTP_PORT', 'TURNLOOP_TEST_HTTP2_PORT')]
+            try:
+                self.assertNotEqual(*ports)
+                for port in ports:
+                    with socket.create_connection(('127.0.0.1', port), timeout=2):
+                        pass
+                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                request = urllib.request.Request(f'http://127.0.0.1:{ports[0]}/__turnloop_shutdown',
+                    method='POST', headers={'x-turnloop-test-token': 'wrong'})
+                with self.assertRaises(urllib.error.HTTPError) as error:
+                    opener.open(request, timeout=2)
+                self.assertEqual(error.exception.code, 403)
+                error.exception.close()
+                with opener.open(f'http://127.0.0.1:{ports[0]}/alive', timeout=2) as response:
+                    self.assertEqual(response.read(), b'GET /alive ')
+            finally:
+                fixtures.http_stop()
+            self.assertFalse((Path(folder) / 'http/state.json').exists())
+            self.assertEqual(fixtures.HTTP_CHILD.returncode, 0)
+            for port in ports:
+                with self.assertRaises(OSError):
+                    socket.create_connection(('127.0.0.1', port), timeout=.2)
+
     def test_docker_wrapper_records_only_its_private_container(self):
         fixtures = runner()
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ):

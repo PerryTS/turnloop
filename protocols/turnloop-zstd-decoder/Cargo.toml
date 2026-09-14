@@ -35,6 +35,7 @@ workspace = true
 
 [package.metadata.turnloop-ci]
 role = "codec"
+wasi-tests = ["reuse"]
 
 [[bench]]
 name = "decode_all"

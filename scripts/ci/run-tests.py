@@ -30,7 +30,7 @@ def checked_tests(command, *, cwd, env=None, minimum_groups=1):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('suite', choices=['native', 'wasi', 'web', 'node', 'loom', 'miri', 'protocol', 'protocol-wasi'])
+    parser.add_argument('suite', choices=['native', 'wasi', 'web', 'node', 'loom', 'miri', 'protocol', 'protocol-wasi', 'interop'])
     parser.add_argument('--manifest-path', default='Cargo.toml')
     parser.add_argument('--target')
     args = parser.parse_args()
@@ -106,7 +106,12 @@ def main():
             fail('Core must mark pure-Rust tests with package.metadata.turnloop-ci.miri-filters')
     else:
         env['TURNLOOP_TEST_REQUIRED'] = '1'
-        for package in select(data, 'protocol'):
+        packages = select(data, 'protocol')
+        if args.suite == 'interop':
+            packages = [p for p in packages if settings(p).get('service-group') == 'http']
+            if not packages:
+                fail('HTTP interop group must contain executable suites')
+        for package in packages:
             targets = settings(package).get('integration-tests', [])
             if not targets:
                 fail(f'{package["name"]}: integration-tests metadata must identify real-server test targets')
