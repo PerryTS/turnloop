@@ -26,6 +26,7 @@ enum State {
     Auth,
     Ready,
     Command,
+    UnackSending,
     Reply,
     Closed,
 }
@@ -202,6 +203,7 @@ impl Connection {
         if self.tx_at == self.tx.len() {
             self.tx.clear();
             self.tx_at = 0;
+            if self.state==State::UnackSending {self.state=State::Ready;self.deadline=None;self.events.push_back(ConnectionEvent::Unacknowledged{token:self.token.take().unwrap()});}
         }
         Ok(())
     }
@@ -209,7 +211,7 @@ impl Connection {
     pub fn receive(&mut self, input: &[u8]) -> Result<usize> {
         if matches!(
             self.state,
-            State::New | State::Tls | State::Ready | State::Reply | State::Closed
+            State::New | State::Tls | State::Ready | State::UnackSending | State::Reply | State::Closed
         ) {
             return Err(Error::protocol("Connection is not expecting a reply"));
         }
@@ -354,19 +356,19 @@ impl Connection {
         }
     }
     pub fn reply(&self) -> Result<&RawDocument> {
-        if self.state != State::Reply {
+        if self.state != State::Reply && !(self.state==State::Closed&&self.token.is_some()&&self.decoder.complete()) {
             return Err(Error::protocol("No reply available"));
         }
         Ok(Message::parse(self.frame(), self.max_message_size)?.body)
     }
     pub fn release_reply(&mut self) -> Result<()> {
-        if self.state != State::Reply {
+        if self.state != State::Reply && !(self.state==State::Closed&&self.token.is_some()&&self.decoder.complete()) {
             return Err(Error::protocol("No reply to release"));
         }
         self.token = None;
         self.decoder.clear();
         self.expanded.clear();
-        self.state = State::Ready;
+        if self.state!=State::Closed{self.state = State::Ready;}
         Ok(())
     }
     pub fn poll_event(&mut self) -> Option<ConnectionEvent> {
@@ -401,8 +403,8 @@ impl Connection {
             .is_some_and(|d| d.get_i32("w").ok() == Some(0));
         self.send(body, sequences, if unack { wire::MORE_TO_COME } else { 0 })?;
         if unack {
-            self.events
-                .push_back(ConnectionEvent::Unacknowledged { token });
+            self.token=Some(token);self.state=State::UnackSending;
+            self.deadline=if self.options.socket_timeout.is_zero(){None}else{Some(now+self.options.socket_timeout)};
         } else {
             self.token = Some(token);
             self.state = State::Command;

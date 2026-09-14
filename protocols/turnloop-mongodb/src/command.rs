@@ -452,11 +452,8 @@ impl<'a> WriteResult<'a> {
         })
     }
 }
-fn integer(d: &RawDocument, k: &str) -> Result<i64> {
-    d.get_i64(k)
-        .or_else(|_| d.get_i32(k).map(i64::from))
-        .map_err(|_| Error::protocol("Missing integer result field"))
-}
+fn integer(d: &RawDocument,k:&str)->Result<i64>{match d.get(k).ok().flatten(){Some(RawBsonRef::Int32(v))=>Ok(i64::from(v)),Some(RawBsonRef::Int64(v))=>Ok(v),_=>Err(Error::protocol("Missing integer result field"))}}
+
 /// Aggregates split batches with original indices preserved. Allocation is solely
 /// owned result/error representation; success counters do not allocate.
 #[derive(Debug, Default)]
@@ -500,3 +497,22 @@ impl BulkResult {
         Ok(!(ordered && errors))
     }
 }
+
+/// Splits a write sequence against all three negotiated size limits without
+/// copying documents. Accumulate results with BulkResult and this batch's offset.
+pub struct BulkBatcher<'a>{documents:&'a [&'a RawDocument],at:usize,overhead:usize,max_message:usize,max_bson:usize,max_count:usize}
+pub struct BulkBatch<'a>{pub offset:usize,pub documents:&'a [&'a RawDocument]}
+impl<'a> BulkBatcher<'a>{
+ pub fn new(documents:&'a [&'a RawDocument],body:&RawDocument,identifier:&str,max_message:usize,max_bson:usize,max_count:usize)->Result<Self>{
+  let overhead=16+4+1+body.as_bytes().len()+1+4+identifier.len()+1;
+  if documents.is_empty()||max_count==0||overhead>=max_message||body.as_bytes().len()>max_bson{return Err(Error::new(ErrorKind::InvalidArgument,"Invalid bulk write size or empty batch"));}
+  for d in documents{if d.as_bytes().len()>max_bson||d.as_bytes().len()>max_message-overhead{return Err(Error::new(ErrorKind::InvalidArgument,"Document exceeds MongoDB size limit"));}}
+  Ok(Self{documents,at:0,overhead,max_message,max_bson,max_count})
+ }
+ pub fn next_batch(&mut self)->Option<BulkBatch<'a>>{if self.at==self.documents.len(){return None;}let start=self.at;let mut bytes=self.overhead;while self.at<self.documents.len()&&self.at-start<self.max_count{let n=self.documents[self.at].as_bytes().len();if n>self.max_bson||n>self.max_message-bytes{break;}bytes+=n;self.at+=1;}Some(BulkBatch{offset:start,documents:&self.documents[start..self.at]})}
+}
+/// ObjectId generator with host-supplied process entropy and wall-clock seconds.
+/// BSON ObjectId specification § Generation: 4 timestamp, 5 random, 3 counter bytes.
+pub struct ObjectIdGenerator{random:[u8;5],counter:u32}
+impl ObjectIdGenerator{pub fn new(random:[u8;5],counter:u32)->Self{Self{random,counter:counter&0x00ff_ffff}}
+ pub fn generate(&mut self,unix_seconds:u32)->bson::oid::ObjectId{let mut bytes=[0;12];bytes[..4].copy_from_slice(&unix_seconds.to_be_bytes());bytes[4..9].copy_from_slice(&self.random);bytes[9..].copy_from_slice(&self.counter.to_be_bytes()[1..]);self.counter=self.counter.wrapping_add(1)&0x00ff_ffff;bson::oid::ObjectId::from_bytes(bytes)}}
