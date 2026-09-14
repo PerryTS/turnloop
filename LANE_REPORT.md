@@ -10,14 +10,26 @@ remain unchanged. Git is read-only; the integrator commits.
 
 ## Implemented
 
-Initial inspection complete. Existing spikes are reference material, not evidence
-that production contracts passed. Verification ledger: `.tools/wasm2/commands.jsonl`;
+WASI 0.2 adapter implemented, including raw canonical poll/read/UDP storage.
+WASI 0.3 direct async wait-set and socket adapter implemented behind
+`wasi-p3-experimental`; runtime validation in progress. Web HostCallback adapter
+and shared browser/Node scenarios implemented; worker/CI integration in progress.
+Existing spikes remain reference material, not production verification. Verification ledger: `.tools/wasm2/commands.jsonl`;
 final commands and results will be copied here.
 
 ## Verification
 
 - PASS: read-only inventory, clean initial git status, required document/source reads.
-- UNRUN: implementation gates, until the new backends and contracts exist.
+- PASS: p2 strict Clippy; existing allocation gates (zero allocations for read,
+  write, timer and accept); shared no-spin, TCP 1/64, UDP, cancel/close, liveness,
+  pooled backpressure and capacity/stale IDs.
+- FAIL: full p2 shared suite: strict timer precision median 1.07875 ms vs <500 us.
+  The gate remains unchanged. Separate coverage run found a writev segment flush
+  bug; fixed, and its 512 KiB write/shutdown scenario now PASS.
+- PASS: web strict Clippy (core and contract); p3 strict Clippy and bounded wait.
+- PASS: pinned Wasmtime 46 installation with official checksum; wasm-bindgen CLI
+  0.2.108 built as a separate normal Cargo project under unchanged seven-day soak.
+- UNRUN: remaining full quality gates, browser and Worker contracts, pending work.
 - UNRUN: Linux/Windows runtime, unavailable hosts.
 
 ## Deviations / questions

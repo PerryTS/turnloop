@@ -1,4 +1,10 @@
-#![cfg(all(target_os = "wasi", any(target_env = "p2", all(target_env = "p3", feature = "wasi-p3-experimental"))))]
+#![cfg(all(
+    target_os = "wasi",
+    any(
+        target_env = "p2",
+        all(target_env = "p3", feature = "wasi-p3-experimental")
+    )
+))]
 use turnloop::backend::Platform;
 use turnloop_contract as contract;
 #[test]

@@ -6,22 +6,67 @@
         target_os = "linux",
         target_os = "android",
         target_os = "freebsd",
-        all(target_os = "wasi", target_env = "p2")
+        all(
+            target_os = "wasi",
+            any(
+                target_env = "p2",
+                all(target_env = "p3", feature = "wasi-p3-experimental")
+            )
+        )
     )
 ))]
 use std::{
     alloc::{GlobalAlloc, Layout, System},
-    cell::Cell,
     time::{Duration, Instant},
 };
 use turnloop::*;
 struct Counting;
+#[cfg(not(target_os = "wasi"))]
+use std::cell::Cell;
+#[cfg(not(target_os = "wasi"))]
 thread_local! { static ACTIVE: Cell<bool> = const { Cell::new(false) }; static ALLOCS: Cell<usize> = const { Cell::new(0) }; }
+#[cfg(not(target_os = "wasi"))]
 fn record() {
     if ACTIVE.try_with(Cell::get).unwrap_or(false) {
         let _ = ALLOCS.try_with(|n| n.set(n.get() + 1));
     }
 }
+// WASI components have one agent. These counters also work before p3 std has
+// initialized its thread-local area, when the harness allocates argument strings.
+#[cfg(target_os = "wasi")]
+mod single_agent_counter {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    pub struct Active(AtomicBool);
+    pub struct Allocations(AtomicUsize);
+    pub static ACTIVE: Active = Active(AtomicBool::new(false));
+    pub static ALLOCS: Allocations = Allocations(AtomicUsize::new(0));
+    impl Active {
+        pub fn with<T>(&self, f: impl FnOnce(&Self) -> T) -> T {
+            f(self)
+        }
+        pub fn set(&self, value: bool) {
+            self.0.store(value, Ordering::Relaxed);
+        }
+    }
+    impl Allocations {
+        pub fn with<T>(&self, f: impl FnOnce(&Self) -> T) -> T {
+            f(self)
+        }
+        pub fn set(&self, value: usize) {
+            self.0.store(value, Ordering::Relaxed);
+        }
+        pub fn get(&self) -> usize {
+            self.0.load(Ordering::Relaxed)
+        }
+    }
+    pub fn record() {
+        if ACTIVE.0.load(Ordering::Relaxed) {
+            ALLOCS.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+#[cfg(target_os = "wasi")]
+use single_agent_counter::{ACTIVE, ALLOCS, record};
 // SAFETY: all allocation calls are forwarded unchanged to System. Counters only
 // access already initialized thread-local Cells and never allocate themselves.
 unsafe impl GlobalAlloc for Counting {
@@ -164,7 +209,7 @@ fn steady_read_write_timer_and_accept_allocate_nothing() {
         bytes += exchange(&mut l, a, b, &mut output, &mut out, true);
     }
     ACTIVE.with(|v| v.set(false));
-    let allocations = ALLOCS.with(Cell::get);
+    let allocations = ALLOCS.with(|n| n.get());
     assert_eq!(bytes, 128_000);
     assert_eq!(allocations, 0, "steady read/write/timer allocations");
     for _ in 0..3 {
@@ -177,7 +222,7 @@ fn steady_read_write_timer_and_accept_allocate_nothing() {
         timers += timer_batch(&mut l, &mut out);
     }
     ACTIVE.with(|v| v.set(false));
-    let allocations = ALLOCS.with(Cell::get);
+    let allocations = ALLOCS.with(|n| n.get());
     assert_eq!(timers, 10_000);
     assert_eq!(
         allocations, 0,
@@ -207,7 +252,7 @@ fn steady_read_write_timer_and_accept_allocate_nothing() {
             }
         }
         ACTIVE.with(|v| v.set(false));
-        let allocations = ALLOCS.with(Cell::get);
+        let allocations = ALLOCS.with(|n| n.get());
         if i > 0 {
             assert_eq!(allocations, 0, "steady accept allocations");
             accepted += 1;
@@ -277,7 +322,7 @@ fn cancellation_reserves_survive_a_full_event_backlog() {
         }
     }
     ACTIVE.with(|v| v.set(false));
-    let allocations = ALLOCS.with(Cell::get);
+    let allocations = ALLOCS.with(|n| n.get());
     assert!(timers > 0);
     assert_eq!((cancelled, closed, posts), (16, 16, 80));
     assert_eq!(allocations, 0, "cancel/close reserves under backpressure");
