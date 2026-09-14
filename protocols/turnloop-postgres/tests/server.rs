@@ -31,6 +31,7 @@ struct Driver {
 }
 impl Driver {
     fn connect(user: &str, ssl: SslMode) -> Self {
+        eprintln!("PostgreSQL connecting as {user}, SSL mode {ssl:?}");
         let password = b"fixture-password".to_vec();
         let config = Config {
             user: user.into(),
@@ -151,7 +152,9 @@ impl Driver {
                 }
                 Event::CopyOut { .. } | Event::CopyDone { .. } => {}
                 Event::CopyData { data, .. } => results.copies.extend_from_slice(data),
-                Event::Closed { reason } => panic!("unexpected close: {reason}"),
+                Event::Closed { reason } => {
+                    panic!("unexpected close: {reason}; server errors: {:?}", results.errors)
+                }
             }
         }
         self.flush();
@@ -285,31 +288,41 @@ fn authentication_queries_pipeline_copy_cancel() {
         .query(7, "SELECT pg_sleep(10)", None)
         .expect("fixture operation must succeed");
     d.flush();
-    // Separate query proves the backend started before sending CancelRequest.
-    let mut observer = Driver::connect("postgres", SslMode::Disable);
+    // The Docker image initializes the superuser as `turnloop`, so a `postgres`
+    // role need not exist. A same-role session can inspect its own backends.
+    let mut observer = Driver::connect("scram_user", SslMode::Disable);
+    let cancel = d.core.cancel_request().expect("BackendKeyData required");
+    let pid = i32::from_be_bytes(cancel[8..12].try_into().expect("four PID bytes"));
+    assert!(pid > 0);
+    let active = format!(
+        "SELECT count(*) FROM pg_stat_activity WHERE pid={pid} AND query='SELECT pg_sleep(10)' AND state='active'"
+    );
+    // Prove this exact backend started before sending the separate CancelRequest.
     let until = Instant::now() + Duration::from_secs(5);
     loop {
-        let r = observer.query("SELECT count(*) FROM pg_stat_activity WHERE query='SELECT pg_sleep(10)' AND state='active'");
+        let r = observer.query(&active);
+        assert!(r.errors.is_empty(), "observer errors: {:?}", r.errors);
         if r.rows[0][0].as_deref() == Some(b"1") {
             break;
         }
-        assert!(Instant::now() < until);
+        assert!(Instant::now() < until, "backend {pid} never became active");
+        std::thread::sleep(Duration::from_millis(10));
     }
     let port: u16 = std::env::var("TURNLOOP_TEST_POSTGRES_PORT")
         .expect("fixture operation must succeed")
         .parse()
         .expect("fixture operation must succeed");
-    TcpStream::connect(("127.0.0.1", port))
-        .expect("fixture operation must succeed")
-        .write_all(
-            &d.core
-                .cancel_request()
-                .expect("fixture operation must succeed"),
-        )
-        .expect("fixture operation must succeed");
+    let mut cancel_io = TcpStream::connect(("127.0.0.1", port)).expect("cancel connection");
+    cancel_io
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("cancel timeout");
+    cancel_io.write_all(&cancel).expect("send CancelRequest");
+    // PostgreSQL closes this connection without a response after processing it.
+    assert_eq!(cancel_io.read(&mut [0; 1]).expect("cancel EOF"), 0);
     let r = d.drain(None);
+    assert_eq!(r.errors.len(), 1);
     assert_eq!(r.errors[0].0, "57014");
-    assert_eq!(r.completed[0].1, Outcome::ServerError);
+    assert_eq!(r.completed, [(7, Outcome::ServerError, TransactionStatus::Idle)]);
     assert_eq!(
         d.query("SELECT count(*) FROM items").rows[0][0],
         Some(b"4".to_vec())
