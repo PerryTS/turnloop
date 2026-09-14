@@ -49,6 +49,7 @@ pub struct Connection {
     context: WebSocketContext,
     deadline: Option<Instant>,
     terminal: bool,
+    peer_close: Option<u16>,
 }
 pub struct Received {
     pub consumed: usize,
@@ -60,6 +61,7 @@ impl Connection {
             context: WebSocketContext::new(role, Some(config)),
             deadline: None,
             terminal: false,
+            peer_close: None,
         }
     }
     pub fn receive(&mut self, input: &[u8], output: &mut Vec<u8>) -> Result<Received, Error> {
@@ -72,7 +74,13 @@ impl Connection {
             read: 0,
         };
         let message = match self.context.read(&mut memory) {
-            Ok(message) => Some(message),
+            Ok(message) => {
+                if let Message::Close(frame) = &message {
+                    self.peer_close = Some(frame.as_ref().map_or(1005, |f| u16::from(f.code)));
+                    self.deadline = None;
+                }
+                Some(message)
+            }
             Err(Error::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => None,
             Err(e) => {
                 self.terminal = true;
@@ -98,12 +106,20 @@ impl Connection {
     }
     /// Flush automatic pong/close replies after consuming an incoming message.
     pub fn flush(&mut self, output: &mut Vec<u8>) -> Result<(), Error> {
+        if self.terminal {
+            return Err(Error::AlreadyClosed);
+        }
         let mut memory = Memory {
             input: &[],
             output,
             read: 0,
         };
-        self.context.flush(&mut memory)
+        let result = self.context.flush(&mut memory);
+        if matches!(result, Err(Error::ConnectionClosed | Error::AlreadyClosed)) {
+            self.terminal = true;
+            self.deadline = None;
+        }
+        result
     }
     pub fn close(
         &mut self,
@@ -137,7 +153,7 @@ impl Connection {
             None
         } else {
             self.terminal = true;
-            Some(1006)
+            self.peer_close.or(Some(1006))
         }
     }
 }
