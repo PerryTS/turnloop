@@ -185,6 +185,11 @@ pub enum ReturnBytes {
 }
 impl ReturnBytes {
     /// Own the canonical list, including its release obligation.
+    ///
+    /// # Safety
+    /// Transfer an initialized canonical byte list exactly once. A nonempty
+    /// list must belong to a live retained arena or the canonical heap allocator,
+    /// with capacity equal to len for heap storage. No host task may still write it.
     pub unsafe fn take(ptr: u32, len: usize) -> Self {
         if len == 0 {
             return Self::Heap(Vec::new());

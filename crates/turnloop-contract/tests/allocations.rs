@@ -1,3 +1,6 @@
+//! On p3, run this binary with --release. The pinned compiler's debug custom
+//! allocator traps in pre-main get-arguments lowering; see docs/wasm.md. CI
+//! requires release allocation counts and runs semantic/no-spin tests in both profiles.
 #![deny(unsafe_op_in_unsafe_fn)]
 #![cfg(all(
     not(loom),
