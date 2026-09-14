@@ -155,6 +155,20 @@ there are no retries in the test loop. Ignored external-service tests do not cou
 
 ## Deviations / proposed DESIGN clarification / next steps
 
+Restart audit at checkpoint **a87ae10**: the working tree was clean and all
+implementation/measurement artifacts were already checkpointed. Re-read the
+required design, contribution, integration and relevant lane reports; reviewed
+the complete source diff against 9e9d8aa. No source correction remained.
+`python3 .tools/core3/resume-audit.py` **PASS**: all 46 recorded source/configuration
+hashes and all three measured binary hashes match; all 390 positive measurements
+have five rounds; all 50 contract and 10 workspace logs contain their expected
+52/237 passes and the specific regression subjects. Saved loom/Miri/default-suite
+counts also match. Dependency/soak policy, instruction gate and baseline remain
+unchanged. An additional post-restart contract all-feature run **PASS**, 52 tests,
+separate from the original 50/50 campaign. No large campaigns were rerun, and no
+builds ran concurrently during the restart audit. Post-restart formatting, path
+validation and diff whitespace checks **PASS**; commands are in the linked ledger.
+
 No Cargo dependency/lockfile, soak setting/security exception, platform gate, test
 threshold or Linux baseline changed. No public Backend trait revision was needed.
 The source changes are confined to Unix services/files, their tests and benchmarks.
@@ -168,8 +182,8 @@ ignores delivery without auto-reaping. DESIGN.md itself is unchanged.
 
 No implementation questions remain. Integrator next steps:
 
-1. Commit the final report/raw measurement artifact and any remaining working-tree
-   changes. Existing external checkpoints contain the implementation.
+1. Integrate the checkpointed implementation and raw measurement artifact; commit
+   the appended restart verification/report entries in the working tree.
 2. Run Linux native contracts, default and all features, and ordinary Callgrind CI.
    Review a corrected-boundary candidate using
    `python3 scripts/ci/instructions.py --record .tools/core3-instruction-candidates.json`.

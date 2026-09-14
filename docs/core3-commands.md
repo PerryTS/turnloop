@@ -258,3 +258,13 @@ Cross-compilation is not runtime execution. Raw output is in `.tools/core3/`.
 - **PASS** `python3 scripts/ci/check-paths.py`; final-paths 1/1, exit 0, 0 test passes, log `.tools/core3/final-paths-01.log`.
 
 - **PASS** `git diff --check`; final-diff 1/1, exit 0, 0 test passes, log `.tools/core3/final-diff-01.log`.
+
+- **PASS** `cargo test -p turnloop-contract --all-features -- --test-threads=1`; resume-contract 1/1, exit 0, 52 test passes, log `.tools/core3/resume-contract-01.log`.
+
+- **PASS** `python3 .tools/core3/resume-audit.py`; resume-audit 1/1, exit 0, 0 test passes, log `.tools/core3/resume-audit-01.log`.
+
+- **PASS** `cargo fmt --check`; resume-fmt 1/1, exit 0, 0 test passes, log `.tools/core3/resume-fmt-01.log`.
+
+- **PASS** `git diff --check`; resume-diff 1/1, exit 0, 0 test passes, log `.tools/core3/resume-diff-01.log`.
+
+- **PASS** `python3 scripts/ci/check-paths.py`; resume-paths 1/1, exit 0, 0 test passes, log `.tools/core3/resume-paths-01.log`.
