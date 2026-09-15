@@ -310,6 +310,8 @@ CI runs on `pull_request` and pushes to `main`, so this branch's runs are
 | [34997592013](https://github.com/PerryTS/turnloop/actions/runs/34997592013) | `95f5e1c` | FAIL — every job green except the three `windows-2025` arms, each failing only `a_handed_off_socket_keeps_its_association_and_duplicates_out_of_it` at the *duplicate* assertion: `a duplicate joins a port: Os { code: 87, … "The parameter is incorrect." }`. Everything else on Windows passed first time, including the named-pipe tagged-event test, the eight other handoff tests and the allocation gate |
 | [34998733403](https://github.com/PerryTS/turnloop/actions/runs/34998733403) | `58b4a8f` | **PASS — every job, `ci-gate` green.** 36 jobs: Linux x86_64 and arm64 (six modes each), macOS (three), Windows (three), WASI 0.2 and 0.3, headless-browser `web`, `protocol`, `protocol-wasi`, `h2spec`, `loom`, `miri`, `instructions`, `dependencies`, the four `lint-native`/`lint-wasm` arms and `workflow-lint` |
 
+| [34999737266](https://github.com/PerryTS/turnloop/actions/runs/34999737266) | `2aba6a0` | **PASS — every job, `ci-gate` green.** Re-run on the final tree, which adds only this report |
+
 Subjects confirmed to have executed in the green run, not merely to have not
 thrown: `iocp::a_handed_off_named_pipe_is_driven_with_a_tagged_event`,
 `iocp::a_handed_off_socket_keeps_its_association_even_through_a_duplicate`,
