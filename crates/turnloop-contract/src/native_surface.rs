@@ -113,6 +113,7 @@ pub fn ipc<B: Backend>(name: &PipeName) {
 pub fn children<B: Backend>(program: &std::ffi::OsStr) {
     let mut l = Driver::<B>::new(Config::default()).expect("loop");
     let mut spec = ProcessSpec::new(program);
+    spec.windows_hide = true;
     spec.args.push("exit".into());
     let mut children = Vec::new();
     for i in 0..256 {
@@ -161,6 +162,7 @@ pub fn children<B: Backend>(program: &std::ffi::OsStr) {
 pub fn child_stdio<B: Backend>(program: &std::ffi::OsStr) {
     let mut l = Driver::<B>::new(Config::default()).expect("loop");
     let mut spec = ProcessSpec::new(program);
+    spec.windows_hide = true;
     spec.args.push("stdio".into());
     spec.stdio = [ProcessStdio::Pipe; 3];
     let child = l.spawn(&spec, Token(1)).expect("spawn stdio child");
@@ -354,6 +356,7 @@ pub fn external_waits<B: Backend>() {
 pub fn process_group<B: Backend>(program: &std::ffi::OsStr) {
     let mut l = Driver::<B>::new(Config::default()).expect("loop");
     let mut spec = ProcessSpec::new(program);
+    spec.windows_hide = true;
     spec.args.push("grandchild".into());
     spec.new_process_group = true;
     spec.stdio[1] = ProcessStdio::Pipe;
@@ -414,6 +417,7 @@ pub fn process_group<B: Backend>(program: &std::ffi::OsStr) {
 pub fn services_no_spin<B: Backend>(program: &std::ffi::OsStr, signal: Signal) {
     let mut l = Driver::<B>::new(Config::default()).expect("loop");
     let mut spec = ProcessSpec::new(program);
+    spec.windows_hide = true;
     spec.args.push("sleep".into());
     let child = l.spawn(&spec, Token(100)).expect("sleeping child");
     let signal = l.signal_start(signal, Token(101)).expect("idle signal");
@@ -470,6 +474,7 @@ pub fn ipc_process<B: Backend>(program: &std::ffi::OsStr, name: &PipeName) {
     l.accept(listener, Token(1)).expect("IPC accept");
     let (_, tx, rx) = crate::pair(&mut l);
     let mut spec = ProcessSpec::new(program);
+    spec.windows_hide = true;
     spec.args = vec!["handle".into(), name.0.clone().into_os_string()];
     let child = l.spawn(&spec, Token(2)).expect("IPC child");
     l.read_start(rx, Token(3)).expect("socket read");
@@ -598,4 +603,61 @@ pub fn pipe_connect_deadlines<B: Backend>(name: &PipeName) {
         }
         assert_eq!(driver.next_deadline(), None);
     }
+}
+
+/// A real synchronous duplex endpoint opposite a native overlapped server.
+#[cfg(windows)]
+pub fn synchronous_duplex_pair() -> (Loop, Handle, Handle) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let mut driver = Loop::new(Config::default()).expect("duplex loop");
+    let name = format!(
+        r"\\.\pipe\turnloop-sync-duplex-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    );
+    let listener = driver
+        .pipe_listen(
+            &PipeName(name.clone().into()),
+            &ListenOpts {
+                backlog: 1,
+                ..ListenOpts::default()
+            },
+        )
+        .expect("duplex listener");
+    driver.accept(listener, Token(1)).expect("duplex accept");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(name)
+        .expect("synchronous duplex client");
+    let client = driver
+        .attach(
+            Detached::from_handle(file.into()).expect("sync classification"),
+            Token(2),
+        )
+        .expect("sync adoption");
+    let mut out = Completions::with_capacity(1);
+    let deadline = driver.now() + Duration::from_secs(5);
+    let server = loop {
+        assert!(driver.now() < deadline);
+        driver
+            .turn(Timeout::Until(deadline), &mut out)
+            .expect("duplex accept turn");
+        if let Some(c) = out.drain().next() {
+            let OpResult::PipeAccepted { conn } = c.result else {
+                panic!("{c:?}")
+            };
+            break conn;
+        }
+    };
+    driver
+        .close(listener, Token(3))
+        .expect("close duplex listener");
+    driver
+        .turn(Timeout::Now, &mut out)
+        .expect("listener closed");
+    assert_eq!(out.len(), 1);
+    assert!(matches!(out[0].result, OpResult::Closed));
+    (driver, client, server)
 }

@@ -1166,6 +1166,103 @@ impl<B: Backend> Drop for Driver<B> {
     }
 }
 
+#[cfg(all(test, windows, not(loom)))]
+mod iocp_failure_tests {
+    use super::*;
+    use windows_sys::Win32::{
+        Foundation::{ERROR_INVALID_HANDLE, WAIT_OBJECT_0},
+        System::Threading::WaitForSingleObject,
+    };
+
+    #[test]
+    fn pump_failure_repeats_before_queued_work_and_drop_joins_pending_io() {
+        let (done, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut bytes = [0xa5; 32]; // remains pinned until driver destruction
+            let mut driver = Loop::new(Config::default()).expect("loop");
+            let listener = driver
+                .tcp_listen(([127, 0, 0, 1], 0).into(), &ListenOpts::default())
+                .expect("listener");
+            let peer = std::net::TcpStream::connect(driver.local_addr(listener).expect("address"))
+                .expect("peer");
+            driver.accept(listener, Token(1)).expect("accept");
+            let deadline = driver.now() + Duration::from_secs(5);
+            let mut out = Completions::with_capacity(1);
+            let stream = loop {
+                assert!(driver.now() < deadline);
+                driver
+                    .turn(Timeout::Until(deadline), &mut out)
+                    .expect("accept turn");
+                if let Some(c) = out.drain().next() {
+                    let OpResult::Accepted { conn, .. } = c.result else {
+                        panic!("{c:?}")
+                    };
+                    break conn;
+                }
+            };
+            // SAFETY: fixed exclusive bytes outlive driver on success and unwind.
+            let buffer = unsafe { IoBufMut::from_raw_parts(bytes.as_mut_ptr(), bytes.len()) };
+            let read = driver
+                .read(stream, ReadBuf::Provided(buffer), Token(2))
+                .expect("idle read");
+            driver
+                .turn(Timeout::Now, &mut out)
+                .expect("start real pending I/O");
+            assert!(out.is_empty());
+            assert!(
+                driver.backend.operation_waiting_for_test(read),
+                "subject reached native wait"
+            );
+            let Integration::Event(event) = driver.integration().expect("helper") else {
+                panic!("event")
+            };
+            let timer = driver
+                .timer(driver.now(), None, Token(3))
+                .expect("ready timer");
+            driver
+                .close(timer, Token(4))
+                .expect("queued cancellation and close");
+            assert!(!driver.queued.is_empty(), "core fast path subject");
+            driver
+                .backend
+                .fail_event_for_test(ERROR_INVALID_HANDLE as i32);
+            let expected: Error =
+                std::io::Error::from_raw_os_error(ERROR_INVALID_HANDLE as i32).into();
+            for _ in 0..8 {
+                assert_eq!(
+                    driver
+                        .turn(Timeout::Now, &mut out)
+                        .expect_err("persistent pump error"),
+                    expected
+                );
+                assert!(out.is_empty());
+                assert_eq!(
+                    driver.integration().expect_err("integration keeps failure"),
+                    expected
+                );
+                assert_eq!(
+                    // SAFETY: borrowed event is owned by the still-live loop.
+                    unsafe { WaitForSingleObject(event as _, 1000) },
+                    WAIT_OBJECT_0
+                );
+            }
+            drop(driver); // joins pump, cancels and drains the live native read
+            assert_eq!(bytes, [0xa5; 32]);
+            bytes.fill(0x5a);
+            drop(peer);
+            assert_eq!(bytes, [0x5a; 32]);
+            done.send(8).expect("completed teardown marker");
+        });
+        assert_eq!(
+            receive
+                .recv_timeout(Duration::from_secs(15))
+                .expect("drop watchdog"),
+            8
+        );
+        worker.join().expect("failure regression thread");
+    }
+}
+
 #[cfg(all(test, not(loom), not(turnloop_backend = "web")))]
 mod clock_contract {
     use super::*;

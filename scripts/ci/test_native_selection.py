@@ -46,6 +46,7 @@ class NativeSelection(unittest.TestCase):
             self.assertEqual(len(selected), 3)
             self.assertEqual(sum('--all-features' in c for c in selected), 1)
         self.assertFalse(any('turnloop-contract' in c for c in commands))
+        self.assertTrue(all(c.count('--no-fail-fast') == 1 for c in commands))
         self.assertIn('PENDING Windows backend contracts: turnloop-contract', summary)
         self.assertIn('WINDOWS_HANDOFF.md', summary)
         self.assertIn('no-spin', summary)
@@ -71,7 +72,9 @@ class NativeSelection(unittest.TestCase):
                 self.assertEqual(len(commands), 9)
                 for command in commands:
                     end = command.index('--')
-                    selection = command[2:end]
+                    # Every binary runs even after a failure; cargo's exit code still fails the job.
+                    self.assertEqual(command[2:end].count('--no-fail-fast'), 1)
+                    selection = [arg for arg in command[2:end] if arg != '--no-fail-fast']
                     actual = selection[1:] if '--workspace' in selection else selection[2:]
                     if '--workspace' in selection or 'turnloop-contract' in selection:
                         expected = features

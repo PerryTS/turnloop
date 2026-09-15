@@ -198,6 +198,33 @@ including when cancelled before the first poll. `LocalExecutor` and adapters are
 
 ## Windows and WASM integration
 
+`ProcessSpec::windows_hide` defaults false and is ignored on Unix. On Windows it
+selects SW_HIDE; CREATE_NO_WINDOW additionally requires no inherited stdio.
+`ProcessSpec::detached` defaults false, creates a new Unix session/process group
+or Windows detached process/group, and excludes Windows children from the
+process-wide lifetime job. It does not imply unref or relinquish loop ownership:
+explicit close and loop Drop still terminate live owned children. WASI/web still
+reject process spawning with Unsupported.
+
+Windows lifetime jobs retain a single non-inheritable handle until parent death,
+using libuv's silent-breakaway policy. Separate explicit tree-control jobs do not
+use KILL_ON_JOB_CLOSE; releasing a normally exited leader preserves grandchildren.
+Synchronous Windows handles have independent read/write FIFOs and workers,
+including per-direction cancellation and quiescence before Closed/Drop. No
+cross-direction ordering of regular-file offsets is promised on Windows.
+
+CTRL_CLOSE follows libuv: an unsubscribed event returns FALSE to older host
+handlers; subscribed Hup is queued before the handler thread sleeps for Windows'
+bounded close period. That subscribed case prevents older handlers from running
+under Windows' newest-first dispatch. The supported API cannot both continue the
+chain and hold the handler thread. The host must exit within the OS close budget.
+
+An Event helper pump error remains visible on every later turn/integration call,
+including the core's queued-work path. Teardown joins the helper, recovers its
+retained packets and drains cancellation with blocking port waits; unrecoverable
+port failure aborts instead of spinning or freeing kernel-owned buffers. See
+[the issue #11 decisions and verification](lanes/iocp-semantics.md).
+
 The production Windows IOCP backend implements these resource/operation shapes:
 named pipe accept/connect, duplicate stdio, duplicated sockets/handles, process waits and Job
 Objects, console modes/resize and console signal dispatch. Keep OVERLAPPED storage

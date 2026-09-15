@@ -536,3 +536,67 @@ fn local_connect_deadlines_complete_and_cancel() {
     ));
     std::fs::remove_file(path).expect("remove deadline listener");
 }
+
+#[test]
+fn detached_process_starts_a_new_unix_session() {
+    let mut checked = 0;
+    for detached in [false, true] {
+        let mut driver = Loop::new(Config::default()).expect("loop");
+        let mut spec = ProcessSpec::new(env!("CARGO_BIN_EXE_native_child"));
+        assert!(!spec.detached && !spec.windows_hide);
+        spec.detached = detached;
+        spec.windows_hide = true; // ignored on Unix
+        spec.args.push("session".into());
+        spec.stdio = [ProcessStdio::Null, ProcessStdio::Pipe, ProcessStdio::Null];
+        let child = driver.spawn(&spec, Token(1)).expect("session probe");
+        assert!(driver.alive(), "detached does not imply unref");
+        driver
+            .read_start(child.stdout.expect("stdout"), Token(2))
+            .expect("session output");
+        let mut out = Completions::with_capacity(1);
+        let mut bytes = Vec::new();
+        let (mut exited, mut eof) = (0, 0);
+        let deadline = driver.now() + std::time::Duration::from_secs(5);
+        while exited == 0 || eof == 0 {
+            assert!(driver.now() < deadline);
+            driver
+                .turn(Timeout::Until(deadline), &mut out)
+                .expect("session turn");
+            for c in out.drain() {
+                match c.result {
+                    OpResult::Read {
+                        n,
+                        lease: Some(data),
+                    } => {
+                        assert!(n > 0);
+                        bytes.extend_from_slice(data.as_slice());
+                    }
+                    OpResult::Exited(status) => {
+                        assert_eq!(status.code, Some(0));
+                        exited += 1;
+                    }
+                    OpResult::Eof => eof += 1,
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+        }
+        assert_eq!((exited, eof), (1, 1));
+        let text = std::str::from_utf8(&bytes).expect("session UTF8");
+        let fields: Vec<i32> = text
+            .trim()
+            .split(':')
+            .map(|s| s.parse().expect("session field"))
+            .collect();
+        assert_eq!(fields.len(), 3);
+        assert_eq!(fields[0] as u32, child.pid);
+        if detached {
+            assert_eq!(fields, [child.pid as i32; 3]);
+        } else {
+            // SAFETY: queries our inherited group/session only, without mutation.
+            let (group, session) = unsafe { (libc::getpgrp(), libc::getsid(0)) };
+            assert_eq!((fields[1], fields[2]), (group, session));
+        }
+        checked += 1;
+    }
+    assert_eq!(checked, 2);
+}
