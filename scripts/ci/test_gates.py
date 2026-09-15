@@ -47,6 +47,21 @@ class Gates(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             publish_order(data)
 
+    def test_semver_baseline_prefers_stable_then_earlier_prerelease(self):
+        release = module('release')
+        record = lambda *nums, yanked=(): {'versions': [{'num': n, 'yanked': n in yanked} for n in nums]}
+        # Pre-release-only crates compare against their newest EARLIER pre-release.
+        self.assertEqual(release.semver_baseline(record('0.1.0-alpha.1', '0.1.0-alpha.2'), '0.1.0-alpha.3'), '0.1.0-alpha.2')
+        # Recovery of an already published version still uses the one below it.
+        self.assertEqual(release.semver_baseline(record('0.1.0-alpha.1', '0.1.0-alpha.2'), '0.1.0-alpha.2'), '0.1.0-alpha.1')
+        # Numeric pre-release identifiers order numerically, not lexically.
+        self.assertEqual(release.semver_baseline(record('0.1.0-alpha.9', '0.1.0-alpha.10'), '0.1.0-alpha.11'), '0.1.0-alpha.10')
+        # A stable release below the target still wins over later pre-releases.
+        self.assertEqual(release.semver_baseline(record('0.1.0', '0.2.0-alpha.1'), '0.2.0-alpha.2'), '0.1.0')
+        # Yanked versions are never baselines; nothing earlier means no baseline.
+        self.assertEqual(release.semver_baseline(record('0.1.0-alpha.1', '0.1.0-alpha.2', yanked=('0.1.0-alpha.2',)), '0.1.0-alpha.3'), '0.1.0-alpha.1')
+        self.assertIsNone(release.semver_baseline(record('0.1.0-alpha.1'), '0.1.0-alpha.1'))
+
     def test_spikes_cannot_be_released(self):
         p = package('spike'); p['manifest_path'] = '/workspace/spikes/p3/Cargo.toml'
         with self.assertRaises(RuntimeError):
