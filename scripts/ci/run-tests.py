@@ -117,12 +117,14 @@ def native_tests(data, base, root, *, windows, modes):
                     output.write(message + '\n')
     for mode, features in modes:
         print(f'Native mode: {mode} ({" ".join(features) or "default features"})', flush=True)
-        checked_tests(base + ['--workspace'] + features + ['--', '--test-threads=1'], cwd=root)
+        # --no-fail-fast runs every test binary before cargo reports failure, so one
+        # failing binary cannot hide later ones. The non-zero exit still fails the job.
+        checked_tests(base + ['--workspace', '--no-fail-fast'] + features + ['--', '--test-threads=1'], cwd=root)
         # Every portable member must execute independently; another crate's tests
         # cannot hide a cfg-excluded core, protocol codec or fixture suite.
         for package in select(data, 'core') + select(data, 'protocol') + [p for p in members(data) if role(p) == 'adapter'] + contracts:
             if package['name'] not in pending:
-                checked_tests(base + ['-p', package['name']] + member_features(package, features) + ['--', '--test-threads=1'], cwd=root)
+                checked_tests(base + ['-p', package['name'], '--no-fail-fast'] + member_features(package, features) + ['--', '--test-threads=1'], cwd=root)
 
 
 def main():
