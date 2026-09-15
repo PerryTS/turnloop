@@ -136,7 +136,9 @@ def main():
         plan_path.write_text(json.dumps({'sha': sha, 'pending': pending, 'recovery': recovery,
             'versions': {p['name']: p['version'] for p in packages}}, indent=2) + '\n')
         return
-    if os.environ.get('GITHUB_ACTIONS') != 'true' or os.environ.get('GITHUB_EVENT_NAME') != 'workflow_run':
+    # crates.io Trusted Publishing issues tokens only to push/release/workflow_dispatch
+    # runs; release.yml dispatches itself after verifying the workflow_run.
+    if os.environ.get('GITHUB_ACTIONS') != 'true' or os.environ.get('GITHUB_EVENT_NAME') != 'workflow_dispatch':
         fail('Publishing is only supported by the protected release.yml workflow')
     plan = json.loads(plan_path.read_text())
     if plan['sha'] != sha or plan['versions'] != {p['name']: p['version'] for p in packages}:
