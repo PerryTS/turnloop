@@ -781,9 +781,16 @@ fn real_console_close_chains_without_hup_and_allows_subscribed_cleanup() {
                 // Terminal's OpenConsole; its hidden PseudoConsoleWindow is destroyed
                 // by WM_CLOSE without any console event (run 34932207539). The
                 // pseudoconsole cases above deliver the same OS event there.
-                println!(
-                    "SKIP {host:?}/{mode}: console window class {class:?} does not turn WM_CLOSE into CTRL_CLOSE_EVENT"
-                );
+                // Written to the process stderr directly so the reason is logged even
+                // when libtest captures the output of a passing test.
+                std::io::Write::write_all(
+                    &mut std::io::stderr(),
+                    format!(
+                        "SKIP {NAME} {host:?}/{mode}: console window class {class:?} does not turn WM_CLOSE into CTRL_CLOSE_EVENT; pseudoconsole cases cover the event\n"
+                    )
+                    .as_bytes(),
+                )
+                .expect("log skip reason");
                 drop(fixture);
                 unblock();
                 reader.join().expect("marker reader");

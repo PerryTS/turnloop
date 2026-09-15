@@ -510,3 +510,193 @@ Rust still checks the MSVC target; installed Zig supplies Windows C headers and
 COFF dependency objects for cross-Clippy. This is not MSVC linking or execution.
 The wrapper and its caches are checkout-local; no source/dependency/gate was
 changed to obtain that pass.
+
+## sem-fix2
+
+Base `a6a345d` (sem-fix1), PR #16, 2026-09-15. Windows runtime evidence comes from
+GitHub windows-2025 runs; raw kernel/session probes ran on throwaway `diag/*`
+branches (`diag/sem-kernel`, `diag/sem-fix2`, deleted afterwards) and are quoted
+below. Commits: `c10097a`, `e96c475`, `ba53146`, `3204fd1`, `c0029a9` and this
+report commit.
+
+### CI reports every failing test
+
+`cargo test` stopped at the first failing test binary, so `allocations` hid
+`windows_console` and `windows_lifetimes`. `scripts/ci/run-tests.py native` now
+passes `--no-fail-fast` to the workspace and per-member commands; cargo's non-zero
+exit still raises and the positive passed-count check is unchanged
+(`scripts/ci/test_native_selection.py` asserts the flag on every native command).
+Run **34930832074** (a6a345d + this change) then showed the complete failing set in
+all three modes: the duplex allocation gate, both new console tests,
+`duplex_cancellation_is_per_direction_and_close_drop_join_both_workers` and the
+sem-fix1 diagnostic. Every other Windows test, including the never-before-run
+lifetime/job tests, passed.
+
+### Root cause 1: one synchronous file object serializes all I/O
+
+sem-fix1's hypothesis did not hold: in run 34930832074 the diagnostic failed on
+"GetConsoleMode did not reproduce the serialization point" (the query on a pipe
+returned without waiting). Raw probe, run **34930861414** (repeated in 34932207539),
+two duplicates of one synchronous duplex named-pipe client:
+
+```
+reader IO pending flag = 1
+WriteFile beside idle read: still blocked after 1.5s
+writer IO pending flag while waiting = 0
+CancelSynchronousIo(writer waiting behind read) -> 0 (Element not found. (os error 1168))
+CancelSynchronousIo(idle reader) -> 1 (ok)
+reader after cancel: returned ok=0 err=995 n=0
+writer after reader cancel: returned ok=1 err=0 n=1
+reissued read receives every server byte: returned ok=1 err=0 n=2 head=[77, 78]
+```
+
+The write waits for the file object's I/O lock with no request of its own (so it
+cannot be cancelled); cancelling the idle read releases it and consumes no data.
+libuv's `uv_pipe_getsockname` documents the same serialization for its
+non-overlapped pipes. Alternatives, measured (run 34932207539):
+
+- ReOpenFile with FILE_FLAG_OVERLAPPED fails with ERROR_PIPE_BUSY (231) for a
+  named-pipe client end, server end, and both anonymous ends. No second object.
+- `FSCTL_PIPE_ASSIGN_EVENT` (readiness without a pending read) returns
+  STATUS_NOT_SUPPORTED (0xC00000BB).
+- Preempting a write is unsafe: a 1-MiB write blocked on quota, after the peer
+  consumed 1000 bytes, returned `ok=0 err=995 n=0` on cancellation and the other
+  1047576 bytes were discarded (`server available after write cancellation = 0`).
+- A read waiting behind a quota-blocked write is not released by data arriving
+  (`ReadFile beside blocked write with 1 byte available: still blocked`) nor by
+  CancelSynchronousIo (ERROR_NOT_FOUND).
+
+**Fix (`sync_io.rs`).** The two direction workers share one state. For synchronous
+pipe handles with both read and write access, the write worker sets `writing`,
+cancels an in-kernel read with CancelSynchronousIo and waits until it returns; the
+read worker treats an aborted preempted read as not consumed and reissues the same
+request after the write, so read FIFO order and exactly-once completion hold. A
+read that starts while a pipe write owns the object parks on the condition variable
+instead of entering ReadFile, so its cancellation needs no kernel call. Consoles,
+disks, other character devices and one-way pipe ends (every anonymous pipe; the
+other direction fails its access check first) are not preempted. No allocation,
+thread or queue is added per operation.
+
+**Lost cancellation.** A CancelSynchronousIo issued just after a named-pipe read
+enters the kernel can report success yet leave the read pending (run 34932207539:
+`CancelSynchronousIo returned TRUE but ReadFile did not return; pending flag=1`). Run **34932652249**,
+300 immediate cancellations: `histogram=[0, 3, 297]` successful calls per read, all
+300 aborted, no bytes lost, worst 25.5 ms. Both the cancellation helper (which
+previously waited forever after one success) and the preemption now re-issue after
+at most 10 ms while the worker is still inside I/O; before kernel entry they yield,
+sleeping 1 ms only after 64 misses (only a foreign holder of the object's I/O lock
+can cause that).
+
+**Documented per-kind limitation.** A pipe write waiting for the peer to drain still
+owns the object, so reads on that endpoint complete only after it finishes or is
+cancelled (evidence above; independence is impossible without an independent
+object, which the kernel does not provide). Idle reads never delay writes.
+
+Tests:
+- `windows_duplex_fifos_make_independent_progress_without_allocating`: unchanged,
+  passes in all modes (512 completions, zero allocations on all threads).
+- The sem-fix1 diagnostic is replaced by
+  `synchronous_pipe_write_waits_behind_idle_read_until_the_read_is_cancelled`,
+  asserting the confirmed kernel behaviour above (blocked write, no writer request,
+  ERROR_NOT_FOUND for the writer, aborted read with 0 bytes, write released, every
+  later byte received).
+- `duplex_cancellation_is_per_direction_and_close_drop_join_both_workers`: the
+  cancel-read case previously required a new read to complete beside a still
+  blocked 1-MiB write, which the kernel forbids. It now first proves the write is
+  inside WriteFile (peer receives bytes), cancels the read, then drains every
+  surviving write byte (all 0x33, full count) and requires the queued read to
+  complete with the peer's byte after the write. Close still cancels a
+  kernel-blocked write, a parked read and two queued requests (4 cancellations in
+  both cases; the surviving write now completes instead of being cancelled).
+  An executor-mode run of the first restructure (34933660415) failed "read overtook
+  the write" because starting a request does not schedule its worker thread; a
+  probe showed a blocked synchronous 1-MiB WriteFile always reports the full count
+  (run 34934771562), so the test pins the in-kernel state instead.
+- New `duplex_writes_preempt_reads_at_every_entry_point_without_losing_bytes`:
+  384 request/response rounds with the read queued in the same turn, one turn
+  earlier, or settled 2 ms, checking every byte and each completion once.
+
+### Root cause 2: CREATE_NEW_CONSOLE is a pseudoconsole on windows-2025
+
+Run **34932207539**, session probe: steps run in session 2, `WinSta0`, visible. An
+isolated CREATE_NEW_CONSOLE child's console window has class `PseudoConsoleWindow`,
+owned by `Microsoft.WindowsTerminal_1.23.20211.0_x64__8wekyb3d8bbwe\OpenConsole.exe`
+(default-terminal handoff). `PostMessageW(WM_CLOSE)` and `WM_SYSCOMMAND/SC_CLOSE`
+succeed, the hidden window is destroyed (`IsWindow` 0) and no control event reaches
+the process (killed after 8 s). `ClosePseudoConsole` on a pseudoconsole child
+delivered `control-event:2` (CTRL_CLOSE_EVENT) and exit 0xC000013A.
+
+`real_console_close_chains_without_hup_and_allows_subscribed_cleanup` now hosts both
+fixtures (`chain`, `hup`) in a pseudoconsole and closes it: a real OS
+CTRL_CLOSE_EVENT on hosted and self-hosted runners alike; these cases always run.
+The original WM_CLOSE cases are kept for a classic `ConsoleWindowClass` window; on
+any other window class each is skipped with a message written directly to stderr
+(visible in CI output), e.g. `SKIP ... NewConsoleWindow/chain: console window class
+"PseudoConsoleWindow" does not turn WM_CLOSE into CTRL_CLOSE_EVENT` (run
+34934771562). Markers moved to a named pipe because stdout is the console under a
+pseudoconsole. **Capability-gated:** the two WM_CLOSE cases, on hosted runners.
+They remain runnable on a self-hosted runner with classic conhost; not yet observed.
+
+### Root cause 3 (backend bug): removing the console handler deadlocked close cleanup
+
+With a real close, the `hup` fixture was killed with 0xC000013A instead of exiting
+23 (run 34933660415). Probe, run **34934409445**: while one thread is inside a
+console control handler, `SetConsoleCtrlHandler` from another thread blocks —
+`add another handler while the handler runs: BLOCKED for 1.5 s ... returned 1 after
+release`, same for removing the running handler. The subscribed Hup handler never
+returns (libuv's hold), and the last subscription's Drop removed it, so dropping
+the loop — the cleanup the hold exists for — deadlocked. `signals.rs` now installs
+the handler once and never removes it, as libuv's `uv__signals_init` does; without
+a matching subscription it returns FALSE, exactly as if absent. The pseudoconsole
+`hup` case then exits 23 with its marker (run 34934771562 and the PR run below).
+
+### Root cause 4: inherited CTRL+C-ignore, and CREATE_NO_WINDOW semantics
+
+Run 34932207539: the cargo test process and its CREATE_NEW_CONSOLE child have
+process-parameter ConsoleFlags `0x1` (CTRL+C ignored, inherited from the runner).
+In the child, `ctrl-c without enabling: handler calls=0`, Ctrl-Break 1, after
+`SetConsoleCtrlHandler(NULL, FALSE)` flags 0x0 and Ctrl-C 1. libuv/Node also honor
+the inherited flag, so `windows_hide_and_detached_match_console_inheritance` now
+establishes the precondition in its isolated host, as the fan-out test already did.
+That exposed the next iteration (run 34934409445):
+`hide=true inherited=0 ... output="console:true,show:0"`. CREATE_NO_WINDOW (applied
+exactly as libuv does) gives the child its own windowless console; the probe
+treated having any console as sharing the host's. `console-probe` now receives the
+host PID and reports membership in the host's console plus whether it has its own
+console; the test additionally asserts that every non-detached child has a console
+and detached ones do not. All eight combinations pass (run 34934771562).
+
+### Verification
+
+Local (macOS arm64): `cargo fmt --check` PASS; `cargo clippy --locked --target
+x86_64-pc-windows-msvc -p turnloop -p turnloop-contract -p turnloop-io --all-targets
+--all-features -- -D warnings -D clippy::undocumented_unsafe_blocks` PASS; `cargo
+clippy --locked --workspace --all-targets -- -D warnings` PASS; `cargo test --locked
+-p turnloop -p turnloop-contract -- --test-threads=1` PASS; `python3 -m unittest
+test_native_selection` PASS.
+
+windows-2025 PR run **34934941536** (commit `c0029a9`): **success**, every job
+green (self-hosted-windows skipped: `vars.SELF_HOSTED_WINDOWS` unset). Workspace
+counts: default **289**, executor **296**, all-features **345** tests executed, plus
+every member. In all three modes: the duplex allocation gate, the kernel
+serialization test, both duplex tests, idle no-spin, both console tests and all
+lifetime/job tests pass. Twelve executor-mode repetitions of both duplex tests
+passed on the diag branch (34934771562). The final report commit only changes this
+document and the skip logging; see the PR checks for its run.
+
+### Open items
+
+- WM_CLOSE on a classic conhost window is untested here (capability-gated on hosted
+  runners; runnable on the self-hosted Windows runner).
+- Two early probe variants (`diag/sem-kernel`, runs 34932652249 and 34933725475)
+  hung while racing immediate cancellations on an anonymous pipe, without printing
+  where; a traced rerun (34934409445) aborted all 20 reads promptly and did not
+  reproduce it. Anonymous pipes are never
+  preempted; user cancellation of their reads is covered by the existing
+  128-round `cancelled_synchronous_reads_release_buffers_and_threads`, which passes.
+- If a foreign thread holds a synchronous pipe's I/O lock, preemption or
+  cancellation retries every 1 ms until that I/O ends (documented; no turnloop
+  thread can cause it).
+- DESIGN §7.3 clarification proposed: per-direction FIFOs on synchronous pipes
+  give idle-read preemption, not concurrent kernel I/O; the console control handler
+  is process-lifetime once installed.
