@@ -18,6 +18,30 @@ import urllib.request
 from common import PIN, ROOT, cargo, entrypoint, fail, get_json, metadata, publish_order, run
 
 
+def release_notes(package):
+    """Release body for one crate: its own changelog section, or a stated fallback.
+
+    A workspace release bumps every crate, but release-plz only writes a section
+    for the crates whose own sources changed. Failing on the others used to abort
+    the publish step *after* crates.io uploads had succeeded, leaving the release
+    half-tagged (alpha.4: 12 crates published, 1 tag created). The requirement is
+    kept where it can still block a release - preflight, before any upload - and a
+    version-only bump gets an explicit body instead of stopping a live publish.
+    """
+    tag = package['name'] + '-v' + package['version']
+    changelog = Path(package['manifest_path']).parent / 'CHANGELOG.md'
+    if not changelog.is_file():
+        fail(f'Missing release-plz changelog for {tag}')
+    lines = changelog.read_text().splitlines(keepends=True)
+    start = next((i for i, line in enumerate(lines)
+                  if line.startswith('## ') and package['version'] in line), None)
+    if start is None:
+        return (f'{package["name"]} {package["version"]}\n\n'
+                'No crate-specific changes; released with the workspace.\n')
+    end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith('## ')), len(lines))
+    return ''.join(lines[start:end])
+
+
 def semver_key(number):
     """SemVer 2.0.0 precedence; build metadata is ignored."""
     core, _, pre = number.split('+', 1)[0].partition('-')
@@ -126,6 +150,9 @@ def main():
                 fail(f'{package["name"]}: no earlier published version for semver-checks')
             run(cargo(PIN) + ['semver-checks', '--manifest-path', package['manifest_path'],
                 *baseline_source(package['name'], baseline), '--all-features'], cwd=data['workspace_root'])
+        for package in packages:
+            if package['name'] in pending:
+                release_notes(package)  # fail here, not after uploading to crates.io
         # One invocation checks EACH crate and stages unpublished siblings in a
         # temporary registry. Separate invocations fail for new dependency versions.
         command = cargo(PIN) + ['publish', '--registry', 'crates-io', '--locked', '--dry-run', '--manifest-path', str(Path(args.manifest_path).resolve())]
@@ -163,17 +190,9 @@ def main():
             fail(f'{package["name"]}: uploaded version is not visible in the crates.io API after 120s')
         verify_existing(package, version, sha)
         tag = package['name'] + '-v' + package['version']
-        changelog = Path(package['manifest_path']).parent / 'CHANGELOG.md'
-        if not changelog.is_file():
-            fail(f'Missing release-plz changelog for {tag}')
-        # Release notes are the first version section, without unreleased history.
-        lines = changelog.read_text().splitlines(keepends=True)
-        start = next((i for i, line in enumerate(lines) if line.startswith('## ') and package['version'] in line), None)
-        if start is None:
-            fail(f'No changelog entry for {tag}')
-        end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith('## ')), len(lines))
         notes = ROOT / '.tools/release-notes.md'
-        notes.write_text(''.join(lines[start:end]))
+        notes.parent.mkdir(parents=True, exist_ok=True)
+        notes.write_text(release_notes(package))
         run(['gh', 'release', 'create', tag, '--repo', 'PerryTS/turnloop', '--target', sha,
              '--title', tag, '--notes-file', str(notes)])
 
