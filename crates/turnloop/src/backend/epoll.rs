@@ -234,10 +234,7 @@ impl Poller for Epoll {
         if n < 0 {
             let e = std::io::Error::last_os_error();
             if e.kind() == std::io::ErrorKind::Interrupted {
-                return Ok(PollInfo {
-                    waits: 1,
-                    zero_event_waits: 1,
-                });
+                return Ok(PollInfo::native(timeout, true));
             }
             return Err(e.into());
         }
@@ -265,10 +262,7 @@ impl Poller for Epoll {
                 });
             }
         }
-        Ok(PollInfo {
-            waits: 1,
-            zero_event_waits: u32::from(native_events == 0),
-        })
+        Ok(PollInfo::native(timeout, native_events == 0))
     }
     fn fd(&self) -> RawFd {
         self.fd.as_raw_fd()
@@ -297,24 +291,36 @@ mod tests {
             // native work. This also leaves the fallback's timer armed.
             poller.waker().wake().expect("notify");
             let info = poller.wait(Some(duration), &mut ready).expect("wake wait");
-            assert_eq!((info.waits, info.zero_event_waits), (1, 0));
+            assert_eq!(
+                (info.waits, info.discovery_polls, info.zero_event_waits),
+                (1, 0, 0)
+            );
             assert!(ready.is_empty());
             // Allow that abandoned timeout to become readable before rearming.
             // The next wait must honor its new deadline, without stale expiry.
             std::thread::sleep(duration);
             let at = Instant::now() + duration;
             let info = poller.wait(Some(duration), &mut ready).expect("timeout");
-            assert_eq!((info.waits, info.zero_event_waits), (1, 1));
+            assert_eq!(
+                (info.waits, info.discovery_polls, info.zero_event_waits),
+                (1, 0, 1)
+            );
             assert!(Instant::now() >= at, "the OS wait must reach its deadline");
             assert!(ready.is_empty());
             timeouts += 1;
         }
         assert_eq!(timeouts, 3);
         let info = poller.wait(Some(Duration::ZERO), &mut ready).expect("now");
-        assert_eq!((info.waits, info.zero_event_waits), (1, 1));
+        assert_eq!(
+            (info.waits, info.discovery_polls, info.zero_event_waits),
+            (0, 1, 1)
+        );
         poller.waker().wake().expect("notify unbounded wait");
         let info = poller.wait(None, &mut ready).expect("unbounded wake");
-        assert_eq!((info.waits, info.zero_event_waits), (1, 0));
+        assert_eq!(
+            (info.waits, info.discovery_polls, info.zero_event_waits),
+            (1, 0, 0)
+        );
     }
 
     #[test]
@@ -330,7 +336,10 @@ mod tests {
         let info = poller
             .wait(Some(Duration::from_secs(1)), &mut ready)
             .expect("I/O wait");
-        assert_eq!((info.waits, info.zero_event_waits), (1, 0));
+        assert_eq!(
+            (info.waits, info.discovery_polls, info.zero_event_waits),
+            (1, 0, 0)
+        );
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].key, key);
         assert!(ready[0].read);

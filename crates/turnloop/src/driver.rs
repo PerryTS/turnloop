@@ -1013,10 +1013,9 @@ impl<B: Backend> Driver<B> {
         let queued =
             !self.queued.is_empty() || !self.poster.is_empty() || !self.work_port.is_empty();
         let mut waits = 0;
+        let mut discovery_polls = 0;
         let mut zero_event_waits = 0;
-        if self.buffered[NATIVE_EVENTS] == 0
-            && (!queued || self.native_pending != 0 || self.backend.has_work())
-        {
+        if self.buffered[NATIVE_EVENTS] == 0 && (!queued || self.native_pending != 0) {
             let mut timeout = deadline.map(|d| d.saturating_duration_since(start));
             if timeout == Some(Duration::ZERO) || queued || notified || !self.notifier.park() {
                 timeout = Some(Duration::ZERO);
@@ -1025,6 +1024,7 @@ impl<B: Backend> Driver<B> {
             self.notifier.running();
             let poll = poll?;
             waits = poll.waits;
+            discovery_polls = poll.discovery_polls;
             zero_event_waits = poll.zero_event_waits;
             // Taking/replacing the preallocated vector preserves storage and allows
             // completion handling to mutate the backend when accepting a socket.
@@ -1127,6 +1127,7 @@ impl<B: Backend> Driver<B> {
             waited: self.backend.now().saturating_duration_since(start),
             alive: self.alive(),
             os_waits: waits,
+            discovery_polls,
             zero_event_waits,
         })
     }
@@ -1160,6 +1161,7 @@ mod clock_contract {
         deadline: Option<Instant>,
         changes: usize,
         polls: usize,
+        cached_work: bool,
         accept_connect: bool,
         pending: Option<Request>,
         cancellation: Option<OpId>,
@@ -1178,6 +1180,7 @@ mod clock_contract {
                 deadline: None,
                 changes: 0,
                 polls: 0,
+                cached_work: false,
                 accept_connect: false,
                 pending: None,
                 cancellation: None,
@@ -1238,7 +1241,7 @@ mod clock_contract {
             }
         }
         fn has_work(&self) -> bool {
-            false
+            self.cached_work
         }
         fn poll(
             &mut self,
@@ -1270,6 +1273,28 @@ mod clock_contract {
             Ok(Integration::HostCallback)
         }
     }
+    #[test]
+    fn queued_core_work_skips_backend_even_with_cached_work() {
+        let mut driver = Driver::<Host>::new(Config::default()).expect("host loop");
+        driver.backend.cached_work = true;
+        let mut out = Completions::with_capacity(1);
+        let mut delivered = 0;
+        for _ in 0..64 {
+            driver
+                .poster()
+                .post(Token(1), Payload::U64(42))
+                .expect("post");
+            let info = driver.turn(Timeout::Now, &mut out).expect("queued turn");
+            assert_eq!(info.completions, 1);
+            assert_eq!(out[0].token, Token(1));
+            assert!(matches!(out[0].result, OpResult::Posted(Payload::U64(42))));
+            assert_eq!((info.os_waits, info.discovery_polls), (0, 0));
+            delivered += 1;
+        }
+        assert_eq!(delivered, 64);
+        assert_eq!(driver.backend.polls, 0, "backend must not be called");
+    }
+
     #[test]
     fn connection_deadline_waits_for_acknowledgement_and_retains_cancellation_errors() {
         let mut driver = Driver::<Host>::new(Config::default()).expect("host loop");

@@ -1368,6 +1368,8 @@ unsafe impl Backend for Iocp {
         let mut entries = [Entry::default(); 64];
         let mut cancel_result = Ok(());
         let (n, info) = if let Some(event) = &mut self.event {
+            // The helper owns the blocking port wait on its own thread.
+            // This turn only drains its queue: no native discovery call.
             (event.drain(&mut entries)?, PollInfo::default())
         } else {
             let armed = timeout.is_some_and(|d| !d.is_zero());
@@ -1390,21 +1392,9 @@ unsafe impl Backend for Iocp {
                 // it is not native work. Notifier and I/O packets still count.
                 Wait::Entries(n) => {
                     let timer_only = entries[..n].iter().all(|entry| entry.key == TIMER);
-                    (
-                        n,
-                        PollInfo {
-                            waits: 1,
-                            zero_event_waits: if timer_only { 1 } else { 0 },
-                        },
-                    )
+                    (n, PollInfo::native(timeout, timer_only))
                 }
-                Wait::Timeout | Wait::Apc => (
-                    0,
-                    PollInfo {
-                        waits: 1,
-                        zero_event_waits: 1,
-                    },
-                ),
+                Wait::Timeout | Wait::Apc => (0, PollInfo::native(timeout, true)),
             }
         };
         let entries_result = self.entries(&entries[..n]);
@@ -1558,6 +1548,43 @@ fn write_buffers(op: &Operation, mut offset: usize, out: &mut [WSABUF; MAX_IOV])
 mod tests {
     use super::*;
 
+    #[test]
+    fn direct_discovery_and_event_queue_draining_have_distinct_counts() {
+        use windows_sys::Win32::{
+            Foundation::WAIT_OBJECT_0, System::Threading::WaitForSingleObject,
+        };
+        let mut backend = Iocp::new(&Config::default(), BufferPool::new(2, 64)).expect("backend");
+        let mut events = Vec::with_capacity(1);
+        for wake in [false, true] {
+            if wake {
+                backend.port.post(WAKE, 0).expect("wake");
+            }
+            let info = backend
+                .poll(Some(Duration::ZERO), &mut events)
+                .expect("discovery");
+            assert_eq!(
+                (info.waits, info.discovery_polls, info.zero_event_waits),
+                (0, 1, u32::from(!wake))
+            );
+            assert!(events.is_empty());
+        }
+        let Integration::Event(event) = backend.integration().expect("event helper") else {
+            panic!("Event required");
+        };
+        backend.port.post(WAKE, 0).expect("helper packet");
+        // SAFETY: backend owns the event throughout this bounded external wait.
+        let result = unsafe { WaitForSingleObject(event as _, 2000) };
+        assert_eq!(result, WAIT_OBJECT_0, "helper must forward a real packet");
+        let info = backend
+            .poll(Some(Duration::ZERO), &mut events)
+            .expect("helper drain");
+        assert_eq!(
+            (info.waits, info.discovery_polls, info.zero_event_waits),
+            (0, 0, 0)
+        );
+        assert!(events.is_empty());
+    }
+
     // These operations model already-dequeued kernel completions. No native I/O
     // is submitted, so unwind must discard their metadata rather than wait on it.
     pub(super) struct Synthetic {
@@ -1617,7 +1644,7 @@ mod tests {
                     .backend
                     .poll(Some(Duration::ZERO), &mut out)
                     .expect("drain valid packet");
-                assert_eq!(info.waits, 0);
+                assert_eq!((info.waits, info.discovery_polls), (0, 0));
                 assert_eq!(out.len(), 1);
                 assert_eq!(out[0].op, op);
                 assert!(out[0].terminal);

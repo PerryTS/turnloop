@@ -206,7 +206,9 @@ The new test initially failed at 500 us: cached readiness ending in EAGAIN consu
 a turn without waiting, and `Driver::turn` forced zero timeout whenever cached
 work existed. The fix preserves the exact timeout, attempts cached I/O first, and
 uses the one permitted OS wait when no completion or runnable work remains.
-Queued completions still avoid waiting; output capacity remains bounded. Native
+Queued completions avoid blocking waits; the tl-i01b amendment in DESIGN §10.3
+permits one zero-time discovery poll only with native operations pending and
+native output reserve. Queued pure-core work makes no OS call. Output capacity remains bounded. Native
 allocation, cancellation, liveness, fairness, timer and descriptor tests pass.
 
 Backend contract revision 2 adds `PollInfo::zero_event_waits`, forwarded through

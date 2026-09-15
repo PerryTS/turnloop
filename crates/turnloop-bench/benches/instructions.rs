@@ -37,7 +37,7 @@ fn idle((mut driver, mut out): (Loop, Completions)) -> (Loop, Completions) {
         waits += driver
             .turn(Timeout::Now, &mut out)
             .expect("idle turn")
-            .os_waits;
+            .discovery_polls;
         assert!(out.is_empty());
     }
     assert_eq!(waits, 100);

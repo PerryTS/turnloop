@@ -16,6 +16,22 @@ fn running_notify() {
     contract::notify_running::<Platform>();
 }
 #[test]
+fn queued_core_work() {
+    contract::queued_core_work::<Platform>();
+}
+#[test]
+fn queued_post_idle_io() {
+    contract::queued_post_idle_io::<Platform>();
+}
+#[test]
+fn queued_terminals_idle_io() {
+    contract::queued_terminals_idle_io::<Platform>();
+}
+#[test]
+fn sustained_posts_idle_io() {
+    contract::sustained_posts_idle_io::<Platform>();
+}
+#[test]
 fn tcp_one() {
     contract::tcp_echo::<Platform>(1);
 }
@@ -242,7 +258,7 @@ fn external_wait_deadlines_do_not_spin() {
                     .expect("wait turn");
                 turns += 1;
                 empty += info.zero_event_waits;
-                waits += info.os_waits;
+                waits += info.os_waits + info.discovery_polls;
                 assert!(
                     turns <= 2 && empty <= 1,
                     "external deadline spun: micros={micros}, expiry={expiries}, turns={turns}, empty={empty}, remaining={:?}",

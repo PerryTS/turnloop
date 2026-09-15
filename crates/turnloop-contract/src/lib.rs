@@ -18,6 +18,7 @@ pub fn bounded_turn<B: Backend>() {
         .turn(Timeout::After(Duration::from_millis(12)), &mut out)
         .expect("turn");
     assert_eq!(info.os_waits, 1, "the wait must actually run");
+    assert_eq!(info.discovery_polls, 0);
     assert!(start.elapsed() >= Duration::from_millis(10));
     assert!(start.elapsed() < Duration::from_millis(500));
     assert_eq!(info.completions, 0);
@@ -42,6 +43,7 @@ pub fn notify_parked<B: Backend>() {
     worker.join().expect("producer");
     assert!(start.elapsed() < Duration::from_secs(2));
     assert_eq!(info.os_waits, 1);
+    assert_eq!(info.discovery_polls, 0);
     assert!(n.wake_syscalls() > 0);
 }
 pub fn notify_running<B: Backend>() {
@@ -185,6 +187,22 @@ mod native {
         io_and_posts_progress_with_repeating_timers::<B>();
     }
     #[test]
+    fn queued_core_work_makes_no_native_calls() {
+        queued_core_work::<B>();
+    }
+    #[test]
+    fn queued_post_with_idle_native_io_never_waits() {
+        queued_post_idle_io::<B>();
+    }
+    #[test]
+    fn queued_terminals_with_idle_native_io_never_wait() {
+        queued_terminals_idle_io::<B>();
+    }
+    #[test]
+    fn sustained_posts_preserve_io_progress_without_waits() {
+        sustained_posts_idle_io::<B>();
+    }
+    #[test]
     fn retained_pool_lease() {
         pooled_lease_backpressure::<B>();
     }
@@ -293,7 +311,7 @@ pub fn cancel_close_ordering<B: Backend>() {
     while closed == 0 {
         assert!(l.now() < until);
         let info = l.turn(Timeout::Until(until), &mut out).expect("turn");
-        assert!(info.os_waits <= 1);
+        assert!(info.os_waits + info.discovery_polls <= 1);
         for c in out.drain() {
             match c.result {
                 OpResult::Cancelled => {
@@ -752,7 +770,7 @@ pub fn capacity_and_stale_ids<B: Backend>() {
         let info = a
             .turn(Timeout::Forever, &mut out)
             .expect("queued work never waits");
-        assert_eq!(info.os_waits, 0);
+        assert_eq!((info.os_waits, info.discovery_polls), (0, 0));
         assert_eq!(out.len(), 1);
         count += 1;
     }
@@ -891,6 +909,310 @@ pub fn ready_timer_liveness<B: Backend>() {
     }
     assert_eq!((cancelled, closed), (1, 1));
 }
+/// Queued core work never calls the native poller without native operations.
+pub fn queued_core_work<B: Backend>() {
+    let mut driver = Driver::<B>::new(Config::default()).expect("loop");
+    let mut out = Completions::with_capacity(1);
+    let mut delivered = 0;
+    for timeout in [
+        Timeout::Now,
+        Timeout::After(Duration::from_secs(1)),
+        Timeout::Forever,
+    ] {
+        // Web only permits Now; validation is separately tested there.
+        if cfg!(all(target_arch = "wasm32", target_os = "unknown"))
+            && !matches!(timeout, Timeout::Now)
+        {
+            continue;
+        }
+        driver
+            .poster()
+            .post(Token(1), Payload::U64(42))
+            .expect("post");
+        let info = driver.turn(timeout, &mut out).expect("post turn");
+        assert_eq!(
+            (info.os_waits, info.discovery_polls, info.zero_event_waits),
+            (0, 0, 0)
+        );
+        assert_eq!(info.completions, 1);
+        assert_eq!(out[0].token, Token(1));
+        assert!(matches!(out[0].result, OpResult::Posted(Payload::U64(42))));
+        delivered += 1;
+        let timer = driver
+            .timer(driver.now() + Duration::from_secs(30), None, Token(2))
+            .expect("timer");
+        driver.close(timer, Token(3)).expect("queue terminals");
+        for token in [Token(2), Token(3)] {
+            let info = driver.turn(timeout, &mut out).expect("terminal turn");
+            assert_eq!(
+                (info.os_waits, info.discovery_polls, info.zero_event_waits),
+                (0, 0, 0)
+            );
+            assert_eq!(info.completions, 1);
+            assert_eq!(out[0].handle, Some(timer));
+            assert_eq!(out[0].token, token);
+            assert!(out[0].terminal);
+            assert!(if token == Token(2) {
+                matches!(out[0].result, OpResult::Cancelled)
+            } else {
+                matches!(out[0].result, OpResult::Closed)
+            });
+            delivered += 1;
+        }
+        assert!(!driver.alive());
+    }
+    assert!(delivered >= 3);
+}
+
+/// DESIGN §10.3: queued posts permit one nonblocking discovery poll with idle I/O.
+pub fn queued_post_idle_io<B: Backend>() {
+    let mut driver = Driver::<B>::new(Config::default()).expect("loop");
+    let socket = driver
+        .udp_bind(localhost(), &UdpOpts::default())
+        .expect("UDP");
+    let read = driver
+        .recv(socket, ReadBuf::Pooled, Token(1))
+        .expect("idle receive");
+    let mut out = Completions::default();
+    driver
+        .turn(Timeout::Now, &mut out)
+        .expect("arm idle receive");
+    assert!(out.is_empty(), "receive must actually remain pending");
+    driver
+        .poster()
+        .post(Token(2), Payload::U64(42))
+        .expect("post accepted");
+    let info = driver
+        .turn(Timeout::Forever, &mut out)
+        .expect("deliver post");
+    assert_eq!(info.completions, 1);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].token, Token(2));
+    assert!(matches!(out[0].result, OpResult::Posted(Payload::U64(42))));
+    eprintln!(
+        "queued post with idle UDP: waits={}, discovery_polls={}, delivered={}",
+        info.os_waits, info.discovery_polls, info.completions
+    );
+
+    let address = driver.local_addr(socket).expect("UDP address");
+    let write = driver
+        .send_to(socket, WriteBuf::Owned(vec![0x49]), address, Token(3))
+        .expect("later send");
+    let until = driver.now() + Duration::from_secs(2);
+    let (mut reads, mut writes) = (0, 0);
+    while reads + writes < 2 {
+        assert!(driver.now() < until, "queued post starved later I/O");
+        let info = driver
+            .turn(Timeout::Until(until), &mut out)
+            .expect("later I/O progress");
+        assert!(info.os_waits + info.discovery_polls <= 1);
+        for c in out.drain() {
+            assert_eq!(c.handle, Some(socket));
+            assert!(c.terminal);
+            match c.result {
+                OpResult::RecvFrom {
+                    n,
+                    from,
+                    lease: Some(lease),
+                } => {
+                    assert_eq!(c.op, Some(read));
+                    assert_eq!(c.token, Token(1));
+                    assert_eq!(from, address);
+                    assert_eq!(n, 1);
+                    assert_eq!(lease.as_slice(), &[0x49]);
+                    reads += 1;
+                }
+                OpResult::Wrote(1) => {
+                    assert_eq!(c.op, Some(write));
+                    assert_eq!(c.token, Token(3));
+                    writes += 1;
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+    assert_eq!((reads, writes), (1, 1));
+    eprintln!("later UDP progress: reads={reads}, writes={writes}");
+    assert_eq!(
+        info.os_waits, 0,
+        "DESIGN §10.3: queued post must avoid blocking wait"
+    );
+    assert_eq!(info.discovery_polls, 1, "idle native discovery must run");
+    assert!(info.zero_event_waits <= info.discovery_polls);
+}
+
+/// Terminal results must retain the no-wait guarantee under capacity-one output.
+pub fn queued_terminals_idle_io<B: Backend>() {
+    let mut driver = Driver::<B>::new(Config::default()).expect("loop");
+    let socket = driver
+        .udp_bind(localhost(), &UdpOpts::default())
+        .expect("UDP");
+    let read = driver
+        .recv(socket, ReadBuf::Pooled, Token(1))
+        .expect("idle receive");
+    let mut out = Completions::with_capacity(1);
+    driver
+        .turn(Timeout::Now, &mut out)
+        .expect("arm idle receive");
+    assert!(out.is_empty());
+    let timer = driver
+        .timer(driver.now() + Duration::from_secs(30), None, Token(2))
+        .expect("timer");
+    driver
+        .close(timer, Token(3))
+        .expect("queue Cancelled and Closed");
+    let mut waits = 0;
+    let mut discovery_polls = 0;
+    for token in [Token(2), Token(3)] {
+        let info = driver
+            .turn(Timeout::Forever, &mut out)
+            .expect("terminal delivery");
+        waits += info.os_waits;
+        assert_eq!(info.os_waits, 0);
+        assert!(info.discovery_polls <= 1);
+        discovery_polls += info.discovery_polls;
+        assert_eq!(info.completions, 1);
+        assert_eq!(
+            out.len(),
+            1,
+            "output must fill without losing the next result"
+        );
+        assert_eq!(out[0].handle, Some(timer));
+        assert_eq!(out[0].token, token);
+        assert!(out[0].terminal);
+        if token == Token(2) {
+            assert!(out[0].op.is_some());
+            assert!(matches!(out[0].result, OpResult::Cancelled));
+        } else {
+            assert!(out[0].op.is_none());
+            assert!(matches!(out[0].result, OpResult::Closed));
+        }
+    }
+    assert_eq!(
+        discovery_polls, 2,
+        "both queued terminal turns discover idle I/O"
+    );
+    assert!(driver.cancel(read), "UDP remained pending throughout");
+    eprintln!(
+        "queued terminals with idle UDP: delivered=2, waits={waits}, discovery_polls={discovery_polls}"
+    );
+    assert_eq!(
+        waits, 0,
+        "DESIGN §10.3 includes queued terminal completions"
+    );
+}
+
+/// Replenishing a post before every turn leaves no post-free discovery turn.
+/// A separate driver sends only after the receiver has exhausted cached readiness.
+pub fn sustained_posts_idle_io<B: Backend>() {
+    let mut receiver = Driver::<B>::new(Config::default()).expect("receiver loop");
+    let mut sender = Driver::<B>::new(Config::default()).expect("sender loop");
+    let rx = receiver
+        .udp_bind(localhost(), &UdpOpts::default())
+        .expect("receiver UDP");
+    let tx = sender
+        .udp_bind(localhost(), &UdpOpts::default())
+        .expect("sender UDP");
+    let destination = receiver.local_addr(rx).expect("destination");
+    let source = sender.local_addr(tx).expect("source");
+    assert_ne!(source, destination);
+    let read = receiver
+        .recv(rx, ReadBuf::Pooled, Token(1))
+        .expect("idle receive");
+    let mut out = Completions::with_capacity(1);
+    receiver
+        .turn(Timeout::Now, &mut out)
+        .expect("exhaust cached readiness");
+    assert!(out.is_empty());
+    let write = sender
+        .send_to(tx, WriteBuf::Owned(vec![0x49]), destination, Token(2))
+        .expect("send after idle");
+    let until = sender.now() + Duration::from_secs(2);
+    loop {
+        assert!(sender.now() < until, "sender did not run");
+        sender
+            .turn(Timeout::Until(until), &mut out)
+            .expect("sender turn");
+        if let Some(c) = out.drain().next() {
+            assert_eq!(c.op, Some(write));
+            assert!(matches!(c.result, OpResult::Wrote(1)));
+            break;
+        }
+    }
+    let poster = receiver.poster();
+    let mut discovery_polls = 0;
+    let (mut waits, mut posts, mut reads, mut turns) = (0, 0, 0, 0);
+    let until = receiver.now() + Duration::from_secs(2);
+    // Keep replenishing until I/O arrives, with the existing fairness contract's
+    // wall-clock deadline. The minimum count proves sustained producer traffic.
+    while turns < 64 || reads == 0 {
+        assert!(
+            receiver.now() < until,
+            "fresh I/O starved: turns={turns}, posts={posts}, reads={reads}, waits={waits}, discovery_polls={discovery_polls}"
+        );
+        poster
+            .post(Token(3), Payload::U64(42))
+            .expect("replenish producer");
+        let info = receiver
+            .turn(Timeout::Now, &mut out)
+            .expect("receiver turn");
+        waits += info.os_waits;
+        assert_eq!(info.os_waits, 0);
+        assert!(info.discovery_polls <= 1);
+        if reads != 0 {
+            assert_eq!(info.discovery_polls, 0, "no native operations remain");
+        }
+        discovery_polls += info.discovery_polls;
+        turns += 1;
+        assert_eq!(out.len(), 1);
+        for c in out.drain() {
+            match c.result {
+                OpResult::Posted(Payload::U64(value)) => {
+                    assert_eq!(c.token, Token(3));
+                    assert_eq!(value, 42);
+                    posts += 1;
+                }
+                OpResult::RecvFrom {
+                    n,
+                    from,
+                    lease: Some(lease),
+                } => {
+                    assert_eq!(c.op, Some(read));
+                    assert_eq!(c.handle, Some(rx));
+                    assert!(c.terminal);
+                    assert_eq!(from, source);
+                    assert_eq!(n, 1);
+                    assert_eq!(lease.as_slice(), &[0x49]);
+                    reads += 1;
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+    eprintln!(
+        "sustained producer: turns={turns}, posts={posts}, reads={reads}, waits={waits}, discovery_polls={discovery_polls}"
+    );
+    assert_eq!(
+        posts,
+        turns - 1,
+        "posts must make progress with full output"
+    );
+    assert_eq!(
+        reads, 1,
+        "fresh native readiness must progress through queued posts"
+    );
+    assert!(discovery_polls > 0, "fresh I/O discovery must run");
+    let info = receiver.turn(Timeout::Now, &mut out).expect("last post");
+    assert_eq!((info.os_waits, info.discovery_polls), (0, 0));
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].token, Token(3));
+    assert!(matches!(out[0].result, OpResult::Posted(Payload::U64(42))));
+    assert_eq!(
+        waits, 0,
+        "DESIGN §10.3 also holds under sustained producer traffic"
+    );
+}
+
 pub fn io_and_posts_progress_with_repeating_timers<B: Backend>() {
     let mut l = Driver::<B>::new(Config {
         max_handles: 8,
@@ -976,8 +1298,8 @@ pub fn no_spin<B: Backend>() {
                 let info = driver
                     .turn(Timeout::Until(deadline), &mut out)
                     .expect("turn");
-                assert!(info.os_waits <= 1);
-                waits += info.os_waits;
+                assert!(info.os_waits + info.discovery_polls <= 1);
+                waits += info.os_waits + info.discovery_polls;
                 zero_events += info.zero_event_waits;
                 assert!(zero_events <= 1, "{micros} us: repeated empty OS waits");
                 if !out.is_empty() {
