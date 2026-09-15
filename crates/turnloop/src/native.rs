@@ -54,6 +54,16 @@ pub struct ProcessSpec {
     pub gid: Option<u32>,
     /// Create an isolated process group (Windows Job Object) for tree termination.
     pub new_process_group: bool,
+    /// Hide child windows on Windows (Node's `windowsHide`); ignored elsewhere.
+    /// Defaults to false. With inherited stdio the console stays attached, even
+    /// when true; with only pipes/null streams Windows uses CREATE_NO_WINDOW.
+    pub windows_hide: bool,
+    /// Prepare the child to outlive the parent process (Node's `detached`).
+    /// Windows creates a detached process group and excludes it from the parent's
+    /// lifetime job; Unix creates a new session and process group. Defaults false.
+    /// This does not unref the child or change turnloop's explicit ownership:
+    /// closing the child or dropping its owning loop still terminates a live child.
+    pub detached: bool,
 }
 impl ProcessSpec {
     /// Launch a program with inherited environment, directory and standard streams.
@@ -68,6 +78,8 @@ impl ProcessSpec {
             uid: None,
             gid: None,
             new_process_group: false,
+            windows_hide: false,
+            detached: false,
         }
     }
 }

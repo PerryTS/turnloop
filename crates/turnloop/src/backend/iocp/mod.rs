@@ -189,12 +189,25 @@ pub struct Iocp {
     event: Option<EventIntegration>,
     notifier: Option<Notifier>,
     services: services::Services,
-    workers: Vec<Option<sync_io::Worker>>,
+    workers: Vec<Option<[sync_io::Worker; 2]>>,
     deadline: Option<Instant>,
     failure: Option<Error>,
     next_listener_key: usize,
 }
 impl Iocp {
+    #[cfg(test)]
+    pub(crate) fn fail_event_for_test(&self, code: i32) {
+        self.event
+            .as_ref()
+            .expect("active helper")
+            .fail_and_wait(code);
+    }
+    #[cfg(test)]
+    pub(crate) fn operation_waiting_for_test(&self, op: OpId) -> bool {
+        self.ops[op.index()]
+            .as_ref()
+            .is_some_and(|p| p.request.op == op && p.waiting)
+    }
     fn get(&self, h: Handle) -> Result<&Resource> {
         self.resources
             .get(h.index())
@@ -252,9 +265,12 @@ impl Iocp {
             }
         }
         if transport.kind == Kind::Sync {
-            // Adoption is resource setup. Reserve the worker here so even the
-            // first read after pooled-buffer backpressure needs no allocation.
-            self.workers[h.index()] = Some(sync_io::Worker::new(raw, Arc::clone(&self.port))?);
+            // Reserve both directions at adoption. A blocked synchronous read
+            // must not serialize writes, including their cancellation state.
+            self.workers[h.index()] = Some([
+                sync_io::Worker::new(raw, Arc::clone(&self.port))?,
+                sync_io::Worker::new(raw, Arc::clone(&self.port))?,
+            ]);
         }
         self.resources[h.index()] = Some(Resource {
             handle: h,
@@ -567,7 +583,7 @@ impl Iocp {
                 }
             };
             let index = p.request.handle.index();
-            self.workers[index].as_ref().expect("stdio worker").start(
+            self.workers[index].as_ref().expect("stdio workers")[p.direction].start(
                 buffer,
                 len,
                 write,
@@ -882,7 +898,7 @@ impl Iocp {
         result
     }
     fn entry(&mut self, entry: &Entry) -> Result<()> {
-        if entry.key == WAKE {
+        if entry.key == WAKE || entry.key == port::STOP {
             return Ok(());
         }
         if entry.key == TIMER {
@@ -935,7 +951,7 @@ impl Iocp {
             Some(
                 self.workers[p.request.handle.index()]
                     .as_ref()
-                    .ok_or_else(invalid)?
+                    .ok_or_else(invalid)?[p.direction]
                     .finish(),
             )
         } else if entry.key == bridge::KEY {
@@ -1113,6 +1129,10 @@ unsafe impl Backend for Iocp {
         Instant::now()
     }
     fn validate_timeout(&self, timeout: Timeout) -> Result<()> {
+        if let Some(event) = &self.event {
+            // Check before the core can deliver already-queued timers/posts.
+            event.check()?;
+        }
         if self.event.is_some() && !matches!(timeout, Timeout::Now) {
             return Err(invalid());
         }
@@ -1274,11 +1294,7 @@ unsafe impl Backend for Iocp {
         if self.ops.get(i).is_none_or(Option::is_some) {
             return Err(invalid());
         }
-        let d = if kind == Kind::Sync {
-            0
-        } else {
-            direction(&request.operation)
-        };
+        let d = direction(&request.operation);
         let r = self.resources[request.handle.index()]
             .as_mut()
             .expect("resource");
@@ -1324,8 +1340,8 @@ unsafe impl Backend for Iocp {
             return Ok(());
         };
         if p.waiting {
-            if let Some(worker) = &self.workers[p.request.handle.index()] {
-                worker.cancel();
+            if let Some(workers) = &self.workers[p.request.handle.index()] {
+                workers[p.direction].cancel();
             } else {
                 // SAFETY: exact live native request; acknowledgement is still required.
                 if unsafe { CancelIoEx(self.io_raw(p), self.kernel_ptr(op.index())) } == 0 {
@@ -1356,6 +1372,9 @@ unsafe impl Backend for Iocp {
         timeout: Option<Duration>,
         events: &mut Vec<Event<Detached>>,
     ) -> Result<PollInfo> {
+        if let Some(event) = &self.event {
+            event.check()?;
+        }
         if let Some(error) = self.failure.take() {
             return Err(error);
         }
@@ -1438,6 +1457,9 @@ unsafe impl Backend for Iocp {
         self.install(h, transport, None, None)
     }
     fn integration(&mut self) -> Result<Integration> {
+        if let Some(event) = &self.event {
+            event.check()?;
+        }
         if self.event.is_none() {
             self.event = Some(EventIntegration::new(Arc::clone(&self.port))?);
             self.arm_event_deadline()?;
@@ -1475,6 +1497,27 @@ impl Iocp {
 }
 impl Drop for Iocp {
     fn drop(&mut self) {
+        // Join the sole consumer and reclaim every forwarded packet, then use
+        // blocking port waits for cancellation. Never repeatedly poll an empty
+        // helper queue (including after its worker has failed).
+        if let Some(mut event) = self.event.take() {
+            if event.shutdown().is_err() {
+                std::process::abort();
+            }
+            let mut entries = [Entry::default(); 64];
+            loop {
+                let Ok(n) = event.drain_retained(&mut entries) else {
+                    std::process::abort();
+                };
+                if n == 0 {
+                    break;
+                }
+                if self.entries(&entries[..n]).is_err() {
+                    std::process::abort();
+                }
+            }
+        }
+        self.failure = None; // teardown no longer arms host deadlines
         for i in 0..self.ops.len() {
             if let Some(p) = &self.ops[i] {
                 let op = p.request.op;
@@ -1489,14 +1532,6 @@ impl Drop for Iocp {
                 std::process::abort();
             }
             events.clear();
-            if self.event.is_some() {
-                std::thread::yield_now();
-            }
-        }
-        if let Some(event) = &mut self.event
-            && event.shutdown().is_err()
-        {
-            std::process::abort();
         }
     }
 }

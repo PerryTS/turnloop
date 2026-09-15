@@ -38,16 +38,26 @@ I/O before releasing caller memory.
   connections cannot be detached;
   socket listeners and connected pipe endpoints can. Reuse-port is unsupported.
 - Child creation uses an explicit inherited handle list, correctly quoted argv,
-  Unicode environment, suspended creation and optional Job Object assignment
-  before resume. Parent stdio ends are overlapped; child ends are synchronous.
+  Unicode environment and suspended creation. `windows_hide` defaults false;
+  true selects SW_HIDE and, without inherited stdio, CREATE_NO_WINDOW, as in libuv.
+  Non-detached children join a process-lifetime, non-inheritable kill-on-close job
+  with silent breakaway. Optional tree-control jobs (`new_process_group` or
+  `detached`) have no kill-on-close limit: normal leader exit/release preserves
+  grandchildren. `detached` also selects DETACHED_PROCESS/CREATE_NEW_PROCESS_GROUP
+  and excludes the child from the lifetime job. Host jobs can restrict breakaway,
+  as with libuv; access denied on lifetime assignment is tolerated. Parent stdio
+  ends are overlapped; child ends are synchronous.
   Direct `.bat`/`.cmd` programs are rejected with InvalidInput, including PATH
   resolution; callers must explicitly select a shell for batch scripts.
   One-shot process waits publish to the owning notifier. Close terminates live
-  owned children, then acknowledges exit before Closed. uid/gid and non-Kill
+  owned children, including detached ones, then acknowledges exit before Closed.
+  Loop Drop retains the same explicit ownership rule. uid/gid and non-Kill
   process signals return Unsupported; console signal subscriptions are separate.
 - Standard streams are duplicated, preserving the host originals. Synchronous
-  files/pipes reserve one worker at adoption; operations on a handle are FIFO,
-  with no worker allocation needed when the first read receives a buffer lease.
+  handles reserve two workers at adoption, one per direction. Reads and writes
+  have independent FIFOs and cancellation state; neither direction waits behind
+  the other's idle I/O. There is no ordering promise between reads and writes
+  on a regular file's shared offset. No worker allocation is needed per operation.
   Imported handles are classified by native file mode before submission;
   overlapped pipes join this IOCP or route an existing foreign association, and
   other overlapped files are unsupported.
@@ -57,11 +67,21 @@ I/O before releasing caller memory.
   Resize delivery requires the console input reader to be active. Captured console
   modes are restored on close/drop; input and output VT modes are distinguished.
 - Console handlers fan out Int/Break/Hup to independent loop subscriptions.
-  Unsupported Unix signals fail explicitly. Hup from CTRL_CLOSE is best-effort:
-  Windows can terminate the process before the host next turns the loop.
+  Unsupported Unix signals fail explicitly. Unsubscribed CTRL_CLOSE returns
+  FALSE, preserving older host handlers. With Hup subscribed, dispatch completes
+  before Sleep(INFINITE), matching libuv's cleanup window (Windows normally
+  terminates after about five seconds). Sleeping retains no subscription access.
+  Windows invokes handlers newest first; this subscribed case prevents older host
+  handlers from running. Windows provides no supported way to both continue that
+  chain and retain the handler thread. Hup remains best-effort; the host must turn
+  and exit within the OS budget. See [the decision and real-close tests](../../../../../docs/lanes/iocp-semantics.md).
 - Integration::Event opts into a sole-consumer helper with a bounded queue and
   an auto-reset event. Timer resets carry generations so old forwarded packets
   cannot complete a later deadline. Hosts call turn(Now) after their GUI wait.
+  A pump error remains observable on every subsequent turn/integration call,
+  including turns with core completions already queued. Drop joins the helper,
+  recovers retained packets and drains cancellation using blocking IOCP waits.
+  An unrecoverable port/teardown error aborts, preserving buffer safety without spin.
 - Core provides timer semantics, liveness, pooled buffers, the parking handshake,
   shared blocking jobs, external waits and executor behavior.
 

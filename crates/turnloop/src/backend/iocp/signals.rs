@@ -8,6 +8,7 @@ use std::{
     },
 };
 use windows_sys::Win32::System::Console::*;
+use windows_sys::Win32::System::Threading::{INFINITE, Sleep};
 
 static SLOTS: [AtomicPtr<Ticket>; 1024] = [const { AtomicPtr::new(ptr::null_mut()) }; 1024];
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
@@ -43,13 +44,34 @@ pub(super) fn dispatch(signal: Signal) -> bool {
     handled
 }
 unsafe extern "system" fn handler(control: u32) -> i32 {
+    handle_control(control, || {
+        // Like libuv, keep the control thread alive so a later host turn can
+        // observe Hup before Windows' bounded close timeout expires. This is
+        // outside dispatch's ACTIVE guard: subscription teardown must not wait
+        // for the lifetime of this sleeping control thread.
+        // SAFETY: Sleep has no pointer/lifetime requirements; Windows owns this
+        // handler thread and terminates the process after the close-time budget.
+        unsafe {
+            Sleep(INFINITE);
+        }
+    })
+}
+fn handle_control(control: u32, hold_close: impl FnOnce()) -> i32 {
     let signal = match control {
         CTRL_C_EVENT => Signal::Int,
         CTRL_BREAK_EVENT => Signal::Break,
         CTRL_CLOSE_EVENT => Signal::Hup,
         _ => return 0,
     };
-    i32::from(dispatch(signal))
+    let handled = dispatch(signal);
+    if control == CTRL_CLOSE_EVENT && handled {
+        // Windows dispatches newest handler first. No supported API can both
+        // continue to older unknown host handlers and hold this thread. We match
+        // libuv only when Hup is subscribed; otherwise return FALSE to the host.
+        // https://github.com/libuv/libuv/blob/v1.52.1/src/win/signal.c
+        hold_close();
+    }
+    i32::from(handled)
 }
 impl Subscription {
     pub(super) fn new(signal: Signal, notifier: Notifier) -> Result<Self> {
@@ -112,6 +134,33 @@ impl Drop for Subscription {
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
+    #[test]
+    fn close_dispatch_releases_tickets_before_holding_the_control_thread() {
+        let driver = crate::Loop::new(crate::Config::default()).expect("notifier owner");
+        let hup = Subscription::new(Signal::Hup, driver.notifier()).expect("Hup");
+        let (entered, receive) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            handle_control(CTRL_CLOSE_EVENT, || {
+                entered.send(()).expect("hold entered after dispatch");
+                wait.recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("test releases hold");
+            })
+        });
+        receive
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("close dispatch ran");
+        assert!(hup.take(), "Hup published before hold");
+        assert!(!hup.take());
+        drop(hup); // must not join the still-held handler thread
+        assert!(!thread.is_finished());
+        release.send(()).expect("release synthetic hold");
+        assert_eq!(thread.join().expect("handler result"), 1);
+        assert_eq!(
+            handle_control(CTRL_CLOSE_EVENT, || panic!("unsubscribed close must chain")),
+            0
+        );
+    }
     #[test]
     fn moved_subscription_keeps_its_published_ticket_alive() {
         let driver = crate::Loop::new(crate::Config::default()).expect("notifier owner");

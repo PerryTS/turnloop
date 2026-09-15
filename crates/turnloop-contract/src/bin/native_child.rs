@@ -48,6 +48,13 @@ fn main() {
                 std::env::current_dir().expect("child cwd").display()
             );
         }
+        #[cfg(unix)]
+        "session" => {
+            // SAFETY: queries this process only; no pointer arguments or mutation.
+            let (pid, group, session) =
+                unsafe { (libc::getpid(), libc::getpgrp(), libc::getsid(0)) };
+            println!("{pid}:{group}:{session}");
+        }
         "grandchild" => {
             let mut child = std::process::Command::new(&args[0])
                 .arg("sleep")
@@ -56,6 +63,27 @@ fn main() {
             println!("grandchild:{}", child.id());
             std::io::stdout().flush().expect("flush ready");
             let _ = child.wait();
+        }
+        #[cfg(windows)]
+        "console-probe" => console_probe(),
+        #[cfg(windows)]
+        "lifetime-parent" => lifetime_parent(&args),
+        #[cfg(windows)]
+        "orphan-leader" => {
+            let child = std::process::Command::new(&args[0])
+                .arg("sleep")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("orphan grandchild");
+            println!("grandchild:{}", child.id());
+            std::io::stdout().flush().expect("grandchild identity");
+            // Handshake keeps the leader alive until the observer pins the grandchild.
+            std::io::stdin()
+                .read_exact(&mut [0])
+                .expect("leader exit permission");
+            std::process::exit(23);
         }
         "stdio" => native_stdio(),
         "handle" => native_handle(args.get(2).expect("pipe path")),
@@ -70,6 +98,69 @@ fn main() {
         }
         _ => panic!("unknown fixture mode"),
     }
+}
+
+#[cfg(windows)]
+fn console_probe() {
+    use turnloop::*;
+    use windows_sys::Win32::System::{Console::*, Threading::*};
+    let mut pids = [0u32; 16];
+    // SAFETY: initialized writable array and its actual element count.
+    let attached = unsafe { GetConsoleProcessList(pids.as_mut_ptr(), pids.len() as u32) } > 0;
+    // SAFETY: writable C startup structure for this process.
+    let mut startup: STARTUPINFOW = unsafe { std::mem::zeroed() };
+    // SAFETY: valid writable output structure, no retained pointers are dereferenced.
+    unsafe {
+        GetStartupInfoW(&mut startup);
+    }
+    if !attached {
+        println!("console:false,show:{}", startup.wShowWindow);
+        return;
+    }
+    let mut driver = Loop::new(Config::default()).expect("console child loop");
+    driver
+        .signal_start(Signal::Int, Token(91))
+        .expect("console child signal");
+    // SAFETY: enable Ctrl-C only in this fixture process, after subscription.
+    assert_ne!(unsafe { SetConsoleCtrlHandler(None, 0) }, 0);
+    println!("console:true,show:{}", startup.wShowWindow);
+    std::io::stdout().flush().expect("ready for broadcast");
+    let mut out = Completions::default();
+    let deadline = driver.now() + Duration::from_secs(10);
+    loop {
+        assert!(driver.now() < deadline, "console child missed broadcast");
+        driver
+            .turn(Timeout::Until(deadline), &mut out)
+            .expect("child signal turn");
+        if let Some(c) = out.drain().next() {
+            assert_eq!(c.token, Token(91));
+            assert!(matches!(c.result, OpResult::Signal(Signal::Int)));
+            println!("ctrl-c-received");
+            return;
+        }
+    }
+}
+
+#[cfg(windows)]
+fn lifetime_parent(args: &[std::ffi::OsString]) {
+    use turnloop::*;
+    let mut driver = Loop::new(Config::default()).expect("lifetime parent loop");
+    let mut spec = ProcessSpec::new(&args[0]);
+    spec.args.push("sleep".into());
+    spec.stdio = [ProcessStdio::Null; 3];
+    spec.windows_hide = true;
+    spec.detached = args[2] == "detached";
+    let child = driver.spawn(&spec, Token(1)).expect("lifetime child");
+    println!("child:{}", child.pid);
+    std::io::stdout().flush().expect("child identity");
+    // Pinning the child before parent exit prevents all PID-reuse races.
+    std::io::stdin()
+        .read_exact(&mut [0])
+        .expect("parent exit permission");
+    if args[3] == "exit" {
+        std::process::exit(23); // OS closes the process-wide job, without Rust Drop
+    }
+    std::thread::sleep(Duration::from_secs(60)); // observer terminates this parent
 }
 
 #[cfg(any(target_vendor = "apple", target_os = "freebsd"))]
