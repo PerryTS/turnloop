@@ -10,5 +10,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.1.0-alpha.3](https://github.com/PerryTS/turnloop/compare/turnloop-wasi-random-v0.1.0-alpha.2...turnloop-wasi-random-v0.1.0-alpha.3) - 2026-09-15
 
 ### Other
-
+- Published dependencies use caret requirements instead of exact pins
 - release v0.1.0-alpha.3

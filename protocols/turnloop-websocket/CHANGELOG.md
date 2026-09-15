@@ -10,5 +10,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.1.0-alpha.3](https://github.com/PerryTS/turnloop/compare/turnloop-websocket-v0.1.0-alpha.2...turnloop-websocket-v0.1.0-alpha.3) - 2026-09-15
 
 ### Other
-
+- `WebSocketStream::close` lingers within its close deadline instead of resetting the peer
 - release v0.1.0-alpha.3

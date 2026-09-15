@@ -10,5 +10,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.1.0-alpha.3](https://github.com/PerryTS/turnloop/compare/turnloop-postgres-v0.1.0-alpha.2...turnloop-postgres-v0.1.0-alpha.3) - 2026-09-15
 
 ### Other
-
 - release v0.1.0-alpha.3
