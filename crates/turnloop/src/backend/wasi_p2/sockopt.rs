@@ -1,4 +1,4 @@
-//! Typed socket options over `wasi:sockets` 0.2 (DESIGN §7.4, §7.6).
+//! Typed socket options over `wasi:sockets` 0.2 (DESIGN §7.4, §7.7).
 //!
 //! WASI exposes a deliberately small option surface. Everything outside it —
 //! Nagle, linger, IPv6-only, broadcast and multicast membership — has no

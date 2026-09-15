@@ -1,4 +1,4 @@
-//! Socket options on live handles (DESIGN §7.6 "Socket options"; issue #34).
+//! Socket options on live handles (DESIGN §7.7; issue #34).
 //!
 //! Every assertion here reads the value back **from the operating system**:
 //! `get_option` is a `getsockopt`/`wasi:sockets` call on the live socket, never a
@@ -550,8 +550,12 @@ pub fn unsupported_options_are_reported<B: Backend>(
     let mut l = Driver::<B>::new(Config::default()).expect("loop");
     let udp = l.udp_bind(localhost(), &UdpOpts::default()).expect("bind");
     for (option, kind) in expected {
+        let refused = l
+            .set_option(udp, *option)
+            .err()
+            .unwrap_or_else(|| panic!("{option:?} was accepted by a backend that cannot apply it"));
         assert_eq!(
-            l.set_option(udp, *option).unwrap_err_or_panic(*option).kind,
+            refused.kind,
             ErrorKind::Unsupported,
             "set {option:?} must report Unsupported"
         );
@@ -566,15 +570,6 @@ pub fn unsupported_options_are_reported<B: Backend>(
         }
     }
     close_all(&mut l, &[udp]);
-}
-trait UnwrapErrOrPanic {
-    fn unwrap_err_or_panic(self, option: SocketOption) -> Error;
-}
-impl UnwrapErrOrPanic for turnloop::Result<()> {
-    fn unwrap_err_or_panic(self, option: SocketOption) -> Error {
-        self.err()
-            .unwrap_or_else(|| panic!("{option:?} was accepted by a backend that cannot apply it"))
-    }
 }
 /// A backend without Nagle control refuses the creation-time hint as well, so a
 /// host cannot tell itself the connection is configured when it is not.

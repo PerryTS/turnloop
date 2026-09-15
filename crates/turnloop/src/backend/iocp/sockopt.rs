@@ -1,4 +1,4 @@
-//! Typed socket options on live Winsock sockets (DESIGN §7.3, §7.6).
+//! Typed socket options on live Winsock sockets (DESIGN §7.3, §7.7).
 //!
 //! Synchronous, allocation-free and uncached, exactly like the Unix module: a
 //! getter always asks Winsock, so a buffer size the stack rounded is visible.

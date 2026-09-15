@@ -80,7 +80,7 @@
 //!   Windows' explicitly requested Integration::Event helper is the D7 exception.
 //! * Unsupported platforms/capabilities return errors; no fake successful I/O.
 //!
-//! # Socket options (§7.6 "Socket options")
+//! # Socket options (§7.7)
 //!
 //! * `set_option`/`get_option` are synchronous and produce no Event. They run
 //!   entirely inside the call, touch no operation storage, and must not allocate.

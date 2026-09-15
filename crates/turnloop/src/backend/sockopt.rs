@@ -1,4 +1,4 @@
-//! Typed socket options on live Unix descriptors (DESIGN §7.1, §7.2, §7.6).
+//! Typed socket options on live Unix descriptors (DESIGN §7.1, §7.2, §7.7).
 //!
 //! Every entry point is synchronous, allocation-free and talks to the kernel on
 //! the calling turn. Nothing is cached: a getter always asks the OS, so a value
