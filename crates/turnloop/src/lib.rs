@@ -76,7 +76,7 @@ pub use blocking::{DnsRequest, PoolConfig};
 mod fs;
 pub use fs::{
     AccessMode, DirEntries, FileMetadata, FileOptions, FileTime, FileType, FsPath, FsRequest,
-    FsResult, FsTarget, RECORD_HEADER, SymlinkKind, TimeChange, WatchEvents, WatchKind,
+    FsResult, FsTarget, Metadata, RECORD_HEADER, SymlinkKind, TimeChange, WatchEvents, WatchKind,
     WatchOptions,
 };
 

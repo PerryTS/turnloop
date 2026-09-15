@@ -383,6 +383,11 @@ pub mod iocp;
 #[cfg(turnloop_backend = "iocp")]
 pub use iocp::Iocp as Platform;
 
+#[cfg(any(
+    turnloop_backend = "wasi_p2",
+    all(turnloop_backend = "wasi_p3", feature = "wasi-p3-experimental")
+))]
+mod wasi_fs;
 #[cfg(turnloop_backend = "wasi_p2")]
 pub mod wasi_p2;
 #[cfg(turnloop_backend = "wasi_p2")]

@@ -137,7 +137,9 @@ impl BufferPool {
     #[cfg(any(
         turnloop_backend = "kqueue",
         turnloop_backend = "epoll",
-        turnloop_backend = "iocp"
+        turnloop_backend = "iocp",
+        turnloop_backend = "wasi_p2",
+        all(turnloop_backend = "wasi_p3", feature = "wasi-p3-experimental")
     ))]
     pub(crate) fn available(&self) -> bool {
         !self.inner.borrow().is_empty()

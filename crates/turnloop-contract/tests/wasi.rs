@@ -349,3 +349,35 @@ fn stdio_streams_preserve_host_ownership() {
         actual.len()
     );
 }
+
+/// Filesystem contracts over the `/turnloop-fs` preopen (scripts/ci/wasmtime-runner.sh).
+mod filesystem {
+    use std::path::Path;
+    use turnloop::backend::Platform;
+    use turnloop_contract::filesystem as contract;
+    fn root() -> &'static Path {
+        let root = Path::new("/turnloop-fs");
+        assert!(root.is_dir(), "the runner must preopen /turnloop-fs");
+        root
+    }
+    #[test]
+    fn bytes_metadata_namespace() {
+        contract::bytes_metadata_namespace::<Platform>(root());
+    }
+    #[test]
+    fn errors() {
+        contract::errors::<Platform>(root());
+    }
+    #[test]
+    fn fifo_cancel_close() {
+        contract::fifo_cancel_close::<Platform>(root());
+    }
+    #[test]
+    fn pooled_lease_wait() {
+        contract::pooled_lease_wait::<Platform>(root());
+    }
+    #[test]
+    fn capability_scope_and_unsupported_surface() {
+        contract::capability_scope::<Platform>(root());
+    }
+}

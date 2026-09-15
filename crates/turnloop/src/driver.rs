@@ -76,6 +76,7 @@ pub struct Driver<B: Backend> {
     work_port: std::sync::Arc<crate::blocking::WorkPort>,
     #[cfg(not(target_arch = "wasm32"))]
     files: crate::fs::Service,
+    metadata: crate::fs::MetadataPool,
     owner: u64,
     thread: ThreadId,
     handles: Table<Resource>,
@@ -135,6 +136,7 @@ impl<B: Backend> Driver<B> {
             external: false,
             #[cfg(not(target_arch = "wasm32"))]
             files: crate::fs::Service::new(&config, work_port.clone(), buffers),
+            metadata: crate::fs::MetadataPool::new(config.max_operations),
             work_port,
             owner,
             thread: thread::current().id(),
@@ -1112,7 +1114,9 @@ impl<B: Backend> Driver<B> {
                 OpResult::Cancelled
             } else {
                 match e.result {
-                    Ok(Outcome::Fs { output, lease }) => fs_result(op.handle, output, lease),
+                    Ok(Outcome::Fs { output, lease }) => {
+                        fs_result(&self.metadata, op.handle, output, lease)
+                    }
                     Err(e) => OpResult::Err(e),
                     Ok(_) => OpResult::Err(Error::new(ErrorKind::Other)),
                 }
@@ -1158,7 +1162,9 @@ impl<B: Backend> Driver<B> {
                 Ok(Outcome::RecvFrom { n, from, lease }) => OpResult::RecvFrom { n, from, lease },
                 Ok(Outcome::Shutdown) => OpResult::Shutdown,
                 Ok(Outcome::Watch { events, overflow }) => OpResult::Watch { events, overflow },
-                Ok(Outcome::Fs { output, lease }) => fs_result(op.handle, output, lease),
+                Ok(Outcome::Fs { output, lease }) => {
+                    fs_result(&self.metadata, op.handle, output, lease)
+                }
                 Ok(Outcome::Cancelled) => OpResult::Cancelled,
             }
         };
@@ -1255,7 +1261,7 @@ impl<B: Backend> Driver<B> {
                 let result = match work.result {
                     _ if cancel => OpResult::Cancelled,
                     Ok(crate::blocking::WorkOutput::Fs(reply)) => {
-                        fs_result(handle, reply.output(metadata), lease)
+                        fs_result(&self.metadata, handle, reply.output(metadata), lease)
                     }
                     Ok(_) => OpResult::Err(Error::new(ErrorKind::Other)),
                     Err(e) => OpResult::Err(e),
@@ -1327,7 +1333,12 @@ impl<B: Backend> Driver<B> {
 }
 
 /// Attach the lease and convert a worker or backend filesystem result.
-fn fs_result(handle: Option<Handle>, output: FsOutput, mut lease: Option<BufLease>) -> OpResult {
+fn fs_result(
+    metadata: &crate::fs::MetadataPool,
+    handle: Option<Handle>,
+    output: FsOutput,
+    mut lease: Option<BufLease>,
+) -> OpResult {
     let mut fill = |n: usize| {
         if let Some(lease) = &mut lease {
             lease.set_len(n);
@@ -1340,7 +1351,7 @@ fn fs_result(handle: Option<Handle>, output: FsOutput, mut lease: Option<BufLeas
             FsResult::Read { n, lease }
         }
         FsOutput::Wrote(n) => FsResult::Wrote(n),
-        FsOutput::Metadata(m) => FsResult::Metadata(m),
+        FsOutput::Metadata(m) => FsResult::Metadata(metadata.lease(m)),
         FsOutput::Directory { n, eof } => {
             fill(n);
             FsResult::Directory { n, lease, eof }

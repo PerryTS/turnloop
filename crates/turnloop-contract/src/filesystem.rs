@@ -64,7 +64,7 @@ fn stat<B: Backend>(l: &mut Driver<B>, p: &Path, follow_symlinks: bool) -> FileM
             follow_symlinks,
         },
     ) {
-        Ok(FsResult::Metadata(m)) => m,
+        Ok(FsResult::Metadata(m)) => *m,
         other => panic!("stat {p:?}: {other:?}"),
     }
 }
@@ -948,5 +948,73 @@ pub fn watch_recursive<B: Backend>(root: &Path) {
         );
     }
     std::fs::remove_dir_all(&dir).expect("cleanup");
+    assert!(!l.alive());
+}
+
+/// WASI: paths outside every preopen are not reachable, capabilities without a
+/// `wasi:filesystem` equivalent reject before acceptance, and watches are Unsupported.
+#[cfg(target_os = "wasi")]
+pub fn capability_scope<B: Backend>(root: &Path) {
+    let mut l = Driver::<B>::new(config()).expect("loop");
+    let e = run(
+        &mut l,
+        FsRequest::Stat {
+            path: path("/etc/passwd"),
+            follow_symlinks: true,
+        },
+    )
+    .expect_err("no ambient authority");
+    assert_eq!(e.kind, ErrorKind::NotFound);
+    let e = run(
+        &mut l,
+        FsRequest::Stat {
+            path: path("relative/without/dot/preopen"),
+            follow_symlinks: true,
+        },
+    )
+    .expect_err("relative paths need a '.' preopen");
+    assert_eq!(e.kind, ErrorKind::NotFound);
+    let r = run(
+        &mut l,
+        FsRequest::Stat {
+            path: path(root),
+            follow_symlinks: true,
+        },
+    );
+    assert!(
+        matches!(&r, Ok(FsResult::Metadata(m)) if m.kind == FileType::Directory),
+        "{r:?}"
+    );
+    for request in [
+        FsRequest::RealPath {
+            path: path(root),
+            buffer: ReadBuf::Pooled,
+        },
+        FsRequest::Chmod {
+            target: FsTarget::Path {
+                path: path(root),
+                follow_symlinks: true,
+            },
+            mode: 0o700,
+        },
+        FsRequest::Access {
+            path: path(root),
+            mode: AccessMode {
+                read: true,
+                ..AccessMode::default()
+            },
+        },
+    ] {
+        assert_eq!(
+            l.fs(request, Token(1)).expect_err("rejected").kind,
+            ErrorKind::Unsupported
+        );
+    }
+    assert_eq!(
+        l.fs_watch(&path(root), WatchOptions::default(), Token(2))
+            .expect_err("no wasi watch API")
+            .kind,
+        ErrorKind::Unsupported
+    );
     assert!(!l.alive());
 }

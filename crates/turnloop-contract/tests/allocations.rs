@@ -1883,7 +1883,7 @@ fn steady_typed_file_requests_allocate_nothing() {
         let op = l.fs(FsRequest::Fstat { file: h }, Token(5)).expect("fstat");
         assert!(matches!(
             fs_wait(&mut l, &mut out, op),
-            FsResult::Metadata(FileMetadata { size: 64, .. })
+            FsResult::Metadata(m) if m.size == 64
         ));
         let op = l
             .fs(
@@ -1896,7 +1896,7 @@ fn steady_typed_file_requests_allocate_nothing() {
             .expect("stat");
         assert!(matches!(
             fs_wait(&mut l, &mut out, op),
-            FsResult::Metadata(FileMetadata { size: 64, .. })
+            FsResult::Metadata(m) if m.size == 64
         ));
         let op = l
             .fs(FsRequest::Truncate { file: h, size: 64 }, Token(7))

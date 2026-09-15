@@ -493,8 +493,8 @@ pub enum FsResult {
     },
     /// Bytes written; may be short.
     Wrote(usize),
-    /// File metadata.
-    Metadata(FileMetadata),
+    /// File metadata, in reusable loop storage (keeps completions small).
+    Metadata(Metadata),
     /// Directory entry records ([`DirEntries`]).
     Directory {
         /// Initialized record bytes.
@@ -513,6 +513,62 @@ pub enum FsResult {
     },
     /// The operation succeeded without a value.
     Done,
+}
+
+/// Metadata result held in reusable per-loop storage; dereferences to
+/// [`FileMetadata`]. Dropping it returns the storage, so steady-state `stat`
+/// requests allocate nothing once the loop has served one. Copy the value out
+/// to keep it beyond the completion.
+// The pool holds boxes so a lease can move one out and dereference it stably.
+#[allow(clippy::vec_box)]
+pub struct Metadata {
+    value: Option<Box<FileMetadata>>,
+    pool: std::rc::Rc<std::cell::RefCell<Vec<Box<FileMetadata>>>>,
+}
+impl std::ops::Deref for Metadata {
+    type Target = FileMetadata;
+    fn deref(&self) -> &FileMetadata {
+        self.value.as_ref().expect("live metadata")
+    }
+}
+impl std::fmt::Debug for Metadata {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        (**self).fmt(f)
+    }
+}
+impl Drop for Metadata {
+    fn drop(&mut self) {
+        let mut pool = self.pool.borrow_mut();
+        if let Some(value) = self.value.take()
+            && pool.len() < pool.capacity()
+        {
+            pool.push(value);
+        }
+    }
+}
+/// Bounded reusable metadata storage, one per loop.
+#[derive(Clone)]
+#[allow(clippy::vec_box)]
+pub(crate) struct MetadataPool(std::rc::Rc<std::cell::RefCell<Vec<Box<FileMetadata>>>>);
+impl MetadataPool {
+    pub fn new(capacity: usize) -> Self {
+        Self(std::rc::Rc::new(std::cell::RefCell::new(
+            Vec::with_capacity(capacity),
+        )))
+    }
+    pub fn lease(&self, metadata: FileMetadata) -> Metadata {
+        let value = match self.0.borrow_mut().pop() {
+            Some(mut boxed) => {
+                *boxed = metadata;
+                boxed
+            }
+            None => Box::new(metadata),
+        };
+        Metadata {
+            value: Some(value),
+            pool: self.0.clone(),
+        }
+    }
 }
 
 /// Backend- or worker-side typed result; the core attaches leases and handles.

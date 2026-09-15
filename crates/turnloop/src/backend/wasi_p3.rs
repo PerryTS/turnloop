@@ -461,6 +461,7 @@ unsafe impl Backend for WasiP3 {
             request.operation,
             Operation::ProcessExit
                 | Operation::WatchSignal
+                | Operation::WatchFs
                 | Operation::SendHandle(_)
                 | Operation::RecvHandle
         ) {
@@ -835,6 +836,7 @@ fn execute(
     match &p.request.operation {
         Operation::ProcessExit
         | Operation::WatchSignal
+        | Operation::WatchFs
         | Operation::SendHandle(_)
         | Operation::RecvHandle => return Err(Error::new(ErrorKind::Unsupported)),
         Operation::Connect => {

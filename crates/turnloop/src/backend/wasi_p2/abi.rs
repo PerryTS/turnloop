@@ -20,6 +20,8 @@ struct Arena {
     ptr: *mut u8,
     len: usize,
     used: usize,
+    /// Largest alignment the storage base satisfies (4 for u32 words, 1 for bytes).
+    align: usize,
 }
 thread_local! { static ARENA: Cell<Option<Arena>> = const { Cell::new(None) }; }
 struct Reset;
@@ -35,6 +37,21 @@ fn scoped<T>(storage: &mut [u32], f: impl FnOnce() -> T) -> T {
             ptr: storage.as_mut_ptr().cast(),
             len: storage.len() * 4,
             used: 0,
+            align: 4,
+        }));
+    });
+    let _reset = Reset;
+    f()
+}
+/// Byte arena over caller output: a single lowered `list<u8>` lands in place.
+fn scoped_bytes<T>(storage: &mut [u8], f: impl FnOnce() -> T) -> T {
+    ARENA.with(|a| {
+        assert!(a.get().is_none(), "nested canonical return arena");
+        a.set(Some(Arena {
+            ptr: storage.as_mut_ptr(),
+            len: storage.len(),
+            used: 0,
+            align: 1,
         }));
     });
     let _reset = Reset;
@@ -58,7 +75,7 @@ unsafe extern "C" fn cabi_realloc(
     if let Some(mut arena) = ARENA.get() {
         // These imports lower lists once, not incrementally via realloc.
         assert_eq!(old_len, 0);
-        assert!(align <= 4);
+        assert!(align <= arena.align);
         let offset = (arena.used + align - 1) & !(align - 1);
         assert!(
             len <= arena.len.saturating_sub(offset),
@@ -102,6 +119,49 @@ unsafe extern "C" {
     fn raw_receive(handle: u32, len: u64, result: *mut u32);
     #[link_name = "[method]outgoing-datagram-stream.send"]
     fn raw_send(handle: u32, input: *const u32, len: usize, result: *mut u64);
+}
+
+#[link(wasm_import_module = "wasi:filesystem/types@0.2.9")]
+unsafe extern "C" {
+    #[link_name = "[method]descriptor.read"]
+    fn raw_file_read(handle: i32, length: i64, offset: i64, result: *mut u8);
+}
+/// `descriptor.read` lowered directly into `output`. Returns the byte count and
+/// the end-of-file flag, or the raw filesystem error-code discriminant.
+pub fn file_read(
+    descriptor: &wasip2::filesystem::types::Descriptor,
+    output: &mut [u8],
+    offset: u64,
+) -> std::result::Result<(usize, bool), u8> {
+    let mut result = [0u32; 4];
+    let base = output.as_mut_ptr();
+    let capacity = output.len();
+    scoped_bytes(output, || {
+        // SAFETY: live descriptor, bounded length, aligned 16-byte result area. The
+        // only list the host lowers is the returned bytes, placed in the arena.
+        unsafe {
+            raw_file_read(
+                descriptor.handle() as i32,
+                capacity as i64,
+                offset as i64,
+                result.as_mut_ptr().cast(),
+            );
+        }
+        match result[0] & 0xff {
+            0 => {
+                let (pointer, n) = (result[1] as usize as *mut u8, result[2] as usize);
+                assert!(n <= capacity);
+                if n != 0 && pointer != base {
+                    // SAFETY: host-initialized bytes inside the output arena; ptr::copy
+                    // tolerates overlap with the destination prefix.
+                    unsafe { ptr::copy(pointer, base, n) };
+                }
+                Ok((n, result[3] & 0xff != 0))
+            }
+            1 => Err((result[1] & 0xff) as u8),
+            _ => unreachable!("invalid read result"),
+        }
+    })
 }
 
 pub fn poll(input: &[u32], storage: &mut [u32], ready: &mut Vec<usize>) {
