@@ -1,5 +1,7 @@
 //! Extra child descriptors: Node's `stdio` tail, its IPC channel, and the
-//! session control a pty child needs. Every assertion runs on Unix and Windows.
+//! session control a pty child needs. Everything here runs on Unix and Windows
+//! except the two cases marked `#[cfg]`, which are about descriptor numbers and
+//! controlling terminals and have no Windows counterpart.
 #![deny(unsafe_op_in_unsafe_fn)]
 #![cfg(all(
     not(loom),
