@@ -1,24 +1,28 @@
 #![cfg(all(windows, not(loom)))]
 #![deny(unsafe_op_in_unsafe_fn)]
 use std::{
+    collections::BTreeMap,
     io::Write,
     os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
     ptr,
     sync::Mutex,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 // GetProcessHandleCount measures the entire test process. Every test in this
 // binary must hold this guard until its handles and helper threads are dropped.
 static HANDLES: Mutex<()> = Mutex::new(());
 use turnloop::*;
-use windows_sys::Win32::{
-    Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT},
-    System::{
-        Pipes::CreatePipe,
-        Threading::{
-            GetCurrentProcess, GetProcessHandleCount, OpenProcess, PROCESS_SYNCHRONIZE,
-            WaitForSingleObject,
+use windows_sys::{
+    Wdk::Foundation::{NtQueryObject, ObjectTypeInformation},
+    Win32::{
+        Foundation::{GetHandleInformation, HANDLE, UNICODE_STRING, WAIT_OBJECT_0, WAIT_TIMEOUT},
+        System::{
+            Pipes::CreatePipe,
+            Threading::{
+                GetCurrentProcess, GetProcessHandleCount, GetProcessId, GetThreadId, OpenProcess,
+                PROCESS_SYNCHRONIZE, WaitForSingleObject,
+            },
         },
     },
 };
@@ -286,6 +290,137 @@ fn handles() -> u32 {
     );
     count
 }
+/// One entry of this process's kernel handle table: what the handle names.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Named {
+    /// The object type: `Process`, `Thread`, `Job`, `IoCompletion`, `Event`, ...
+    kind: String,
+    /// The thread or process this handle names, where its type has an identity.
+    id: u32,
+}
+impl std::fmt::Display for Named {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.id == 0 {
+            write!(f, "{}", self.kind)
+        } else {
+            write!(f, "{}#{}", self.kind, self.id)
+        }
+    }
+}
+/// Every valid handle in this process, by handle value, with its object type.
+///
+/// `GetProcessHandleCount` reports a number; a leak report needs the identity, so
+/// this names each handle instead. Kernel handle values are multiples of four
+/// drawn from a dense per-process table, so scanning the low range covers a test
+/// process completely. Both calls are pure queries -- `GetHandleInformation`
+/// asks whether a value is a handle at all, and `ObjectTypeInformation` never
+/// blocks the way `ObjectNameInformation` can on a synchronous pipe -- so the
+/// scan cannot change the count it is explaining.
+fn handle_table() -> BTreeMap<usize, Named> {
+    let mut table = BTreeMap::new();
+    // Eight-byte aligned PUBLIC_OBJECT_TYPE_INFORMATION storage: a UNICODE_STRING
+    // header, the reserved words, and room for the name it points at.
+    let mut buffer = [0u64; 128];
+    for value in (4..0x10000usize).step_by(4) {
+        let handle = value as HANDLE;
+        let mut flags = 0;
+        // SAFETY: pure query with a writable output; a value that is not a handle
+        // of this process simply reports failure.
+        if unsafe { GetHandleInformation(handle, &mut flags) } == 0 {
+            continue;
+        }
+        let mut returned = 0;
+        // SAFETY: live handle, documented class, and a writable buffer described
+        // by its own byte length.
+        let status = unsafe {
+            NtQueryObject(
+                handle,
+                ObjectTypeInformation,
+                buffer.as_mut_ptr().cast(),
+                size_of_val(&buffer) as u32,
+                &mut returned,
+            )
+        };
+        // SAFETY: a successful query wrote a PUBLIC_OBJECT_TYPE_INFORMATION whose
+        // first member is the type name; it is read, not retained.
+        let name = unsafe { buffer.as_ptr().cast::<UNICODE_STRING>().read() };
+        let kind = if status < 0 || name.Buffer.is_null() {
+            format!("untyped({status:#010x})")
+        } else {
+            // SAFETY: the returned name points into `buffer`, and UNICODE_STRING
+            // counts bytes, not UTF-16 units.
+            let units =
+                unsafe { std::slice::from_raw_parts(name.Buffer, name.Length as usize / 2) };
+            String::from_utf16_lossy(units)
+        };
+        let id = match kind.as_str() {
+            // SAFETY: a live handle of exactly the type this query accepts.
+            "Thread" => unsafe { GetThreadId(handle) },
+            // SAFETY: a live handle of exactly the type this query accepts.
+            "Process" => unsafe { GetProcessId(handle) },
+            _ => 0,
+        };
+        table.insert(value, Named { kind, id });
+    }
+    table
+}
+/// How long the Windows thread pool may take to finish releasing what a cycle
+/// already unregistered. Bounded, so a real leak still fails this test.
+const SETTLE: Duration = Duration::from_secs(5);
+/// Require this process's handle count to be exactly `baseline` again.
+///
+/// The comparison stays exact; only the moment of sampling is allowed to wait.
+/// `GetProcessHandleCount` covers the whole process, and `RegisterWaitForSingleObject`
+/// -- how the backend learns a child exited -- is backed by a thread-pool
+/// `WaitCompletionPacket`. `UnregisterWaitEx(INVALID_HANDLE_VALUE)` is the strongest
+/// join Windows documents and it joins the *callback*; the pool then closes its own
+/// packet on its own threads. On a loaded runner that release lags the cycle that
+/// caused it. A 192-cycle sweep on windows-2025 with eight busy threads saw the
+/// table oscillate 130 -> 131 -> 130, gaining and releasing exactly one
+/// `WaitCompletionPacket` each time, on 129 of the 192 rounds; the identical sweep
+/// on the same idle runner moved zero times (issue #26, run 34954538795). A single
+/// sample therefore reports the pool's tear-down as a leak once in a while, which
+/// is what failed PR #24 with 83 against an 82 baseline.
+///
+/// A genuinely leaked handle never comes back, so it fails at the deadline -- and
+/// names itself, because the report walks the handle table by object type.
+fn settled(subject: &str, baseline: u32, named: &BTreeMap<usize, Named>) {
+    let deadline = Instant::now() + SETTLE;
+    loop {
+        // Read once, so the deadline verdict and the message describe the same
+        // observation.
+        let count = handles();
+        if count == baseline {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{subject}: {count} handles against a {baseline} baseline, still outstanding \
+             {SETTLE:?} after the drop, so this is not the thread pool releasing its own wait \
+             packet; {}",
+            handle_diff(named, &handle_table())
+        );
+        // Yield a slot: the pool thread that closes the packet needs one too.
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+/// Name what a handle table gained and lost, for a leak report.
+fn handle_diff(before: &BTreeMap<usize, Named>, after: &BTreeMap<usize, Named>) -> String {
+    let side = |a: &BTreeMap<usize, Named>, b: &BTreeMap<usize, Named>| {
+        a.iter()
+            .filter(|(value, named)| b.get(value) != Some(named))
+            .map(|(value, named)| format!("{value:#x}={named}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!(
+        "{} -> {} handles; gained [{}]; released [{}]",
+        before.len(),
+        after.len(),
+        side(after, before),
+        side(before, after)
+    )
+}
 #[test]
 fn cancelled_synchronous_reads_release_buffers_and_threads() {
     let _guard = HANDLES
@@ -444,9 +579,10 @@ fn loop_drop_and_stale_wakers_release_windows_handles() {
     };
     cycle(); // process-lifetime Winsock/runtime setup precedes the baseline
     let baseline = handles();
+    let named = handle_table();
     for _ in 0..32 {
         cycle();
-        assert_eq!(handles(), baseline, "native handle leak");
+        settled("native handle leak", baseline, &named);
     }
 }
 
@@ -844,14 +980,11 @@ fn loop_drop_terminates_live_children_and_releases_their_handles() {
     };
     assert_eq!(cycle(), 8); // initialize Windows thread-pool wait infrastructure
     let baseline = handles();
+    let named = handle_table();
     let mut reaped = 0;
     for _ in 0..16 {
         reaped += cycle();
-        assert_eq!(
-            handles(),
-            baseline,
-            "live-child drop leaked a native handle"
-        );
+        settled("live-child drop leaked a native handle", baseline, &named);
     }
     assert_eq!(reaped, 128);
 }
@@ -1167,10 +1300,11 @@ fn listener_reuse_and_busy_connect_drop_release_native_handles() {
     };
     assert_eq!(cycle(), 4);
     let baseline = handles();
+    let named = handle_table();
     let mut drops = 0;
     for _ in 0..8 {
         drops += cycle();
-        assert_eq!(handles(), baseline, "listener or availability handle leak");
+        settled("listener or availability handle leak", baseline, &named);
     }
     assert_eq!(drops, 32);
 }
