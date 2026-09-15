@@ -235,7 +235,7 @@ Every command, in order, with its result. `CARGO_BUILD_JOBS=4`. Clippy flags are
 | 24 | `cargo fmt --all --check` | PASS |
 | 25 | `cargo test -p turnloop -p turnloop-contract -- --test-threads=1` | PASS (lib 15, contract lib 22, allocations 12, filesystem 11, native_surface 17, lifetimes 1, others 0 on macOS) |
 | 26 | `cargo test --workspace -- --test-threads=1` (foreground) | UNRUN: killed by the tool's 10-minute limit while compiling |
-| 27 | `cargo test --workspace -- --test-threads=1` (background) | PASS: 80 result groups, 339 tests, 0 failed |
+| 27 | `cargo test --workspace -- --test-threads=1` (background) | PASS, 0 failed. Correction: the log also captured the still-running cargo from #26 (every doc-test group appears twice), so the "80 groups / 339 tests" first recorded here was double-counted; a clean single run is #47 |
 | 28 | `cargo test -p turnloop-contract --test filesystem -- --test-threads=1` (with the loop-drop test) | PASS 12/12 |
 | 29 | `cargo clippy --workspace --all-targets -- $FLAGS` | PASS |
 | 30 | `cargo clippy --workspace --all-targets --all-features -- $FLAGS` | PASS |
@@ -254,6 +254,22 @@ Every command, in order, with its result. `CARGO_BUILD_JOBS=4`. Clippy flags are
 | 41b | `python3 scripts/ci/run-tests.py wasi --target wasm32-wasip3` (rerun) | PASS (core lib 10; `wasi` debug 28 and release 28, median 1.17 ms; `allocations` release 11) |
 | 42 | `cargo test -p turnloop -p turnloop-contract --all-features -- --test-threads=1` | PASS: 88 tests (lib 15, contract lib 22, allocations 13, executor 6, filesystem 12, native_surface 17, lifetimes 1, doc 2) |
 | 43 | Linux runtime (epoll/inotify), Windows runtime (IOCP/RDCW), FreeBSD | UNRUN (no host) |
+| 44 | `git fetch origin` | PASS, but this clone's `origin` (the local `windlass` clone) still had `main` at 63f5eee; `git fetch gh main` fetched GitHub `main` f6fc128 containing #20 and #16 |
+| 45 | `git merge --no-ff gh/main` | 2 conflicts (see §10), resolved keeping both sides; merge-only tree `cargo check -p turnloop -p turnloop-contract --all-targets` PASS; committed `75011b4` |
+| 46 | Rule 3 fixes: `cargo test -p turnloop --lib -- --test-threads=1 backend_path_request natively_accepted queued_core` | PASS 3/3; sabotage (flag disabled): FAIL as expected |
+| 46a | `cargo test -p turnloop-contract --test filesystem -- --test-threads=1` | FAIL: `watch_backpressure` (2 idle turns: I01 now reports a notification-driven zero-timeout poll as `discovery_polls`, not `os_waits`); spin redefined as a turn with no native call and no output, plus ≤ 64 turns per 20 ms window; then PASS 13/13, `watch_backpressure` ×3 PASS; sabotage (watch `has_work` ignoring lease availability): FAIL as expected |
+| 46b | wasip2 `--test wasi ... filesystem` | first version of the starvation contract passed even with the flag disabled (an open handle's request made the backend native); split into a path-only phase: PASS 6/6, sabotage FAIL ("starved behind queued posts after 480525 turns") |
+| 47 | Post-merge `/scratchpad/verify2.sh`: `cargo fmt --all --check` | PASS |
+| 48 | clippy `--workspace --all-targets` default and `--all-features` | PASS ×2 |
+| 49 | clippy `--target x86_64-unknown-linux-gnu -p turnloop -p turnloop-contract -p turnloop-io --all-targets` default and `--all-features` | PASS ×2 |
+| 50 | clippy `--target x86_64-pc-windows-msvc` (same packages) default and `--all-features` | PASS ×2 |
+| 51 | clippy `--target wasm32-wasip2` (same packages) `--all-features`; `+nightly-2026-09-07 --target wasm32-wasip3` `--all-features` | PASS ×2 |
+| 52 | clippy `--target wasm32-unknown-unknown -p turnloop -p turnloop-contract --all-targets` default and `--all-features` | PASS ×2 |
+| 53 | `cargo test --workspace -- --test-threads=1` | PASS: 64 result groups, 278 tests, 0 failed |
+| 54 | `python3 scripts/ci/run-tests.py wasi --target wasm32-wasip2` | PASS (core lib 11; `wasi` debug 33, release 33 with median lateness 1.66 ms; `allocations` release 11) |
+| 55 | `python3 scripts/ci/run-tests.py wasi --target wasm32-wasip3` | PASS (core lib 13; `wasi` debug 33, release 33 with median 1.11 ms; `allocations` release 12) |
+| 56 | `bash scripts/ci/no-tokio.sh` | PASS (18 target/feature graphs) |
+| 57 | `python3 scripts/ci/soak.py` | PASS (251 locked versions, 1 existing exception) |
 
 `$FLAGS` = `-D warnings -D clippy::undocumented_unsafe_blocks`. Wasmtime 46.0.0 was
 linked into this clone's ignored `.tools/bin` from the `wasm2` clone (read only).
@@ -270,7 +286,10 @@ p3 target (`nightly-2026-09-07`).
 | `284349d` | WASI core and 0.2 bindings; metadata leases; Wasmtime runner preopen |
 | `5d83e8c` | WASI 0.3 hand-lowered bindings |
 | `84adc74` | DESIGN D8/§5a.4/§6/§7.6 clarification; loop-drop buffer test; IOCP watch terminal cleanup; web/unsupported dead-code allowance |
-| (last) | this report |
+| `58e6bda` | this report |
+| `75011b4` | merge of GitHub `main` f6fc128 (#20 I01, #16 Windows semantics) |
+| `d0d35b3` | DESIGN §10 rule 3 applied to filesystem requests; regressions |
+| (last) | report update for the merge |
 
 ## 8. Needs CI (runtime not available here)
 
@@ -294,9 +313,48 @@ p3 target (`nightly-2026-09-07`).
 - Linux recursive watches are left to the host (Node's own approach); a built-in
   tree-walking option would need pool-backed scans.
 - Vectored `readv`/`writev`, `statfs` and clone-copy are not in the surface.
-- **Rebase note for PR #20 (I01):** no `PollInfo`/`TurnInfo` counter was touched.
-  Under I01's `native_pending` rule, WASI backend-accepted *path* requests (no
-  handle) should set `op.native = true` in `Driver::fs`, exactly as I01 does for
-  natively accepted DNS lookups; handle requests are already counted through
-  their `Kind::Socket` handle. `backend/kqueue.rs` gains one field in the `Ready`
-  literal next to I01's `PollInfo::native` change (trivial conflict).
+- I01 is merged and applied (§10).
+
+## 10. Merge of `main` with I01 (#20) and Windows semantics (#16)
+
+Merged GitHub `main` f6fc128 with a merge commit (`75011b4`). This clone's `origin`
+remote is the local `windlass` clone, whose `main` was still 63f5eee, so the merge
+source was `gh/main`.
+
+Conflicts, both resolved by keeping both sides:
+
+- `crates/turnloop/src/driver.rs`, `struct Op` and its initializer in `new_op`:
+  this lane's `fs: bool` (typed filesystem request) and I01's `native: bool`
+  (counted in `native_pending`) are both kept.
+- `crates/turnloop-contract/tests/allocations.rs`, end of file: this lane's
+  filesystem/watch gates and helpers, then #16's
+  `windows_sync_pipe_character_and_disk_workers_reuse_classification_without_allocating`.
+
+Auto-merged without conflict and reviewed: `backend/kqueue.rs` (the new
+`Ready::vnode` field next to I01's `PollInfo::native`), `backend/epoll.rs`,
+`backend/mod.rs`, `backend/unix.rs`, `backend/wasi_p2.rs`, `backend/wasi_p3.rs`,
+`backend/web.rs`, `completion.rs`, `DESIGN.md`, and `backend/iocp/mod.rs`, where
+#16 made sync workers a per-direction pair and treats `port::STOP` as a wake; the
+watch keys stay below `STOP`, so watch completions route as before.
+
+Rule 3 applied (`d0d35b3`):
+
+- `Driver::fs`: once a `Filesystem::Backend` (WASI) backend accepts a request, the
+  operation is native (`native = true`, `native_pending += 1`), as I01 does for
+  lookups. Handle requests and opens were already native through their
+  `Kind::Socket` handle; path requests were not, so a producer posting before every
+  turn starved them (the sabotage run spun for 480,525 turns). Terminal completion
+  retires the flag through `retire`.
+- Native pool requests are **not** native operations, matching I01's definition of
+  queued work (blocking-pool results): their results arrive through the work port,
+  so a queued turn with only pool requests makes no native call.
+  §10 rule 3 now names both cases.
+- Regressions: `driver::clock_contract::backend_path_request_is_a_pending_native_operation`
+  (synthetic backend: one native step while pending, `os_waits == 0` on queued
+  turns, flag retired) and the shared contract `queued_posts_do_not_starve_requests`
+  (path phase, open, handle request under a post before every turn; asserts
+  `os_waits == 0`, `discovery_polls <= 1`, and zero discovery polls for pool
+  requests) run natively and on WASI 0.2/0.3.
+- Counters: `filesystem::wait` asserts `os_waits + discovery_polls <= 1`;
+  `watch_backpressure` counts a spin only for a turn with neither a blocking wait
+  nor a discovery poll and no output, and bounds all turns per 20 ms window.
