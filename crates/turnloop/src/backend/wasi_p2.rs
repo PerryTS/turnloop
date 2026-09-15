@@ -675,6 +675,13 @@ unsafe impl Backend for WasiP2 {
             return Err(Error::new(ErrorKind::Unsupported));
         }
         abi::poll(&self.handles, &mut self.poll_storage, &mut self.indices);
+        // The private deadline pollable implements this wait's timeout, so its
+        // readiness has the meaning of the poll returning nothing (see `PollInfo`
+        // in backend/mod.rs, epoll's timerfd and the IOCP deadline packet): it is
+        // not native work. It is the only handle without an `owners` entry, so
+        // socket and DNS readiness alone counts, including when they arrive in
+        // the same result as the expiry.
+        let mut native_events = 0;
         for i in 0..self.indices.len() {
             match self.owners.get(self.indices[i]).copied() {
                 Some(PollOwner::Socket(h, d)) => {
@@ -683,16 +690,18 @@ unsafe impl Backend for WasiP2 {
                         .expect("live poll owner")
                         .ready[d] = true;
                     self.schedule(h);
+                    native_events += 1;
                 }
                 Some(PollOwner::Dns(i)) => {
-                    self.lookups[i].as_mut().expect("live lookup").ready = true
+                    self.lookups[i].as_mut().expect("live lookup").ready = true;
+                    native_events += 1;
                 }
                 None => {}
             }
         }
         self.run_ready(events);
         self.run_dns(events);
-        Ok(PollInfo::native(timeout, self.indices.is_empty()))
+        Ok(PollInfo::native(timeout, native_events == 0))
     }
     fn release(&mut self, h: Handle) {
         self.files.release(h);

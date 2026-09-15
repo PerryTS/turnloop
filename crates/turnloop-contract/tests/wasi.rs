@@ -141,6 +141,12 @@ fn timers_io_posts() {
 fn no_spin() {
     contract::no_spin::<Platform>();
 }
+/// DESIGN §10.4a and the `PollInfo` contract: the private WASI deadline
+/// pollable (0.2) / subtask (0.3) is this wait's timeout, not native work.
+#[test]
+fn quiet_deadline_accounting() {
+    contract::quiet_deadline_accounting::<Platform>();
+}
 
 #[test]
 fn repeated_eof_shutdown_and_empty_datagram() {

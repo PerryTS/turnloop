@@ -595,11 +595,19 @@ unsafe impl Backend for WasiP3 {
             }
         }
         let (kind, waitable, code) = self.wait_set.step(blocking);
+        // The private deadline subtask implements this wait's timeout, so its
+        // completion has the meaning of the step returning no event (see
+        // `PollInfo` in backend/mod.rs, epoll's timerfd and the IOCP deadline
+        // packet): it is not native work. Socket subtask events still count, and
+        // a step that returns one leaves any simultaneous expiry for the timer
+        // wheel, which reads the clock rather than this event.
+        let deadline_event =
+            kind != 0 && deadline.is_some_and(|(task, _)| task != 0 && waitable == task);
         if let Some((task, initial)) = deadline
             && task != 0
         {
             self.wait_set.remove(task);
-            if initial < 2 && !(kind != 0 && waitable == task && code >= 2) {
+            if initial < 2 && !(deadline_event && code >= 2) {
                 // SAFETY: synchronously cancel this turn-owned deadline subtask before dropping it.
                 unsafe {
                     wait_set::subtask_cancel(task);
@@ -610,7 +618,7 @@ unsafe impl Backend for WasiP3 {
                 wait_set::subtask_drop(task);
             }
         }
-        if kind != 0 {
+        if kind != 0 && !deadline_event {
             for i in 0..self.ops.len() {
                 let Some(p) = &mut self.ops[i] else {
                     continue;
@@ -628,7 +636,7 @@ unsafe impl Backend for WasiP3 {
         self.run_ready(events);
         Ok(PollInfo::native(
             if blocking { None } else { Some(Duration::ZERO) },
-            kind == 0,
+            kind == 0 || deadline_event,
         ))
     }
     fn release(&mut self, h: Handle) {
