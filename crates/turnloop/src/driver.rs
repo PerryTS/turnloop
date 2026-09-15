@@ -717,7 +717,15 @@ impl<B: Backend> Driver<B> {
     pub fn recv(&mut self, h: Handle, buf: ReadBuf, token: Token) -> Result<OpId> {
         self.submit(h, Operation::RecvFrom(buf), token)
     }
-    /// Queue stream write-side shutdown after earlier writes.
+    /// Queue stream write-side shutdown after earlier writes. The handle and its
+    /// read direction stay open: reads continue until the peer's EOF.
+    ///
+    /// TCP half-closes on every native backend (`SHUT_WR`, `SD_SEND`, WASI
+    /// `shutdown(send)` / send-stream close) and Unix-domain stream sockets on
+    /// epoll/kqueue. Transports without an independent write direction fail with
+    /// [`ErrorKind::Unsupported`]: Windows named pipes and synchronous handles,
+    /// Unix ttys, FIFOs and regular files, and web fetches. WASI stdout/stderr
+    /// close their output stream; a web WebSocket starts its close handshake.
     pub fn shutdown(&mut self, h: Handle, token: Token) -> Result<OpId> {
         self.submit(h, Operation::Shutdown, token)
     }

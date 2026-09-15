@@ -78,6 +78,259 @@ fn tcp_roundtrip_and_deadline() {
     finish(&mut timeout);
 }
 
+async fn read_to_eof<S: AsyncRead + Unpin>(stream: &mut S) -> Vec<u8> {
+    let mut received = Vec::new();
+    let mut bytes = [0; 256];
+    loop {
+        // A reset here (instead of EOF) is the failure lingering close prevents.
+        let n = read(stream, &mut bytes)
+            .await
+            .expect("clean EOF, not a reset");
+        if n == 0 {
+            return received;
+        }
+        received.extend_from_slice(&bytes[..n]);
+    }
+}
+#[test]
+fn half_close_keeps_reading_until_peer_eof() {
+    let mut executor = LocalExecutor::<Platform>::new(Config::default()).expect("executor");
+    let h = executor.handle();
+    let listener = Listener::bind(&h, "127.0.0.1:0".parse().expect("address")).expect("listen");
+    let address = listener.local_addr().expect("address");
+    let mut server = executor
+        .spawn_local(async move {
+            let mut s = listener.accept().await.expect("accept");
+            write_all(&mut s, b"response").await.expect("write");
+            assert!(!s.is_write_shut());
+            shutdown(&mut s).await.expect("half-close");
+            assert!(s.is_write_shut());
+            shutdown(&mut s)
+                .await
+                .expect("a completed half-close stays complete");
+            assert!(
+                write_all(&mut s, b"x").await.is_err(),
+                "writes end at the half-close"
+            );
+            let late = read_to_eof(&mut s).await;
+            close(&mut s).await.expect("close");
+            late
+        })
+        .expect("spawn");
+    let mut client = executor
+        .spawn_local(async move {
+            let mut s = h
+                .connect(address, Default::default())
+                .await
+                .expect("connect");
+            let response = read_to_eof(&mut s).await;
+            // The peer ended only its write direction: this one still delivers.
+            write_all(&mut s, b"late request")
+                .await
+                .expect("write after the peer's half-close");
+            shutdown(&mut s).await.expect("client half-close");
+            response
+        })
+        .expect("spawn");
+    let end = executor.driver().now() + Duration::from_secs(5);
+    while !server.is_finished() || !client.is_finished() {
+        assert!(executor.driver().now() < end);
+        executor.turn(Timeout::Until(end)).expect("turn");
+    }
+    assert_eq!(finish(&mut client), b"response");
+    assert_eq!(finish(&mut server), b"late request");
+}
+
+#[test]
+fn lingering_close_discards_peer_input_until_eof() {
+    let mut executor = LocalExecutor::<Platform>::new(Config::default()).expect("executor");
+    let h = executor.handle();
+    let client_h = h.clone();
+    let listener = Listener::bind(&h, "127.0.0.1:0".parse().expect("address")).expect("listen");
+    let address = listener.local_addr().expect("address");
+    let mut server = executor
+        .spawn_local(async move {
+            let mut s = listener.accept().await.expect("accept");
+            write_all(&mut s, b"final response").await.expect("write");
+            let mut scratch = [0; 512];
+            linger_close(&mut s, &mut scratch, Some(h.now() + Duration::from_secs(5)))
+                .await
+                .expect("lingering close")
+        })
+        .expect("spawn");
+    let mut client = executor
+        .spawn_local(async move {
+            let mut s = client_h
+                .connect(address, Default::default())
+                .await
+                .expect("connect");
+            let response = read_to_eof(&mut s).await;
+            // Bytes sent after the server's final response stay unread by its
+            // protocol; lingering close must drain them instead of resetting.
+            for _ in 0..3 {
+                write_all(&mut s, &[7; 1024]).await.expect("late bytes");
+            }
+            close(&mut s).await.expect("client close");
+            response
+        })
+        .expect("spawn");
+    let end = executor.driver().now() + Duration::from_secs(5);
+    while !server.is_finished() || !client.is_finished() {
+        assert!(executor.driver().now() < end);
+        executor.turn(Timeout::Until(end)).expect("turn");
+    }
+    assert_eq!(finish(&mut client), b"final response");
+    let lingered = finish(&mut server);
+    assert_eq!(lingered.end, LingerEnd::Eof);
+    assert_eq!(lingered.discarded, 3 * 1024);
+    assert!(lingered.reads > 0);
+}
+
+#[test]
+fn lingering_close_deadline_closes_silent_peer_without_spinning() {
+    let mut executor = LocalExecutor::<Platform>::new(Config::default()).expect("executor");
+    let h = executor.handle();
+    let client_h = h.clone();
+    let listener = Listener::bind(&h, "127.0.0.1:0".parse().expect("address")).expect("listen");
+    let address = listener.local_addr().expect("address");
+    const LINGER: Duration = Duration::from_millis(200);
+    let mut server = executor
+        .spawn_local(async move {
+            let mut s = listener.accept().await.expect("accept");
+            write_all(&mut s, b"final").await.expect("write");
+            let at = h.now() + LINGER;
+            let mut scratch = [0; 64];
+            let lingered = linger_close(&mut s, &mut scratch, Some(at))
+                .await
+                .expect("lingering close");
+            assert!(h.now() >= at, "closed before the linger deadline");
+            lingered
+        })
+        .expect("spawn");
+    let mut client = executor
+        .spawn_local(async move {
+            let mut s = client_h
+                .connect(address, Default::default())
+                .await
+                .expect("connect");
+            assert_eq!(read_to_eof(&mut s).await, b"final");
+            // Never close: the server's deadline alone must end its linger.
+            s
+        })
+        .expect("spawn");
+    let end = executor.driver().now() + Duration::from_secs(5);
+    while !client.is_finished() {
+        assert!(executor.driver().now() < end);
+        executor.turn(Timeout::Until(end)).expect("turn");
+    }
+    let _silent_peer = finish(&mut client);
+    // The client saw the half-close, so the server is now waiting on its idle
+    // read and the linger timer. Settle residual discovery from the exchange, as
+    // the keep-alive no-spin tests do; the remaining wait must block until the
+    // deadline: at most two turns and one zero-event wait for the one expiry.
+    for _ in 0..3 {
+        executor.turn(Timeout::Now).expect("settle queued events");
+    }
+    assert!(!server.is_finished(), "linger ended before its deadline");
+    let (mut turns, mut empty) = (0, 0);
+    while !server.is_finished() {
+        assert!(turns < 2, "lingering close spun");
+        let info = executor.turn(Timeout::Until(end)).expect("turn");
+        turns += 1;
+        empty += info.zero_event_waits;
+    }
+    assert!(empty <= 1, "zero-event waits while lingering: {empty}");
+    let lingered = finish(&mut server);
+    assert_eq!(lingered.end, LingerEnd::Deadline);
+    assert_eq!((lingered.reads, lingered.discarded), (0, 0));
+}
+
+#[test]
+fn lingering_close_deadline_bounds_a_stalled_half_close() {
+    let mut executor = LocalExecutor::<Platform>::new(Config::default()).expect("executor");
+    let h = executor.handle();
+    let client_h = h.clone();
+    let listener = Listener::bind(&h, "127.0.0.1:0".parse().expect("address")).expect("listen");
+    let address = listener.local_addr().expect("address");
+    let mut server = executor
+        .spawn_local(async move {
+            let mut s = listener.accept().await.expect("accept");
+            // Fill the peer's receive window and our send buffer: the peer never
+            // reads, so the last accepted write can never be flushed.
+            let chunk = [9; 16384];
+            let mut written = 0;
+            loop {
+                let write = std::future::poll_fn(|cx| Pin::new(&mut s).poll_write(cx, &chunk));
+                match h.timeout(Duration::from_millis(200), write).await {
+                    Ok(result) => written += result.expect("write"),
+                    Err(e) => {
+                        assert_eq!(e.kind, turnloop::ErrorKind::TimedOut);
+                        break;
+                    }
+                }
+                assert!(written < 1 << 30, "socket buffers never filled");
+            }
+            let at = h.now() + Duration::from_millis(50);
+            let mut scratch = [0; 64];
+            let error = linger_close(&mut s, &mut scratch, Some(at))
+                .await
+                .expect_err("a half-close that cannot flush must not wait forever");
+            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+            assert!(h.now() >= at);
+            // Dropping the unclosed stream releases its handle.
+            drop(s);
+            written
+        })
+        .expect("spawn");
+    let mut client = executor
+        .spawn_local(async move {
+            client_h
+                .connect(address, Default::default())
+                .await
+                .expect("connect")
+        })
+        .expect("spawn");
+    let end = executor.driver().now() + Duration::from_secs(20);
+    while !server.is_finished() || !client.is_finished() {
+        assert!(executor.driver().now() < end);
+        executor.turn(Timeout::Until(end)).expect("turn");
+    }
+    assert!(finish(&mut server) > 0);
+    drop(finish(&mut client));
+}
+
+#[test]
+fn half_close_is_unsupported_on_datagram_adapters() {
+    let mut executor = LocalExecutor::<Platform>::new(Config::default()).expect("executor");
+    let h = executor.handle();
+    let mut task = executor
+        .spawn_local(async move {
+            let handle = h
+                .driver()
+                .udp_bind("127.0.0.1:0".parse().expect("address"), &Default::default())
+                .expect("udp");
+            let peer = h.driver().local_addr(handle).expect("address");
+            let mut udp = h.udp(handle, peer);
+            let error = shutdown(&mut udp)
+                .await
+                .expect_err("datagrams cannot half-close");
+            assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+            let mut scratch = [0; 16];
+            let lingered = linger_close(&mut udp, &mut scratch, None)
+                .await
+                .expect("closes without lingering");
+            assert_eq!(lingered.end, LingerEnd::Unsupported);
+            1
+        })
+        .expect("spawn");
+    let end = executor.driver().now() + Duration::from_secs(5);
+    while !task.is_finished() {
+        assert!(executor.driver().now() < end);
+        executor.turn(Timeout::Until(end)).expect("turn");
+    }
+    assert_eq!(finish(&mut task), 1);
+}
+
 #[cfg(any(
     not(target_arch = "wasm32"),
     all(target_os = "wasi", target_env = "p2")

@@ -21,7 +21,9 @@ an owned stream, shared TLS configuration, executor handle, absolute handshake
 deadline and host wall time. Await the handshake, inspect `alpn_protocol()`, then
 use `turnloop_io::{read, write_all, close}`. These helpers work on TCP and pipes
 and compose with HTTP/WebSocket adapters. `close` flushes close_notify; dropping
-aborts the transport. Refresh host wall time with `set_unix_seconds` when needed.
+aborts the transport. `turnloop_io::shutdown` flushes close_notify and half-closes
+the transport while decryption continues until the peer's close_notify or EOF, which
+is what a lingering server close uses. Refresh host wall time with `set_unix_seconds` when needed.
 The host continues calling `LocalExecutor::turn` throughout the connection.
 
 After a successful handshake, `peer_certificates()` borrows the peer chain,

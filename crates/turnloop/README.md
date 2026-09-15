@@ -39,7 +39,8 @@ driver.turn(Timeout::Until(deadline), &mut completions)?;
 
 Enable `executor` for `LocalExecutor<B>` and its futures-io adapters. Read/write
 staging and task tables are reserved at construction. Writes are buffered; flush
-or close before dropping an adapter to confirm underlying completion. The crate's
+or close before dropping an adapter to confirm underlying completion.
+`AsyncIo::poll_shutdown` half-closes a stream without releasing its handle. The crate's
 rustdoc includes runnable loop and executor examples. See the
 [revision 2 handoff](https://github.com/PerryTS/turnloop/blob/main/docs/BACKEND_REVISION_2.md)
 for native ownership, process teardown, platform integration and contract details.
