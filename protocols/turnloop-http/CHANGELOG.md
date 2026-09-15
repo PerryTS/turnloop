@@ -10,5 +10,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.1.0-alpha.3](https://github.com/PerryTS/turnloop/compare/turnloop-http-v0.1.0-alpha.2...turnloop-http-v0.1.0-alpha.3) - 2026-09-15
 
 ### Other
-
+- Servers close gracefully: HTTP/1 and HTTP/2 linger after the final response instead of resetting a peer that still has unread bytes (#21)
+- `server::Options { linger_timeout }` (default 5 s), `Server::bind_with`, `Shutdown::with_options` and `Shutdown::stop_by(deadline)`
 - release v0.1.0-alpha.3
