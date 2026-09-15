@@ -181,8 +181,11 @@ own getter at all.
 
 **Coverage by endpoint**: connected client, **accepted connection**, listener
 (through `accept_defaults` and `ipv4_membership_by_interface_index`), UDP socket,
-adopted/attached socket, unconnected TCP socket (which is where address-family
-detection for IP-level options is non-obvious), and non-socket handles.
+adopted/attached socket, a listener moved between loops
+(`accept_defaults_survive_transfer` — the defaults live on the transport, so they
+travel through `detach`/`attach` and still configure connections on the new loop),
+unconnected TCP socket (where address-family detection for IP-level options is
+non-obvious), and non-socket handles.
 
 **`Unsupported` paths**: `socket_options_without_a_wasi_interface_are_unsupported`
 (8 options + 6 getter kinds on WASI), `socket_options_are_unsupported_on_a_host_stream`
@@ -224,9 +227,9 @@ with an `OWNER` file naming this lane.
 | `RUSTDOCFLAGS='-D warnings' cargo +nightly-2026-08-20 doc -p turnloop --all-features --no-deps` | PASS |
 | `cargo +stable check --locked --workspace --all-targets --all-features` | PASS |
 | `cargo test --workspace --no-fail-fast -- --test-threads=1` (macOS) | PASS — 65 test binaries ok, 0 failed |
-| `cargo test -p turnloop-contract --test sockopts -- --test-threads=1` (macOS) | PASS — 16/16 |
-| `cargo test -p turnloop-contract --test sockopts -- --test-threads=1` (Linux, epoll) | PASS — 16/16 |
-| Linux six required modes: `default`, `epoll-timerfd`, `process-sigchld`, `fallbacks`, `executor`, `all-features`, each `cargo +nightly-2026-08-20 test --locked --workspace --no-fail-fast … -- --test-threads=1 --skip permission_denied_is_reported` | PASS — 406 `test result: ok` lines, 0 FAILED; the new `getsockopt`, multicast and allocation tests ran in all six |
+| `cargo test -p turnloop-contract --test sockopts -- --test-threads=1` (macOS) | PASS — 17/17 |
+| `cargo test -p turnloop-contract --test sockopts -- --test-threads=1` (Linux, epoll) | PASS — 17/17 |
+| Linux six required modes: `default`, `epoll-timerfd`, `process-sigchld`, `fallbacks`, `executor`, `all-features`, each `cargo +nightly-2026-08-20 test --locked --workspace --no-fail-fast … -- --test-threads=1 --skip permission_denied_is_reported` | PASS — all six modes, 0 FAILED; the new `getsockopt`, multicast, transfer and allocation tests ran in every mode |
 | `python3 scripts/ci/run-tests.py wasi --target wasm32-wasip2` (Wasmtime 46.0.0) | PASS — 42 contract + 13 allocation tests |
 | `python3 scripts/ci/run-tests.py wasi --target wasm32-wasip3` (nightly-2026-09-07) | PASS — 42 contract + 14 allocation tests |
 | `python3 scripts/ci/run-tests.py node` (web backend under Node 26.5.1) | PASS — 16/16, including `socket_options_are_unsupported_on_a_host_stream` |
@@ -254,3 +257,15 @@ with an `OWNER` file naming this lane.
 2. **WASI in CI** — ran locally against the pinned Wasmtime 46.0.0 for both p2 and
    p3, so this is a confirmation rather than an unknown.
 3. **Browser web arm** — Chromium and Firefox, same assertions the Node arm passed.
+
+## Follow-ups this lane deliberately did not take
+
+- `turnloop-http`'s server still configures nothing per connection. Now that
+  `ListenOpts::accept_defaults` exists, `nodelay: true` is the obvious default for
+  an HTTP/1.1 and HTTP/2 server; that is a protocol-crate decision, not a core one.
+- `TcpOpts` gained no new fields. Anything a host wants to change after connect
+  goes through `set_option`, so the connect-time struct stays minimal.
+- No `SocketOption` variant was added for `SO_REUSEADDR`, `SO_REUSEPORT`,
+  `IP_MULTICAST_IF` or `SO_BINDTODEVICE`: the first two are bind-time (already in
+  the opts structs) and the last two have no portable shape worth guessing at
+  before a host asks for them.
