@@ -445,6 +445,80 @@ fn steady_udp_allocate_nothing() {
     assert_eq!(total, 0, "steady UDP allocations");
 }
 
+/// Setting and reading a socket option is a syscall and nothing else: no queue,
+/// no completion, no allocation (DESIGN §10 rule 1; issue #34). The options used
+/// here are the ones every backend with sockets supports, so the gate runs
+/// identically on native and WASI.
+#[test]
+fn steady_socket_options_allocate_nothing() {
+    use turnloop::{KeepAlive, SocketOption, SocketOptionKind};
+    let mut l = Loop::new(Config::default()).expect("loop");
+    let udp = l
+        .udp_bind("127.0.0.1:0".parse().expect("address"), &UdpOpts::default())
+        .expect("UDP");
+    let mut total = 0;
+    let mut applied = 0;
+    for i in 0..101u32 {
+        ALLOCS.with(|n| n.set(0));
+        ACTIVE.with(|v| v.set(i != 0));
+        let size = 32 * 1024 + (i % 8) * 4096;
+        l.set_option(udp, SocketOption::RecvBufferSize(size))
+            .expect("receive buffer");
+        l.set_option(udp, SocketOption::SendBufferSize(size))
+            .expect("send buffer");
+        l.set_option(udp, SocketOption::Ttl(1 + i % 64))
+            .expect("hop limit");
+        let read = l.get_option(udp, SocketOptionKind::Ttl).expect("read back");
+        assert!(
+            matches!(read, SocketOption::Ttl(hops) if hops == 1 + i % 64),
+            "the OS did not keep the hop limit: {read:?}"
+        );
+        let _ = l
+            .get_option(udp, SocketOptionKind::RecvBufferSize)
+            .expect("read receive buffer");
+        ACTIVE.with(|v| v.set(false));
+        if i != 0 {
+            applied += 1;
+            total += ALLOCS.with(|n| n.get());
+        }
+    }
+    assert_eq!(applied, 100, "the socket-option subject ran");
+    assert_eq!(total, 0, "steady socket-option allocations");
+    // Keep-alive writes three TCP-level values behind one option; a connected
+    // socket proves that path allocates nothing either.
+    let (server, client, conn) =
+        turnloop_contract::sockopts::plain_pair(&mut l, &ListenOpts::default());
+    let schedule = KeepAlive {
+        idle: Some(Duration::from_secs(5)),
+        interval: Some(Duration::from_secs(2)),
+        count: Some(3),
+    };
+    let mut probes = 0;
+    for i in 0..101 {
+        ALLOCS.with(|n| n.set(0));
+        ACTIVE.with(|v| v.set(i != 0));
+        l.set_option(conn, SocketOption::KeepAlive(Some(schedule)))
+            .expect("enable");
+        let read = l
+            .get_option(conn, SocketOptionKind::KeepAlive)
+            .expect("read");
+        l.set_option(conn, SocketOption::KeepAlive(None))
+            .expect("disable");
+        ACTIVE.with(|v| v.set(false));
+        assert!(
+            matches!(read, SocketOption::KeepAlive(Some(_))),
+            "keep-alive was not actually on: {read:?}"
+        );
+        if i != 0 {
+            probes += 1;
+            total += ALLOCS.with(|n| n.get());
+        }
+    }
+    assert_eq!(probes, 100, "the keep-alive subject ran");
+    assert_eq!(total, 0, "steady keep-alive allocations");
+    turnloop_contract::sockopts::close_all(&mut l, &[client, conn, server, udp]);
+}
+
 #[test]
 fn steady_deadline_poll_allocate_nothing() {
     let mut l = Loop::new(Config::default()).expect("loop");

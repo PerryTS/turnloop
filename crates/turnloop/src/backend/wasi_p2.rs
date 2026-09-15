@@ -2,6 +2,7 @@
 //! lists, and synchronous nonblocking I/O with generational cancellation.
 mod abi;
 mod fs;
+mod sockopt;
 use crate::{
     backend::{Backend, Event, Filesystem, Operation, Outcome, PollInfo, Request, Wake},
     *,
@@ -69,6 +70,8 @@ pub struct Detached {
     poll: Option<Pollable>,
     socket: Socket,
     kind: Kind,
+    /// A listener's per-connection defaults, applied to each socket it accepts.
+    accept_defaults: AcceptDefaults,
 }
 struct Resource {
     handle: Handle,
@@ -414,7 +417,7 @@ unsafe impl Backend for WasiP2 {
         self.wake.clone()
     }
     fn open(&mut self, h: Handle, spec: Open) -> Result<()> {
-        let (addr, kind, reuse, backlog) = match spec {
+        let (addr, kind, reuse, backlog, accept_defaults) = match spec {
             Open::Pipe(_) | Open::PipeListener { .. } => {
                 return Err(Error::new(ErrorKind::Unsupported));
             }
@@ -438,17 +441,27 @@ unsafe impl Backend for WasiP2 {
                         poll: None,
                         socket: Socket::Stdio,
                         kind: Kind::Stdio(which),
+                        accept_defaults: AcceptDefaults::EMPTY,
                     },
                     None,
                 );
             }
-            Open::Tcp { addr, .. } => (addr, Kind::Tcp, false, 0),
-            Open::Listener { addr, opts } => (addr, Kind::Listener, opts.reuse_port, opts.backlog),
-            Open::Udp { addr, opts } => (addr, Kind::Udp, opts.reuse_port, 0),
+            Open::Tcp { addr, .. } => (addr, Kind::Tcp, false, 0, AcceptDefaults::EMPTY),
+            Open::Listener { addr, opts } => (
+                addr,
+                Kind::Listener,
+                opts.reuse_port,
+                opts.backlog,
+                opts.accept_defaults,
+            ),
+            Open::Udp { addr, opts } => {
+                (addr, Kind::Udp, opts.reuse_port, 0, AcceptDefaults::EMPTY)
+            }
         };
         if reuse {
             return Err(Error::new(ErrorKind::Unsupported));
         }
+        sockopt::validate_accept_defaults(accept_defaults)?;
         let family = if addr.is_ipv4() {
             IpAddressFamily::Ipv4
         } else {
@@ -475,6 +488,7 @@ unsafe impl Backend for WasiP2 {
                 datagrams: Some(datagrams),
                 socket: Socket::Udp(socket),
                 kind,
+                accept_defaults,
             }
         } else {
             let socket = create_tcp_socket(family).map_err(error)?;
@@ -495,11 +509,19 @@ unsafe impl Backend for WasiP2 {
                 datagrams: None,
                 socket: Socket::Tcp(socket),
                 kind,
+                accept_defaults,
             }
         };
         // Keep all child fields established before installation.
         transport.kind = kind;
         self.install(h, transport, (kind == Kind::Tcp).then_some(addr))
+    }
+    fn set_option(&mut self, h: Handle, option: SocketOption) -> Result<()> {
+        let socket = &self.get(h)?.transport.socket;
+        sockopt::set(socket, option)
+    }
+    fn get_option(&self, h: Handle, kind: SocketOptionKind) -> Result<SocketOption> {
+        sockopt::get(&self.get(h)?.transport.socket, kind)
     }
     fn local_addr(&self, h: Handle) -> Result<SocketAddr> {
         let a = match &self.get(h)?.transport.socket {
@@ -757,12 +779,16 @@ fn execute(
             };
             let (socket, input, output) = socket.accept().map_err(error)?;
             let peer = native(socket.remote_address().map_err(error)?);
+            // Before the connection becomes visible to the host. A rejected
+            // default fails this accept and drops the socket.
+            sockopt::apply_accept_defaults(&socket, t.accept_defaults)?;
             let transport = Detached {
                 streams: Some(streams(input, output)),
                 datagrams: None,
                 poll: Some(socket.subscribe()),
                 socket: Socket::Tcp(socket),
                 kind: Kind::Tcp,
+                accept_defaults: AcceptDefaults::EMPTY,
             };
             Ok(Some((Outcome::Accepted { transport, peer }, !*multishot)))
         }

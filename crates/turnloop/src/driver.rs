@@ -663,6 +663,35 @@ impl<B: Backend> Driver<B> {
         self.resource(h)?;
         self.backend.local_addr(h)
     }
+    /// Apply a socket option to a live socket handle, including an accepted one.
+    ///
+    /// The option is applied immediately, inside this call, through the OS: no
+    /// operation is submitted, no completion is produced, nothing is queued and
+    /// nothing is allocated. A handle that is closing, or that is not a socket,
+    /// is `InvalidInput`; a platform with no equivalent for the option is
+    /// `Unsupported`. A backend never accepts an option it cannot apply.
+    ///
+    /// Bind-time-only options are not reachable here: `SO_REUSEPORT` and
+    /// `SO_REUSEADDR` belong to [`ListenOpts`]/[`UdpOpts`], and a listener's
+    /// per-connection defaults belong to [`AcceptDefaults`]. See [`SocketOption`].
+    pub fn set_option(&mut self, h: Handle, option: SocketOption) -> Result<()> {
+        let r = self.resource(h)?;
+        if r.closing.is_some() || !matches!(r.kind, Kind::Socket) {
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
+        self.backend.set_option(h, option)
+    }
+    /// Read a socket option back from the OS.
+    ///
+    /// Always a fresh kernel query, never a cache of what was set, so a value the
+    /// OS rounded, clamped or doubled is visible as the OS holds it.
+    pub fn get_option(&self, h: Handle, kind: SocketOptionKind) -> Result<SocketOption> {
+        let r = self.resource(h)?;
+        if !matches!(r.kind, Kind::Socket) {
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
+        self.backend.get_option(h, kind)
+    }
     fn submit(&mut self, h: Handle, operation: Operation, token: Token) -> Result<OpId> {
         let r = self.resource(h)?;
         if r.closing.is_some() || !matches!(r.kind, Kind::Socket) {

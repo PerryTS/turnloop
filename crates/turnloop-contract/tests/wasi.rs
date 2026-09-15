@@ -137,6 +137,74 @@ fn timer_liveness() {
 fn timers_io_posts() {
     contract::io_and_posts_progress_with_repeating_timers::<Platform>();
 }
+/// Socket options (issue #34). `wasi:sockets` exposes keep-alive, buffer sizes
+/// and the hop limit and nothing else, so those round-trip through the OS and the
+/// rest must report Unsupported instead of being accepted and dropped.
+#[test]
+fn socket_option_keep_alive() {
+    contract::sockopts::keep_alive_round_trip::<Platform>();
+}
+#[test]
+fn socket_option_buffer_sizes() {
+    contract::sockopts::buffer_sizes_round_trip::<Platform>();
+}
+#[test]
+fn socket_option_ttl() {
+    contract::sockopts::ttl_round_trip::<Platform>();
+}
+#[test]
+fn socket_option_accept_defaults() {
+    contract::sockopts::accept_defaults_keep_alive::<Platform>();
+}
+#[test]
+fn socket_option_handle_validation() {
+    contract::sockopts::option_handle_validation::<Platform>();
+}
+#[test]
+fn socket_options_without_a_wasi_interface_are_unsupported() {
+    use std::time::Duration;
+    use turnloop::{MulticastGroup, SocketOption, SocketOptionKind};
+    let group = MulticastGroup {
+        group: std::net::Ipv4Addr::new(224, 0, 0, 251).into(),
+        interface: 0,
+    };
+    contract::sockopts::unsupported_options_are_reported::<Platform>(&[
+        (SocketOption::NoDelay(true), Some(SocketOptionKind::NoDelay)),
+        (
+            SocketOption::Linger(Some(Duration::ZERO)),
+            Some(SocketOptionKind::Linger),
+        ),
+        (
+            SocketOption::Ipv6Only(true),
+            Some(SocketOptionKind::Ipv6Only),
+        ),
+        (
+            SocketOption::Broadcast(true),
+            Some(SocketOptionKind::Broadcast),
+        ),
+        (
+            SocketOption::MulticastTtl(4),
+            Some(SocketOptionKind::MulticastTtl),
+        ),
+        (
+            SocketOption::MulticastLoop(false),
+            Some(SocketOptionKind::MulticastLoop),
+        ),
+        (SocketOption::MulticastJoin(group), None),
+        (SocketOption::MulticastLeave(group), None),
+    ]);
+}
+/// `wasi:sockets` has no Nagle control, so a listener asking for it as a
+/// per-connection default is refused when it is created.
+#[test]
+fn nodelay_accept_default_rejects_the_listener() {
+    contract::sockopts::unsupported_accept_default_rejects_the_listener::<Platform>(
+        turnloop::AcceptDefaults {
+            nodelay: true,
+            ..turnloop::AcceptDefaults::EMPTY
+        },
+    );
+}
 #[test]
 fn no_spin() {
     contract::no_spin::<Platform>();

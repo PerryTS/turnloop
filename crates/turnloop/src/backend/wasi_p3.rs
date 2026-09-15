@@ -5,6 +5,7 @@
 mod abi;
 mod fs;
 mod return_storage;
+mod sockopt;
 mod wait_set;
 use crate::{
     backend::{Backend, Event, Filesystem, Operation, Outcome, PollInfo, Request, Wake},
@@ -85,6 +86,8 @@ pub struct Detached {
     incoming: Option<wasip3::wit_bindgen::rt::async_support::StreamReader<TcpSocket>>,
     socket: Socket,
     kind: Kind,
+    /// A listener's per-connection defaults, applied to each socket it accepts.
+    accept_defaults: AcceptDefaults,
 }
 struct Resource {
     _udp_return: Option<return_storage::Reservation>,
@@ -368,7 +371,7 @@ unsafe impl Backend for WasiP3 {
         self.wake.clone()
     }
     fn open(&mut self, h: Handle, spec: Open) -> Result<()> {
-        let (addr, kind, reuse, backlog) = match spec {
+        let (addr, kind, reuse, backlog, accept_defaults) = match spec {
             Open::Pipe(_) | Open::PipeListener { .. } => {
                 return Err(Error::new(ErrorKind::Unsupported));
             }
@@ -410,17 +413,27 @@ unsafe impl Backend for WasiP3 {
                         incoming: None,
                         socket: Socket::Stdio,
                         kind: Kind::Stdio(which),
+                        accept_defaults: AcceptDefaults::EMPTY,
                     },
                     None,
                 );
             }
-            Open::Tcp { addr, .. } => (addr, Kind::Tcp, false, 0),
-            Open::Listener { addr, opts } => (addr, Kind::Listener, opts.reuse_port, opts.backlog),
-            Open::Udp { addr, opts } => (addr, Kind::Udp, opts.reuse_port, 0),
+            Open::Tcp { addr, .. } => (addr, Kind::Tcp, false, 0, AcceptDefaults::EMPTY),
+            Open::Listener { addr, opts } => (
+                addr,
+                Kind::Listener,
+                opts.reuse_port,
+                opts.backlog,
+                opts.accept_defaults,
+            ),
+            Open::Udp { addr, opts } => {
+                (addr, Kind::Udp, opts.reuse_port, 0, AcceptDefaults::EMPTY)
+            }
         };
         if reuse {
             return Err(Error::new(ErrorKind::Unsupported));
         }
+        sockopt::validate_accept_defaults(accept_defaults)?;
         let family = if addr.is_ipv4() {
             IpAddressFamily::Ipv4
         } else {
@@ -434,6 +447,7 @@ unsafe impl Backend for WasiP3 {
                 incoming: None,
                 socket: Socket::Udp(s),
                 kind,
+                accept_defaults,
             }
         } else {
             let s = TcpSocket::create(family).map_err(error)?;
@@ -450,9 +464,16 @@ unsafe impl Backend for WasiP3 {
                 incoming,
                 socket: Socket::Tcp(s),
                 kind,
+                accept_defaults,
             }
         };
         self.install(h, transport, (kind == Kind::Tcp).then_some(addr))
+    }
+    fn set_option(&mut self, h: Handle, option: SocketOption) -> Result<()> {
+        sockopt::set(&self.get(h)?.transport.socket, option)
+    }
+    fn get_option(&self, h: Handle, kind: SocketOptionKind) -> Result<SocketOption> {
+        sockopt::get(&self.get(h)?.transport.socket, kind)
     }
     fn local_addr(&self, h: Handle) -> Result<SocketAddr> {
         match &self.get(h)?.transport.socket {
@@ -767,11 +788,15 @@ fn execute(
                 // SAFETY: one canonical owned socket handle was transferred into area[0].
                 let socket = unsafe { TcpSocket::from_handle(p.area[0]) };
                 let peer = native(socket.get_remote_address().map_err(error)?);
+                // Before the connection becomes visible to the host. A rejected
+                // default fails this accept and drops the socket.
+                sockopt::apply_accept_defaults(&socket, r.transport.accept_defaults)?;
                 let transport = Detached {
                     streams: Some(streams(&socket)),
                     incoming: None,
                     socket: Socket::Tcp(socket),
                     kind: Kind::Tcp,
+                    accept_defaults: AcceptDefaults::EMPTY,
                 };
                 let multishot =
                     matches!(p.request.operation, Operation::Accept { multishot: true });

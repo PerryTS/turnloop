@@ -100,6 +100,73 @@ fn now_only_and_unsupported() {
             .kind,
         ErrorKind::Unsupported
     );
+    // A timer is not a socket on any backend, so the core rejects it before the
+    // browser adapter is asked anything (issue #34).
+    let timer = l
+        .timer(l.now() + Duration::from_secs(60), None, Token(2))
+        .expect("timer");
+    assert_eq!(
+        l.set_option(timer, SocketOption::NoDelay(true))
+            .expect_err("a timer is not a socket")
+            .kind,
+        ErrorKind::InvalidInput
+    );
+    assert_eq!(
+        l.get_option(timer, SocketOptionKind::NoDelay)
+            .expect_err("a timer is not a socket")
+            .kind,
+        ErrorKind::InvalidInput
+    );
+    l.close(timer, Token(3)).expect("close");
+    l.turn(Timeout::Now, &mut out).expect("drain");
+}
+/// A browser host has no socket behind its WebSocket, so every option is
+/// reported `Unsupported` rather than accepted and ignored (DESIGN §7.5).
+#[wasm_bindgen_test(async)]
+async fn socket_options_are_unsupported_on_a_host_stream() {
+    let mut l = Loop::new(Config::default()).expect("loop");
+    let h = websocket(&mut l).await;
+    for option in [
+        SocketOption::NoDelay(true),
+        SocketOption::KeepAlive(None),
+        SocketOption::Linger(Some(Duration::ZERO)),
+        SocketOption::RecvBufferSize(4096),
+        SocketOption::SendBufferSize(4096),
+        SocketOption::Ttl(4),
+        SocketOption::Ipv6Only(true),
+        SocketOption::Broadcast(true),
+        SocketOption::MulticastTtl(4),
+        SocketOption::MulticastLoop(true),
+    ] {
+        assert_eq!(
+            l.set_option(h, option).expect_err("no socket here").kind,
+            ErrorKind::Unsupported,
+            "set {option:?}"
+        );
+    }
+    for kind in [
+        SocketOptionKind::NoDelay,
+        SocketOptionKind::KeepAlive,
+        SocketOptionKind::Linger,
+        SocketOptionKind::RecvBufferSize,
+        SocketOptionKind::SendBufferSize,
+        SocketOptionKind::Ttl,
+        SocketOptionKind::Ipv6Only,
+        SocketOptionKind::Broadcast,
+        SocketOptionKind::MulticastTtl,
+        SocketOptionKind::MulticastLoop,
+    ] {
+        assert_eq!(
+            l.get_option(h, kind).expect_err("no socket here").kind,
+            ErrorKind::Unsupported,
+            "get {kind:?}"
+        );
+    }
+    let mut out = Completions::default();
+    l.close(h, Token(93)).expect("close websocket");
+    l.turn(Timeout::Now, &mut out).expect("drain close");
+    assert_eq!(out.len(), 1);
+    assert!(matches!(out[0].result, OpResult::Closed));
 }
 #[wasm_bindgen_test(async)]
 async fn queued_post_with_idle_callback_io_never_waits() {
