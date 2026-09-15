@@ -22,7 +22,7 @@ use std::{
     sync::Arc,
 };
 use windows_sys::Win32::{
-    Foundation::{ERROR_NOT_FOUND, INVALID_HANDLE_VALUE, RtlNtStatusToDosError, STATUS_CANCELLED},
+    Foundation::{ERROR_NOT_FOUND, INVALID_HANDLE_VALUE, RtlNtStatusToDosError},
     Storage::FileSystem::*,
     System::IO::{CancelIoEx, OVERLAPPED},
 };
@@ -301,16 +301,13 @@ impl Watches {
         }
         Ok(true)
     }
+    /// Queue the Cancelled terminal of a cancelling watch whose request is quiescent.
     fn finish(&mut self, h: Handle) {
         let Some(watch) = self.get_mut(h) else { return };
+        debug_assert!(watch.cancelling && !watch.armed);
         if let Some(op) = watch.op.take() {
-            let result = if watch.cancelling {
-                Ok(())
-            } else {
-                Err(Error::new(ErrorKind::Other))
-            };
             self.ops[op.index()] = None;
-            self.finished.push_back((op, result));
+            self.finished.push_back((op, Ok(())));
         }
     }
     /// Apply a port packet addressed to a watch key. Returns false for other keys.
@@ -336,13 +333,13 @@ impl Watches {
         }
         watch.armed = false;
         let h = watch.handle;
-        if watch.cancelling || entry.status == STATUS_CANCELLED {
-            if watch.cancelling {
-                self.finish(h);
-            }
+        if watch.cancelling {
+            // Cancellation acknowledged (or raced with a completion): report Cancelled.
+            self.finish(h);
             return Ok(true);
         }
         if entry.status < 0 {
+            // Includes an unrequested STATUS_CANCELLED: the watch cannot continue.
             // SAFETY: pure NTSTATUS conversion with no pointers.
             let code = unsafe { RtlNtStatusToDosError(entry.status) };
             let error: Error = std::io::Error::from_raw_os_error(code as i32).into();

@@ -302,3 +302,81 @@ fn permission_denied_is_reported() {
     assert!(!l.alive());
     std::fs::remove_dir_all(&dir).expect("cleanup");
 }
+
+/// A cancelled open exposes no handle, and dropping a loop withdraws requests
+/// still queued on the shared pool: their buffers are never accessed afterwards.
+#[test]
+fn cancelled_open_and_loop_drop_never_touch_buffers() {
+    let dir = root("drop");
+    let file = FsPath::new(dir.join("file")).expect("path");
+    std::fs::write(file.as_path(), b"0123456789").expect("fixture");
+    let mut l = Loop::new(Config::default()).expect("loop");
+    let op = l
+        .fs(
+            FsRequest::Open {
+                path: file.clone(),
+                options: FileOptions::default(),
+            },
+            Token(1),
+        )
+        .expect("open");
+    let Ok(FsResult::Opened(h)) = contract::wait(&mut l, op) else {
+        panic!("open")
+    };
+    let hold = Hold::new(&mut l);
+    let hidden = l
+        .fs(
+            FsRequest::Open {
+                path: file.clone(),
+                options: FileOptions::default(),
+            },
+            Token(2),
+        )
+        .expect("queued open");
+    assert!(l.cancel(hidden));
+    let mut head = [0x11u8; 8];
+    let mut queued = [0x22u8; 8];
+    let read = |bytes: &mut [u8]| FsRequest::Read {
+        file: h,
+        // SAFETY: both arrays outlive the loop, which is dropped below.
+        buffer: ReadBuf::Provided(unsafe {
+            IoBufMut::from_raw_parts(bytes.as_mut_ptr(), bytes.len())
+        }),
+        offset: Some(0),
+    };
+    l.fs(read(&mut head), Token(3)).expect("head read");
+    l.fs(read(&mut queued), Token(4)).expect("queued read");
+    drop(l);
+    head.fill(0x33);
+    queued.fill(0x44);
+    let jobs = hold.jobs.len();
+    drop(hold);
+    // Give the released pool threads time to dequeue the withdrawn job.
+    let mut probe = Loop::new(Config::default()).expect("probe loop");
+    let mut out = Completions::default();
+    let op = probe
+        .fs(
+            FsRequest::Stat {
+                path: file.clone(),
+                follow_symlinks: true,
+            },
+            Token(5),
+        )
+        .expect("probe request queues behind the withdrawn job");
+    let until = probe.now() + Duration::from_secs(10);
+    let mut done = false;
+    while !done {
+        assert!(probe.now() < until);
+        probe.turn(Timeout::Until(until), &mut out).expect("turn");
+        for c in out.drain() {
+            assert_eq!(c.op, Some(op));
+            assert!(matches!(c.result, OpResult::Fs(FsResult::Metadata(_))));
+            done = true;
+        }
+    }
+    assert_eq!(jobs, Config::default().blocking_pool.threads);
+    assert_eq!(head, [0x33; 8], "withdrawn head never ran after drop");
+    assert_eq!(queued, [0x44; 8], "queued successor never ran after drop");
+    drop(probe);
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+}

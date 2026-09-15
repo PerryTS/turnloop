@@ -468,6 +468,10 @@ impl FsRequest {
         matches!(self, Self::Open { .. } | Self::OpenDir { .. })
     }
     /// The read buffer to fill, if the request produces bytes.
+    #[cfg_attr(
+        any(turnloop_backend = "web", turnloop_backend = "unsupported"),
+        allow(dead_code)
+    )]
     pub(crate) fn read_buffer(&mut self) -> Option<&mut ReadBuf> {
         match self {
             Self::Read { buffer, .. }
