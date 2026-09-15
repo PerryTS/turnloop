@@ -126,9 +126,14 @@ impl Detached {
     ///
     /// **The IOCP association is permanent and travels with the socket.** Windows
     /// has no way to dissociate a handle from a completion port, and rejects a
-    /// second `CreateIoCompletionPort` for one with `ERROR_INVALID_PARAMETER`, so
-    /// the receiving host cannot put this socket on a port of its own. What it
-    /// can do:
+    /// second `CreateIoCompletionPort` with `ERROR_INVALID_PARAMETER`. Nor is
+    /// there a way around it: the association belongs to the underlying socket,
+    /// and `WSADuplicateSocketW` only produces another descriptor *for that same
+    /// socket*, so a duplicate is refused too (this is asserted, not assumed).
+    ///
+    /// It is inert, though. `Driver::detach` proved the transport quiescent, so
+    /// no completion packet will ever be posted for it. The receiving host has
+    /// two ways to drive it, and one route back:
     ///
     /// * **Synchronous or non-blocking Winsock calls** — `recv`/`send`/`select`
     ///   and `WSARecv`/`WSASend` without an `OVERLAPPED`. These never touch a
@@ -136,10 +141,9 @@ impl Detached {
     /// * **Overlapped calls with `hEvent` tagged** — set the low-order bit of
     ///   `OVERLAPPED.hEvent` (`hEvent | 1`). Windows then skips queueing the
     ///   completion packet, and the host waits on its own event.
-    /// * **Its own completion port** — duplicate first:
-    ///   `WSADuplicateSocketW` into `WSAPROTOCOL_INFOW`, then `WSASocketW` with
-    ///   `FROM_PROTOCOL_INFO`. The duplicate is a new, unassociated socket for the
-    ///   same underlying connection; drop this one once it exists.
+    /// * **Back onto a loop** — `Detached::from_socket` and `Driver::attach`.
+    ///   That is what an imported association is for: the backend detects it and
+    ///   routes completions through overlapped events instead of the port.
     ///
     /// Issuing an untagged overlapped call is the one thing that is not allowed:
     /// its completion packet would arrive on the source loop's port carrying an
@@ -163,12 +167,12 @@ impl Detached {
     /// other property is handed over unchanged, including
     /// `FILE_FLAG_OVERLAPPED` on a pipe instance: the receiving host must supply
     /// an `OVERLAPPED` for every `ReadFile`/`WriteFile`, and the IOCP rules in
-    /// [`into_socket`](Self::into_socket) apply unchanged. For a pipe the
-    /// duplication escape hatch does **not** exist — `DuplicateHandle` shares the
-    /// same file object and therefore the same association — so tagging
-    /// `OVERLAPPED.hEvent` with its low-order bit (`hEvent | 1`) is the only way
-    /// to drive it, and it is enough: the host waits on its own event and the
-    /// source loop's port never sees a packet.
+    /// [`into_socket`](Self::into_socket) apply unchanged — `DuplicateHandle`
+    /// shares the file object and therefore the association, exactly as
+    /// `WSADuplicateSocketW` does for a socket. So tagging `OVERLAPPED.hEvent`
+    /// with its low-order bit (`hEvent | 1`) is how a host drives one, and it is
+    /// enough: the host waits on its own event and the source loop's port never
+    /// sees a packet.
     pub fn into_handle(self) -> Result<OwnedHandle> {
         match self.native {
             Native::Handle(_) => {}

@@ -272,13 +272,17 @@ resource out keeps refusing in `detach`, as the IOCP backend does for pipe
 listeners and connecting pipes.
 
 Windows is the one platform where the handoff has a standing consequence. An IOCP
-association cannot be undone, so it travels with the handle; quiescence makes it
-inert, and the receiving host uses synchronous/non-blocking calls, tags
-`OVERLAPPED.hEvent` with its low-order bit to suppress the completion packet, or
-(sockets only) duplicates out of the association with `WSADuplicateSocketW`. An
-untagged overlapped call would deliver a packet to the source loop's port with a
-foreign `OVERLAPPED`; that loop reports `InvalidInput` from `turn` rather than
-dereferencing it, which is the existing `entry` guard, not a new rule.
+association cannot be undone and cannot be duplicated away — it belongs to the
+underlying socket or file object, so `WSADuplicateSocketW` and `DuplicateHandle`
+both inherit it — so it travels with the handle. Quiescence makes it inert, and
+the receiving host uses synchronous/non-blocking calls or tags
+`OVERLAPPED.hEvent` with its low-order bit to suppress the completion packet; a
+host that wants completion-port-driven I/O again hands the transport back through
+`Detached::from_socket`/`from_handle` and `attach`, whose imported-association
+routing already exists for exactly this. An untagged overlapped call would deliver
+a packet to the source loop's port with a foreign `OVERLAPPED`; that loop reports
+`InvalidInput` from `turn` rather than dereferencing it, which is the existing
+`entry` guard, not a new rule.
 
 ## Specification clarifications proposed for review
 

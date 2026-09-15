@@ -98,8 +98,8 @@ Decisions, all written into the rustdoc, DESIGN §5a/§7.6 and
 | --- | --- | --- | --- |
 | Linux (epoll) | `Detached::into_fd` | `RawTransport::Fd` | `detach` deregisters from epoll first; closing the last descriptor would too, but the loop no longer owns it |
 | macOS/BSD (kqueue) | `Detached::into_fd` | `RawTransport::Fd` | identical; termios restored for an adopted terminal |
-| Windows (IOCP), socket | `Detached::into_socket` | `RawTransport::Socket` | IOCP association is permanent — see below |
-| Windows (IOCP), named-pipe instance | `Detached::into_handle` | `RawTransport::Handle` | keeps `FILE_FLAG_OVERLAPPED`; association is permanent and cannot be duplicated away |
+| Windows (IOCP), socket | `Detached::into_socket` | `RawTransport::Socket` | IOCP association is permanent and inescapable — see below |
+| Windows (IOCP), named-pipe instance | `Detached::into_handle` | `RawTransport::Handle` | keeps `FILE_FLAG_OVERLAPPED`; same permanent association |
 | Windows (IOCP), pipe listener / connecting pipe | refused by `detach` (`Unsupported`) | `Unsupported` (no instance of its own) | unchanged from before this lane |
 | WASI 0.2 | `Unsupported` | `Unsupported` | a `wasi:sockets` socket is a component-model resource handle in the component's own table, not a descriptor; no interface hands one to the embedder |
 | WASI 0.3 | `Unsupported` | `Unsupported` | same reason |
@@ -109,14 +109,26 @@ Decisions, all written into the rustdoc, DESIGN §5a/§7.6 and
 
 Windows cannot dissociate a handle from a completion port. `CreateIoCompletionPort`
 on an already-associated handle fails with `ERROR_INVALID_PARAMETER`, and the
-association lives on the *file object*, so `DuplicateHandle` shares it. The
-association therefore travels with every socket and pipe instance turnloop hands
-over, for the life of that handle.
+association lives on the underlying socket / file object rather than on the
+descriptor — so **duplication does not escape it either**: `DuplicateHandle` for a
+pipe and `WSADuplicateSocketW` + `WSASocketW` for a socket both produce another
+descriptor for the same object, and the duplicate is refused too. The association
+therefore travels with every socket and pipe instance turnloop hands over, for the
+life of that object.
+
+That last point is a correction this lane's own test forced. The first version of
+`a_handed_off_socket_keeps_its_association_and_duplicates_out_of_it` asserted that
+a `WSADuplicateSocketW` duplicate *could* join a fresh port — the reading of MSDN
+that seemed obvious — and Windows CI failed it with `ERROR_INVALID_PARAMETER` on
+all three arms. The test is now
+`a_handed_off_socket_keeps_its_association_even_through_a_duplicate` and asserts
+what Windows actually does, and the rustdoc, DESIGN §5a and
+`docs/BACKEND_REVISION_2.md` were corrected with it.
 
 What saves this is quiescence: `detach` refuses until every operation has
 terminated, so **no completion packet can ever be posted to the source loop's port
 for that handle by turnloop**. The association is inert. The receiving host has
-three ways to work with it:
+two ways to drive the transport, and one route back:
 
 1. **Synchronous or non-blocking Winsock calls** — `recv`/`send`/`select`, or
    `WSARecv`/`WSASend` with no `OVERLAPPED`. These never involve a completion port.
@@ -125,13 +137,14 @@ three ways to work with it:
    `OVERLAPPED.hEvent` (`hEvent | 1`). Windows then does not queue the completion
    packet, and the host waits on its own event and calls `GetOverlappedResult`.
    This is the *only* way to drive a handed-over **named pipe**, because a pipe
-   instance keeps `FILE_FLAG_OVERLAPPED` (every `ReadFile`/`WriteFile` needs an
-   `OVERLAPPED`) and cannot duplicate out of its association. turnloop's own
-   `pipes::Connect` already relies on the inverse of this rule.
-3. **Duplicating out of it — sockets only** — `WSADuplicateSocketW` into a
-   `WSAPROTOCOL_INFOW`, then `WSASocketW` with `FROM_PROTOCOL_INFO`. The result is
-   a *new*, unassociated socket for the same connection, which the host may put on
-   its own completion port; the original is then closed.
+   instance keeps `FILE_FLAG_OVERLAPPED`: every `ReadFile`/`WriteFile` needs an
+   `OVERLAPPED`. turnloop's own `pipes::Connect` already relies on the inverse of
+   this rule ("the event's low bit is clear for IOCP delivery").
+3. **Back onto a loop** — `Detached::from_socket`/`from_handle` + `Loop::attach`.
+   An imported association is precisely what the IOCP backend's overlapped-event
+   routing exists for, so a host that wants completion-driven async I/O again asks
+   turnloop for it rather than fighting Windows. The allocation gate exercises this
+   round trip 100 times on Windows.
 
 The one thing a host must not do is an **untagged overlapped call**. Its completion
 packet would arrive on the source loop's port carrying an `OVERLAPPED` that loop
@@ -210,12 +223,12 @@ different for two live transports, unchanged after the socket is used, and the
 socket still works after being reported (reporting is read-only). A timer reports
 `Unsupported` from `raw_transport` and `InvalidInput` from `detach`.
 
-**`a_handed_off_socket_keeps_its_association_and_duplicates_out_of_it`**
+**`a_handed_off_socket_keeps_its_association_even_through_a_duplicate`**
 (Windows) — `CreateIoCompletionPort` on the handed-over socket fails with
 `ERROR_INVALID_PARAMETER`; synchronous Winsock I/O then carries bytes both ways;
-the loop stays quiet; and `WSADuplicateSocketW` + `WSASocketW` produces a socket
-that **does** associate with the test's own port. The documented escape hatch is
-executed, not asserted in prose.
+the loop stays quiet; and a `WSADuplicateSocketW` + `WSASocketW` duplicate is
+refused by the same port for the same reason, because it is another descriptor for
+the same socket. This is the test that corrected the documentation.
 
 **`a_handed_off_named_pipe_is_driven_with_a_tagged_event`** (Windows) — a
 connected named-pipe instance is handed over; association is proved permanent the
@@ -297,11 +310,9 @@ nothing else, which is why the six-mode matrix skips it by name.
 - **TLS on turnloop as the answer for the upgrade case** (the issue's option 3).
   `turnloop-tls` exists and Perry P5 uses it; this lane makes the *general* handoff
   work, which is what unblocks P1 now and what `socket._handle.fd` needs anyway.
-- **No automatic duplication on Windows.** `into_socket` could have duplicated out
-  of the IOCP association for the host, but a pipe cannot (the association is on
-  the file object), so it would be an inconsistency dressed as a convenience — and
-  it would silently change the socket the host asked for. The recipe is documented
-  and tested instead.
+- **No automatic duplication on Windows.** It was considered and is now known to
+  be impossible: a duplicate inherits the association (see above), so there is
+  nothing `into_socket` could have done for the host that the host cannot do.
 - **No `Detached::into_fd` for WASI.** A `wasi:sockets` resource could in principle
   be handed to another component, but there is no descriptor and no interface for
   it; inventing one would be a `wasi:sockets` proposal, not a turnloop change.

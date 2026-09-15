@@ -374,8 +374,9 @@ mod iocp {
         }
         Ok(())
     }
-    /// `WSADuplicateSocketW` + `WSASocketW`: the documented escape hatch for a
-    /// host that needs a socket on a completion port of its own.
+    /// `WSADuplicateSocketW` + `WSASocketW`. The new descriptor references the
+    /// *same underlying socket*, which is where the completion-port association
+    /// lives, so this does not escape it — the test below proves that.
     fn duplicate(socket: RawSocket) -> ws::SOCKET {
         // SAFETY: valid zeroed C output storage for the protocol information.
         let mut info: ws::WSAPROTOCOL_INFOW = unsafe { std::mem::zeroed() };
@@ -404,7 +405,7 @@ mod iocp {
     }
 
     #[test]
-    fn a_handed_off_socket_keeps_its_association_and_duplicates_out_of_it() {
+    fn a_handed_off_socket_keeps_its_association_even_through_a_duplicate() {
         let mut l = Loop::new(Config::default()).expect("loop");
         let (h, mut peer) = connected(&mut l);
         exchange_through_the_loop(&mut l, h, &mut peer);
@@ -438,13 +439,23 @@ mod iocp {
         assert_eq!(&bytes, b"and back");
         assert_quiet(&mut l);
 
-        // A host that wants its own overlapped I/O duplicates first; the
-        // duplicate is a new socket for the same connection, with no association.
+        // There is no way out of the association. `WSADuplicateSocketW` gives a
+        // new *descriptor* for the same underlying socket, and the association
+        // belongs to that socket, so the duplicate inherits it. (Windows CI
+        // caught this: the first version of this test asserted the opposite.)
+        // The route back to completion-port-driven I/O is `Loop::attach`, which
+        // detects an imported association and routes through overlapped events.
         let duplicate = duplicate(raw);
-        associate(duplicate as HANDLE, &port, 2).expect("a duplicate joins a port");
-        drop(socket);
+        let refused = associate(duplicate as HANDLE, &port, 2)
+            .expect_err("a duplicate shares the original's association");
+        assert_eq!(
+            refused.raw_os_error(),
+            Some(ERROR_INVALID_PARAMETER as i32),
+            "unexpected duplicate association error: {refused}"
+        );
         // SAFETY: the duplicate is this test's and is used no further.
         assert_eq!(unsafe { ws::closesocket(duplicate) }, 0);
+        drop(socket);
     }
 
     #[test]
