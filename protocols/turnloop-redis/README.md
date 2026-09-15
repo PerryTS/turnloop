@@ -30,7 +30,7 @@ transport failures use retry policy. The host reports transport/DNS/TLS errors.
 
 ## Getting started on turnloop
 
-Enable `turnloop-redis = { version = "0.1.0-alpha.1", features = ["turnloop"] }`
+Enable `turnloop-redis = { version = "0.1.0-alpha.2", features = ["turnloop"] }`
 and use the `asynchronous` module: `Client::command/pipeline, Subscriber::next, ClusterClient and sentinel`. The default feature set remains sans-I/O.
 The adapter reuses `turnloop-io`; the host owns `LocalExecutor` and calls `turn`.
 Spawn local futures through its handle and keep their `JoinHandle`s until completion.

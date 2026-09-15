@@ -6,7 +6,7 @@ in the default sans-I/O feature set. The crate forbids unsafe. TLS and entropy a
 
 ## Getting started on turnloop
 
-Enable `turnloop-mysql = { version = "0.1.0-alpha.1", features = ["turnloop"] }`
+Enable `turnloop-mysql = { version = "0.1.0-alpha.2", features = ["turnloop"] }`
 and use the `asynchronous` module: `Connection::connect, query, prepare/execute, begin and Pool::acquire`. The default feature set remains sans-I/O.
 The adapter reuses `turnloop-io`; the host owns `LocalExecutor` and calls `turn`.
 Spawn local futures through its handle and keep their `JoinHandle`s until completion.

@@ -59,7 +59,7 @@ under workspace `.tools/`. Test certificate keys are public fixture data.
 
 ## Getting started on turnloop
 
-Enable `turnloop-smtp = { version = "0.1.0-alpha.1", features = ["turnloop"] }`
+Enable `turnloop-smtp = { version = "0.1.0-alpha.2", features = ["turnloop"] }`
 and use the `asynchronous` module: `Transport::connect and send`. The default feature set remains sans-I/O.
 The adapter reuses `turnloop-io`; the host owns `LocalExecutor` and calls `turn`.
 Spawn local futures through its handle and keep their `JoinHandle`s until completion.
