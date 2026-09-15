@@ -91,6 +91,13 @@ jobs:
         env:
           GIT_TOKEN: ${{ steps.app.outputs.token }}
           RUSTUP_TOOLCHAIN: nightly-2026-08-20
+          # release-plz resolves each crate against the registry, where our own
+          # siblings are hours old, so the seven-day publish-age soak rejects
+          # them ("turnloop-io = ^0.1.0-alpha.3 is too new"). The soak exists for
+          # third-party supply chain, and this resolution produces no artifact:
+          # every lockfile the release PR carries is still gated by
+          # scripts/ci/soak.py in required CI, which no exception here can skip.
+          CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE: allow
         run: release-plz release-pr --repo-url https://github.com/PerryTS/turnloop --config release-plz.toml
   dispatch-publish:
     needs: verify
