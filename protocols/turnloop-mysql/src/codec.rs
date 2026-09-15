@@ -1,5 +1,6 @@
 //! Reusable plain/compressed MySQL framing. mysql_common's compressed codec
-//! creates a zlib encoder/decoder per frame; this one resets retained states.
+//! creates a zlib encoder/decoder per frame; this one retains both for the
+//! connection and never resets the encoder (see `zlib.rs`).
 use crate::{Error, Result};
 use bytes::{Buf, BytesMut};
 use flate2::{Compress, Compression, Decompress, FlushDecompress, Status};

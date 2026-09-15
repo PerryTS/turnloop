@@ -84,8 +84,11 @@ terminates input. To reject an enabled request safely, abort the connection.
 
 Compression negotiates CLIENT_COMPRESS. Plain and compressed framing handle
 24-bit lengths, sequence wrapping, continuation and exact-boundary empty frames.
-The outer zlib encoder/decoder states are retained and reset; upstream's
-per-frame zlib construction did not satisfy this lane's allocation contract.
+The outer zlib encoder/decoder states are retained for the connection; upstream's
+per-frame zlib construction did not satisfy this lane's allocation contract. The
+encoder is never reset either — each frame is a full-flushed segment wrapped in
+its own RFC 1950 header, final block and Adler-32 (`src/zlib.rs`), because
+resetting a deflate state reallocates its LZ buffer on wasm32.
 Zstd and MariaDB extensions are out of scope.
 
 ## mysql2 conversions and hooks
