@@ -1184,6 +1184,7 @@ mod udp_tests {
                     .expect("new empty socket waits");
                 assert!(events.is_empty(), "old datagram crossed socket lifetime");
                 assert_eq!(info.waits, 1);
+                assert_eq!(info.discovery_polls, 0);
                 assert!(Instant::now() >= at);
                 assert_eq!(peer.send_to(b"new", endpoint).expect("new packet"), 3);
                 backend

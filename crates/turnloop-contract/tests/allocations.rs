@@ -66,6 +66,80 @@ unsafe impl GlobalAlloc for Counting {
 }
 #[global_allocator]
 static ALLOCATOR: Counting = Counting;
+
+#[test]
+fn queued_posts_and_terminals_with_idle_udp_allocate_nothing() {
+    ALLOCS.set(0);
+    ACTIVE.set(true);
+    let calibration = std::hint::black_box(Box::new([0x49_u8; 64]));
+    ACTIVE.set(false);
+    assert_eq!(calibration[63], 0x49);
+    assert_eq!(ALLOCS.get(), 1, "allocator must detect real work");
+    let mut driver = Loop::new(Config::default()).expect("loop");
+    let socket = driver
+        .udp_bind(([127, 0, 0, 1], 0).into(), &UdpOpts::default())
+        .expect("UDP");
+    let read = driver
+        .recv(socket, ReadBuf::Pooled, Token(1))
+        .expect("idle receive");
+    let poster = driver.poster();
+    let mut out = Completions::with_capacity(1);
+    driver
+        .turn(Timeout::Now, &mut out)
+        .expect("arm idle receive");
+    assert!(out.is_empty());
+    for measured in [false, true] {
+        ALLOCS.set(0);
+        ACTIVE.set(measured);
+        let mut delivered = 0;
+        let mut discovery_polls = 0;
+        for sequence in 0..1000 {
+            poster.post(Token(2), Payload::U64(sequence)).expect("post");
+            let info = driver.turn(Timeout::Now, &mut out).expect("post turn");
+            assert_eq!(info.os_waits, 0);
+            assert_eq!(info.discovery_polls, 1);
+            discovery_polls += info.discovery_polls;
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].token, Token(2));
+            assert!(
+                matches!(out[0].result, OpResult::Posted(Payload::U64(value)) if value == sequence)
+            );
+            delivered += 1;
+            let timer = driver
+                .timer(driver.now() + Duration::from_secs(30), None, Token(3))
+                .expect("timer");
+            driver
+                .close(timer, Token(4))
+                .expect("queue terminal results");
+            for token in [Token(3), Token(4)] {
+                let info = driver.turn(Timeout::Now, &mut out).expect("terminal turn");
+                assert_eq!(info.os_waits, 0);
+                assert_eq!(info.discovery_polls, 1);
+                discovery_polls += info.discovery_polls;
+                assert_eq!(out.len(), 1);
+                assert_eq!(out[0].handle, Some(timer));
+                assert_eq!(out[0].token, token);
+                assert!(out[0].terminal);
+                assert!(if token == Token(3) {
+                    matches!(out[0].result, OpResult::Cancelled)
+                } else {
+                    matches!(out[0].result, OpResult::Closed)
+                });
+                delivered += 1;
+            }
+        }
+        ACTIVE.set(false);
+        assert_eq!(delivered, 3000);
+        assert_eq!(discovery_polls, 3000);
+        assert_eq!(
+            ALLOCS.get(),
+            0,
+            "queued posts/terminal results with idle native I/O"
+        );
+    }
+    assert!(driver.cancel(read), "idle receive remained pending");
+}
+
 fn exchange(
     l: &mut Loop,
     a: Handle,
@@ -826,6 +900,7 @@ fn file_readiness_survives_pool_backpressure_without_allocations_or_spin() {
         .turn(Timeout::Until(at), &mut out)
         .expect("pool exhaustion wait");
     assert_eq!(info.os_waits, 1);
+    assert_eq!(info.discovery_polls, 0);
     assert_eq!(info.zero_event_waits, 1);
     assert!(l.now() >= at);
     assert_eq!(out.len(), 1);
@@ -1035,7 +1110,10 @@ fn quiet_deadline_waits_have_identical_accounting_without_allocations() {
             let h = l.timer(at, None, token).expect("timer");
             let op = l.timer_op(h).expect("timer operation");
             let info = l.turn(Timeout::Until(at), &mut out).expect("quiet wait");
-            assert_eq!((info.os_waits, info.zero_event_waits), (1, 1));
+            assert_eq!(
+                (info.os_waits, info.discovery_polls, info.zero_event_waits),
+                (1, 0, 1)
+            );
             assert!(l.now() >= at);
             assert_eq!(out.len(), 1);
             assert_eq!(
@@ -1045,7 +1123,10 @@ fn quiet_deadline_waits_have_identical_accounting_without_allocations() {
             assert!(matches!(out[0].result, OpResult::Timer));
             l.close(h, token).expect("close timer");
             let info = l.turn(Timeout::Now, &mut out).expect("queued close");
-            assert_eq!((info.os_waits, info.zero_event_waits), (0, 0));
+            assert_eq!(
+                (info.os_waits, info.discovery_polls, info.zero_event_waits),
+                (0, 0, 0)
+            );
             assert_eq!(out.len(), 1);
             assert!(matches!(out[0].result, OpResult::Closed));
             expiries += 1;
@@ -1345,7 +1426,7 @@ fn windows_child_watch_cancel_exit_and_close_allocate_nothing_after_setup() {
     let info = driver
         .turn(Timeout::After(Duration::from_secs(2)), &mut out)
         .expect("cancel watch turn");
-    assert_eq!(info.os_waits, 0);
+    assert_eq!((info.os_waits, info.discovery_polls), (0, 0));
     assert_eq!(out.len(), 8);
     for completion in out.drain() {
         let i = completion.token.0 as usize;
@@ -1498,10 +1579,11 @@ fn windows_backlog_accept_rearm_and_busy_deadlines_allocate_nothing() {
         let mut waits = 0;
         loop {
             assert!(client.now() < at + Duration::from_secs(3));
-            waits += client
+            let info = client
                 .turn(Timeout::Until(at + Duration::from_secs(3)), &mut out)
-                .expect("busy wait expiry")
-                .os_waits;
+                .expect("busy wait expiry");
+            // Revision-2 wait counts included zero-time calls: keep that total.
+            waits += info.os_waits + info.discovery_polls;
             if out.is_empty() {
                 continue;
             }

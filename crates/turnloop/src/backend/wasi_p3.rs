@@ -614,10 +614,10 @@ unsafe impl Backend for WasiP3 {
             }
         }
         self.run_ready(events);
-        Ok(PollInfo {
-            waits: 1,
-            zero_event_waits: u32::from(kind == 0),
-        })
+        Ok(PollInfo::native(
+            if blocking { None } else { Some(Duration::ZERO) },
+            kind == 0,
+        ))
     }
     fn release(&mut self, h: Handle) {
         if self.get(h).is_ok() {

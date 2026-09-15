@@ -107,8 +107,11 @@ Backend selection is `crates/turnloop/build.rs:8`; CI matrices are
 
 ## 3. Remaining blockers and qualification of green CI
 
-1. **Reproduced outside current gates:** queued post + idle UDP makes an OS poll
-   despite §10.3; WASI 0.2 compressed MongoDB commands allocate once per command.
+1. **Reproduced outside current gates:** WASI 0.2 compressed MongoDB commands
+   allocate once per command. (The queued post + idle UDP OS poll was resolved by
+   the tl-i01b amendment of DESIGN §10 rule 3: queued turns never block, may make one
+   zero-timeout discovery poll only with native operations pending, and make no OS
+   call otherwise; `discovery_polls` is counted separately from blocking waits.)
    See [local evidence](AUDIT_EVIDENCE.md#local-failures-and-probes).
 2. **No-spin assurance is partial:** ordinary native/WASI/web subjects pass;
    WASI private timer events undercount `zero_event_waits`, and p3 still relies on

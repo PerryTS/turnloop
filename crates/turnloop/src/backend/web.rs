@@ -389,6 +389,7 @@ unsafe impl Backend for Web {
         if self.has_work() {
             wake(self.id).map_err(error)?;
         }
+        // Draining callbacks performs neither a blocking wait nor native discovery.
         Ok(PollInfo::default())
     }
     fn release(&mut self, h: Handle) {

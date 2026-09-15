@@ -34,16 +34,21 @@
 //!
 //! * `poll` appends at most `events.capacity() - events.len()` Events; never grows
 //!   the vector. A full buffer retains work for the next turn, without losing an
-//!   edge. It performs at most one blocking OS wait, and zero waits if work is
-//!   already queued or can be executed using cached readiness. `None` means an
-//!   unbounded wait. Durations must retain sub-millisecond precision.
+//!   edge. At most one OS wait is allowed (DESIGN §10 rule 3). Queued work
+//!   prohibits blocking waits: the driver passes a zero timeout, and calls poll
+//!   for that one discovery poll only with native operations pending and native
+//!   output reserve. With no native operation pending, the driver skips poll for
+//!   queued work, whatever `has_work` reports (web, whose poll never
+//!   enters the OS, keeps draining cached host work). `None` means an unbounded
+//!   wait. Durations must retain sub-millisecond precision.
 //! * Readiness backends execute I/O in poll, cache readiness until EAGAIN, and
 //!   requeue partially processed work fairly. Completion backends drain native
 //!   completions. WASI 0.2 polls pollables; 0.3 drives a waitable set; web drains
 //!   callback results and rejects blocking waits on the main thread.
 //! * EINTR ends this poll early; it must not restart the timeout. `PollInfo.waits`
-//!   reports actual wait invocations for the contract tests; `zero_event_waits`
-//!   counts OS waits with no native I/O or notifier events, including EINTR.
+//!   counts positive-timeout/infinite waits; `discovery_polls` counts zero-time
+//!   native polls. Their sum is at most one. `zero_event_waits`
+//!   counts raw empty calls across both counters, including EINTR.
 //!   Private timeout events (e.g. timerfd expiry) count as zero-event waits, just
 //!   like a timed OS wait returning zero; never infer this from user completions.
 //! * Cached readiness ending in EAGAIN with no completion must retain the original
@@ -199,11 +204,34 @@ pub enum Outcome<D> {
 #[derive(Clone, Copy, Debug, Default)]
 /// Instrumentation for the single bounded backend wait.
 pub struct PollInfo {
-    /// Actual OS wait invocations, at most one for this poll.
+    /// Blocking native wait invocations (positive timeout or infinite).
     pub waits: u32,
-    /// OS waits with no native I/O or notifier events (including interrupted waits).
+    /// Nonblocking native discovery invocations (zero timeout).
+    /// `waits + discovery_polls` is at most one per poll.
+    pub discovery_polls: u32,
+    /// Native wait/discovery invocations with no I/O or notifier events, including EINTR.
+    /// Bounded by `waits + discovery_polls`; retains revision-2 raw empty-poll accounting.
     /// Private timeout events, such as timerfd expiry, are not native work.
     pub zero_event_waits: u32,
+}
+
+#[cfg(any(
+    turnloop_backend = "epoll",
+    turnloop_backend = "kqueue",
+    turnloop_backend = "iocp",
+    turnloop_backend = "wasi_p2",
+    all(turnloop_backend = "wasi_p3", feature = "wasi-p3-experimental")
+))]
+impl PollInfo {
+    /// Record one native wait/discovery call using its effective timeout.
+    pub(crate) fn native(timeout: Option<Duration>, empty: bool) -> Self {
+        let discovery = timeout == Some(Duration::ZERO);
+        Self {
+            waits: u32::from(!discovery),
+            discovery_polls: u32::from(discovery),
+            zero_event_waits: u32::from(empty),
+        }
+    }
 }
 
 /// # Safety

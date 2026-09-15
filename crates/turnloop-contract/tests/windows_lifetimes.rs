@@ -471,7 +471,11 @@ fn cancelled_child_watch_completes_while_child_is_alive() {
     let info = driver
         .turn(Timeout::After(Duration::from_secs(2)), &mut out)
         .expect("one cancellation turn");
-    assert_eq!(info.os_waits, 0, "cancelled watch is immediately ready");
+    assert_eq!(
+        (info.os_waits, info.discovery_polls),
+        (0, 0),
+        "cancelled watch is immediately ready"
+    );
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].handle, Some(child.handle));
     assert_eq!(out[0].token, Token(1));
@@ -713,7 +717,10 @@ fn busy_pipe_connect_parks_expires_cancels_and_retries() {
     let info = client
         .turn(Timeout::Until(at), &mut out)
         .expect("pending availability wait");
-    assert_eq!((info.os_waits, info.zero_event_waits), (1, 1));
+    assert_eq!(
+        (info.os_waits, info.discovery_polls, info.zero_event_waits),
+        (1, 0, 1)
+    );
     assert!(client.now() >= at && out.is_empty());
     server
         .accept(listener, Token(4))
@@ -1118,7 +1125,10 @@ fn listener_reuse_and_busy_connect_drop_release_native_handles() {
             let info = client
                 .turn(Timeout::Until(at), &mut out)
                 .expect("park availability before drop");
-            assert_eq!((info.os_waits, info.zero_event_waits), (1, 1));
+            assert_eq!(
+                (info.os_waits, info.discovery_polls, info.zero_event_waits),
+                (1, 0, 1)
+            );
             assert!(client.now() >= at && out.is_empty());
             drop(client); // must cancel/drain the pending FSCTL before freeing its input
             server

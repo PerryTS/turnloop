@@ -249,7 +249,8 @@ fn idle_keepalive(h2: bool) {
                 let info = executor.turn(Timeout::Until(at)).expect("turn");
                 turns += 1;
                 empty += info.zero_event_waits;
-                waits += info.os_waits;
+                // Old revision-2 wait counts included zero-time calls: keep that total.
+                waits += info.os_waits + info.discovery_polls;
             }
             assert!(empty <= 1);
             assert!(waits > 0);

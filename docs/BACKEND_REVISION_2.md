@@ -9,7 +9,8 @@ No tag or commit is created from this read-only Git checkout.
 
 The full contract is rustdoc on `turnloop::backend::Backend`. Generational
 `Handle`/`OpId`, buffer ownership, cancellation acknowledgements, bounded output,
-notifier parking and the single-wait/no-spin rules are unchanged.
+notifier parking and the no-spin rule are unchanged. The spec-owner-approved
+tl-i01b amendment below refines the single-wait rule.
 
 | Addition | Purpose and required behavior |
 |---|---|
@@ -41,6 +42,41 @@ and `ExternalWait`. A process is still an ordinary referenced handle after its
 exit completion; close it, or unref it when the host does not want it keeping the
 loop alive. `signal_stop` emits `Stopped` then `Closed`. A resize subscription is
 an independent signal handle; stop it explicitly when finished with the TTY.
+
+## Blocking waits and nonblocking discovery (tl-i01b)
+
+DESIGN D7 and §10 rule 3 permit at most one OS wait per turn. Queued work
+(posts, blocking-pool and external-wait results, synchronous or terminal
+completions) prohibits positive-timeout or infinite waits.
+One zero-time native discovery poll is permitted only with native operations
+pending and native output reserve available. Queued work with no native operation
+pending makes no OS call. This retains fresh-I/O fairness through sustained
+queued posts/timers, as libuv does with its zero-timeout `uv__io_poll`.
+
+The driver enforces the skip; backends need no new method. On native and WASI
+backends a queued turn with no native operation never calls `poll`,
+even when `has_work()` reports stale cached readiness, because draining it could
+fall through to the OS. The web backend's poll only drains host callbacks and
+Worker/condition rings and never enters the OS, so it keeps revision 2's policy of
+polling for cached host work. A lookup accepted by `Backend::resolve` (WASI 0.2)
+counts as a pending native operation, like socket I/O.
+
+`PollInfo::waits` and `TurnInfo::os_waits` now count only blocking waits;
+`discovery_polls` counts zero-time native polls in both types. The two counters
+sum to at most one. Callers that meant all invocations must add them; Now-only
+benchmarks use `discovery_polls`. `zero_event_waits` retains its revision-2 meaning:
+raw empty native calls **across both categories**, including EINTR and private
+timeout events, never inferred from user completions. The no-spin gates retain
+all previous numerical bounds and count both invocation categories.
+
+Epoll (including timerfd), kqueue, direct IOCP and WASI p2 classify the effective
+native timeout. WASI p3 classifies its actual wait-set step (wait versus poll),
+including a deadline already completed during setup. Its existing cooperative
+host yield remains part of discovery; the documented experimental scheduler
+limitations remain. Web callback draining and IOCP Event-helper queue draining
+report zero in both counters: neither performs a native wait/discovery call on
+the turning thread. The opted-in helper's independent waits are outside the turn,
+just as the GUI host's external wait is. No default helper or new collection API.
 
 ## Native implementation and ownership
 

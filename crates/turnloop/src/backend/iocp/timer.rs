@@ -290,7 +290,10 @@ mod tests {
         let info = backend
             .poll(Some(Duration::from_secs(30)), &mut out)
             .expect("first wait");
-        assert_eq!((info.waits, info.zero_event_waits), (1, 0));
+        assert_eq!(
+            (info.waits, info.discovery_polls, info.zero_event_waits),
+            (1, 0, 0)
+        );
         assert!(out.is_empty());
         assert!(backend.timer_pending && backend.timer.active);
         let generation = backend.timer.generation;
@@ -315,7 +318,10 @@ mod tests {
         let info = backend
             .poll(Some(Duration::from_secs(30)), &mut out)
             .expect("drain pending timer");
-        assert_eq!((info.waits, info.zero_event_waits), (1, 1));
+        assert_eq!(
+            (info.waits, info.discovery_polls, info.zero_event_waits),
+            (1, 0, 1)
+        );
         assert_eq!(backend.timer.generation, generation, "no premature rearm");
         assert_eq!(
             CANCELS.with(Cell::get),

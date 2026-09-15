@@ -110,6 +110,19 @@ and lockfile together. Do not add a cargo-deny advisory ignore. rustls 0.23.45 w
 published at `2026-09-14T15:11:17Z`, so its exception is no longer usable at
 `2026-09-21T15:11:17Z`, even though the policy stores only the date `2026-09-21`.
 
+## Wait and discovery counters
+
+DESIGN §10 rule 3 allows at most one OS wait per turn. Queued work (posts, pool
+results, terminal completions) forbids blocking waits; one zero-time discovery poll is allowed
+only with native operations pending and native output reserve. Queued work with no
+native operation pending makes no OS call. For queued turns with pending native
+work test `os_waits == 0` and `discovery_polls <= 1` (exactly 1 where the backend has
+no cached work); require both zero without native operations. For all-call totals
+and bounds use their sum. Preserve the raw `zero_event_waits` counter across both
+categories and every §10 rule 4a no-spin bound. Callback/Event-helper queue draining
+is neither kind of native call.
+See [Backend revision 2](docs/BACKEND_REVISION_2.md#blocking-waits-and-nonblocking-discovery-tl-i01b).
+
 ## Workspace discovery and test metadata
 
 Scripts use `cargo metadata` and its `workspace_members`, never a crate list or

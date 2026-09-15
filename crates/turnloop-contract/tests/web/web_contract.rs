@@ -40,6 +40,7 @@ async fn scheduled(l: &mut Loop, out: &mut Completions) {
         .expect("scheduled turn");
     let info = l.turn(Timeout::Now, out).expect("turn");
     assert_eq!(info.os_waits, 0);
+    assert_eq!(info.discovery_polls, 0);
     assert_eq!(info.zero_event_waits, 0);
     // Clear the callback before dropping the Rust closure.
     l.set_schedule_turn(&Function::new_no_args(""))
@@ -100,6 +101,72 @@ fn now_only_and_unsupported() {
         ErrorKind::Unsupported
     );
 }
+#[wasm_bindgen_test(async)]
+async fn queued_post_with_idle_callback_io_never_waits() {
+    let mut l = Loop::new(Config::default()).expect("loop");
+    let h = websocket(&mut l).await;
+    let read = l
+        .read(h, ReadBuf::Pooled, Token(90))
+        .expect("idle callback read");
+    let mut out = Completions::with_capacity(1);
+    let idle = l.turn(Timeout::Now, &mut out).expect("arm idle read");
+    assert_eq!(idle.completions, 0);
+    assert_eq!(idle.os_waits, 0);
+    assert_eq!(idle.discovery_polls, 0);
+    for sequence in 0..64 {
+        l.poster()
+            .post(Token(91), Payload::U64(sequence))
+            .expect("queued post");
+        let info = l.turn(Timeout::Now, &mut out).expect("post delivery");
+        assert_eq!(info.os_waits, 0);
+        assert_eq!(info.discovery_polls, 0);
+        assert_eq!(info.zero_event_waits, 0);
+        assert_eq!(info.completions, 1);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].token, Token(91));
+        assert!(
+            matches!(out[0].result, OpResult::Posted(Payload::U64(value)) if value == sequence)
+        );
+    }
+    let mut out = Completions::with_capacity(2);
+    let write = l
+        .write(h, WriteBuf::Owned(vec![0x49]), Token(92))
+        .expect("later websocket write");
+    let (mut reads, mut writes) = (0, 0);
+    while reads + writes < 2 {
+        scheduled(&mut l, &mut out).await;
+        for c in out.drain() {
+            assert_eq!(c.handle, Some(h));
+            assert!(c.terminal);
+            match c.result {
+                OpResult::Read {
+                    n,
+                    lease: Some(lease),
+                } => {
+                    assert_eq!(c.op, Some(read));
+                    assert_eq!(c.token, Token(90));
+                    assert_eq!(n, 1);
+                    assert_eq!(lease.as_slice(), &[0x49]);
+                    reads += 1;
+                }
+                OpResult::Wrote(1) => {
+                    assert_eq!(c.op, Some(write));
+                    assert_eq!(c.token, Token(92));
+                    writes += 1;
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+    assert_eq!((reads, writes), (1, 1));
+    l.close(h, Token(93)).expect("close websocket");
+    let info = l.turn(Timeout::Now, &mut out).expect("queued close");
+    assert_eq!(info.os_waits, 0);
+    assert_eq!(info.discovery_polls, 0);
+    assert_eq!(out.len(), 1);
+    assert!(matches!(out[0].result, OpResult::Closed));
+}
+
 #[wasm_bindgen_test(async)]
 async fn timer_no_spin_with_idle_websocket() {
     let mut l = Loop::new(Config::default()).expect("loop");
@@ -721,4 +788,9 @@ async fn executor_fetch_bytes_and_deadline_abort() {
         _ => panic!("fetch task incomplete"),
     }
     ex.turn(Timeout::Now).expect("cancel and close delivery");
+}
+
+#[wasm_bindgen_test]
+fn queued_core_work_makes_no_native_calls() {
+    turnloop_contract::queued_core_work::<turnloop::backend::Platform>();
 }

@@ -436,9 +436,9 @@ pub fn services_no_spin<B: Backend>(program: &std::ffi::OsStr, signal: Signal) {
                 assert!(turns <= 2, "registered services spun");
                 let info = l.turn(Timeout::Until(at), &mut out).expect("turn");
                 zero += info.zero_event_waits;
-                waits += info.os_waits;
+                waits += info.os_waits + info.discovery_polls;
                 assert!(zero <= 1);
-                assert!(info.os_waits <= 1);
+                assert!(info.os_waits + info.discovery_polls <= 1);
                 if !out.is_empty() {
                     assert_eq!(out.len(), 1);
                     assert!(matches!(out[0].result, OpResult::Timer));
