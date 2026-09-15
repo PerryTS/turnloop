@@ -91,8 +91,12 @@ I/O before releasing caller memory.
   Resize delivery requires the console input reader to be active. Captured console
   modes are restored on close/drop; input and output VT modes are distinguished.
 - Console handlers fan out Int/Break/Hup to independent loop subscriptions.
-  Unsupported Unix signals fail explicitly. Unsubscribed CTRL_CLOSE returns
-  FALSE, preserving older host handlers. With Hup subscribed, dispatch completes
+  Unsupported Unix signals fail explicitly. The console handler is installed
+  with the first subscription and never removed, as in libuv:
+  SetConsoleCtrlHandler blocks while any control handler runs, so removing it
+  beside a held close handler would deadlock the host's cleanup. Without a
+  matching subscription it returns FALSE, as if absent. Unsubscribed CTRL_CLOSE
+  therefore preserves older host handlers. With Hup subscribed, dispatch completes
   before Sleep(INFINITE), matching libuv's cleanup window (Windows normally
   terminates after about five seconds). Sleeping retains no subscription access.
   Windows invokes handlers newest first; this subscribed case prevents older host

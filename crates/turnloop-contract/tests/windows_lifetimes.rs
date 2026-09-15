@@ -1821,9 +1821,37 @@ fn duplex_cancellation_is_per_direction_and_close_drop_join_both_workers() {
                     .turn(Timeout::Now, &mut out)
                     .expect("start both workers");
                 assert!(out.is_empty(), "neither direction has peer progress");
+                let deadline = driver.now() + Duration::from_secs(5);
+                let mut drained = 0;
+                if !cancel_write {
+                    // Starting a request does not schedule its worker thread. Before the
+                    // read's cancellation, pin the state under test: peer bytes prove the
+                    // write is inside WriteFile, still blocked on the rest of 1 MiB.
+                    driver
+                        .read(server, ReadBuf::Pooled, Token(5))
+                        .expect("first surviving write bytes");
+                    while drained == 0 {
+                        assert!(driver.now() < deadline, "write never reached the peer");
+                        driver
+                            .turn(Timeout::Until(deadline), &mut out)
+                            .expect("write enters the kernel");
+                        for c in out.drain() {
+                            let OpResult::Read {
+                                n,
+                                lease: Some(bytes),
+                            } = c.result
+                            else {
+                                panic!("before cancellation: {:?}", c.result);
+                            };
+                            assert_eq!(c.handle, Some(server));
+                            assert!(bytes.as_slice().iter().all(|byte| *byte == 0x33));
+                            drained += n;
+                        }
+                    }
+                    assert!(drained < payload.len());
+                }
                 let cancelled = if cancel_write { write } else { read };
                 assert!(driver.cancel(cancelled), "cancel one direction");
-                let deadline = driver.now() + Duration::from_secs(5);
                 let mut acks = 0;
                 while acks == 0 {
                     assert!(
@@ -1859,14 +1887,14 @@ fn duplex_cancellation_is_per_direction_and_close_drop_join_both_workers() {
                 // drain holds it (synchronous_pipe_write_waits_behind_idle_read_until_the_
                 // read_is_cancelled; sync_io.rs), so the new read completes only after it.
                 let (mut reads, mut responses) = (0, 0);
-                let (mut drained, mut wrote) = if cancel_write {
-                    (payload.len(), true)
+                let mut wrote = cancel_write;
+                if cancel_write {
+                    drained = payload.len();
                 } else {
                     driver
                         .read(server, ReadBuf::Pooled, Token(5))
                         .expect("peer drains the surviving write");
-                    (0, false)
-                };
+                }
                 let mut trace = Vec::new(); // failure context: completion order
                 while reads == 0 || responses == 0 || !wrote || drained < payload.len() {
                     assert!(
