@@ -1188,6 +1188,115 @@ fn stdio_reads_reuse_caller_buffers_through_eof() {
 
 #[cfg(windows)]
 #[test]
+fn windows_kill_repeat_and_immediate_close_allocate_nothing_after_setup() {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::{
+        Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT},
+        System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject},
+    };
+    let mut driver = Loop::new(Config::default()).expect("loop");
+    let mut spec = ProcessSpec::new(env!("CARGO_BIN_EXE_native_child"));
+    spec.args.push("sleep".into());
+    spec.stdio = [ProcessStdio::Null; 3];
+    // Cover a plain process, a process-only kill in a job, and a whole-job kill.
+    let children: [_; 18] = std::array::from_fn(|i| {
+        spec.new_process_group = i % 3 != 0;
+        driver.spawn(&spec, Token(i as u64)).expect("child")
+    });
+    let waits: [OwnedHandle; 18] = std::array::from_fn(|i| {
+        // SAFETY: driver's owned child pins the PID; open only a wait handle.
+        let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, children[i].pid) };
+        assert!(!raw.is_null());
+        // SAFETY: successful OpenProcess transferred this handle's ownership.
+        unsafe { OwnedHandle::from_raw_handle(raw) }
+    });
+    let mut out = Completions::with_capacity(1);
+    driver.turn(Timeout::Now, &mut out).expect("warm services");
+    assert!(out.is_empty());
+    let mut cancelled = [false; 18];
+    let mut closed = [false; 18];
+    let (mut kills, mut repeats, mut cancellations, mut closes) = (0, 0, 0, 0);
+    let deadline = driver.now() + Duration::from_secs(10);
+    ALLOCS.with(|count| count.set(0));
+    ACTIVE.with(|active| active.set(true));
+    for (i, child) in children.iter().enumerate() {
+        assert_eq!(
+            // SAFETY: owned duplicate, nonblocking query proves a live kill subject.
+            unsafe { WaitForSingleObject(waits[i].as_raw_handle(), 0) },
+            WAIT_TIMEOUT
+        );
+        if i % 3 == 2 {
+            driver
+                .kill_group(child.handle, Signal::Kill)
+                .expect("kill job");
+            assert_eq!(
+                driver
+                    .kill_group(child.handle, Signal::Kill)
+                    .expect_err("repeat job kill")
+                    .kind,
+                ErrorKind::NotFound
+            );
+        } else {
+            driver
+                .kill(child.handle, Signal::Kill)
+                .expect("kill process");
+            assert_eq!(
+                driver
+                    .kill(child.handle, Signal::Kill)
+                    .expect_err("repeat process kill")
+                    .kind,
+                ErrorKind::NotFound
+            );
+        }
+        kills += 1;
+        repeats += 1;
+        driver
+            .close(child.handle, Token(i as u64))
+            .expect("immediate close");
+    }
+    while driver.alive() {
+        assert!(driver.now() < deadline, "termination deadline");
+        driver
+            .turn(Timeout::Until(deadline), &mut out)
+            .expect("close delivery");
+        for completion in out.drain() {
+            let i = completion.token.0 as usize;
+            assert!(i < children.len());
+            assert_eq!(completion.handle, Some(children[i].handle));
+            assert!(completion.terminal);
+            match completion.result {
+                OpResult::Cancelled => {
+                    assert!(completion.op.is_some());
+                    assert!(!closed[i]);
+                    assert!(!std::mem::replace(&mut cancelled[i], true));
+                    cancellations += 1;
+                }
+                OpResult::Closed => {
+                    assert!(completion.op.is_none());
+                    assert!(cancelled[i]);
+                    assert!(!std::mem::replace(&mut closed[i], true));
+                    assert_eq!(
+                        // SAFETY: owned duplicate survives Closed; child must have exited.
+                        unsafe { WaitForSingleObject(waits[i].as_raw_handle(), 0) },
+                        WAIT_OBJECT_0
+                    );
+                    closes += 1;
+                }
+                other => panic!("unexpected child completion: {other:?}"),
+            }
+        }
+    }
+    driver
+        .turn(Timeout::Now, &mut out)
+        .expect("no duplicate completion");
+    assert!(out.is_empty());
+    ACTIVE.with(|active| active.set(false));
+    assert_eq!(ALLOCS.with(Cell::get), 0, "kill/repeat/close allocations");
+    assert_eq!((kills, repeats, cancellations, closes), (18, 18, 18, 18));
+}
+
+#[cfg(windows)]
+#[test]
 fn windows_child_watch_cancel_exit_and_close_allocate_nothing_after_setup() {
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use windows_sys::Win32::{

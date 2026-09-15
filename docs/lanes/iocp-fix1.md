@@ -174,3 +174,133 @@ intermediate failure and the final passes. Formatting was also applied with
   hosts/Windows SDK for ring). SQL and browser runtime are UNRUN in this lane;
   known sandbox failures are not counted as test passes. No unrelated service or
   browser code was changed.
+
+## iocp-fix2
+
+Base: integrator commit `87a44cd`, PR #5. Host: macOS arm64, 2026-09-15.
+Windows runtime for this follow-up is **UNRUN locally (no Windows host)**.
+
+### Root cause
+
+The integrator's windows-2025 run **34910929791** failed
+`kill_then_close_children_completes_once` with OS error 5 in all three modes.
+The prior check recognized only a fully signaled process. A successful termination
+request can precede handle signaling, so immediate close issued another request
+and leaked ERROR_ACCESS_DENIED. The prior unit test covered callback lag after
+complete exit, leaving this earlier window untested. Its panic poisoned the
+shared test mutex, causing the two reported knock-on failures.
+
+Microsoft documents asynchronous [TerminateProcess](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-terminateprocess)
+and the same termination mechanism for [TerminateJobObject](https://learn.microsoft.com/en-us/windows/win32/api/jobapi2/nf-jobapi2-terminatejobobject).
+[libuv's Windows kill path](https://github.com/libuv/libuv/blob/v1.x/src/win/process.c#L1299-L1324)
+checks the exit code on access denied, retaining a zero-timeout handle check for
+an actual exit code equal to STILL_ACTIVE (259). This supports the supplied
+diagnosis; this lane cannot reproduce the kernel timing on macOS.
+
+### Fix and call-site audit
+
+- `Child::terminating` records an accepted process/job kill, or access denied
+  with evidence that exit has begun. A second kill returns NotFound. Close skips
+  repeated termination, while exit readiness still requires the real callback or
+  a signaled owned handle. No early status, cancellation or Closed is synthesized.
+- Access denied checks `GetExitCodeProcess != STILL_ACTIVE` and retains the
+  signaled-handle fallback. Other termination errors preserve both kind and OS
+  code; a failed exit-code query does not replace the termination error.
+- `Child::Drop` routes termination through the same logic, avoids repeats, waits
+  for actual exit and joins the callback. `job_assigned` distinguishes a usable
+  tree from failed suspended-spawn setup: an unassigned job cannot substitute for
+  terminating the child directly. A failed job kill still permits process cleanup.
+- `Platform::kill` and `Services::kill` already delegate to Child. Services close
+  sets its closing flag only after `Child::close` succeeds, and collection retains
+  the exit watch until real exit. These paths require no additional mutation.
+- The standalone spike's Drop deliberately ignores both termination return values
+  and always waits on the parent; repeated-call access denied cannot escape or
+  skip its wait. Its group-kill probe issues one request after asserting both live
+  subjects, then waits for parent and grandchild. These three spike call sites
+  remain unchanged. The unit-test forwarding calls count the real APIs and use
+  the same Child result handling as production.
+- All eight lifetime-test mutex acquisitions recover with
+  `unwrap_or_else(std::sync::PoisonError::into_inner)`. Original test failures
+  still fail. A source comparison confirms the **200 process + 200 job** loop,
+  its completion helper and thresholds are unchanged (only the guard changed).
+
+### Added coverage
+
+Three Windows unit tests and one Windows allocation test were added:
+
+- `terminating_process_without_callback_does_not_repeat_kill_or_complete_early`:
+  four process/job × successful-request/access-denied cases. Per-child test-only
+  overrides model termination results and an exit code while a real suspended
+  child, with its wait unregistered, stays unsignaled. Counters require exactly
+  one termination call and the appropriate exit query; two repeat kills and two
+  closes must leave readiness/status pending. Cleanup restores real APIs even
+  during assertion unwinding.
+- `termination_errors_keep_their_identity_and_allow_retry`: four process/job ×
+  active-status/failed-query cases preserve exact errors, retry actual wrapper
+  calls, and prove other errors bypass the status query.
+- `drop_joins_termination_without_repeating_it_and_handles_unassigned_jobs`:
+  five real suspended-child cases cover process/job Drop, prior successful
+  process/job kill and an unassigned job. Exact API counts and a signaled duplicate
+  after Drop prove termination and joining ran.
+- `windows_kill_repeat_and_immediate_close_allocate_nothing_after_setup`: eighteen
+  children cover plain process kill, process-only kill within a job and group
+  kill. After setup, all kills/repeat NotFound/close operations and 18 Cancelled +
+  18 Closed completions require **zero allocations**. Capacity-one output, exact
+  identities, positive counts, no duplicates and signaled handles at Closed are
+  asserted. The existing allocation test is unchanged.
+
+Deterministic kernel timing is unavailable: suspending the child's user thread
+does not suspend kernel termination. The injected test establishes the unsignaled
+state without a timing race; it is explicitly not proof of kernel timing. The
+unchanged 400-cycle real-Windows contract remains the runtime regression.
+
+### Verification commands
+
+All available local checks passed. [Every command and all 36 nested native
+invocations](../iocp-fix2-commands.md) are recorded separately; raw logs and the
+machine-readable ledger are under `.tools/iocp-fix2/`. No verification failure
+occurred in this follow-up. Cross-compilation is not Windows runtime proof.
+
+| Result | Command |
+| --- | --- |
+| PASS | `cargo clippy --locked --target x86_64-pc-windows-msvc -p turnloop -p turnloop-contract -p turnloop-io --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks` |
+| PASS | `cargo clippy --locked --workspace --all-targets -- -D warnings -D clippy::undocumented_unsafe_blocks` |
+| PASS | `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks` |
+| PASS | `cargo +stable check --locked --workspace --all-targets --all-features` |
+| PASS | `cargo fmt --all --check` (also applied `cargo fmt --all`) |
+| PASS | `python3 scripts/ci/run-tests.py native` |
+| PASS | `bash scripts/ci/no-tokio.sh` |
+| PASS | `python3 scripts/ci/soak.py` |
+| PASS | `python3 scripts/ci/check-paths.py` |
+| PASS | `python3 scripts/ci/feature_modes.py` |
+| PASS | `python3 .tools/iocp-fix2/audit.py` |
+| PASS | `git diff --check` |
+| UNRUN | `cargo test --locked -p turnloop --lib backend::iocp::process -- --nocapture` (Windows) |
+| UNRUN | `cargo test --locked -p turnloop-contract --test windows_lifetimes -- --nocapture` (Windows, default parallelism) |
+| UNRUN | `cargo test --locked -p turnloop-contract --test allocations -- --test-threads=1` (Windows) |
+| UNRUN | `python3 scripts/ci/run-tests.py native` (Windows) |
+
+Native workspace counts are **236 / 243 / 276** (default/executor/all features),
+with **49 / 56 / 56** independently executed contract tests. The total **1,297
+passes** includes package repetitions. Existing allocation/no-spin gates ran in
+all applicable modes. Ignored services and cfg-excluded Windows tests are UNRUN.
+No-tokio passes all eight targets plus their union, default/all features. The
+soak gate passes all **251 locked versions**, with only the inherited exact rustls
+exception. Linux runtime and WASI/web runtime are UNRUN in this Windows-only lane;
+SQL bodies remain UNRUN (sandbox).
+
+### Deviations, open items and next steps
+
+No DESIGN change is proposed. No dependencies, lockfile, soak settings, CI gates,
+allocation thresholds, no-spin code or assertions changed. The inherited rustls
+security exception is unchanged. Test-only overrides add no production fields,
+indirection or allocations.
+
+Integrator: commit the coherent tree and run Windows default/executor/all-features
+CI, including `windows_lifetimes` with normal libtest parallelism. The supplied
+87a44cd passing tests remain historical Windows evidence, not a follow-up pass.
+This lane makes no commits or pushes because `.git` is read-only.
+
+Known unrelated open item: `protocol-wasi (wasm32-wasip3)` HTTP
+`expect_continue_timeout_and_early_response` hit a usize assertion. Outside this
+lane's scope; no WASI implementation or test was changed.

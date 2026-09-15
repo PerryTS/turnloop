@@ -251,9 +251,17 @@ pub(super) struct Child {
     process: OwnedHandle,
     thread: OwnedHandle,
     job: Option<OwnedHandle>,
+    job_assigned: bool,
+    // A successful request (or an observed exit code) precedes actual exit.
+    // Only the wait callback/signaled handle may publish completion readiness.
+    terminating: bool,
     context: Arc<Context>,
     wait: HANDLE,
     status: Option<ExitStatus>,
+    #[cfg(test)]
+    terminate_override: Option<fn(HANDLE, bool) -> Result<()>>,
+    #[cfg(test)]
+    exit_code_override: Option<fn(HANDLE) -> Result<u32>>,
     pub pid: u32,
 }
 impl Child {
@@ -267,9 +275,7 @@ impl Child {
         if let Some(status) = self.status {
             return Ok(Some(status));
         }
-        let mut code = 0;
-        // SAFETY: registered wait reported actual process termination.
-        bool_result(unsafe { GetExitCodeProcess(self.process.as_raw_handle(), &mut code) })?;
+        let code = self.exit_code()?;
         self.join()?;
         let status = ExitStatus {
             code: Some(code as i32),
@@ -295,30 +301,63 @@ impl Child {
         }
     }
     pub(super) fn kill(&mut self, signal: Signal, group: bool) -> Result<()> {
-        if self.status.is_some() {
+        if self.status.is_some() || self.terminating {
             return Err(crate::Error::new(crate::ErrorKind::NotFound));
         }
         if signal != Signal::Kill {
             return Err(unsupported());
         }
-        let result = if group {
-            let job = self.job.as_ref().ok_or_else(invalid)?;
-            // SAFETY: exclusively owned process tree; no PID/handle reuse is possible.
-            bool_result(unsafe { TerminateJobObject(job.as_raw_handle(), 1) })
-        } else {
-            // SAFETY: process handle pins the identity even if its PID is later reused.
-            bool_result(unsafe { TerminateProcess(self.process.as_raw_handle(), 1) })
-        };
-        if let Err(error) = result
+        let result = self.terminate(group);
+        if result.is_ok() {
+            self.terminating = true;
+        } else if let Err(error) = result
             && error.os == Some(ERROR_ACCESS_DENIED as i32)
-            // SAFETY: the owned process handle pins its identity; zero timeout
-            // only queries termination and never waits for the callback.
-            && unsafe { WaitForSingleObject(self.process.as_raw_handle(), 0) } == WAIT_OBJECT_0
         {
-            self.context.ready.store(true, Ordering::Release);
-            return Err(crate::Error::new(crate::ErrorKind::NotFound));
+            // The exit code may be set before the process handle is signaled.
+            // Preserve the original termination error if the query fails.
+            let exiting = self
+                .exit_code()
+                .is_ok_and(|code| code != STILL_ACTIVE as u32);
+            // SAFETY: owned identity; zero timeout queries actual exit without blocking.
+            let exited =
+                unsafe { WaitForSingleObject(self.process.as_raw_handle(), 0) } == WAIT_OBJECT_0;
+            if exited {
+                self.context.ready.store(true, Ordering::Release);
+            }
+            if exiting || exited {
+                self.terminating = true;
+                return Err(crate::Error::new(crate::ErrorKind::NotFound));
+            }
         }
         result
+    }
+    fn terminate(&self, group: bool) -> Result<()> {
+        let handle = if group {
+            self.job.as_ref().ok_or_else(invalid)?.as_raw_handle()
+        } else {
+            self.process.as_raw_handle()
+        };
+        #[cfg(test)]
+        if let Some(terminate) = self.terminate_override {
+            return terminate(handle, group);
+        }
+        if group {
+            // SAFETY: exclusively owned process tree; no PID/handle reuse is possible.
+            bool_result(unsafe { TerminateJobObject(handle, 1) })
+        } else {
+            // SAFETY: process handle pins the identity even if its PID is later reused.
+            bool_result(unsafe { TerminateProcess(handle, 1) })
+        }
+    }
+    fn exit_code(&self) -> Result<u32> {
+        #[cfg(test)]
+        if let Some(exit_code) = self.exit_code_override {
+            return exit_code(self.process.as_raw_handle());
+        }
+        let mut code = 0;
+        // SAFETY: owned process handle and writable exit-code output.
+        bool_result(unsafe { GetExitCodeProcess(self.process.as_raw_handle(), &mut code) })?;
+        Ok(code)
     }
     pub(super) fn close(&mut self) -> Result<()> {
         if self.status.is_some() {
@@ -326,6 +365,9 @@ impl Child {
         }
         if self.ready() {
             self.status()?;
+            return Ok(());
+        }
+        if self.terminating {
             return Ok(());
         }
         match self.kill(Signal::Kill, self.job.is_some()) {
@@ -337,13 +379,16 @@ impl Child {
 impl Drop for Child {
     fn drop(&mut self) {
         if self.status.is_none() {
-            // SAFETY: teardown owns the process and optional job; termination then
-            // blocking wait prevents a live child or outstanding callback escaping.
+            if !self.terminating && self.job_assigned {
+                let _ = self.kill(Signal::Kill, true);
+            }
+            if !self.terminating {
+                // Also covers failed job assignment during suspended spawn.
+                let _ = self.kill(Signal::Kill, false);
+            }
+            // SAFETY: teardown owns the process; a termination request is not
+            // completion, so join the real exit before releasing its resources.
             unsafe {
-                if let Some(job) = &self.job {
-                    TerminateJobObject(job.as_raw_handle(), 1);
-                }
-                TerminateProcess(self.process.as_raw_handle(), 1);
                 WaitForSingleObject(self.process.as_raw_handle(), INFINITE);
             }
         }
@@ -477,12 +522,18 @@ pub(super) fn spawn(
             process: owned(info.hProcess)?,
             thread: owned(info.hThread)?,
             job,
+            job_assigned: false,
+            terminating: false,
             context: Arc::new(Context {
                 ready: AtomicBool::new(false),
                 notifier,
             }),
             wait: ptr::null_mut(),
             status: None,
+            #[cfg(test)]
+            terminate_override: None,
+            #[cfg(test)]
+            exit_code_override: None,
             pid: info.dwProcessId,
         }
     };
@@ -491,6 +542,7 @@ pub(super) fn spawn(
         bool_result(unsafe {
             AssignProcessToJobObject(job.as_raw_handle(), child.process.as_raw_handle())
         })?;
+        child.job_assigned = true;
     }
     // SAFETY: initialized callback context and owned child precede registration;
     // immediate exits are safe and Drop joins the one-shot callback.
@@ -510,6 +562,217 @@ pub(super) fn spawn(
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    thread_local! {
+        static TERMINATIONS: Cell<[usize; 2]> = const { Cell::new([0; 2]) };
+        static EXIT_QUERIES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    fn count_termination(group: bool) {
+        TERMINATIONS.with(|count| {
+            let mut calls = count.get();
+            calls[usize::from(group)] += 1;
+            count.set(calls);
+        });
+    }
+
+    fn denied(_: HANDLE, group: bool) -> Result<()> {
+        count_termination(group);
+        Err(std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32).into())
+    }
+
+    fn suspended(driver: &crate::Loop, group: bool) -> Child {
+        let mut spec = ProcessSpec::new(std::env::current_exe().expect("test executable"));
+        spec.args.push("--list".into());
+        spec.stdio = [ProcessStdio::Null; 3];
+        spec.new_process_group = group;
+        spawn(&spec, [None; 3], driver.notifier())
+            .expect("suspended child")
+            .0
+    }
+
+    // Fault injection never kills this suspended child. Restore real teardown on
+    // assertion failure as well as success, so a failed test cannot leak/hang it.
+    struct InjectedChild(Child);
+    impl Drop for InjectedChild {
+        fn drop(&mut self) {
+            self.0.terminate_override = None;
+            self.0.exit_code_override = None;
+            self.0.terminating = false;
+        }
+    }
+
+    fn assert_unsignaled(child: &mut Child) {
+        assert_eq!(
+            // SAFETY: owned process handle, nonblocking liveness query.
+            unsafe { WaitForSingleObject(child.process.as_raw_handle(), 0) },
+            WAIT_TIMEOUT
+        );
+        assert!(!child.ready(), "termination request must not publish exit");
+        assert_eq!(child.status().expect("pending exit"), None);
+    }
+
+    #[test]
+    fn terminating_process_without_callback_does_not_repeat_kill_or_complete_early() {
+        let driver = crate::Loop::new(crate::Config::default()).expect("notifier owner");
+        let mut checked = 0;
+        for group in [false, true] {
+            for access_denied in [false, true] {
+                let mut fixture = InjectedChild(suspended(&driver, group));
+                let child = &mut fixture.0;
+                child.join().expect("remove callback while suspended");
+                assert_unsignaled(child);
+                TERMINATIONS.with(|count| count.set([0; 2]));
+                EXIT_QUERIES.with(|count| count.set(0));
+                child.terminate_override = Some(if access_denied {
+                    denied
+                } else {
+                    |_, group| {
+                        count_termination(group);
+                        Ok(())
+                    }
+                });
+                child.exit_code_override = Some(|_| {
+                    EXIT_QUERIES.with(|count| count.set(count.get() + 1));
+                    Ok(1)
+                });
+                // Model the OS boundary deterministically: success or access
+                // denied with an exit code, while the real handle is unsignaled.
+                // Suspending a child alone cannot hold Windows in this window.
+                let result = child.kill(Signal::Kill, group);
+                if access_denied {
+                    assert_eq!(
+                        result.expect_err("termination underway").kind,
+                        crate::ErrorKind::NotFound
+                    );
+                } else {
+                    result.expect("termination accepted");
+                }
+                assert!(child.terminating);
+                assert_unsignaled(child);
+                for repeat_group in [false, true] {
+                    assert_eq!(
+                        child
+                            .kill(Signal::Kill, repeat_group)
+                            .expect_err("repeat kill")
+                            .kind,
+                        crate::ErrorKind::NotFound
+                    );
+                }
+                child.close().expect("close while terminating");
+                child.close().expect("repeat close while terminating");
+                assert_unsignaled(child);
+                assert_eq!(
+                    TERMINATIONS.with(Cell::get),
+                    if group { [0, 1] } else { [1, 0] }
+                );
+                assert_eq!(EXIT_QUERIES.with(Cell::get), usize::from(access_denied));
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 4);
+    }
+
+    #[test]
+    fn termination_errors_keep_their_identity_and_allow_retry() {
+        let driver = crate::Loop::new(crate::Config::default()).expect("notifier owner");
+        let mut checked = 0;
+        for group in [false, true] {
+            for query_fails in [false, true] {
+                let mut fixture = InjectedChild(suspended(&driver, group));
+                let child = &mut fixture.0;
+                child.join().expect("unregister suspended child");
+                child.terminate_override = Some(denied);
+                if query_fails {
+                    child.exit_code_override = Some(|_| {
+                        Err(std::io::Error::from_raw_os_error(ERROR_INVALID_HANDLE as i32).into())
+                    });
+                } // Otherwise GetExitCodeProcess really returns STILL_ACTIVE.
+                TERMINATIONS.with(|count| count.set([0; 2]));
+                let original: crate::Error =
+                    std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32).into();
+                assert_eq!(child.kill(Signal::Kill, group), Err(original));
+                assert_eq!(child.close(), Err(original));
+                assert!(!child.terminating);
+                assert_unsignaled(child);
+                assert_eq!(
+                    TERMINATIONS.with(Cell::get),
+                    if group { [0, 2] } else { [2, 0] }
+                );
+                // A different termination error must not be hidden by an exit query.
+                child.terminate_override = Some(|_, group| {
+                    count_termination(group);
+                    Err(std::io::Error::from_raw_os_error(ERROR_INVALID_HANDLE as i32).into())
+                });
+                child.exit_code_override = Some(|_| panic!("query after unrelated error"));
+                let original: crate::Error =
+                    std::io::Error::from_raw_os_error(ERROR_INVALID_HANDLE as i32).into();
+                assert_eq!(child.kill(Signal::Kill, group), Err(original));
+                assert_eq!(child.close(), Err(original));
+                assert!(!child.terminating);
+                assert_unsignaled(child);
+                assert_eq!(
+                    TERMINATIONS.with(Cell::get),
+                    if group { [0, 4] } else { [4, 0] }
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 4);
+    }
+
+    #[test]
+    fn drop_joins_termination_without_repeating_it_and_handles_unassigned_jobs() {
+        let driver = crate::Loop::new(crate::Config::default()).expect("notifier owner");
+        let mut checked = 0;
+        for (group, kill_first, unassigned_job) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (true, true, false),
+            (false, false, true),
+        ] {
+            let mut child = suspended(&driver, group);
+            if unassigned_job {
+                // Reproduce spawn unwinding before job assignment succeeds.
+                // SAFETY: unnamed owned job, never assigned this suspended child.
+                child.job = Some(
+                    unsafe { owned(CreateJobObjectW(ptr::null(), ptr::null())) }
+                        .expect("unassigned job"),
+                );
+                assert!(!child.job_assigned);
+            }
+            let wait = child.process.try_clone().expect("duplicate process");
+            TERMINATIONS.with(|count| count.set([0; 2]));
+            child.terminate_override = Some(|handle, group| {
+                count_termination(group);
+                // SAFETY: wrapper receives the same owned process/job as the real call.
+                bool_result(unsafe {
+                    if group {
+                        TerminateJobObject(handle, 1)
+                    } else {
+                        TerminateProcess(handle, 1)
+                    }
+                })
+            });
+            if kill_first {
+                child.kill(Signal::Kill, group).expect("initial kill");
+            }
+            drop(child);
+            assert_eq!(
+                TERMINATIONS.with(Cell::get),
+                if group { [0, 1] } else { [1, 0] }
+            );
+            assert_eq!(
+                // SAFETY: owned duplicate survives Child::drop; nonblocking exit query.
+                unsafe { WaitForSingleObject(wait.as_raw_handle(), 0) },
+                WAIT_OBJECT_0
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 5);
+    }
 
     #[test]
     fn exited_process_without_callback_maps_kill_and_close() {

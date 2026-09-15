@@ -79,7 +79,9 @@ fn assert_cancelled_then_closed(driver: &mut Loop, child: Handle, wait: &OwnedHa
 
 #[test]
 fn kill_then_close_children_completes_once() {
-    let _guard = HANDLES.lock().expect("handle test lock");
+    let _guard = HANDLES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut driver = Loop::new(Config::default()).expect("loop");
     let mut completed = 0;
     for group in [false, true] {
@@ -115,7 +117,9 @@ fn kill_then_close_children_completes_once() {
 
 #[test]
 fn close_after_raw_child_wait_before_servicing_exit() {
-    let _guard = HANDLES.lock().expect("handle test lock");
+    let _guard = HANDLES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut driver = Loop::new(Config::default()).expect("loop");
     let mut spec = ProcessSpec::new(env!("CARGO_BIN_EXE_native_child"));
     spec.args.push("exit".into());
@@ -144,7 +148,9 @@ fn close_after_raw_child_wait_before_servicing_exit() {
 
 #[test]
 fn batch_programs_are_rejected_before_spawn() {
-    let _guard = HANDLES.lock().expect("handle test lock");
+    let _guard = HANDLES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let directory = std::env::temp_dir().join(format!("turnloop-batch-{}", std::process::id()));
     std::fs::create_dir(&directory).expect("private batch directory");
     let marker = directory.join("marker");
@@ -194,7 +200,9 @@ fn batch_programs_are_rejected_before_spawn() {
 
 #[test]
 fn imported_overlapped_pipe_routes_away_from_its_existing_port() {
-    let _guard = HANDLES.lock().expect("handle test lock");
+    let _guard = HANDLES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
     use windows_sys::Win32::{
         Foundation::INVALID_HANDLE_VALUE, Storage::FileSystem::FILE_FLAG_OVERLAPPED,
@@ -247,7 +255,9 @@ fn imported_overlapped_pipe_routes_away_from_its_existing_port() {
 
 #[test]
 fn overlapped_regular_files_are_rejected_before_worker_submission() {
-    let _guard = HANDLES.lock().expect("handle test lock");
+    let _guard = HANDLES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED;
     let file = std::fs::OpenOptions::new()
@@ -275,7 +285,9 @@ fn handles() -> u32 {
 }
 #[test]
 fn cancelled_synchronous_reads_release_buffers_and_threads() {
-    let _guard = HANDLES.lock().expect("handle test lock");
+    let _guard = HANDLES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (mut read, mut write) = (ptr::null_mut(), ptr::null_mut());
     // SAFETY: two output slots; noninherited anonymous synchronous pipe.
     assert_ne!(
@@ -399,7 +411,9 @@ fn cancelled_synchronous_reads_release_buffers_and_threads() {
 }
 #[test]
 fn loop_drop_and_stale_wakers_release_windows_handles() {
-    let _guard = HANDLES.lock().expect("handle test lock");
+    let _guard = HANDLES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let cycle = || {
         let mut driver = Loop::new(Config::default()).expect("loop");
         let (_, _, receiver) = turnloop_contract::pair(&mut driver);
@@ -435,7 +449,9 @@ fn loop_drop_and_stale_wakers_release_windows_handles() {
 
 #[test]
 fn cancelled_child_watch_completes_while_child_is_alive() {
-    let _guard = HANDLES.lock().expect("handle test lock");
+    let _guard = HANDLES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut driver = Loop::new(Config::default()).expect("loop");
     let mut spec = ProcessSpec::new(env!("CARGO_BIN_EXE_native_child"));
     spec.args.push("sleep".into());
