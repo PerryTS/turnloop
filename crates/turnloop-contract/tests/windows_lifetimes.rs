@@ -1424,6 +1424,257 @@ fn normal_leader_exit_keeps_grandchildren_alive_through_close_and_drop() {
 }
 
 #[test]
+fn idle_synchronous_pipe_reader_does_not_spin() {
+    let _guard = HANDLES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (mut driver, client, _server) =
+        turnloop_contract::native_surface::synchronous_duplex_pair();
+    let read = driver
+        .read(client, ReadBuf::Pooled, Token(90))
+        .expect("idle read");
+    let mut out = Completions::with_capacity(1);
+    let (mut expiries, mut waits) = (0, 0);
+    for micros in [500, 2_000, 10_000] {
+        for _ in 0..20 {
+            let at = driver.now() + Duration::from_micros(micros);
+            let timer = driver.timer(at, None, Token(91)).expect("timer");
+            let (mut turns, mut empty_waits) = (0, 0);
+            loop {
+                turns += 1;
+                assert!(turns <= 2, "idle synchronous read caused timer spin");
+                let info = driver
+                    .turn(Timeout::Until(at), &mut out)
+                    .expect("timer turn");
+                assert!(info.os_waits <= 1);
+                waits += info.os_waits;
+                empty_waits += info.zero_event_waits;
+                assert!(empty_waits <= 1);
+                if !out.is_empty() {
+                    assert_eq!(out.len(), 1);
+                    assert_eq!((out[0].handle, out[0].token), (Some(timer), Token(91)));
+                    assert!(matches!(out[0].result, OpResult::Timer));
+                    assert!(driver.now() >= at);
+                    expiries += 1;
+                    break;
+                }
+            }
+            driver.close(timer, Token(92)).expect("release timer");
+            driver.turn(Timeout::Now, &mut out).expect("timer closed");
+            assert_eq!(out.len(), 1);
+            assert!(matches!(out[0].result, OpResult::Closed));
+        }
+    }
+    assert_eq!(expiries, 60);
+    assert!(waits >= 60);
+    assert!(
+        driver.cancel(read),
+        "read stayed pending through all deadlines"
+    );
+    let deadline = driver.now() + Duration::from_secs(3);
+    loop {
+        assert!(driver.now() < deadline);
+        driver
+            .turn(Timeout::Until(deadline), &mut out)
+            .expect("read cancellation");
+        if !out.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(out.len(), 1);
+    assert_eq!(
+        (out[0].op, out[0].token, out[0].terminal),
+        (Some(read), Token(90), true)
+    );
+    assert!(matches!(out[0].result, OpResult::Cancelled));
+}
+
+#[test]
+fn synchronous_pipe_mode_query_blocks_but_direct_write_makes_progress() {
+    use std::{io::Read, sync::mpsc, time::Instant};
+    use windows_sys::Win32::{
+        Foundation::{
+            ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE, GetLastError, INVALID_HANDLE_VALUE,
+        },
+        Storage::FileSystem::{
+            CreateFileW, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
+        },
+        System::{
+            Console::GetConsoleMode,
+            Pipes::{
+                ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
+            },
+            Threading::GetThreadIOPendingFlag,
+        },
+    };
+    let _guard = HANDLES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let name: Vec<u16> = format!(r"\\.\pipe\turnloop-sync-query-{}", std::process::id())
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    // SAFETY: terminated private name; one synchronous duplex instance, no inheritance.
+    let raw = unsafe {
+        CreateNamedPipeW(
+            name.as_ptr(),
+            PIPE_ACCESS_DUPLEX,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+            1,
+            4096,
+            4096,
+            0,
+            ptr::null(),
+        )
+    };
+    assert_ne!(raw, INVALID_HANDLE_VALUE);
+    // SAFETY: successful create transferred unique ownership.
+    let mut server = std::fs::File::from(unsafe { OwnedHandle::from_raw_handle(raw) });
+    // SAFETY: terminated private name; synchronous client with both data directions.
+    let raw = unsafe {
+        CreateFileW(
+            name.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            0,
+            ptr::null(),
+            OPEN_EXISTING,
+            0,
+            ptr::null_mut(),
+        )
+    };
+    assert_ne!(raw, INVALID_HANDLE_VALUE);
+    // SAFETY: successful create transferred unique ownership.
+    let client = std::fs::File::from(unsafe { OwnedHandle::from_raw_handle(raw) });
+    // SAFETY: both ends already open, so synchronous connect cannot wait for a client.
+    if unsafe { ConnectNamedPipe(server.as_raw_handle(), ptr::null_mut()) } == 0 {
+        // SAFETY: immediately inspect this thread's last error.
+        assert_eq!(unsafe { GetLastError() }, ERROR_PIPE_CONNECTED);
+    }
+    // This is a raw kernel control, independent of turnloop and its worker code.
+    let reader = client.try_clone().expect("reader duplicate");
+    let query = client.try_clone().expect("query duplicate");
+    let writer = client.try_clone().expect("writer duplicate");
+    let read_thread = std::thread::spawn(move || {
+        let mut byte = [0];
+        let mut count = 0;
+        // SAFETY: owned synchronous handle and exclusive one-byte buffer until return.
+        let ok = unsafe {
+            ReadFile(
+                reader.as_raw_handle(),
+                byte.as_mut_ptr(),
+                1,
+                &mut count,
+                ptr::null_mut(),
+            )
+        };
+        assert_ne!(ok, 0, "raw ReadFile: {}", std::io::Error::last_os_error());
+        assert_eq!(count, 1);
+        byte
+    });
+    // Always release the raw reader before a failed assertion unwinds. The
+    // one-byte response fits the otherwise empty server-to-client pipe quota.
+    struct ReleaseRead(Option<std::fs::File>);
+    impl Drop for ReleaseRead {
+        fn drop(&mut self) {
+            if let Some(mut server) = self.0.take() {
+                let _ = server.write_all(&[0x77]);
+            }
+        }
+    }
+    let mut release = ReleaseRead(Some(server));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut pending_probes = 0;
+    loop {
+        let mut pending = 0;
+        // SAFETY: join handle pins the reader thread; output is valid.
+        assert_ne!(
+            // SAFETY: join handle pins the reader thread; output is valid.
+            unsafe { GetThreadIOPendingFlag(read_thread.as_raw_handle(), &mut pending) },
+            0
+        );
+        pending_probes += 1;
+        if pending != 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "raw ReadFile never entered kernel I/O"
+        );
+        std::thread::sleep(Duration::from_millis(1)); // test synchronization only
+    }
+    let (started, start) = mpsc::channel();
+    let (queried, query_done) = mpsc::channel();
+    let query_thread = std::thread::spawn(move || {
+        started.send(()).expect("query started");
+        let mut mode = 0;
+        // SAFETY: owned duplicate and valid output, deliberately probing behind idle I/O.
+        let result = unsafe { GetConsoleMode(query.as_raw_handle(), &mut mode) };
+        queried.send(result).expect("query completed");
+    });
+    start
+        .recv_timeout(Duration::from_secs(5))
+        .expect("query thread ran");
+    let blocked_query = matches!(
+        query_done.recv_timeout(Duration::from_millis(100)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    );
+    let (written, write_done) = mpsc::channel();
+    let write_thread = std::thread::spawn(move || {
+        let mut count = 0;
+        // SAFETY: owned synchronous handle and immutable byte until the call returns.
+        let ok = unsafe {
+            WriteFile(
+                writer.as_raw_handle(),
+                [0x33].as_ptr(),
+                1,
+                &mut count,
+                ptr::null_mut(),
+            )
+        };
+        let result = if ok == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(count)
+        };
+        written.send(result).expect("write completed");
+    });
+    let before_reply = write_done.recv_timeout(Duration::from_secs(2));
+    // Cleanup precedes assertions about progress, even if WriteFile itself stalled.
+    server = release.0.take().expect("server retained");
+    server.write_all(&[0x77]).expect("release raw read");
+    assert_eq!(read_thread.join().expect("read joined"), [0x77]);
+    query_thread.join().expect("query joined");
+    write_thread.join().expect("write joined");
+    let progressed = before_reply.is_ok();
+    let count = match before_reply {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => write_done.recv().expect("released write"),
+        Err(error) => panic!("raw writer disconnected: {error}"),
+    }
+    .expect("raw write succeeded");
+    assert_eq!(count, 1);
+    let mut byte = [0];
+    server
+        .read_exact(&mut byte)
+        .expect("raw write reached peer");
+    assert_eq!(byte, [0x33]);
+    assert!(pending_probes > 0);
+    assert!(
+        blocked_query,
+        "GetConsoleMode did not reproduce the serialization point"
+    );
+    assert_eq!(
+        query_done.recv().expect("released query"),
+        0,
+        "pipe is not a console"
+    );
+    assert!(
+        progressed,
+        "raw WriteFile blocked behind idle ReadFile (different kernel cause)"
+    );
+}
+
+#[test]
 fn duplex_cancellation_is_per_direction_and_close_drop_join_both_workers() {
     let _guard = HANDLES
         .lock()

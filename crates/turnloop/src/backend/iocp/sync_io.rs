@@ -38,6 +38,7 @@ struct Shared {
     changed: Condvar,
     port: Arc<Port>,
     handle: OwnedHandle,
+    console: bool,
     thread_handle: Mutex<Option<OwnedHandle>>,
 }
 pub(super) struct Worker {
@@ -97,7 +98,7 @@ fn canceller() -> Result<mpsc::Sender<Arc<Shared>>> {
         .clone()
 }
 impl Worker {
-    pub(super) fn new(handle: HANDLE, port: Arc<Port>) -> Result<Self> {
+    pub(super) fn new(handle: HANDLE, console: bool, port: Arc<Port>) -> Result<Self> {
         let canceller = canceller()?;
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
@@ -110,6 +111,7 @@ impl Worker {
             changed: Condvar::new(),
             port,
             handle: process::duplicate(handle, false)?,
+            console,
             thread_handle: Mutex::new(None),
         });
         let run = Arc::clone(&shared);
@@ -196,10 +198,11 @@ fn pump(shared: Arc<Shared>) {
         let result = if cancelled {
             Err(super::socket::error(ERROR_OPERATION_ABORTED as i32))
         } else {
-            let mut mode = 0;
-            // SAFETY: handle stays owned throughout the worker; failure means non-console.
-            let terminal = unsafe { GetConsoleMode(shared.handle.as_raw_handle(), &mut mode) } != 0;
-            if terminal && !job.write {
+            // Classification belongs to quiescent adoption. GetConsoleMode is
+            // itself I/O, and on a synchronous pipe can wait behind the other
+            // worker's idle ReadFile before this worker even reaches WriteFile.
+            // Console identity is immutable; tty_set_mode only changes its flags.
+            if shared.console && !job.write {
                 console.read(
                     shared.handle.as_raw_handle(),
                     job.pointer as *mut u8,
@@ -340,8 +343,10 @@ impl ConsoleBytes {
     }
 }
 impl Detached {
-    /// Adopt a quiescent file, pipe or console handle. Synchronous handles use a
-    /// worker; overlapped pipes use event-routed I/O even with a prior IOCP
+    /// Adopt a quiescent file, pipe or console handle. Synchronous handles retain
+    /// their console classification and use per-direction workers on attachment.
+    /// Arbitrary character devices retain their driver's I/O serialization and
+    /// cancellation semantics. Overlapped pipes use event-routed I/O even with a prior IOCP
     /// association. Other overlapped handles return Unsupported. Captured console
     /// modes are restored on close or drop.
     pub fn from_handle(handle: OwnedHandle) -> Result<Self> {

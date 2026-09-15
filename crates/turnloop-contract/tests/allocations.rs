@@ -1730,6 +1730,168 @@ fn windows_console_control_delivery_allocates_nothing_on_any_thread() {
 
 #[cfg(windows)]
 #[test]
+fn windows_sync_pipe_character_and_disk_workers_reuse_classification_without_allocating() {
+    use std::{
+        os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
+        ptr,
+        sync::atomic::Ordering,
+    };
+    use windows_sys::Win32::{
+        Storage::FileSystem::{FILE_TYPE_CHAR, FILE_TYPE_DISK, FILE_TYPE_PIPE, GetFileType},
+        System::Pipes::CreatePipe,
+    };
+    let (mut read, mut write) = (ptr::null_mut(), ptr::null_mut());
+    // SAFETY: valid outputs for non-inherited synchronous anonymous pipe ends.
+    assert_ne!(
+        // SAFETY: valid outputs for non-inherited synchronous anonymous pipe ends.
+        unsafe { CreatePipe(&mut read, &mut write, ptr::null(), 4096) },
+        0
+    );
+    // SAFETY: successful CreatePipe transfers two distinct owned handles.
+    let (read, write) = unsafe {
+        (
+            OwnedHandle::from_raw_handle(read),
+            OwnedHandle::from_raw_handle(write),
+        )
+    };
+    let null = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("NUL")
+        .expect("character device");
+    let path = std::env::temp_dir().join(format!("turnloop-sync-kinds-{}", std::process::id()));
+    let disk = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .expect("disk file");
+    for (handle, kind) in [
+        (read.as_raw_handle(), FILE_TYPE_PIPE),
+        (write.as_raw_handle(), FILE_TYPE_PIPE),
+        (null.as_raw_handle(), FILE_TYPE_CHAR),
+        (disk.as_raw_handle(), FILE_TYPE_DISK),
+    ] {
+        // SAFETY: all handles remain owned and quiescent during classification.
+        assert_eq!(unsafe { GetFileType(handle) }, kind);
+    }
+    let mut byte = [0xa5];
+    let mut driver = Loop::new(Config::default()).expect("loop");
+    let mut adopt = |handle| {
+        driver
+            .attach(
+                Detached::from_handle(handle).expect("sync classification"),
+                Token(0),
+            )
+            .expect("adoption")
+    };
+    let read = adopt(read);
+    let write = adopt(write);
+    let null = adopt(null.into());
+    let disk = adopt(disk.into());
+    let mut out = Completions::with_capacity(1);
+    ALL_THREADS_ALLOCS.store(0, Ordering::SeqCst);
+    ALL_THREADS_ACTIVE.store(true, Ordering::SeqCst);
+    let calibration = Box::new([0u8; 1024]);
+    std::hint::black_box(&calibration);
+    ALL_THREADS_ACTIVE.store(false, Ordering::SeqCst);
+    assert!(
+        ALL_THREADS_ALLOCS.load(Ordering::SeqCst) > 0,
+        "allocator calibration"
+    );
+    drop(calibration);
+    let mut completions = [0; 3];
+    for round in 0..129 {
+        ALL_THREADS_ALLOCS.store(0, Ordering::SeqCst);
+        ALL_THREADS_ACTIVE.store(round != 0, Ordering::SeqCst);
+        for (kind, (reader, writer)) in [(read, write), (null, null), (disk, disk)]
+            .into_iter()
+            .enumerate()
+        {
+            // NUL and the regular file return EOF at their current position;
+            // anonymous pipe input stays pending until its separate end writes.
+            // SAFETY: fixed byte stays exclusive until the read acknowledgement.
+            let buffer = unsafe { IoBufMut::from_raw_parts(byte.as_mut_ptr(), 1) };
+            let input = driver
+                .read(reader, ReadBuf::Provided(buffer), Token(1))
+                .expect("read");
+            let deadline = driver.now() + Duration::from_secs(3);
+            if kind != 0 {
+                loop {
+                    assert!(driver.now() < deadline);
+                    driver
+                        .turn(Timeout::Until(deadline), &mut out)
+                        .expect("EOF turn");
+                    if !out.is_empty() {
+                        break;
+                    }
+                }
+                assert_eq!(
+                    (out[0].handle, out[0].op, out[0].token, out[0].terminal),
+                    (Some(reader), Some(input), Token(1), true)
+                );
+                assert!(matches!(out[0].result, OpResult::Eof));
+            }
+            // SAFETY: static immutable payload lives through every acknowledgement.
+            let buffer = unsafe { IoBuf::from_raw_parts(b"X".as_ptr(), 1) };
+            let output = driver
+                .write(writer, WriteBuf::Provided(buffer), Token(2))
+                .expect("write");
+            let (mut reads, mut writes) = (usize::from(kind != 0), 0);
+            while reads != 1 || writes != 1 {
+                assert!(driver.now() < deadline);
+                driver
+                    .turn(Timeout::Until(deadline), &mut out)
+                    .expect("worker turn");
+                for c in out.drain() {
+                    assert!(c.terminal);
+                    match c.result {
+                        OpResult::Read { n: 1, lease: None } => {
+                            assert_eq!(kind, 0);
+                            assert_eq!(
+                                (c.handle, c.op, c.token),
+                                (Some(reader), Some(input), Token(1))
+                            );
+                            assert_eq!(reads, 0);
+                            reads += 1;
+                        }
+                        OpResult::Wrote(1) => {
+                            assert_eq!(
+                                (c.handle, c.op, c.token),
+                                (Some(writer), Some(output), Token(2))
+                            );
+                            assert_eq!(writes, 0);
+                            writes += 1;
+                        }
+                        other => panic!("unexpected worker result: {other:?}"),
+                    }
+                }
+            }
+            if kind == 0 {
+                assert_eq!(byte, *b"X");
+            }
+            if round != 0 {
+                completions[kind] += reads + writes;
+            }
+        }
+        ALL_THREADS_ACTIVE.store(false, Ordering::SeqCst);
+        assert_eq!(
+            ALL_THREADS_ALLOCS.load(Ordering::SeqCst),
+            0,
+            "all worker threads reuse classification"
+        );
+    }
+    assert_eq!(completions, [256; 3]);
+    drop(driver);
+    assert_eq!(
+        std::fs::read(&path).expect("actual disk bytes"),
+        [b'X'; 129]
+    );
+    std::fs::remove_file(path).expect("remove fixture");
+}
+
+#[cfg(windows)]
+#[test]
 fn windows_duplex_fifos_make_independent_progress_without_allocating() {
     use std::sync::atomic::Ordering;
     ALL_THREADS_ALLOCS.store(0, Ordering::SeqCst);

@@ -265,11 +265,11 @@ impl Iocp {
             }
         }
         if transport.kind == Kind::Sync {
-            // Reserve both directions at adoption. A blocked synchronous read
-            // must not serialize writes, including their cancellation state.
+            // Reserve both directions and classify once, while still quiescent.
+            // A worker must not query console mode behind the other's idle I/O.
             self.workers[h.index()] = Some([
-                sync_io::Worker::new(raw, Arc::clone(&self.port))?,
-                sync_io::Worker::new(raw, Arc::clone(&self.port))?,
+                sync_io::Worker::new(raw, transport.mode.is_some(), Arc::clone(&self.port))?,
+                sync_io::Worker::new(raw, transport.mode.is_some(), Arc::clone(&self.port))?,
             ]);
         }
         self.resources[h.index()] = Some(Resource {

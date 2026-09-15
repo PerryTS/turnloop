@@ -144,6 +144,55 @@ fn console_input_resize_and_modes_restore() {
                 "completion before any input was written: {:?}",
                 out.drain().map(|c| c.result).collect::<Vec<_>>()
             );
+            // Console input and output are distinct native objects. An idle
+            // input worker must leave actual output usable after cached adoption
+            // classification, including the mode changes above.
+            // SAFETY: initialized native output storage, queried on the output handle.
+            let mut before: CONSOLE_SCREEN_BUFFER_INFO = unsafe { std::mem::zeroed() };
+            // SAFETY: owned output handle and valid screen information output.
+            assert_ne!(
+                // SAFETY: owned output handle and valid screen information output.
+                unsafe { GetConsoleScreenBufferInfo(output.as_raw_handle(), &mut before) },
+                0
+            );
+            // SAFETY: static immutable byte remains live until its write completion.
+            let bytes = unsafe { IoBuf::from_raw_parts(b"Q".as_ptr(), 1) };
+            let write = driver
+                .write(screen, WriteBuf::Provided(bytes), Token(8))
+                .expect("output beside idle input");
+            let deadline = driver.now() + Duration::from_secs(3);
+            loop {
+                assert!(driver.now() < deadline, "idle console read blocked output");
+                driver
+                    .turn(Timeout::Until(deadline), &mut out)
+                    .expect("console output turn");
+                if !out.is_empty() {
+                    break;
+                }
+            }
+            assert_eq!(out.len(), 1);
+            assert_eq!(
+                (out[0].handle, out[0].op, out[0].token, out[0].terminal),
+                (Some(screen), Some(write), Token(8), true)
+            );
+            assert!(matches!(out[0].result, OpResult::Wrote(1)));
+            let mut character = 0u16;
+            let mut count = 0;
+            // SAFETY: owned screen buffer, valid one-character output and count.
+            assert_ne!(
+                // SAFETY: owned screen buffer, valid one-character output and count.
+                unsafe {
+                    ReadConsoleOutputCharacterW(
+                        output.as_raw_handle(),
+                        &mut character,
+                        1,
+                        before.dwCursorPosition,
+                        &mut count,
+                    )
+                },
+                0
+            );
+            assert_eq!((character, count), (b'Q' as u16, 1));
             // SAFETY: initialized native input records; fill the selected union arms.
             let mut records: [INPUT_RECORD; 2] = unsafe { std::mem::zeroed() };
             records[0].EventType = WINDOW_BUFFER_SIZE_EVENT as u16;

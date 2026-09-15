@@ -284,3 +284,229 @@ Read-only source/reference inspection (`rg`, `cat`, `sed`, `git status/diff/show
 `rustup target list --installed`, `rustup toolchain list`, upstream downloads and
 SHA-256 inventory): PASS. Two guessed read paths/globs and the first report patch
 were rejected; corrected reads/patches succeeded. No rejected mutation changed files.
+
+## sem-fix1
+
+Base `6e5baf5`, PR #16; macOS arm64, 2026-09-15. Candidate fix and tests
+implemented. **Windows runtime and exact kernel root cause remain UNRUN locally.**
+Integrator reports windows-2025 run **34925939690** failed only
+`windows_duplex_fifos_make_independent_progress_without_allocating`, in all three
+modes. That report is pre-fix evidence, not a post-fix pass.
+
+### Finding and selected fix
+
+The workers duplicated one native file object, as the supplied hypothesis states.
+However, each job also called **GetConsoleMode before ReadFile/WriteFile**, despite
+`Detached::from_handle` already classifying the quiescent handle. This unnecessary
+control-I/O call is a separate potential blocking point. The failing allocation
+workload repeatedly starts writes beside an idle read; the reported passing
+cancellation test alone does not identify which native call is blocked.
+
+`Shared::console` now retains the classification supplied at adoption. Workers
+select console-record reads or ordinary byte I/O directly. Console identity stays
+fixed when tty flags change. This removes the redundant syscall for every adopted
+synchronous kind, without changing the file object, buffer ownership, two FIFOs,
+per-direction cancellation, completion publication, close, detach or joining.
+No new worker, retry, cancellation, queue, allocation or wait is added per operation.
+The original failing test and all its counts/thresholds are **byte-for-byte intact**.
+
+This is a source-supported candidate, **not a claim that the macOS host verified
+Windows kernel behavior**. The new raw diagnostic must confirm a pending ReadFile,
+a blocked mode query and a direct WriteFile completing before the peer replies.
+It releases the read and joins the threads before checking the progress result,
+so a failure can distinguish the two hypotheses. If direct WriteFile also stalls,
+this candidate is insufficient and the integrator must relay that result for a
+kernel-I/O scheduling fix. No test was changed to accept stalled duplex writes.
+
+### Research / alternatives
+
+- [Microsoft's synchronous file-object contract](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-zwcreatefile)
+  documents shared-object serialization. This supports investigating the supplied
+  diagnosis; it does not establish which call stalled in this CI trace.
+- [libuv v1.52.1 pipe.c](https://github.com/libuv/libuv/blob/v1.52.1/src/win/pipe.c):
+  adoption queries file mode; the non-overlapped read worker uses a zero-byte
+  ReadFile and writes run in a separate FIFO worker calling WriteFile directly.
+  Neither worker reclassifies the pipe as a console. `uv__pipe_read_eof` stops
+  reading and emits EOF; interrupt/stop uses CancelSynchronousIo and a yield loop
+  to close the before-kernel-entry race. That loop is not copied into ordinary
+  turnloop duplex progress.
+- [libuv v1.52.1 tty.c](https://github.com/libuv/libuv/blob/v1.52.1/src/win/tty.c):
+  `uv__tty_read_stop` wakes raw input with an injected record; line-input stop uses
+  its read-console cancellation helper. These are specialized console paths,
+  not a general mechanism for restarting arbitrary byte reads before writes.
+- [CPython's original Windows-console implementation investigation](https://bugs.python.org/msg372536)
+  identifies GetConsoleMode as NtDeviceIoControlFile and ordinary ReadFile/WriteFile
+  as different NT calls. This motivates the diagnostic; it is not this lane's
+  own Windows stack trace.
+- [ReOpenFile](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-reopenfile)
+  has original-object and sharing constraints; changing regular-file overlap also
+  changes file-position management. No reopen preserving every adopted endpoint's
+  identity and offset was established, so option (a) is not used speculatively.
+- [CancelSynchronousIo](https://learn.microsoft.com/en-us/windows/win32/api/ioapiset/nf-ioapiset-cancelsynchronousio)
+  may race a successful read and is not an acknowledgement. Option (b) would need
+  an acknowledged restart protocol and protection against replaying consumed bytes;
+  it is not justified until the direct-I/O diagnostic demonstrates it is needed.
+  Option (c) is not used to relax the existing duplex pipe contract.
+
+### Handle-kind audit and coverage
+
+| Adopted synchronous kind | Behavior / coverage |
+| --- | --- |
+| Duplex named pipe | Same endpoint and independent byte FIFOs; original 32 idle reads before 32 writes, FIFO replies, 512 measured read/write completions and all-thread zero allocation preserved. New raw diagnostic separates data/control calls. Existing 32 cancellation/close/drop cases unchanged. |
+| Anonymous pipe | Native ends are one-way; read and write endpoints each use cached non-console classification. New gate checks actual pipe types, exact bytes and 256 measured completions. Existing 128 cancellation/close/drop and fresh-byte cases unchanged. |
+| Console input / screen output | Distinct native objects; cached console identity survives tty mode changes. Existing isolated mode/resize/UTF-8 test additionally writes Q while input is idle, requires its exact completion and reads Q from the real screen buffer in both close/drop cases. |
+| Character devices | NUL positively exercises FILE_TYPE_CHAR, byte writes and EOF with 256 measured completions. Other synchronous character handles retain ReadFile/WriteFile and the device driver's native serialization/cancellation semantics; separate workers are not a guarantee about arbitrary drivers. Serial-port/third-party-device runtime is UNRUN (hardware unavailable). |
+| Regular files | Shared file position retained; reads at EOF complete instead of waiting for append. New gate checks FILE_TYPE_DISK, 256 measured EOF/write completions and all 129 persisted bytes. Existing FIFO, drop and allocation workloads unchanged. Other overlapped files remain Unsupported. |
+
+New allocation workload runs one warmup and 128 measured rounds per kind, checks
+exact identities, positive allocator calibration and **zero allocations on all
+Rust threads**: 768 measured completions. No pre-existing gate is reduced.
+`idle_synchronous_pipe_reader_does_not_spin` adds 60 expiries at 500 us / 2 ms /
+10 ms, with the existing ≤2 turns / ≤1 empty wait bounds, actual OS waits,
+no early expiry and exactly one final read-cancellation acknowledgement.
+These are Windows tests: compilation is not execution.
+
+### Verification
+
+Final local gates **PASS**: fmt, strict native workspace Clippy in default/all
+features, strict Windows core/contract/io and whole-workspace all-target/all-feature
+Clippy, stable workspace all-target/all-feature check, core/contract rustdoc,
+no-tokio, seven-day soak (251 versions; inherited rustls exception unchanged),
+path/feature gates, source-preservation audit and whitespace check.
+
+Native CI passed all three modes: **252 default / 259 executor / 308 all-feature**
+workspace tests, plus every independent member check. The independent contract
+counts are **51 / 58 / 58**. Default/executor ignore 13 service tests and all
+features ignore 20; these are UNRUN, not passes. Existing native allocation and
+no-spin gates executed. All new/strengthened Windows subjects remain **UNRUN**.
+
+Corrected intermediate failures are retained: Win32 constants imported from the
+wrong module; an incomplete diagnostic edit; unsafe comments outside assertion
+macros; and the initial direct Zig target spelling. No assertion or lint was
+suppressed to obtain a pass. See the exact ledger below and `.tools/sem-fix1/` logs.
+
+### Deviations / proposed DESIGN clarification
+
+No dependency, lockfile, seven-day policy, security exception, CI requirement,
+allocation threshold or existing no-spin assertion changed. No new I/O unwrap or
+production unsafe block. DESIGN.md is unchanged. Proposed §7.3 clarification:
+classify adopted synchronous handles while quiescent and retain that identity;
+per-direction queues do not override arbitrary device-driver serialization.
+Also qualify the blanket statement that synchronous files cannot be reopened:
+ReOpenFile can reopen files under its access/sharing constraints, but preserving
+all imported pipe endpoints and shared file-position behavior is not established.
+The backend README records the type-specific behavior and remaining runtime gap.
+
+### Open questions / next steps
+
+1. Integrator: commit the coherent tree and run the Windows commands below;
+   `.git` is read-only here. Confirm the raw diagnostic and original failure before
+   treating the candidate as a verified fix. An asynchronous request for these
+   results was sent through this conversation while local checks continued.
+2. **UNRUN (Windows):**
+   `cargo test --locked -p turnloop-contract --test windows_lifetimes -- --test-threads=1 --nocapture`;
+   includes the raw diagnostic, synchronous no-spin and existing lifecycle cases.
+3. **UNRUN (Windows):**
+   `cargo test --locked -p turnloop-contract --test allocations -- --test-threads=1 --nocapture`;
+   original duplex gate plus the new three-kind gate and all original workloads.
+4. **UNRUN (Windows):**
+   `cargo test --locked -p turnloop-contract --test windows_console -- --test-threads=1 --nocapture`.
+5. **UNRUN (Windows):** `python3 scripts/ci/run-tests.py native` for the full required
+   default/executor/all-feature matrix. Linux runtime has no host. WASI/web runtime
+   and SQL servers are UNRUN in this Windows-only lane; no capability/gate changed.
+
+### sem-fix1 verification commands
+
+Every invocation is retained, including corrected intermediate failures.
+
+| Invocation | Result | Exact command |
+| --- | --- | --- |
+| fmt-first | **PASS** | `cargo fmt --all` |
+| windows-first | **FAIL** | `cargo clippy --locked --target x86_64-pc-windows-msvc -p turnloop -p turnloop-contract -p turnloop-io --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks` |
+| fmt-tests | **PASS** | `cargo fmt --all` |
+| windows-tests | **FAIL** | `cargo clippy --locked --target x86_64-pc-windows-msvc -p turnloop -p turnloop-contract -p turnloop-io --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks` |
+| fmt-complete | **PASS** | `cargo fmt --all` |
+| windows-complete | **FAIL** | `cargo clippy --locked --target x86_64-pc-windows-msvc -p turnloop -p turnloop-contract -p turnloop-io --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks` |
+| windows-fixed | **PASS** | `cargo clippy --locked --target x86_64-pc-windows-msvc -p turnloop -p turnloop-contract -p turnloop-io --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks` |
+| no-tokio | **PASS** | `bash scripts/ci/no-tokio.sh` |
+| soak | **PASS** | `python3 scripts/ci/soak.py` |
+| features | **PASS** | `python3 scripts/ci/feature_modes.py` |
+| paths | **PASS** | `python3 scripts/ci/check-paths.py` |
+| native-clippy | **PASS** | `cargo clippy --locked --workspace --all-targets -- -D warnings -D clippy::undocumented_unsafe_blocks` |
+| native-all-clippy | **PASS** | `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks` |
+| stable | **PASS** | `cargo +stable check --locked --workspace --all-targets --all-features` |
+| windows-workspace | **FAIL** | `env 'CC_x86_64_pc_windows_msvc=zig cc -target x86_64-windows-gnu' AR_x86_64_pc_windows_msvc=/opt/homebrew/opt/llvm/bin/llvm-ar ZIG_GLOBAL_CACHE_DIR=/Users/amlug/projects/perry/windlass-lanes/iocp-semantics/.tools/sem-fix1/zig-global ZIG_LOCAL_CACHE_DIR=/Users/amlug/projects/perry/windlass-lanes/iocp-semantics/.tools/sem-fix1/zig-local cargo clippy --locked --workspace --all-targets --all-features --target x86_64-pc-windows-msvc -- -D warnings -D clippy::undocumented_unsafe_blocks` |
+| fmt-final | **PASS** | `cargo fmt --all` |
+| fmt-check | **PASS** | `cargo fmt --check` |
+| windows-workspace-wrapper | **PASS** | `env CC_x86_64_pc_windows_msvc=/Users/amlug/projects/perry/windlass-lanes/iocp-semantics/.tools/sem-fix1/clang-windows AR_x86_64_pc_windows_msvc=/opt/homebrew/opt/llvm/bin/llvm-ar ZIG_GLOBAL_CACHE_DIR=/Users/amlug/projects/perry/windlass-lanes/iocp-semantics/.tools/sem-fix1/zig-global ZIG_LOCAL_CACHE_DIR=/Users/amlug/projects/perry/windlass-lanes/iocp-semantics/.tools/sem-fix1/zig-local cargo clippy --locked --workspace --all-targets --all-features --target x86_64-pc-windows-msvc -- -D warnings -D clippy::undocumented_unsafe_blocks` |
+| rustdoc | **PASS** | `env RUSTDOCFLAGS=-Dwarnings cargo doc --locked -p turnloop -p turnloop-contract --all-features --no-deps` |
+| audit | **PASS** | `python3 .tools/sem-fix1/audit.py` |
+| whitespace | **PASS** | `git diff --check` |
+| native-ci | **PASS** | `python3 scripts/ci/run-tests.py native` |
+| fmt-final-check | **PASS** | `cargo fmt --check` |
+| report-whitespace | **PASS** | `git diff --check` |
+
+All native CI subprocesses (counts exclude ignored and cfg-excluded tests):
+
+| Exact command | Result |
+| --- | --- |
+| `cargo +nightly-2026-08-20 metadata --format-version 1 --locked --manifest-path /Users/amlug/projects/perry/windlass-lanes/iocp-semantics/Cargo.toml --no-deps` | **PASS metadata** |
+| `cargo +nightly-2026-08-20 test --locked --manifest-path /Users/amlug/projects/perry/windlass-lanes/iocp-semantics/Cargo.toml --workspace -- --test-threads=1` | **PASS executed 252 tests** |
+| `cargo +nightly-2026-08-20 test --locked --manifest-path /Users/amlug/projects/perry/windlass-lanes/iocp-semantics/Cargo.toml -p turnloop -- --test-threads=1` | **PASS executed 14 tests** |
+| `cargo +nightly-2026-08-20 test --locked --manifest-path /Users/amlug/projects/perry/windlass-lanes/iocp-semantics/Cargo.toml -p turnloop-http -- --test-threads=1` | **PASS executed 26 tests** |
+| `cargo +nightly-2026-08-20 test --locked --manifest-path /Users/amlug/projects/perry/windlass-lanes/iocp-semantics/Cargo.toml -p turnloop-tls -- --test-threads=1` | **PASS executed 11 tests** |
+| `cargo +nightly-2026-08-20 test --locked --manifest-path /Users/amlug/projects/perry/windlass-lanes/iocp-semantics/Cargo.toml -p turnloop-mongodb -- --test-threads=1` | **PASS executed 21 tests** |
+| `cargo +nightly-2026-08-20 test --locked --manifest-path /Users/amlug/projects/perry/windlass-lanes/iocp-semantics/Cargo.toml -p turnloop-mysql -- --test-threads=1` | **PASS executed 12 tests** |
+| `cargo +nightly-2026-08-20 test --locked --manifest-path /Users/amlug/projects/perry/windlass-lanes/iocp-semantics/Cargo.toml -p turnloop-postgres -- --test-threads=1` | **PASS executed 18 tests** |
+| `cargo +nightly-2026-08-20 test --locked --manifest-path /Users/amlug/projects/perry/windlass-lanes/iocp-semantics/Cargo.toml -p turnloop-redis -- --test-threads=1` | **PASS executed 10 tests** |
+| `cargo +nightly-2026-08-20 test --locked --manifest-path /Users/amlug/projects/perry/windlass-lanes/iocp-semantics/Cargo.toml -p turnloop-smtp -- --test-threads=1` | **PASS executed 12 tests** |
+| `cargo +nightly-2026-08-20 test --locked --manifest-path /Users/amlug/projects/perry/windlass-lanes/iocp-semantics/Cargo.toml -p turnloop-websocket -- --test-threads=1` | **PASS executed 3 tests** |
+| `cargo +nightly-2026-08-20 test --locked --manifest-path /Users/amlug/projects/perry/windlass-lanes/iocp-semantics/Cargo.toml -p turnloop-io -- --test-threads=1` | **PASS executed 5 tests** |
+| `cargo +nightly-2026-08-20 test --locked --manifest-path /Users/amlug/projects/perry/windlass-lanes/iocp-semantics/Cargo.toml -p turnloop-contract -- --test-threads=1` | **PASS executed 51 tests** |
+| `cargo +nightly-2026-08-20 test --locked --manifest-path /Users/amlug/projects/perry/windlass-lanes/iocp-semantics/Cargo.toml --workspace --features turnloop/executor,turnloop-contract/executor -- --test-threads=1` | **PASS executed 259 tests** |
+| `cargo +nightly-2026-08-20 test --locked --manifest-path /Users/amlug/projects/perry/windlass-lanes/iocp-semantics/Cargo.toml -p turnloop --features turnloop/executor -- --test-threads=1` | **PASS executed 15 tests** |
+| `cargo +nightly-2026-08-20 test --locked --manifest-path /Users/amlug/projects/perry/windlass-lanes/iocp-semantics/Cargo.toml -p turnloop-http -- --test-threads=1` | **PASS executed 26 tests** |
+| `cargo +nightly-2026-08-20 test --locked --manifest-path /Users/amlug/projects/perry/windlass-lanes/iocp-semantics/Cargo.toml -p turnloop-tls -- --test-threads=1` | **PASS executed 11 tests** |
+| `cargo +nightly-2026-08-20 test --locked --manifest-path /Users/amlug/projects/perry/windlass-lanes/iocp-semantics/Cargo.toml -p turnloop-mongodb -- --test-threads=1` | **PASS executed 21 tests** |
+| `cargo +nightly-2026-08-20 test --locked --manifest-path /Users/amlug/projects/perry/windlass-lanes/iocp-semantics/Cargo.toml -p turnloop-mysql -- --test-threads=1` | **PASS executed 12 tests** |
+| `cargo +nightly-2026-08-20 test --locked --manifest-path /Users/amlug/projects/perry/windlass-lanes/iocp-semantics/Cargo.toml -p turnloop-postgres -- --test-threads=1` | **PASS executed 18 tests** |
+| `cargo +nightly-2026-08-20 test --locked --manifest-path /Users/amlug/projects/perry/windlass-lanes/iocp-semantics/Cargo.toml -p turnloop-redis -- --test-threads=1` | **PASS executed 10 tests** |
+| `cargo +nightly-2026-08-20 test --locked --manifest-path /Users/amlug/projects/perry/windlass-lanes/iocp-semantics/Cargo.toml -p turnloop-smtp -- --test-threads=1` | **PASS executed 12 tests** |
+| `cargo +nightly-2026-08-20 test --locked --manifest-path /Users/amlug/projects/perry/windlass-lanes/iocp-semantics/Cargo.toml -p turnloop-websocket -- --test-threads=1` | **PASS executed 3 tests** |
+| `cargo +nightly-2026-08-20 test --locked --manifest-path /Users/amlug/projects/perry/windlass-lanes/iocp-semantics/Cargo.toml -p turnloop-io --features turnloop/executor -- --test-threads=1` | **PASS executed 5 tests** |
+| `cargo +nightly-2026-08-20 test --locked --manifest-path /Users/amlug/projects/perry/windlass-lanes/iocp-semantics/Cargo.toml -p turnloop-contract --features turnloop/executor,turnloop-contract/executor -- --test-threads=1` | **PASS executed 58 tests** |
+| `cargo +nightly-2026-08-20 test --locked --manifest-path /Users/amlug/projects/perry/windlass-lanes/iocp-semantics/Cargo.toml --workspace --all-features -- --test-threads=1` | **PASS executed 308 tests** |
+| `cargo +nightly-2026-08-20 test --locked --manifest-path /Users/amlug/projects/perry/windlass-lanes/iocp-semantics/Cargo.toml -p turnloop --all-features -- --test-threads=1` | **PASS executed 15 tests** |
+| `cargo +nightly-2026-08-20 test --locked --manifest-path /Users/amlug/projects/perry/windlass-lanes/iocp-semantics/Cargo.toml -p turnloop-http --all-features -- --test-threads=1` | **PASS executed 38 tests** |
+| `cargo +nightly-2026-08-20 test --locked --manifest-path /Users/amlug/projects/perry/windlass-lanes/iocp-semantics/Cargo.toml -p turnloop-tls --all-features -- --test-threads=1` | **PASS executed 14 tests** |
+| `cargo +nightly-2026-08-20 test --locked --manifest-path /Users/amlug/projects/perry/windlass-lanes/iocp-semantics/Cargo.toml -p turnloop-mongodb --all-features -- --test-threads=1` | **PASS executed 25 tests** |
+| `cargo +nightly-2026-08-20 test --locked --manifest-path /Users/amlug/projects/perry/windlass-lanes/iocp-semantics/Cargo.toml -p turnloop-mysql --all-features -- --test-threads=1` | **PASS executed 16 tests** |
+| `cargo +nightly-2026-08-20 test --locked --manifest-path /Users/amlug/projects/perry/windlass-lanes/iocp-semantics/Cargo.toml -p turnloop-postgres --all-features -- --test-threads=1` | **PASS executed 24 tests** |
+| `cargo +nightly-2026-08-20 test --locked --manifest-path /Users/amlug/projects/perry/windlass-lanes/iocp-semantics/Cargo.toml -p turnloop-redis --all-features -- --test-threads=1` | **PASS executed 13 tests** |
+| `cargo +nightly-2026-08-20 test --locked --manifest-path /Users/amlug/projects/perry/windlass-lanes/iocp-semantics/Cargo.toml -p turnloop-smtp --all-features -- --test-threads=1` | **PASS executed 16 tests** |
+| `cargo +nightly-2026-08-20 test --locked --manifest-path /Users/amlug/projects/perry/windlass-lanes/iocp-semantics/Cargo.toml -p turnloop-websocket --all-features -- --test-threads=1` | **PASS executed 8 tests** |
+| `cargo +nightly-2026-08-20 test --locked --manifest-path /Users/amlug/projects/perry/windlass-lanes/iocp-semantics/Cargo.toml -p turnloop-io --all-features -- --test-threads=1` | **PASS executed 5 tests** |
+| `cargo +nightly-2026-08-20 test --locked --manifest-path /Users/amlug/projects/perry/windlass-lanes/iocp-semantics/Cargo.toml -p turnloop-contract --all-features -- --test-threads=1` | **PASS executed 58 tests** |
+
+Read-only source/API inspection (`rg`, `cat`, `sed`, `git status/diff/show`,
+upstream API opens/searches and the CPython message download), initial clean-tree
+check, preserved-function comparison and dependency/no-new-unwrap audit: **PASS**.
+The final scripted audit independently checks the preserved functions. No Windows
+code, ignored service test or empty native harness is counted as runtime coverage.
+
+The first full-workspace Windows attempt failed because cc-rs supplied an LLVM
+target spelling that Zig rejects. The successful attempt uses this local executable
+C compiler wrapper (the exact environment and command are recorded above):
+
+```python
+#!/usr/bin/env python3
+import os
+import sys
+args = [arg for arg in sys.argv[1:] if arg != '--target=x86_64-pc-windows-msvc']
+os.execv('/opt/homebrew/bin/zig', ['zig', 'cc', '-target', 'x86_64-windows-gnu', *args])
+```
+
+Rust still checks the MSVC target; installed Zig supplies Windows C headers and
+COFF dependency objects for cross-Clippy. This is not MSVC linking or execution.
+The wrapper and its caches are checkout-local; no source/dependency/gate was
+changed to obtain that pass.

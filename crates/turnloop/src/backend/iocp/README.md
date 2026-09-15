@@ -55,9 +55,20 @@ I/O before releasing caller memory.
   process signals return Unsupported; console signal subscriptions are separate.
 - Standard streams are duplicated, preserving the host originals. Synchronous
   handles reserve two workers at adoption, one per direction. Reads and writes
-  have independent FIFOs and cancellation state; neither direction waits behind
-  the other's idle I/O. There is no ordering promise between reads and writes
-  on a regular file's shared offset. No worker allocation is needed per operation.
+  have independent FIFOs and cancellation state. Workers reuse the console
+  classification captured at quiescent adoption: a per-operation GetConsoleMode
+  is itself I/O and can wait behind an idle pipe read before WriteFile is reached.
+  No worker allocation or classification syscall is needed per operation.
+  Duplex pipe contracts require writes to progress before the peer replies to
+  idle reads. Anonymous pipe ends are one-way; console input and screen output
+  use separate native objects. Synchronous regular files preserve their shared
+  file position, with no cross-direction ordering promise; reads at EOF complete
+  rather than waiting for appended data. Other synchronous character devices
+  use ReadFile/WriteFile with their native driver's serialization/cancellation
+  semantics. Separate queues do not promise concurrent kernel I/O for arbitrary
+  device drivers. NUL exercises the ordinary character-device path; serial-port
+  and third-party hardware-driver runtime behavior is not covered by that test.
+  See [sem-fix1 evidence and Windows runtime handoff](../../../../../docs/lanes/iocp-semantics.md#sem-fix1).
   Imported handles are classified by native file mode before submission;
   overlapped pipes join this IOCP or route an existing foreign association, and
   other overlapped files are unsupported.
