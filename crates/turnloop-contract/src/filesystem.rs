@@ -587,7 +587,18 @@ pub fn fifo_cancel_close<B: Backend>(root: &Path) {
         assert!(out.is_empty());
     }
     let content = std::fs::read(&file).expect("file");
-    assert_eq!(content, if wrote { &b"unwritten"[..] } else { b"" });
+    if wrote {
+        assert_eq!(content, b"unwritten");
+    } else {
+        // D8: a write already running on a pool thread when close cancelled it
+        // runs to its end and still reports Cancelled; mutations are not rolled
+        // back. It never runs partially, and a write that never started never
+        // writes (the queued read above proves unstarted buffers stay untouched).
+        assert!(
+            content.is_empty() || content == b"unwritten",
+            "cancelled write left partial content: {content:?}"
+        );
+    }
     std::fs::remove_dir_all(&dir).expect("cleanup");
     assert!(!l.alive());
 }
