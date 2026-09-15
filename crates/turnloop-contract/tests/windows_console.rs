@@ -333,7 +333,11 @@ fn windows_hide_and_detached_match_console_inheritance() {
                 let attached = !detached && (!hide || inherited != 0);
                 let deadline = driver.now() + Duration::from_secs(10);
                 while exit == 0 || eof == 0 {
-                    assert!(driver.now() < deadline, "console probe watchdog");
+                    assert!(
+                        driver.now() < deadline,
+                        "console probe watchdog: hide={hide} inherited={inherited} detached={detached} exit={exit} eof={eof} triggered={triggered} output={:?}",
+                        String::from_utf8_lossy(&bytes)
+                    );
                     driver
                         .turn(Timeout::Until(deadline), &mut out)
                         .expect("probe turn");

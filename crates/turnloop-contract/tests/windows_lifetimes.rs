@@ -1867,16 +1867,27 @@ fn duplex_cancellation_is_per_direction_and_close_drop_join_both_workers() {
                         .expect("peer drains the surviving write");
                     (0, false)
                 };
+                let mut trace = Vec::new(); // failure context: completion order
                 while reads == 0 || responses == 0 || !wrote || drained < payload.len() {
-                    assert!(driver.now() < deadline);
+                    assert!(
+                        driver.now() < deadline,
+                        "cancel_write={cancel_write}: {trace:?}"
+                    );
                     driver
                         .turn(Timeout::Until(deadline), &mut out)
                         .expect("other direction survives cancellation");
                     for c in out.drain() {
+                        trace.push(match &c.result {
+                            OpResult::Read { n, .. } => format!("{:?}:Read({n})", c.token),
+                            other => format!("{:?}:{other:?}", c.token),
+                        });
                         match c.result {
                             OpResult::Read { n: 1, lease: None } => {
                                 assert_eq!(c.op, Some(expected_read));
-                                assert!(wrote, "read overtook the write it queued behind");
+                                assert!(
+                                    wrote,
+                                    "read overtook the write it queued behind: close={close} {trace:?}"
+                                );
                                 reads += 1;
                             }
                             OpResult::Read {
