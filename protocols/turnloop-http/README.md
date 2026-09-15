@@ -41,6 +41,16 @@ The HTTP/1 callback streams request events into a reusable Response encoder.
 HTTP/2 GOAWAY while existing streams drain. Wrap drain in an application deadline;
 dropping Server cancels its remaining service tasks.
 
+Connections close with a lingering close, as nginx `lingering_close` does: after the
+final response (and GOAWAY) is flushed, the server half-closes, reads and discards
+peer input until the peer's EOF, then closes. Closing with unread peer bytes (a
+pipelined request, HTTP/2 SETTINGS or WINDOW_UPDATE acknowledgements) would send
+RST, which can discard the peer's unread copy of the response on macOS and Windows.
+`server::Options::linger_timeout` (default 5 s, `Server::bind_with` or
+`Shutdown::with_options`) bounds the discard phase, and `Shutdown::stop_by(deadline)`
+closes every lingering connection by an overall shutdown deadline. Streams passed to
+`server::http1`/`http2` implement `turnloop_io::HalfClose`.
+
 ```sh
 cargo run -p turnloop-http --features turnloop --example https_get -- https://example.com/
 cargo run -p turnloop-http --features turnloop --example tls_echo -- cert.pem key.pem 127.0.0.1:8443

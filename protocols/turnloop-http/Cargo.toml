@@ -45,7 +45,7 @@ workspace = true
 [package.metadata.turnloop-ci]
 role = "protocol"
 service-group = "http"
-integration-tests = ["interop", "asynchronous"]
+integration-tests = ["interop", "asynchronous", "server_allocations"]
 wasi-tests = ["asynchronous", "codecs", "allocations"]
 
 [[test]]
@@ -66,6 +66,11 @@ required-features = ["turnloop"]
 
 [[test]]
 name = "asynchronous"
+required-features = ["turnloop"]
+
+[[test]]
+name = "server_allocations"
+harness = false
 required-features = ["turnloop"]
 
 [target.'cfg(all(target_os = "wasi", target_env = "p3"))'.dependencies]
