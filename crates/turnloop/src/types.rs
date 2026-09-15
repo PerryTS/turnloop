@@ -34,6 +34,24 @@ macro_rules! id {
 id!(Handle);
 id!(OpId);
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+/// The native identity of a transport, for host reporting and for a descriptor
+/// the host has taken ownership of (DESIGN §5a).
+///
+/// [`Driver::raw_transport`](crate::Driver::raw_transport) reports this for a
+/// live, loop-owned handle; it is Node's `socket._handle.fd`. The value is
+/// **reporting only**: see that method for the rules. Taking ownership is a
+/// separate, owning step (`detach` then `Detached::into_fd`/`into_socket`/
+/// `into_handle`).
+pub enum RawTransport {
+    /// A Unix file descriptor.
+    Fd(i32),
+    /// A Windows `SOCKET`.
+    Socket(usize),
+    /// A Windows `HANDLE`: a named-pipe instance, console or adopted stream.
+    Handle(usize),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Portable error categories independent of native numeric error codes.
 pub enum ErrorKind {

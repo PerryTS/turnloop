@@ -30,6 +30,7 @@ tl-i01b amendment below refines the single-wait rule.
 | `Backend::kill(handle, Signal, group)` | Signal the owned child or its explicitly created process group/tree. Never signal a reused process identity. |
 | `Backend::signal(handle, Signal)` | Install a per-loop subscription to the process-wide dispatcher, then accept `WatchSignal`. |
 | `Backend::tty_set_mode` / `tty_window_size` | Set/restore terminal mode and query character dimensions. Save original state for final release/drop. |
+| `Backend::raw_transport(handle) -> Result<RawTransport>` | Report a live transport's native identity (Unix fd, Windows SOCKET/HANDLE) for the host's own bookkeeping, Node's `socket._handle.fd`. Read it out of the backend's existing table; touch no operation storage and allocate nothing. Resources with no descriptor identity of their own — timers, processes, signals, watches, and every WASI/web resource — return `Unsupported`. Default is `Unsupported`. |
 
 The five optional native capability methods default to `Unsupported`; no native
 success is synthesized. `set_notifier` and `prepare_close` have separate no-op defaults. Backend
@@ -252,6 +253,32 @@ experimental. WASI stdio, single-agent external waits, Worker condition delivery
 and executor contracts run through the required platform runners. Windows IOCP
 runs in all three required native CI modes. Cross-checking is not runtime proof;
 browser and Windows runtime status remains explicit in the root lane report.
+
+## Descriptor handoff (§5a, issue #35)
+
+`raw_transport` is the only place a native identity crosses the backend boundary,
+and it crosses *outwards only*: the core returns the value to the host unchanged
+and never acts on it. Ownership does not travel that way. It travels through the
+existing `detach`, whose returned `Detached` now also converts into an owned
+descriptor — `into_fd` on Unix, `into_socket`/`into_handle` on Windows — instead
+of only into another loop's `attach`. That is what lets a host perform Node's
+mid-stream `socket.upgradeToTLS` without choosing the transport at creation time.
+
+Nothing in the trait changes for that conversion: `detach` already guarantees a
+quiescent, unregistered resource, so the backend has nothing left to release and
+the conversion is a move plus whatever the backend restores on adoption (Unix
+status flags and termios, Windows console mode). A backend that cannot hand a
+resource out keeps refusing in `detach`, as the IOCP backend does for pipe
+listeners and connecting pipes.
+
+Windows is the one platform where the handoff has a standing consequence. An IOCP
+association cannot be undone, so it travels with the handle; quiescence makes it
+inert, and the receiving host uses synchronous/non-blocking calls, tags
+`OVERLAPPED.hEvent` with its low-order bit to suppress the completion packet, or
+(sockets only) duplicates out of the association with `WSADuplicateSocketW`. An
+untagged overlapped call would deliver a packet to the source loop's port with a
+foreign `OVERLAPPED`; that loop reports `InvalidInput` from `turn` rather than
+dereferencing it, which is the existing `entry` guard, not a new rule.
 
 ## Specification clarifications proposed for review
 

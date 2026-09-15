@@ -2,7 +2,10 @@
 //!
 //! Public only so the contract runner and independently developed backends can use
 //! it; not a stable end-user extension API. All identifiers and buffers are core
-//! types. No raw fd, OVERLAPPED pointer, pollable or browser object crosses here.
+//! types. No raw fd, OVERLAPPED pointer, pollable or browser object crosses here,
+//! with one deliberate exception: `raw_transport` reports a `RawTransport` the core
+//! passes straight through to the host and never acts on (§5a handle transfer).
+//! Ownership still leaves through `detach`/`Detached`, never through that value.
 //!
 //! # Ownership and completion rules (D1–D4)
 //!
@@ -75,6 +78,11 @@
 //! * `Detached` may be an enum, not an integer: IOCP socket migration may require
 //!   duplication; WASI/browser objects need not support transfer. `Resource` is
 //!   intentionally absent: each backend owns its native tables keyed by Handle.
+//! * A `Detached` is also how a descriptor leaves turnloop for good: the platform
+//!   types expose `into_fd`/`into_socket`/`into_handle`, which restore whatever
+//!   the backend changed on adoption (status flags, terminal or console mode) and
+//!   then release ownership. Because `detach` already proved quiescence, the loop
+//!   has no operation, buffer or registration left for that transport.
 //! * `Wake` is Send + Sync on every target, but single-thread WASI/web may implement
 //!   it as a flag/host scheduler token. No backend creates a loop-driving thread.
 //!   Windows' explicitly requested Integration::Event helper is the D7 exception.
@@ -372,6 +380,16 @@ pub unsafe trait Backend: Sized + 'static {
         _handle: Handle,
         _kind: crate::SocketOptionKind,
     ) -> Result<crate::SocketOption> {
+        Err(Error::new(crate::ErrorKind::Unsupported))
+    }
+    /// Report the native identity of a live transport, for the host only.
+    ///
+    /// The core never acts on the value and never stores it: it reads it out of
+    /// the backend's own table and returns it, so a host can implement Node's
+    /// `socket._handle.fd`. Backends return Unsupported for a resource with no
+    /// descriptor identity of its own (timers, processes, signals, watches, and
+    /// every WASI/web resource). See `Driver::raw_transport` for the host rules.
+    fn raw_transport(&self, _handle: Handle) -> Result<crate::RawTransport> {
         Err(Error::new(crate::ErrorKind::Unsupported))
     }
     /// Query current terminal dimensions.

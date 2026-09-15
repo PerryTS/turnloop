@@ -258,6 +258,10 @@ There are two ways a host drives a loop:
 5. **Handle transfer:**
    - **Between loops:** `Loop::detach(h) -> Detached` (`Send`) and `Loop::attach(Detached, token) -> Handle`. For sockets, pipes and servers across threads or workers, it cancels in-flight ops with the usual exactly-once completions before detaching.
    - **Between processes:** fd passing via `SCM_RIGHTS` on Unix and `WSADuplicateSocketW` / `DuplicateHandle` on Windows, exposed on pipe handles so `child.send(msg, handle)` and cluster round-robin can move sockets (today `emitter.rs:430` drops the handle).
+   - **Out of turnloop entirely (host handoff):** the same `detach` followed by `Detached::into_fd()` on Unix, or `into_socket()` / `into_handle()` on Windows. This is Node's mid-stream `socket.upgradeToTLS` — PostgreSQL's `SSLRequest` hands a live, already-connected socket to a TLS layer — so the class of socket that *might* later be upgraded no longer has to choose its transport at creation. `detach` already proves quiescence, so the guarantee the host gets is total: no operation, no buffer, no registration, no completion, ever again, for that transport. Conversion restores what the backend changed on adoption (Unix status flags and termios, Windows console mode) and hands the descriptor over in the mode the loop held it: non-blocking for a loop-created socket.
+     - **Windows:** a handle's IOCP association is permanent — Windows cannot dissociate one, and rejects a second `CreateIoCompletionPort` with `ERROR_INVALID_PARAMETER`. Quiescence makes it inert (no packet can ever arrive for it), and the receiving host has three ways to work: synchronous/non-blocking Winsock calls, overlapped calls with `OVERLAPPED.hEvent`'s low-order bit set (which suppresses the completion packet), or — sockets only — `WSADuplicateSocketW` + `WSASocketW` to obtain a fresh, unassociated socket for the same connection. A named-pipe instance keeps `FILE_FLAG_OVERLAPPED` and cannot duplicate out of its association (`DuplicateHandle` shares the file object), so the tagged-`hEvent` rule is how a host drives one.
+     - **WASI 0.2/0.3 and web:** `Unsupported`. A WASI socket is a component-model resource handle in the component's own table, not a descriptor, and there is no interface that hands one to the embedder; a browser resource is a host JS object. Neither has an identity a host could act on.
+   - **Reporting only:** `Loop::raw_transport(h) -> RawTransport` reports a live transport's native identity for Node's `socket._handle.fd`. The loop keeps ownership; the value is valid until the handle is closed or detached, and is for reporting and read-only queries, never for I/O, closing, mode changes or registration elsewhere.
 6. **Multi-threaded accept:**
    - **Kernel-balanced:** where the kernel balances load (`SO_REUSEPORT` on Linux/FreeBSD), each loop gets its own listener with `ListenOpts::reuse_port`.
    - **Everywhere else** (macOS doesn't balance, and on Windows a socket can join only one completion port): one accepting loop hands connections to other loops with `detach`/`attach`. The policy (round-robin, least-loaded) belongs to the host.
@@ -311,10 +315,15 @@ impl Loop {
     pub fn poster(&self) -> Poster;             // Send + Sync + Clone: post (token, payload) to THIS loop
     pub fn integration(&mut self) -> io::Result<Integration>; // Fd | Event | HostCallback | RuntimeOwned
 
-    // multithreading (§5a)
+    // multithreading and host handoff (§5a)
     pub fn detach(&mut self, h: Handle) -> io::Result<Detached>;          // Detached: Send
     pub fn attach(&mut self, d: Detached, tok: Token) -> io::Result<Handle>;
     pub fn send_handle(&mut self, pipe: Handle, h: Handle, tok: Token) -> io::Result<OpId>; // SCM_RIGHTS / DuplicateHandle
+    pub fn raw_transport(&self, h: Handle) -> io::Result<RawTransport>;   // borrowed, reporting only: socket._handle.fd
+    // and, on the transport a detach returned, ownership leaves for good:
+    //   unix:    Detached::into_fd(self) -> OwnedFd
+    //   windows: Detached::into_socket(self) -> io::Result<OwnedSocket>
+    //            Detached::into_handle(self) -> io::Result<OwnedHandle>
 
     // timers
     pub fn timer(&mut self, at: Instant, repeat: Option<Duration>, tok: Token) -> Handle;
@@ -441,6 +450,8 @@ Two backends, because both versions matter now:
 | Outbound HTTP | protocol crate | protocol crate | protocol crate | protocol crate or `wasi:http` | protocol crate or `wasi:http` | host `fetch` |
 | WebSocket | protocol crate | protocol crate | protocol crate | protocol crate | protocol crate | host `WebSocket` |
 | Local IPC | AF_UNIX | AF_UNIX | named pipes (overlapped) | unsupported | unsupported | `postMessage` |
+| Descriptor handoff (§5a) | `Detached::into_fd` | `Detached::into_fd` | `into_socket`/`into_handle`; IOCP association is permanent, so tagged `hEvent` or `WSADuplicateSocketW` | unsupported (resource handle, not a descriptor) | unsupported (resource handle, not a descriptor) | unsupported (host object) |
+| Native identity reporting (`_handle.fd`) | `RawTransport::Fd` | `RawTransport::Fd` | `RawTransport::Socket`/`Handle` | unsupported | unsupported | unsupported |
 | Stdio pipes | readiness | readiness | overlapped, or reader thread | `wasi:cli` streams | `wasi:cli` streams | unsupported |
 | TTY | termios + readiness | termios + readiness | console API reader thread, VT modes | size only | size only | unsupported |
 | Child processes | pidfd / SIGCHLD | EVFILT_PROC | RegisterWaitForSingleObject + Job Object | unsupported | unsupported | unsupported |

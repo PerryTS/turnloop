@@ -1608,6 +1608,7 @@ pub fn no_spin<B: Backend>() {
 
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub mod filesystem;
+pub mod handoff;
 pub mod native_surface;
 pub mod sockopts;
 

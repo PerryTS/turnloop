@@ -105,15 +105,100 @@ impl Detached {
             accept_defaults: AcceptDefaults::EMPTY,
         }
     }
-}
-impl Drop for Detached {
-    fn drop(&mut self) {
+    /// The socket or handle this transport owns, for host reporting only.
+    /// A pipe listener owns no instance of its own and reports Unsupported.
+    pub fn raw_transport(&self) -> Result<crate::RawTransport> {
+        match &self.native {
+            Native::Socket(s) => Ok(crate::RawTransport::Socket(s.as_raw_socket() as usize)),
+            Native::Handle(h) => Ok(crate::RawTransport::Handle(h.as_raw_handle() as usize)),
+            Native::PipeListener => Err(unsupported()),
+        }
+    }
+    /// Give the socket to the caller; turnloop never touches it again.
+    ///
+    /// `Driver::detach` already proved quiescence, so no operation, kernel
+    /// storage or worker of this loop refers to the socket. It is handed over
+    /// exactly as the loop held it: non-blocking (`FIONBIO`), and with
+    /// `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS` still set if the provider is an
+    /// IFS provider. Call `ioctlsocket(FIONBIO, 0)` (or
+    /// `TcpStream::set_nonblocking(false)`) for blocking I/O, which is what a
+    /// synchronous TLS handshake on the socket needs.
+    ///
+    /// **The IOCP association is permanent and travels with the socket.** Windows
+    /// has no way to dissociate a handle from a completion port, and rejects a
+    /// second `CreateIoCompletionPort` for one with `ERROR_INVALID_PARAMETER`, so
+    /// the receiving host cannot put this socket on a port of its own. What it
+    /// can do:
+    ///
+    /// * **Synchronous or non-blocking Winsock calls** — `recv`/`send`/`select`
+    ///   and `WSARecv`/`WSASend` without an `OVERLAPPED`. These never touch a
+    ///   completion port and are the supported way to use a handed-over socket.
+    /// * **Overlapped calls with `hEvent` tagged** — set the low-order bit of
+    ///   `OVERLAPPED.hEvent` (`hEvent | 1`). Windows then skips queueing the
+    ///   completion packet, and the host waits on its own event.
+    /// * **Its own completion port** — duplicate first:
+    ///   `WSADuplicateSocketW` into `WSAPROTOCOL_INFOW`, then `WSASocketW` with
+    ///   `FROM_PROTOCOL_INFO`. The duplicate is a new, unassociated socket for the
+    ///   same underlying connection; drop this one once it exists.
+    ///
+    /// Issuing an untagged overlapped call is the one thing that is not allowed:
+    /// its completion packet would arrive on the source loop's port carrying an
+    /// `OVERLAPPED` that loop does not own, and that loop's next `turn` reports
+    /// `InvalidInput` rather than dereferencing it.
+    pub fn into_socket(self) -> Result<OwnedSocket> {
+        if !matches!(self.native, Native::Socket(_)) {
+            return Err(invalid());
+        }
+        match self.take_native() {
+            Native::Socket(socket) => Ok(socket),
+            _ => Err(invalid()),
+        }
+    }
+    /// Give the named-pipe instance, console or adopted stream handle to the
+    /// caller; turnloop never touches it again. A socket is `InvalidInput`
+    /// (use [`into_socket`](Self::into_socket)) and a pipe listener, which owns
+    /// no instance of its own, is `Unsupported`.
+    ///
+    /// A captured console mode is restored first, exactly as on close. Every
+    /// other property is handed over unchanged, including
+    /// `FILE_FLAG_OVERLAPPED` on a pipe instance: the receiving host must supply
+    /// an `OVERLAPPED` for every `ReadFile`/`WriteFile`, and the IOCP rules in
+    /// [`into_socket`](Self::into_socket) apply unchanged. For a pipe the
+    /// duplication escape hatch does **not** exist — `DuplicateHandle` shares the
+    /// same file object and therefore the same association — so tagging
+    /// `OVERLAPPED.hEvent` with its low-order bit (`hEvent | 1`) is the only way
+    /// to drive it, and it is enough: the host waits on its own event and the
+    /// source loop's port never sees a packet.
+    pub fn into_handle(self) -> Result<OwnedHandle> {
+        match self.native {
+            Native::Handle(_) => {}
+            Native::Socket(_) => return Err(invalid()),
+            Native::PipeListener => return Err(unsupported()),
+        }
+        match self.take_native() {
+            Native::Handle(handle) => Ok(handle),
+            _ => Err(invalid()),
+        }
+    }
+    /// Restore adopted settings, then move the native resource out. What is left
+    /// behind owns nothing, so the usual Drop releases the rest of the transport.
+    fn take_native(mut self) -> Native {
+        self.restore();
+        self.mode = None;
+        std::mem::replace(&mut self.native, Native::PipeListener)
+    }
+    fn restore(&self) {
         if let Some(mode) = self.mode {
             // SAFETY: owned console handle is still live; mode was captured on adoption.
             unsafe {
                 windows_sys::Win32::System::Console::SetConsoleMode(self.native.raw(), mode);
             }
         }
+    }
+}
+impl Drop for Detached {
+    fn drop(&mut self) {
+        self.restore();
     }
 }
 struct Resource {
@@ -1488,6 +1573,12 @@ unsafe impl Backend for Iocp {
             self.workers[h.index()] = None;
             self.resources[h.index()] = None;
         }
+    }
+    fn raw_transport(&self, h: Handle) -> Result<crate::RawTransport> {
+        if self.services.contains(h) || self.watches.contains(h) {
+            return Err(unsupported());
+        }
+        self.get(h)?.transport.raw_transport()
     }
     fn detach(&mut self, h: Handle) -> Result<Detached> {
         let r = self.get(h)?;

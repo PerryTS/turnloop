@@ -519,6 +519,73 @@ fn steady_socket_options_allocate_nothing() {
     turnloop_contract::sockopts::close_all(&mut l, &[client, conn, server, udp]);
 }
 
+/// Handing a transport to the host and taking it back allocates nothing: the
+/// identity is read out of the backend's own table, `detach` only unregisters,
+/// and the conversion to an owned descriptor moves the resource it already held.
+#[test]
+fn steady_handoff_allocates_nothing() {
+    let mut l = Loop::new(Config::default()).expect("loop");
+    let (server, client, conn) =
+        turnloop_contract::sockopts::plain_pair(&mut l, &ListenOpts::default());
+    let mut h = conn;
+    let mut total = 0;
+    let mut cycles = 0;
+    for i in 0..101u32 {
+        ALLOCS.with(|n| n.set(0));
+        ACTIVE.with(|v| v.set(i != 0));
+        let reported = l.raw_transport(h).expect("identity");
+        let transport = l.detach(h).expect("handoff");
+        #[cfg(unix)]
+        let (owned, back) = {
+            use std::os::fd::AsRawFd;
+            let fd = transport.into_fd();
+            let owned = RawTransport::Fd(fd.as_raw_fd());
+            (owned, Detached::from_fd(fd).expect("re-adopt"))
+        };
+        #[cfg(windows)]
+        let (owned, back) = {
+            use std::os::windows::io::AsRawSocket;
+            let socket = transport.into_socket().expect("socket transport");
+            let owned = RawTransport::Socket(socket.as_raw_socket() as usize);
+            (owned, Detached::from_socket(socket).expect("re-adopt"))
+        };
+        h = l.attach(back, Token(0)).expect("attach");
+        ACTIVE.with(|v| v.set(false));
+        assert_eq!(
+            owned, reported,
+            "the host received a different transport from the reported one"
+        );
+        if i != 0 {
+            cycles += 1;
+            total += ALLOCS.with(|n| n.get());
+        }
+    }
+    assert_eq!(cycles, 100, "the handoff subject ran");
+    assert_eq!(total, 0, "steady handoff allocations");
+    // The socket survived a hundred round trips: the cycle was not vacuous.
+    let mut out = Completions::default();
+    l.write(h, WriteBuf::Owned(b"round trip".to_vec()), Token(1))
+        .expect("write");
+    l.read(client, ReadBuf::Pooled, Token(2)).expect("read");
+    let until = l.now() + Duration::from_secs(5);
+    let mut read = 0;
+    while read == 0 {
+        assert!(l.now() < until, "the re-attached socket stopped working");
+        l.turn(Timeout::Until(until), &mut out).expect("turn");
+        for c in out.drain() {
+            if let OpResult::Read {
+                n,
+                lease: Some(data),
+            } = c.result
+            {
+                assert_eq!(&data.as_slice()[..n], b"round trip");
+                read += 1;
+            }
+        }
+    }
+    turnloop_contract::sockopts::close_all(&mut l, &[client, h, server]);
+}
+
 #[test]
 fn steady_deadline_poll_allocate_nothing() {
     let mut l = Loop::new(Config::default()).expect("loop");

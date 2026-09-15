@@ -50,6 +50,46 @@ impl std::fmt::Debug for Detached {
     }
 }
 impl Detached {
+    /// The descriptor this transport owns, for host reporting only.
+    pub fn raw_transport(&self) -> crate::RawTransport {
+        crate::RawTransport::Fd(self.fd.as_raw_fd())
+    }
+    /// Give the descriptor to the caller; turnloop never touches it again.
+    ///
+    /// The transport is already unregistered and quiescent: `Driver::detach`
+    /// refuses a handle with an outstanding operation, so no loop, poller or
+    /// buffer refers to this descriptor any more. Status flags and terminal
+    /// settings captured when the descriptor was adopted are restored first,
+    /// exactly as they would be on close, and then the close is *not* performed.
+    ///
+    /// A descriptor turnloop created itself was created non-blocking with
+    /// `FD_CLOEXEC`, and it is handed over that way: nothing is restored,
+    /// because nothing was changed. Call `fcntl(F_SETFL)` (or
+    /// `TcpStream::set_nonblocking(false)`) if the receiving code wants blocking
+    /// I/O, which is what a synchronous TLS handshake on the descriptor needs.
+    pub fn into_fd(self) -> OwnedFd {
+        self.restore();
+        let this = std::mem::ManuallyDrop::new(self);
+        // SAFETY: `this` is never dropped, so this move of the single owning
+        // field cannot be observed twice; the remaining fields are Copy/plain
+        // data whose Drop is a no-op. `restore` already ran, and it is the only
+        // thing this type's Drop does besides releasing `fd`.
+        unsafe { std::ptr::read(&this.fd) }
+    }
+    fn restore(&self) {
+        if let Some(mode) = &self.original_mode {
+            // SAFETY: descriptor is still owned; restore before OwnedFd drops.
+            unsafe {
+                libc::tcsetattr(self.fd.as_raw_fd(), libc::TCSANOW, mode);
+            }
+        }
+        if let Some(flags) = self.original_flags {
+            // SAFETY: descriptor is still owned and flags came from F_GETFL.
+            unsafe {
+                libc::fcntl(self.fd.as_raw_fd(), libc::F_SETFL, flags);
+            }
+        }
+    }
     pub(super) fn new(fd: OwnedFd, kind: Kind) -> Self {
         // SAFETY: termios is plain C storage, filled by tcgetattr on a terminal.
         let mut mode: libc::termios = unsafe { std::mem::zeroed() };
@@ -73,18 +113,7 @@ impl Detached {
 }
 impl Drop for Detached {
     fn drop(&mut self) {
-        if let Some(mode) = &self.original_mode {
-            // SAFETY: descriptor is still owned; restore before OwnedFd drops.
-            unsafe {
-                libc::tcsetattr(self.fd.as_raw_fd(), libc::TCSANOW, mode);
-            }
-        }
-        if let Some(flags) = self.original_flags {
-            // SAFETY: descriptor is still owned and flags came from F_GETFL.
-            unsafe {
-                libc::fcntl(self.fd.as_raw_fd(), libc::F_SETFL, flags);
-            }
-        }
+        self.restore();
     }
 }
 struct Resource {
@@ -704,6 +733,12 @@ unsafe impl Backend for Unix {
             self.resources[h.index()] = None;
         }
         // Closing the final descriptor removes its registration from epoll/kqueue.
+    }
+    fn raw_transport(&self, h: Handle) -> Result<crate::RawTransport> {
+        if self.services.contains(h) || self.watches.contains(h) {
+            return Err(Error::new(ErrorKind::Unsupported));
+        }
+        Ok(self.get(h)?.transport.raw_transport())
     }
     fn detach(&mut self, h: Handle) -> Result<Detached> {
         let r = self.get(h)?;

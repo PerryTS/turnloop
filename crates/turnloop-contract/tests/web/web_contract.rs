@@ -504,6 +504,11 @@ async fn capability_errors_and_oversize_response_are_terminal() {
         l.detach(h).expect_err("transfer").kind,
         ErrorKind::Unsupported
     );
+    // A browser resource is a host object with no descriptor identity (#35).
+    assert_eq!(
+        l.raw_transport(h).expect_err("identity").kind,
+        ErrorKind::Unsupported
+    );
     let read = l.read(h, ReadBuf::Pooled, Token(3)).expect("read");
     assert_eq!(
         l.read(h, ReadBuf::Pooled, Token(4))
