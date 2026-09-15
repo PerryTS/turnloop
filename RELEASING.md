@@ -99,6 +99,15 @@ so its changelog and version proposals are useful. Review the resulting APIs and
 changelog before merging. Only merging a branch named `release-plz-*` into main
 is eligible to publish, verified through the associated-PR API and merge SHA.
 
+crates.io Trusted Publishing refuses OIDC tokens to `workflow_run` runs, so when
+the verified commit is a merged release PR, the `dispatch-publish` job dispatches
+`release.yml` itself (`workflow_dispatch` on `main`) with that SHA and CI run ID.
+The dispatched run verifies both inputs again with main's own verifier script
+(never the input commit's scripts) before its publish job can start. The Trusted
+Publisher configuration therefore stays `release.yml` + environment `crates-io`.
+If a dispatch is lost, an owner can start it manually with the same two inputs
+from the Actions tab; the same verification applies.
+
 After environment approval, the publishing job checks the exact commit's CI again,
 checks locked dependency ages and all eight runtime dependency graphs, runs
 `cargo semver-checks --all-features` against registry baselines, and performs a

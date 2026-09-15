@@ -4,6 +4,19 @@ on: # zizmor: ignore[dangerous-triggers] -- Exact SHA/API-verified same-reposito
     workflows: [CI]
     branches: [main]
     types: [completed]
+  # crates.io Trusted Publishing refuses OIDC tokens from workflow_run events, so
+  # the verified workflow_run dispatches this same workflow for the publish job.
+  # Every input is re-verified through the API before anything is published.
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Merged release-plz commit on main to publish (40 hex)
+        required: true
+        type: string
+      ci_run_id:
+        description: Successful ci.yml push-to-main run for that commit
+        required: true
+        type: string
 permissions: {}
 concurrency:
   group: release-main
@@ -15,9 +28,10 @@ defaults:
 jobs:
   verify:
     if: >-
+      github.event_name == 'workflow_dispatch' || (
       github.event.workflow_run.event == 'push' &&
       github.event.workflow_run.head_repository.full_name == 'PerryTS/turnloop' &&
-      github.event.workflow_run.conclusion == 'success'
+      github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -30,7 +44,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: ${{ github.event.workflow_run.head_sha }}
+          # A dispatch runs main's verifier (github.sha), never the input commit's
+          # scripts; the verifier proves inputs.sha is a merged release commit.
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.14'
@@ -38,11 +54,12 @@ jobs:
         id: ci
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
-          CI_RUN_ID: ${{ github.event.workflow_run.id }}
+          RELEASE_SHA: ${{ github.event.workflow_run.head_sha || inputs.sha }}
+          CI_RUN_ID: ${{ github.event.workflow_run.id || inputs.ci_run_id }}
         run: python3 scripts/ci/check-ci.py --release-pr
   release-pr:
     needs: verify
+    if: github.event_name == 'workflow_run'
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -75,9 +92,23 @@ jobs:
           GIT_TOKEN: ${{ steps.app.outputs.token }}
           RUSTUP_TOOLCHAIN: nightly-2026-08-20
         run: release-plz release-pr --repo-url https://github.com/PerryTS/turnloop --config release-plz.toml
+  dispatch-publish:
+    needs: verify
+    if: github.event_name == 'workflow_run' && needs.verify.outputs.release == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+    timeout-minutes: 5
+    steps:
+      - name: Dispatch the Trusted Publishing run for the verified release commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
+          CI_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: gh workflow run release.yml --repo PerryTS/turnloop --ref main -f "sha=$RELEASE_SHA" -f "ci_run_id=$CI_RUN_ID"
   publish:
     needs: verify
-    if: needs.verify.outputs.release == 'true'
+    if: github.event_name == 'workflow_dispatch' && needs.verify.outputs.release == 'true'
     runs-on: ubuntu-24.04
     # The owner must configure required reviewers and main-only deployments.
     environment: crates-io
@@ -87,13 +118,13 @@ jobs:
       id-token: write
     timeout-minutes: 60
     env:
-      RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
-      CI_RUN_ID: ${{ github.event.workflow_run.id }}
+      RELEASE_SHA: ${{ inputs.sha }}
+      CI_RUN_ID: ${{ inputs.ci_run_id }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: ${{ github.event.workflow_run.head_sha }}
+          ref: ${{ inputs.sha }}
           fetch-depth: 0
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
