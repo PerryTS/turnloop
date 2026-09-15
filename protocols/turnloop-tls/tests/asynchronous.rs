@@ -57,15 +57,14 @@ fn async_tls_alpn_fragmented_plaintext_and_close_notify() {
             assert_eq!(tls.alpn_protocol(), Some(b"h2".as_slice()));
             let mut data = [0; 1];
             let mut count = 0;
-            loop {
+            while count < 32768 {
                 let n = read(&mut tls, &mut data).await.expect("TLS read");
-                if n == 0 {
-                    break;
-                }
-                assert_eq!(data[0], b'x');
+                assert_eq!((n, data[0]), (1, b'x'), "early EOF or corrupt plaintext");
                 count += n;
             }
-            assert_eq!(count, 32768);
+            write_all(&mut tls, b"k").await.expect("acknowledge");
+            flush(&mut tls).await.expect("acknowledge flush");
+            assert_eq!(read(&mut tls, &mut data).await.expect("close notify"), 0);
             count
         })
         .expect("spawn");
@@ -89,6 +88,13 @@ fn async_tls_alpn_fragmented_plaintext_and_close_notify() {
             write_all(&mut tls, &[b'x'; 32768])
                 .await
                 .expect("TLS write");
+            flush(&mut tls).await.expect("TLS flush");
+            // Reading the acknowledgement also consumes the server's session tickets.
+            // Closing a socket with unread bytes sends RST, and Windows then discards
+            // data the server has not read yet (Unix delivers it before the reset).
+            let mut ack = [0; 1];
+            assert_eq!(read(&mut tls, &mut ack).await.expect("acknowledgement"), 1);
+            assert_eq!(ack[0], b'k');
             close(&mut tls).await.expect("close notify");
             32768
         })

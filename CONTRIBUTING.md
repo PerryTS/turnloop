@@ -52,8 +52,8 @@ for each core/protocol/contract member, and runs native Node/curl interop with t
 same mode. Independent member runs retain the selected features belonging to that
 member or its direct dependencies; a sans-IO crate with no core dependency has
 no backend feature to select. The workspace run keeps the full feature selection.
-The existing Windows pending-contract marker remains scoped to
-that provider. Every arm is required through the matrix job's `ci-gate` result.
+Every arm independently requires positive contract counts, including Windows
+IOCP. Every arm is required through the matrix job's `ci-gate` result.
 
 `python3 scripts/ci/run-tests.py native` runs all applicable modes on the current
 host; `--mode epoll-timerfd` selects just that Linux arm. `interop --mode MODE`
@@ -381,15 +381,14 @@ protocol member, with default, executor and all features. The existing sans-IO u
 SCRAM, SDAM/selection fixture and allocation tests are portable. No unnecessary
 Unix test cfg exclusions were found.
 
-Production IOCP contracts are explicitly pending through the contract member's
-`windows-contracts-pending = "WINDOWS_HANDOFF.md"` metadata. The runner lists their
-scope and handoff in the Windows job summary. Remove this metadata when IOCP lands;
-the ordinary independent positive-count contract gate then applies on Windows too.
-This marker applies only to Windows contracts; core/protocol zero counts and Unix
-contract zero counts always fail.
+The production IOCP backend implements revision 2 and runs the shared contracts,
+including no-spin and allocation gates, plus Windows process, console, GUI and
+lifetime tests. The pending-contract metadata has been removed; zero counts fail
+on Windows just as on Unix. Cross-compilation does not establish runtime coverage.
 
-- **Wave 2 Windows:** adapt `spikes/iocp` to the production Backend, instantiate
-  `turnloop-contract` on IOCP, run all contracts (including no-spin) on Windows.
+- **Windows:** run `python3 scripts/ci/run-tests.py native` on Windows for all
+  three required modes. Keep platform-specific runtime results explicit in lane
+  reports when developing on another host.
 - **WASM providers and contracts:** production p2 and web adapters and the
   experimental p3 adapter now live in `crates/turnloop`. Run the mandatory
   `run-tests.py wasi --target wasm32-wasip2`, `... wasm32-wasip3`, `run-tests.py web`

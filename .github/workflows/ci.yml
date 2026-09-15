@@ -103,7 +103,6 @@ jobs:
           cargo +nightly-2026-08-20 clippy --locked --workspace --all-targets --target "$TARGET" --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks
           rustup toolchain install stable --profile minimal --target "$TARGET"
           cargo +stable check --locked --workspace --all-targets --all-features --target "$TARGET"
-  # PENDING Windows shared contracts until the IOCP production provider lands (wave 2).
   test-native:
     strategy:
       fail-fast: false
@@ -148,6 +147,13 @@ jobs:
           package-manager-cache: false
       - name: Install pinned Rust
         run: rustup toolchain install nightly-2026-08-20 --profile minimal --component rustfmt,clippy
+      - name: Install checksum-pinned curl with HTTP/2 on Windows
+        # Shell condition, not a step `if:`: native mode steps stay unconditional for the feature-coverage gate.
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            python3 scripts/ci/install-tools.py curl
+            echo "TURNLOOP_TEST_CURL=$GITHUB_WORKSPACE/.tools/bin/curl.exe" >> "$GITHUB_ENV"
+          fi
       - name: Workspace and single-threaded contracts in the selected mode
         run: python3 scripts/ci/run-tests.py native --mode "$NATIVE_MODE"
       - name: HTTP, TLS and WebSocket Node/curl interop
@@ -176,6 +182,10 @@ jobs:
           package-manager-cache: false
       - name: Install pinned Rust
         run: rustup toolchain install nightly-2026-08-20 --profile minimal --component rustfmt,clippy
+      - name: Install checksum-pinned curl with HTTP/2
+        run: |
+          python3 scripts/ci/install-tools.py curl
+          echo "TURNLOOP_TEST_CURL=$GITHUB_WORKSPACE/.tools/bin/curl.exe" >> "$GITHUB_ENV"
       - name: Native Windows lint and contracts
         run: |
           cargo +nightly-2026-08-20 clippy --locked --workspace --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks

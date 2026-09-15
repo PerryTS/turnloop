@@ -2,8 +2,9 @@
 
 Standalone workspace, windows-sys 0.61.2 only. No tokio or compio dependency.
 Requires Windows 10 1803+ for the high-resolution timer probes. NT packet probes
-feature-detect ntdll exports and fail explicitly if unavailable. All Windows
-runtime tests are **UNRUN** on the development macOS host.
+feature-detect ntdll exports and fail explicitly if unavailable. Originally
+cross-checked on macOS; native Windows results, the recorded APC failure and
+the production backend validation are in [WINDOWS_RESULTS.md](WINDOWS_RESULTS.md).
 
 Each mechanism has its own Cargo integration-test binary:
 

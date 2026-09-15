@@ -86,7 +86,8 @@ fn blocked_signal() {
     target_vendor = "apple",
     target_os = "linux",
     target_os = "android",
-    target_os = "freebsd"
+    target_os = "freebsd",
+    target_os = "windows"
 ))]
 fn native_stdio() {
     use turnloop::*;
@@ -134,7 +135,8 @@ fn native_stdio() {
     target_vendor = "apple",
     target_os = "linux",
     target_os = "android",
-    target_os = "freebsd"
+    target_os = "freebsd",
+    target_os = "windows"
 )))]
 fn native_stdio() {
     panic!("instantiate stdio fixture on production native backend");
@@ -143,7 +145,8 @@ fn native_stdio() {
     target_vendor = "apple",
     target_os = "linux",
     target_os = "android",
-    target_os = "freebsd"
+    target_os = "freebsd",
+    target_os = "windows"
 ))]
 fn native_handle(path: &std::ffi::OsStr) {
     use turnloop::*;
@@ -190,7 +193,8 @@ fn native_handle(path: &std::ffi::OsStr) {
     target_vendor = "apple",
     target_os = "linux",
     target_os = "android",
-    target_os = "freebsd"
+    target_os = "freebsd",
+    target_os = "windows"
 )))]
 fn native_handle(_: &std::ffi::OsStr) {
     panic!("instantiate handle fixture on production native backend");

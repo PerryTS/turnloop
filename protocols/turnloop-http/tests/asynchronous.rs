@@ -690,19 +690,27 @@ fn expect_continue_timeout_and_early_response() {
         .spawn_local(async move {
             let tls = turnloop_tls::ClientConfig::new(Default::default(), 1_789_344_000)
                 .expect("TLS config");
-            let mut client = Client::new(
-                h,
-                tls,
-                1_789_344_000,
-                Options {
-                    continue_timeout: Duration::from_millis(2),
-                    ..Default::default()
-                },
-            );
+            let client = |continue_timeout| {
+                Client::new(
+                    h.clone(),
+                    tls.clone(),
+                    1_789_344_000,
+                    Options {
+                        continue_timeout,
+                        ..Default::default()
+                    },
+                )
+            };
             let mut request = Request::new(&format!("http://{address}/"), "POST").expect("request");
             request.headers.push(Header::new("expect", "100-continue"));
             request.body = vec![b'x'; 16384];
+            // Cases 0 and 1 need the 2 ms continue timeout to expire (case 1 never
+            // sends 100). Case 2 proves an early final response suppresses the upload,
+            // so its timeout must not be able to win the race on a slow runtime.
+            let mut short = client(Duration::from_millis(2));
+            let mut long = client(Duration::from_secs(30));
             for case in 0..3 {
+                let client = if case == 2 { &mut long } else { &mut short };
                 let head = client
                     .request(&mut request, |_| panic!("empty response"))
                     .await
@@ -759,7 +767,8 @@ fn curl_against_async_http1_server() {
             received
         })
         .expect("spawn");
-    let child = Command::new("curl")
+    let curl = std::env::var_os("TURNLOOP_TEST_CURL").unwrap_or_else(|| "curl".into());
+    let mut child = Command::new(curl)
         .args([
             "--http1.1",
             "--silent",
@@ -774,11 +783,20 @@ fn curl_against_async_http1_server() {
             &format!("http://{address}/"),
         ])
         .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("curl required for HTTP/1.1");
     let end = executor.driver().now() + Duration::from_secs(10);
     while !task.is_finished() {
-        assert!(executor.driver().now() < end);
+        if executor.driver().now() >= end {
+            // Tell a hung server (curl exited, its close never delivered) from a hung curl.
+            let exited = child.try_wait();
+            let _ = child.kill();
+            panic!(
+                "server task pending after 10 s; curl before kill: {exited:?}; curl output: {:?}",
+                child.wait_with_output()
+            );
+        }
         executor.turn(Timeout::Until(end)).expect("turn");
     }
     assert_eq!(finish(&mut task), 15);

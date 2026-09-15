@@ -5,7 +5,7 @@
 //! process-wide blocking, signal and external-wait services start only on use.
 //!
 //! ```
-//! # #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android", target_os = "freebsd"))]
+//! # #[cfg(any(windows, target_vendor = "apple", target_os = "linux", target_os = "android", target_os = "freebsd"))]
 //! # fn main() -> turnloop::Result<()> {
 //! use std::time::Duration;
 //! use turnloop::{Completions, Config, Loop, OpResult, Timeout, Token};
@@ -24,7 +24,7 @@
 //! driver.turn(Timeout::Now, &mut completions)?;
 //! assert!(!driver.alive());
 //! # Ok(()) }
-//! # #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android", target_os = "freebsd")))]
+//! # #[cfg(not(any(windows, target_vendor = "apple", target_os = "linux", target_os = "android", target_os = "freebsd")))]
 //! # fn main() {}
 //! ```
 //!
@@ -58,12 +58,15 @@ pub use notifier::{Notifier, PostError, Poster};
 #[cfg(any(
     turnloop_backend = "kqueue",
     turnloop_backend = "epoll",
+    turnloop_backend = "iocp",
     turnloop_backend = "wasi_p2",
     turnloop_backend = "web",
     all(turnloop_backend = "wasi_p3", feature = "wasi-p3-experimental")
 ))]
 /// The platform driver selected for the compilation target; owned by one agent.
 pub type Loop = Driver<backend::Platform>;
+#[cfg(turnloop_backend = "iocp")]
+pub use backend::iocp::Detached;
 #[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
 pub use backend::unix::Detached;
 
