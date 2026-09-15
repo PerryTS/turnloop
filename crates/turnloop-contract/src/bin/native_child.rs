@@ -21,6 +21,12 @@ fn main() {
             println!("60 service timer expiries; no-spin bounds passed");
         }
         "exit" => std::process::exit(23),
+        "exit-with" => std::process::exit(
+            args[2]
+                .to_str()
+                .and_then(|code| code.parse().ok())
+                .expect("exit code"),
+        ),
         "sleep" => std::thread::sleep(Duration::from_secs(60)),
         "roundtrip" => {
             let mut stdout = std::io::stdout().lock();
@@ -89,6 +95,59 @@ fn main() {
         "handle" => native_handle(args.get(2).expect("pipe path")),
         #[cfg(any(target_vendor = "apple", target_os = "freebsd"))]
         "blocked-signal" => blocked_signal(),
+        // Both extra descriptors carry bytes in both directions. The channel
+        // number is read out of the environment exactly as Node reads
+        // NODE_CHANNEL_FD, so this proves the handoff, not a hard-coded 3.
+        "channel" => {
+            let channel = numbered_fd("NODE_CHANNEL_FD");
+            let extra = numbered_fd("TURNLOOP_EXTRA_FD");
+            let mut request = [0u8; 6];
+            read_exact(channel, &mut request);
+            assert_eq!(&request, b"ping-3", "channel request");
+            write_all(channel, b"pong-3");
+            read_exact(extra, &mut request);
+            assert_eq!(&request, b"ping-4", "extra request");
+            write_all(extra, b"pong-4");
+            print!("ok");
+            std::io::stdout().flush().expect("flush transcript");
+        }
+        // One-way pipe, null device and an adopted parent transport.
+        "extra-sources" => {
+            let (one_way, null, adopted) = (fd_stream(3), fd_stream(4), fd_stream(5));
+            write_all(one_way, b"three");
+            write_all(null, b"void");
+            let mut discard = [0u8; 4];
+            assert_eq!(read_once(null, &mut discard), 0, "null device reads EOF");
+            write_all(adopted, b"five");
+            print!("ok");
+            std::io::stdout().flush().expect("flush transcript");
+        }
+        #[cfg(unix)]
+        "tty-session" => {
+            // SAFETY: queries this process only; no pointer arguments or mutation.
+            let (pid, group, session) =
+                unsafe { (libc::getpid(), libc::getpgrp(), libc::getsid(0)) };
+            // SAFETY: constant device path with integer flags; -1 means no
+            // controlling terminal, which is the distinction under test.
+            let terminal = unsafe { libc::open(c"/dev/tty".as_ptr(), libc::O_RDWR) };
+            let foreground = if terminal < 0 {
+                -1
+            } else {
+                // SAFETY: live descriptor on this process's controlling terminal.
+                unsafe { libc::tcgetpgrp(terminal) }
+            };
+            if terminal >= 0 {
+                // SAFETY: closing the descriptor this branch just opened.
+                unsafe {
+                    libc::close(terminal);
+                }
+            }
+            println!("{pid}:{group}:{session}:{}", i32::from(terminal >= 0));
+            assert_eq!(
+                foreground, group,
+                "child leads its terminal foreground group"
+            );
+        }
         "copy" => {
             let mut bytes = Vec::new();
             std::io::stdin()
@@ -316,4 +375,111 @@ fn native_handle(path: &std::ffi::OsStr) {
 )))]
 fn native_handle(_: &std::ffi::OsStr) {
     panic!("instantiate handle fixture on production native backend");
+}
+
+/// A child descriptor as this platform's stream identity: the number itself on
+/// Unix, and the C run-time's handle for it on Windows, which is precisely how
+/// libuv's `uv_pipe_open` turns Node's `NODE_CHANNEL_FD` into a usable stream.
+#[cfg(unix)]
+type FdStream = std::os::fd::RawFd;
+#[cfg(windows)]
+type FdStream = windows_sys::Win32::Foundation::HANDLE;
+
+#[cfg(windows)]
+unsafe extern "C" {
+    fn _get_osfhandle(fd: i32) -> isize;
+}
+
+fn fd_stream(fd: i32) -> FdStream {
+    #[cfg(unix)]
+    {
+        fd
+    }
+    #[cfg(windows)]
+    {
+        // SAFETY: the C run-time owns its descriptor table; this only reads it.
+        let handle = unsafe { _get_osfhandle(fd) };
+        assert!(handle > 0, "descriptor {fd} is absent from the C run-time");
+        handle as FdStream
+    }
+}
+
+fn numbered_fd(variable: &str) -> FdStream {
+    let value = std::env::var(variable).unwrap_or_else(|_| panic!("{variable} is unset"));
+    fd_stream(value.parse().expect("descriptor number"))
+}
+
+fn read_once(stream: FdStream, buffer: &mut [u8]) -> usize {
+    #[cfg(unix)]
+    {
+        // SAFETY: live inherited descriptor and a writable buffer of that length.
+        let n = unsafe { libc::read(stream, buffer.as_mut_ptr().cast(), buffer.len()) };
+        assert!(n >= 0, "read: {}", std::io::Error::last_os_error());
+        n as usize
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::{Foundation::ERROR_BROKEN_PIPE, Storage::FileSystem::ReadFile};
+        let mut read = 0;
+        // SAFETY: live inherited handle, writable buffer of the stated length,
+        // and a synchronous handle so no OVERLAPPED is required.
+        let ok = unsafe {
+            ReadFile(
+                stream,
+                buffer.as_mut_ptr(),
+                buffer.len() as u32,
+                &mut read,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            let error = std::io::Error::last_os_error();
+            assert_eq!(
+                error.raw_os_error(),
+                Some(ERROR_BROKEN_PIPE as i32),
+                "read: {error}"
+            );
+            return 0;
+        }
+        read as usize
+    }
+}
+
+fn read_exact(stream: FdStream, buffer: &mut [u8]) {
+    let mut filled = 0;
+    while filled < buffer.len() {
+        let n = read_once(stream, &mut buffer[filled..]);
+        assert_ne!(n, 0, "premature end of stream after {filled} bytes");
+        filled += n;
+    }
+}
+
+fn write_all(stream: FdStream, mut bytes: &[u8]) {
+    while !bytes.is_empty() {
+        #[cfg(unix)]
+        // SAFETY: live inherited descriptor and a readable buffer of that length.
+        let n = unsafe { libc::write(stream, bytes.as_ptr().cast(), bytes.len()) };
+        #[cfg(unix)]
+        assert!(n > 0, "write: {}", std::io::Error::last_os_error());
+        #[cfg(unix)]
+        let n = n as usize;
+        #[cfg(windows)]
+        let n = {
+            let mut wrote = 0;
+            // SAFETY: live inherited handle, readable buffer of the stated
+            // length, and a synchronous handle so no OVERLAPPED is required.
+            let ok = unsafe {
+                windows_sys::Win32::Storage::FileSystem::WriteFile(
+                    stream,
+                    bytes.as_ptr(),
+                    bytes.len() as u32,
+                    &mut wrote,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_ne!(ok, 0, "write: {}", std::io::Error::last_os_error());
+            wrote as usize
+        };
+        bytes = &bytes[n..];
+    }
 }

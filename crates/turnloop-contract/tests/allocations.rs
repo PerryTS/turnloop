@@ -1175,6 +1175,157 @@ fn executor_steady_io_poll_and_sleep_allocate_nothing() {
     assert_eq!(count, 1001);
 }
 
+/// Steady-state traffic on a child's extra descriptors, on both platforms.
+///
+/// Spawning is resource creation and is charged to setup, like any other open.
+/// What must be free is everything after it: the writes, the reads, the exit
+/// and the closes of a child holding two descriptors beyond its standard three.
+#[cfg(any(unix, windows))]
+#[test]
+fn extra_child_descriptor_traffic_allocates_nothing_after_spawn() {
+    const CHILDREN: usize = 8;
+    /// `ping-3` then `ping-4`, so one static region serves both writes.
+    static PINGS: [u8; 12] = *b"ping-3ping-4";
+    fn ping(extra: usize) -> WriteBuf {
+        // SAFETY: a static region outlives every completion and the loop itself.
+        WriteBuf::Provided(unsafe { IoBuf::from_raw_parts(PINGS[extra * 6..].as_ptr(), 6) })
+    }
+    /// Turn until the awaited handle has produced `want` bytes, folding every
+    /// other completion into the counters. Nothing here allocates.
+    fn collect(l: &mut Loop, out: &mut Completions, h: Handle, want: &[u8], seen: &mut [usize; 4]) {
+        let mut got = [0u8; 6];
+        let mut filled = 0;
+        while filled < want.len() {
+            l.read(h, ReadBuf::Pooled, Token(70)).expect("read");
+            let before = filled;
+            while filled == before {
+                let until = l.now() + Duration::from_secs(10);
+                assert!(l.now() < until);
+                l.turn(Timeout::Until(until), out).expect("turn");
+                for c in out.drain() {
+                    match c.result {
+                        OpResult::Read {
+                            n,
+                            lease: Some(bytes),
+                        } => {
+                            assert_eq!(c.handle, Some(h), "only one read is in flight");
+                            assert!(n > 0);
+                            got[filled..filled + n].copy_from_slice(bytes.as_slice());
+                            filled += n;
+                        }
+                        OpResult::Wrote(n) => {
+                            assert_eq!(n, 6);
+                            seen[0] += 1;
+                        }
+                        OpResult::Exited(status) => {
+                            assert_eq!(status.code, Some(0));
+                            seen[1] += 1;
+                        }
+                        OpResult::Eof => seen[2] += 1,
+                        OpResult::Closed => seen[3] += 1,
+                        other => panic!("unexpected {other:?}"),
+                    }
+                }
+            }
+        }
+        assert_eq!(filled, want.len(), "exchanges are fixed length");
+        assert_eq!(&got[..filled], want, "the child answered");
+    }
+    let mut l = Loop::new(Config::default()).expect("loop");
+    let mut spec = ProcessSpec::new(env!("CARGO_BIN_EXE_native_child"));
+    spec.windows_hide = true;
+    spec.args = vec!["channel".into()];
+    spec.stdio = [ProcessStdio::Null, ProcessStdio::Pipe, ProcessStdio::Null];
+    spec.extra = vec![
+        ChildFd {
+            number: 3,
+            source: ChildFdSource::Duplex,
+        },
+        ChildFd {
+            number: 4,
+            source: ChildFdSource::Duplex,
+        },
+    ];
+    spec.env = vec![
+        ("NODE_CHANNEL_FD".into(), "3".into()),
+        ("TURNLOOP_EXTRA_FD".into(), "4".into()),
+    ];
+    let mut ends = [[None; 2]; CHILDREN];
+    let children: [_; CHILDREN] = std::array::from_fn(|i| {
+        l.spawn_extra(&spec, Token(i as u64), &mut ends[i])
+            .expect("child with extra descriptors")
+    });
+    let mut out = Completions::default();
+    // Warm the notifier, services and pooled buffers, leaving the children live.
+    l.turn(Timeout::Now, &mut out).expect("warm services");
+    assert!(out.is_empty());
+    let mut seen = [0usize; 4];
+    ALLOCS.with(|n| n.set(0));
+    ACTIVE.with(|v| v.set(true));
+    for (i, child) in children.iter().enumerate() {
+        for (extra, end) in ends[i].iter().enumerate() {
+            let h = end.expect("parent end");
+            l.write(h, ping(extra), Token(71)).expect("write ping");
+            collect(
+                &mut l,
+                &mut out,
+                h,
+                if extra == 0 { b"pong-3" } else { b"pong-4" },
+                &mut seen,
+            );
+        }
+        collect(
+            &mut l,
+            &mut out,
+            child.stdout.expect("child stdout"),
+            b"ok",
+            &mut seen,
+        );
+    }
+    // Every child must report its own exit before anything is closed, so a
+    // Cancelled watch can never stand in for a delivered status.
+    let until = l.now() + Duration::from_secs(20);
+    while seen[1] < CHILDREN {
+        assert!(l.now() < until, "exit deadline");
+        l.turn(Timeout::Until(until), &mut out).expect("exits");
+        for c in out.drain() {
+            match c.result {
+                OpResult::Exited(status) => {
+                    assert_eq!(status.code, Some(0));
+                    seen[1] += 1;
+                }
+                OpResult::Eof => seen[2] += 1,
+                other => panic!("unexpected exit-phase completion {other:?}"),
+            }
+        }
+    }
+    for (i, child) in children.iter().enumerate() {
+        for h in [ends[i][0], ends[i][1], child.stdout, Some(child.handle)] {
+            l.close(h.expect("handle"), Token(72)).expect("close");
+        }
+    }
+    while l.alive() {
+        assert!(l.now() < until, "teardown deadline");
+        l.turn(Timeout::Until(until), &mut out).expect("teardown");
+        for c in out.drain() {
+            match c.result {
+                OpResult::Eof => seen[2] += 1,
+                OpResult::Closed => seen[3] += 1,
+                other => panic!("unexpected teardown {other:?}"),
+            }
+        }
+    }
+    ACTIVE.with(|v| v.set(false));
+    assert_eq!(
+        ALLOCS.with(Cell::get),
+        0,
+        "extra-descriptor writes, reads, exits and closes"
+    );
+    assert_eq!(seen[0], CHILDREN * 2, "every ping completed");
+    assert_eq!(seen[1], CHILDREN, "every child exited exactly once");
+    assert_eq!(seen[3], CHILDREN * 4, "every handle closed exactly once");
+}
+
 #[cfg(unix)]
 #[test]
 fn signal_exit_and_external_notification_delivery_allocate_nothing() {

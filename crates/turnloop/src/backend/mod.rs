@@ -338,10 +338,15 @@ pub unsafe trait Backend: Sized + 'static {
     fn set_notifier(&mut self, _notifier: crate::Notifier) {}
     /// Spawn and bind the child and requested parent pipe handles atomically.
     /// Failure must release all supplied handles and reap any created child.
+    ///
+    /// `extra` is parallel to `spec.extra`: a handle is supplied for every entry
+    /// whose source has a parent end, and `None` for the rest. The core has
+    /// already checked descriptor numbers and duplicates.
     fn spawn(
         &mut self,
         _handle: Handle,
         _pipes: [Option<Handle>; 3],
+        _extra: &[Option<Handle>],
         _spec: &crate::ProcessSpec,
     ) -> Result<u32> {
         Err(Error::new(crate::ErrorKind::Unsupported))
@@ -488,6 +493,8 @@ pub mod wasi_p3;
 pub use wasi_p3::WasiP3 as Platform;
 #[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
 mod ipc;
+#[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
+mod process;
 
 #[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
 mod services;

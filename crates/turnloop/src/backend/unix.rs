@@ -15,7 +15,7 @@ use crate::{
 use std::{
     collections::VecDeque,
     net::SocketAddr,
-    os::fd::{AsRawFd, OwnedFd},
+    os::fd::{AsRawFd, OwnedFd, RawFd},
     sync::Arc,
     time::Duration,
 };
@@ -329,7 +329,13 @@ unsafe impl Backend for Unix {
     fn kill(&mut self, h: Handle, signal: Signal, group: bool) -> Result<()> {
         self.services.kill(h, signal, group)
     }
-    fn spawn(&mut self, h: Handle, pipes: [Option<Handle>; 3], spec: &ProcessSpec) -> Result<u32> {
+    fn spawn(
+        &mut self,
+        h: Handle,
+        pipes: [Option<Handle>; 3],
+        extra: &[Option<Handle>],
+        spec: &ProcessSpec,
+    ) -> Result<u32> {
         use std::os::unix::process::CommandExt;
         use std::process::{Command, Stdio as ChildStdio};
         // Explicit SIG_IGN/NOCLDWAIT would auto-reap children behind our ownership.
@@ -341,6 +347,10 @@ unsafe impl Backend for Unix {
             return Err(last_error());
         }
         if action.sa_sigaction == libc::SIG_IGN || action.sa_flags & libc::SA_NOCLDWAIT != 0 {
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
+        if spec.controlling_terminal && !spec.detached {
+            // TIOCSCTTY succeeds only for a session leader without a terminal.
             return Err(Error::new(ErrorKind::InvalidInput));
         }
         let mut command = Command::new(&spec.program);
@@ -358,19 +368,7 @@ unsafe impl Backend for Unix {
         if let Some(gid) = spec.gid {
             command.gid(gid);
         }
-        if spec.detached {
-            // SAFETY: the child hook only calls async-signal-safe setsid and
-            // constructs an OS error without allocation; it captures no state.
-            unsafe {
-                command.pre_exec(|| {
-                    if libc::setsid() < 0 {
-                        Err(std::io::Error::last_os_error())
-                    } else {
-                        Ok(())
-                    }
-                });
-            }
-        } else if spec.new_process_group {
+        if !spec.detached && spec.new_process_group {
             command.process_group(0);
         }
         for (i, stdio) in spec.stdio.iter().enumerate() {
@@ -398,7 +396,68 @@ unsafe impl Backend for Unix {
                 }
             }
         }
+        // Child ends of the extra descriptors, still at whatever numbers the OS
+        // gave them. They are relocated above every target number first, so the
+        // child hook's dup2 sequence cannot overwrite a source it has not used.
+        let mut sources = Vec::with_capacity(spec.extra.len());
+        let mut parent_ends = Vec::with_capacity(spec.extra.len());
+        let floor = super::process::checked_floor(spec.extra.iter().map(|fd| fd.number))?;
+        for fd in &spec.extra {
+            let (child, parent) = match fd.source {
+                ChildFdSource::Null => (super::process::null()?, None),
+                ChildFdSource::Pipe => {
+                    let (parent, child) = super::process::one_way()?;
+                    (child, Some((parent, false)))
+                }
+                ChildFdSource::Duplex => {
+                    let (parent, child) = super::process::stream_pair()?;
+                    (child, Some((parent, true)))
+                }
+                ChildFdSource::Handle(source) => (
+                    self.get(source)?
+                        .transport
+                        .fd
+                        .try_clone()
+                        .map_err(Error::from)?,
+                    None,
+                ),
+            };
+            sources.push((super::process::lift(child, floor)?, fd.number as RawFd));
+            parent_ends.push(parent);
+        }
+        let dups: Vec<(RawFd, RawFd)> = sources
+            .iter()
+            .map(|(child, target)| (child.as_raw_fd(), *target))
+            .collect();
+        let (detached, terminal) = (spec.detached, spec.controlling_terminal);
+        if detached || terminal || !dups.is_empty() {
+            // SAFETY: the child hook calls only async-signal-safe setsid, ioctl
+            // and dup2, reads a captured plain-integer list without allocating,
+            // and builds an OS error from errno alone. std runs it after the
+            // standard streams are in place and immediately before exec, so
+            // descriptor 0 is already the child's stdin and every source is
+            // above every target.
+            unsafe {
+                command.pre_exec(move || {
+                    if detached && libc::setsid() < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if terminal && libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    for &(source, target) in &dups {
+                        // dup2 leaves the new descriptor without FD_CLOEXEC, so
+                        // it is exactly this number that survives exec.
+                        if libc::dup2(source, target) < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
+                    Ok(())
+                });
+            }
+        }
         let mut child = command.spawn().map_err(Error::from)?;
+        drop(sources);
         let pid = child.id();
         let stdio: [Option<OwnedFd>; 3] = [
             child.stdin.take().map(Into::into),
@@ -418,10 +477,26 @@ unsafe impl Backend for Unix {
                     self.install(handle, transport, None)?;
                 }
             }
+            for (handle, end) in extra.iter().zip(parent_ends.drain(..)) {
+                if let (Some(handle), Some((fd, stream))) = (handle, end) {
+                    let transport = if stream {
+                        // A socket pair's own end, exactly as an accepted local
+                        // connection is adopted: configured, not re-classified.
+                        socket::configure(fd.as_raw_fd())?;
+                        Detached::new(fd, Kind::Pipe)
+                    } else {
+                        super::ipc::classify(fd)?
+                    };
+                    self.install(*handle, transport, None)?;
+                }
+            }
             Ok(pid)
         })();
         if result.is_err() {
-            for handle in std::iter::once(h).chain(pipes.into_iter().flatten()) {
+            for handle in std::iter::once(h)
+                .chain(pipes.into_iter().flatten())
+                .chain(extra.iter().flatten().copied())
+            {
                 self.release(handle);
             }
         }

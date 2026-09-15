@@ -540,34 +540,51 @@ impl<B: Backend> Driver<B> {
     /// Spawn a child and submit its exactly-once exit operation. Closing a live
     /// child initiates termination, then waits through ordinary turns for reaping
     /// before Cancelled and Closed; a new process group enables `kill_group`.
+    ///
+    /// A spec carrying [`ProcessSpec::extra`] descriptors is `InvalidInput` here,
+    /// because their parent ends have nowhere to be reported; use
+    /// [`Driver::spawn_extra`].
     pub fn spawn(&mut self, spec: &ProcessSpec, token: Token) -> Result<Process> {
+        self.spawn_extra(spec, token, &mut [])
+    }
+    /// Spawn a child that also receives [`ProcessSpec::extra`] descriptors.
+    ///
+    /// `parents` must have exactly one slot per [`ChildFd`], in the same order.
+    /// Each slot receives the parent end of that descriptor: a readable handle
+    /// for [`ChildFdSource::Pipe`], a readable and writable one for
+    /// [`ChildFdSource::Duplex`], and `None` for a source that has no parent end.
+    /// Every returned handle belongs to this loop and is closed like any other.
+    ///
+    /// Descriptor numbers are the child's own, run from 3 to 255, and must not
+    /// repeat. The child's view of them is a plain descriptor number on Unix and
+    /// a C run-time descriptor on Windows, so a `NODE_CHANNEL_FD`-style handoff
+    /// is the same environment entry on both: set it in [`ProcessSpec::env`].
+    ///
+    /// On failure nothing is created: no child, no handle, no completion.
+    pub fn spawn_extra(
+        &mut self,
+        spec: &ProcessSpec,
+        token: Token,
+        parents: &mut [Option<Handle>],
+    ) -> Result<Process> {
+        if parents.len() != spec.extra.len() {
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
+        for (i, fd) in spec.extra.iter().enumerate() {
+            if !(3..=MAX_CHILD_FD).contains(&fd.number)
+                || spec.extra[..i].iter().any(|seen| seen.number == fd.number)
+            {
+                return Err(Error::new(ErrorKind::InvalidInput));
+            }
+        }
+        if spec.controlling_terminal && !spec.detached {
+            // TIOCSCTTY only succeeds for a session leader without a terminal.
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
+        parents.fill(None);
         let h = self.new_handle(Kind::Socket)?;
         let mut pipes = [None; 3];
-        let result = (|| {
-            for (i, stdio) in spec.stdio.iter().enumerate() {
-                if let ProcessStdio::Handle(source) = stdio {
-                    self.resource(*source)?;
-                }
-                if *stdio == ProcessStdio::Pipe {
-                    pipes[i] = Some(self.new_handle(Kind::Socket)?);
-                }
-            }
-            // Reserve the terminal completion before creating an OS child.
-            let op = self.new_op(Some(h), token)?;
-            let result = self.backend.spawn(h, pipes, spec).and_then(|pid| {
-                self.backend.submit(Request {
-                    op,
-                    handle: h,
-                    operation: Operation::ProcessExit,
-                })?;
-                Ok(pid)
-            });
-            if result.is_err() {
-                self.retire(op);
-                self.outstanding -= 1;
-            }
-            result
-        })();
+        let result = self.spawn_inner(h, spec, token, &mut pipes, parents);
         match result {
             Ok(pid) => Ok(Process {
                 handle: h,
@@ -577,15 +594,65 @@ impl<B: Backend> Driver<B> {
                 stderr: pipes[2],
             }),
             Err(e) => {
-                for handle in std::iter::once(h).chain(pipes.into_iter().flatten()) {
+                for handle in std::iter::once(h)
+                    .chain(pipes.into_iter().flatten())
+                    .chain(parents.iter().flatten().copied())
+                {
                     self.backend.release(handle);
                     if self.handles.remove(handle.key).is_some() {
                         self.refs -= 1;
                     }
                 }
+                parents.fill(None);
                 Err(e)
             }
         }
+    }
+    fn spawn_inner(
+        &mut self,
+        h: Handle,
+        spec: &ProcessSpec,
+        token: Token,
+        pipes: &mut [Option<Handle>; 3],
+        parents: &mut [Option<Handle>],
+    ) -> Result<u32> {
+        for (i, stdio) in spec.stdio.iter().enumerate() {
+            if let ProcessStdio::Handle(source) = stdio {
+                self.resource(*source)?;
+            }
+            if *stdio == ProcessStdio::Pipe {
+                pipes[i] = Some(self.new_handle(Kind::Socket)?);
+            }
+        }
+        for (slot, fd) in parents.iter_mut().zip(&spec.extra) {
+            match fd.source {
+                ChildFdSource::Handle(source) => {
+                    self.resource(source)?;
+                }
+                ChildFdSource::Pipe | ChildFdSource::Duplex => {
+                    *slot = Some(self.new_handle(Kind::Socket)?);
+                }
+                ChildFdSource::Null => {}
+            }
+        }
+        // Reserve the terminal completion before creating an OS child.
+        let op = self.new_op(Some(h), token)?;
+        let result = self
+            .backend
+            .spawn(h, *pipes, parents, spec)
+            .and_then(|pid| {
+                self.backend.submit(Request {
+                    op,
+                    handle: h,
+                    operation: Operation::ProcessExit,
+                })?;
+                Ok(pid)
+            });
+        if result.is_err() {
+            self.retire(op);
+            self.outstanding -= 1;
+        }
+        result
     }
     /// Signal a child still owned by this loop.
     pub fn kill(&mut self, process: Handle, signal: Signal) -> Result<()> {
