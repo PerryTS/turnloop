@@ -690,19 +690,27 @@ fn expect_continue_timeout_and_early_response() {
         .spawn_local(async move {
             let tls = turnloop_tls::ClientConfig::new(Default::default(), 1_789_344_000)
                 .expect("TLS config");
-            let mut client = Client::new(
-                h,
-                tls,
-                1_789_344_000,
-                Options {
-                    continue_timeout: Duration::from_millis(2),
-                    ..Default::default()
-                },
-            );
+            let client = |continue_timeout| {
+                Client::new(
+                    h.clone(),
+                    tls.clone(),
+                    1_789_344_000,
+                    Options {
+                        continue_timeout,
+                        ..Default::default()
+                    },
+                )
+            };
             let mut request = Request::new(&format!("http://{address}/"), "POST").expect("request");
             request.headers.push(Header::new("expect", "100-continue"));
             request.body = vec![b'x'; 16384];
+            // Cases 0 and 1 need the 2 ms continue timeout to expire (case 1 never
+            // sends 100). Case 2 proves an early final response suppresses the upload,
+            // so its timeout must not be able to win the race on a slow runtime.
+            let mut short = client(Duration::from_millis(2));
+            let mut long = client(Duration::from_secs(30));
             for case in 0..3 {
+                let client = if case == 2 { &mut long } else { &mut short };
                 let head = client
                     .request(&mut request, |_| panic!("empty response"))
                     .await
