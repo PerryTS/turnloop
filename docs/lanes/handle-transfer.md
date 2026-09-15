@@ -287,8 +287,9 @@ build box.
 | `cargo +nightly-2026-08-20 deny --locked check` | PASS — advisories, bans, licenses, sources |
 | `python3 scripts/ci/lint-workflows.py` | PASS — no workflow files were changed |
 | `python3 -m unittest discover -s scripts/ci -p 'test_*.py'` | PASS — 98 tests |
-| `python3 scripts/ci/run-tests.py web` (headless Chromium/Firefox) | UNRUN locally (no browsers on this machine); covered by CI |
-| Windows `cargo test` (the IOCP and named-pipe probes) | UNRUN locally; cross-compiled clean and covered by the three `windows-2025` CI arms |
+| `python3 scripts/ci/run-tests.py web` (headless Chromium/Firefox) | UNRUN locally (no browsers on this machine); PASS **in CI** (run 34998733403) |
+| Windows `cargo test` (the IOCP and named-pipe probes) | UNRUN locally; cross-compiled clean and PASS **in CI** on all three `windows-2025` arms (run 34998733403) |
+| `python3 scripts/ci/run-tests.py protocol` (real-server fixtures, incl. `turnloop-tls/upgrade`) | UNRUN locally (needs the fixture servers); PASS **in CI** (run 34998733403) |
 
 ### Pre-existing failure seen on the build box (not this lane)
 
@@ -301,9 +302,21 @@ nothing else, which is why the six-mode matrix skips it by name.
 
 ### CI
 
+CI runs on `pull_request` and pushes to `main`, so this branch's runs are
+`workflow_dispatch` on `lane/handle-transfer`. No PR was opened.
+
 | Run | SHA | Result |
 | --- | --- | --- |
-| _(filled in below)_ | | |
+| [34997592013](https://github.com/PerryTS/turnloop/actions/runs/34997592013) | `95f5e1c` | FAIL — every job green except the three `windows-2025` arms, each failing only `a_handed_off_socket_keeps_its_association_and_duplicates_out_of_it` at the *duplicate* assertion: `a duplicate joins a port: Os { code: 87, … "The parameter is incorrect." }`. Everything else on Windows passed first time, including the named-pipe tagged-event test, the eight other handoff tests and the allocation gate |
+| [34998733403](https://github.com/PerryTS/turnloop/actions/runs/34998733403) | `58b4a8f` | **PASS — every job, `ci-gate` green.** 36 jobs: Linux x86_64 and arm64 (six modes each), macOS (three), Windows (three), WASI 0.2 and 0.3, headless-browser `web`, `protocol`, `protocol-wasi`, `h2spec`, `loom`, `miri`, `instructions`, `dependencies`, the four `lint-native`/`lint-wasm` arms and `workflow-lint` |
+
+Subjects confirmed to have executed in the green run, not merely to have not
+thrown: `iocp::a_handed_off_named_pipe_is_driven_with_a_tagged_event`,
+`iocp::a_handed_off_socket_keeps_its_association_even_through_a_duplicate`,
+`steady_handoff_allocates_nothing` and the rest of `tests/handoff.rs` in every
+`windows-2025` arm (workspace and per-member runs), and
+`a_plaintext_socket_is_handed_off_mid_stream_for_a_real_tls_handshake` in
+`protocol` (`turnloop-tls/upgrade | PASS | 1 tests passed`).
 
 ## Follow-ups this lane deliberately did not take
 
