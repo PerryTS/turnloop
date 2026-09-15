@@ -1160,6 +1160,7 @@ unsafe impl Backend for Iocp {
         &mut self,
         handle: Handle,
         pipes: [Option<Handle>; 3],
+        extra: &[Option<Handle>],
         spec: &ProcessSpec,
     ) -> Result<u32> {
         let mut existing = [None; 3];
@@ -1168,8 +1169,19 @@ unsafe impl Backend for Iocp {
                 existing[i] = Some(self.get(*h)?.transport.native.raw());
             }
         }
-        let (child, parents) =
-            process::spawn(spec, existing, self.notifier.clone().ok_or_else(invalid)?)?;
+        let mut sources = Vec::with_capacity(spec.extra.len());
+        for fd in &spec.extra {
+            sources.push(match fd.source {
+                crate::ChildFdSource::Handle(h) => Some(self.get(h)?.transport.native.raw()),
+                _ => None,
+            });
+        }
+        let (child, parents, extra_parents) = process::spawn(
+            spec,
+            existing,
+            &sources,
+            self.notifier.clone().ok_or_else(invalid)?,
+        )?;
         let pid = child.pid;
         let result = (|| {
             for (h, parent) in pipes.into_iter().zip(parents) {
@@ -1177,10 +1189,19 @@ unsafe impl Backend for Iocp {
                     self.install(h, parent, None, None)?;
                 }
             }
+            for (h, parent) in extra.iter().zip(extra_parents) {
+                if let (Some(h), Some(parent)) = (h, parent) {
+                    self.install(*h, parent, None, None)?;
+                }
+            }
             child.resume()
         })();
         if let Err(error) = result {
-            for h in pipes.into_iter().flatten() {
+            for h in pipes
+                .into_iter()
+                .flatten()
+                .chain(extra.iter().flatten().copied())
+            {
                 self.release(h);
             }
             return Err(error);

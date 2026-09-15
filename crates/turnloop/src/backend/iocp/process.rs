@@ -1,5 +1,5 @@
 use super::{Detached, Kind, Native, bool_result, invalid, os_error, port::owned, unsupported};
-use crate::{ExitStatus, Notifier, ProcessSpec, ProcessStdio, Result, Signal};
+use crate::{ChildFdSource, ExitStatus, Notifier, ProcessSpec, ProcessStdio, Result, Signal};
 use std::{
     collections::BTreeMap,
     ffi::{OsStr, OsString, c_void},
@@ -166,13 +166,13 @@ pub(super) fn duplicate(handle: HANDLE, inherit: bool) -> Result<OwnedHandle> {
     // SAFETY: successful DuplicateHandle transferred unique ownership.
     unsafe { owned(out) }.map_err(Into::into)
 }
-pub(super) fn null(input: bool) -> Result<OwnedHandle> {
+pub(super) fn null(access: u32) -> Result<OwnedHandle> {
     let name: Vec<u16> = "NUL\0".encode_utf16().collect();
     // SAFETY: valid device path; exclusive ownership of newly created handle.
     unsafe {
         owned(CreateFileW(
             name.as_ptr(),
-            if input { GENERIC_READ } else { GENERIC_WRITE },
+            access,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             ptr::null(),
             OPEN_EXISTING,
@@ -187,12 +187,30 @@ pub(super) fn stdio(index: usize, inherit: bool) -> Result<OwnedHandle> {
     let handle =
         unsafe { GetStdHandle([STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE][index]) };
     if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-        let handle = null(index == 0)?;
+        let handle = null(read_or_write(index == 0))?;
         return duplicate(handle.as_raw_handle(), inherit);
     }
     duplicate(handle, inherit)
 }
-fn pipe(index: usize) -> Result<(Detached, OwnedHandle)> {
+/// Which ends of a child pipe each side may use.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Direction {
+    /// Child stdin: the parent writes, the child reads.
+    ParentWrites,
+    /// Child stdout/stderr and a one-way extra descriptor: the child writes.
+    ParentReads,
+    /// Both ends readable and writable, as Node's stdio pipes and IPC channel are.
+    Duplex,
+}
+fn read_or_write(read: bool) -> u32 {
+    if read { GENERIC_READ } else { GENERIC_WRITE }
+}
+fn pipe(direction: Direction) -> Result<(Detached, OwnedHandle)> {
+    let (parent_access, child_access) = match direction {
+        Direction::ParentWrites => (PIPE_ACCESS_OUTBOUND, GENERIC_READ),
+        Direction::ParentReads => (PIPE_ACCESS_INBOUND, GENERIC_WRITE),
+        Direction::Duplex => (PIPE_ACCESS_DUPLEX, GENERIC_READ | GENERIC_WRITE),
+    };
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let name = format!(
         r"\\.\pipe\turnloop-stdio-{}-{}",
@@ -204,13 +222,7 @@ fn pipe(index: usize) -> Result<(Detached, OwnedHandle)> {
     let parent = unsafe {
         owned(CreateNamedPipeW(
             name.as_ptr(),
-            FILE_FLAG_OVERLAPPED
-                | FILE_FLAG_FIRST_PIPE_INSTANCE
-                | if index == 0 {
-                    PIPE_ACCESS_OUTBOUND
-                } else {
-                    PIPE_ACCESS_INBOUND
-                },
+            FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE | parent_access,
             PIPE_TYPE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
             1,
             65536,
@@ -223,11 +235,7 @@ fn pipe(index: usize) -> Result<(Detached, OwnedHandle)> {
     let child = unsafe {
         owned(CreateFileW(
             name.as_ptr(),
-            if index == 0 {
-                GENERIC_READ
-            } else {
-                GENERIC_WRITE
-            },
+            child_access,
             0,
             ptr::null(),
             OPEN_EXISTING,
@@ -462,35 +470,143 @@ impl Drop for Child {
         }
     }
 }
+/// C run-time descriptor flags, as every MSVCRT/UCRT program reads them back out
+/// of the inherited-descriptor block at startup.
+const FOPEN: u8 = 0x01;
+const FPIPE: u8 = 0x08;
+const FDEV: u8 = 0x40;
+
+fn crt_flags(handle: HANDLE) -> u8 {
+    // SAFETY: live inheritable handle; the query only classifies it.
+    FOPEN
+        | match unsafe { GetFileType(handle) } {
+            FILE_TYPE_PIPE => FPIPE,
+            FILE_TYPE_CHAR => FDEV,
+            _ => 0,
+        }
+}
+
+/// The inherited-descriptor block passed through `STARTUPINFOW.lpReserved2`.
+///
+/// This is how a child gets descriptor numbers at all on Windows, and it is the
+/// same convention libuv and Node use, so `NODE_CHANNEL_FD=3` names the same
+/// thing in a child here as it does under Node. The layout is the C run-time's:
+/// a descriptor count, then one flag byte per descriptor, then one handle per
+/// descriptor, all packed without padding, so every handle is written as bytes.
+/// Unused numbers below the highest one in use are present and closed.
+fn inherited_block(slots: &[Option<OwnedHandle>]) -> Result<Vec<u8>> {
+    let count = slots.len();
+    let width = size_of::<usize>();
+    let bytes = size_of::<i32>() + count + count * width;
+    // cbReserved2 is a u16; MAX_CHILD_FD keeps this far below the limit.
+    if u16::try_from(bytes).is_err() {
+        return Err(invalid());
+    }
+    let mut block = vec![0u8; bytes];
+    block[..size_of::<i32>()].copy_from_slice(&(count as i32).to_ne_bytes());
+    for (i, slot) in slots.iter().enumerate() {
+        let (flags, handle) = match slot {
+            Some(handle) => (
+                crt_flags(handle.as_raw_handle()),
+                handle.as_raw_handle() as usize,
+            ),
+            None => (0, INVALID_HANDLE_VALUE as usize),
+        };
+        block[size_of::<i32>() + i] = flags;
+        let at = size_of::<i32>() + count + i * width;
+        block[at..at + width].copy_from_slice(&handle.to_ne_bytes());
+    }
+    Ok(block)
+}
+
+/// A started child, the parent ends of its standard streams, and the parent ends
+/// of its extra descriptors in `ProcessSpec::extra` order.
+type Spawned = (Child, [Option<Detached>; 3], Vec<Option<Detached>>);
+
 pub(super) fn spawn(
     spec: &ProcessSpec,
     existing: [Option<HANDLE>; 3],
+    extra_sources: &[Option<HANDLE>],
     notifier: Notifier,
-) -> Result<(Child, [Option<Detached>; 3])> {
+) -> Result<Spawned> {
     if spec.uid.is_some() || spec.gid.is_some() || spec.program.is_empty() {
+        return Err(unsupported());
+    }
+    if spec.controlling_terminal {
+        // Windows has no session/controlling-terminal concept to claim.
         return Err(unsupported());
     }
     let application = wide(program(spec)?.as_os_str())?;
     let mut parents = [None, None, None];
-    let mut child_ends = Vec::with_capacity(3);
+    let slot_count = spec
+        .extra
+        .iter()
+        .map(|fd| fd.number as usize + 1)
+        .max()
+        .unwrap_or(0)
+        .max(3);
+    let mut slots: Vec<Option<OwnedHandle>> = (0..slot_count).map(|_| None).collect();
     for (i, option) in spec.stdio.iter().enumerate() {
         let handle = match option {
             ProcessStdio::Inherit => stdio(i, true)?,
             ProcessStdio::Null => {
-                let handle = null(i == 0)?;
+                let handle = null(read_or_write(i == 0))?;
                 duplicate(handle.as_raw_handle(), true)?
             }
             ProcessStdio::Handle(_) => duplicate(existing[i].ok_or_else(invalid)?, true)?,
             ProcessStdio::Pipe => {
-                let (parent, child) = pipe(i)?;
+                let (parent, child) = pipe(if i == 0 {
+                    Direction::ParentWrites
+                } else {
+                    Direction::ParentReads
+                })?;
                 parents[i] = Some(parent);
                 duplicate(child.as_raw_handle(), true)?
             }
         };
-        child_ends.push(handle);
+        slots[i] = Some(handle);
     }
-    let handles = std::array::from_fn::<_, 3, _>(|i| child_ends[i].as_raw_handle());
+    let mut extra_parents = Vec::with_capacity(spec.extra.len());
+    for (i, fd) in spec.extra.iter().enumerate() {
+        let (handle, parent) = match fd.source {
+            ChildFdSource::Null => {
+                let handle = null(GENERIC_READ | GENERIC_WRITE)?;
+                (duplicate(handle.as_raw_handle(), true)?, None)
+            }
+            ChildFdSource::Handle(_) => (
+                duplicate(
+                    extra_sources
+                        .get(i)
+                        .copied()
+                        .flatten()
+                        .ok_or_else(invalid)?,
+                    true,
+                )?,
+                None,
+            ),
+            ChildFdSource::Pipe => {
+                let (parent, child) = pipe(Direction::ParentReads)?;
+                (duplicate(child.as_raw_handle(), true)?, Some(parent))
+            }
+            ChildFdSource::Duplex => {
+                let (parent, child) = pipe(Direction::Duplex)?;
+                (duplicate(child.as_raw_handle(), true)?, Some(parent))
+            }
+        };
+        let slot = slots.get_mut(fd.number as usize).ok_or_else(invalid)?;
+        if slot.is_some() {
+            return Err(invalid());
+        }
+        *slot = Some(handle);
+        extra_parents.push(parent);
+    }
+    let handles: Vec<HANDLE> = slots
+        .iter()
+        .flatten()
+        .map(AsRawHandle::as_raw_handle)
+        .collect();
     let mut attributes = Attributes::new(&handles)?;
+    let mut block = inherited_block(&slots)?;
     let mut command = Vec::new();
     quote(&spec.program, &mut command)?;
     for arg in &spec.args {
@@ -542,9 +658,17 @@ pub(super) fn spawn(
     } else {
         SW_SHOWDEFAULT
     } as u16;
-    startup.StartupInfo.hStdInput = handles[0];
-    startup.StartupInfo.hStdOutput = handles[1];
-    startup.StartupInfo.hStdError = handles[2];
+    let standard = std::array::from_fn::<_, 3, _>(|i| {
+        slots[i]
+            .as_ref()
+            .map_or(ptr::null_mut(), AsRawHandle::as_raw_handle)
+    });
+    startup.StartupInfo.hStdInput = standard[0];
+    startup.StartupInfo.hStdOutput = standard[1];
+    startup.StartupInfo.hStdError = standard[2];
+    // The child's own descriptor numbers, including 0..2, come from here.
+    startup.StartupInfo.cbReserved2 = block.len() as u16;
+    startup.StartupInfo.lpReserved2 = block.as_mut_ptr();
     startup.lpAttributeList = attributes.0.as_mut_ptr().cast();
     let job = if spec.new_process_group || spec.detached {
         // Explicit tree control is separate from parent lifetime. Releasing this
@@ -561,7 +685,8 @@ pub(super) fn spawn(
     // SAFETY: plain writable process output structure.
     let mut info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: explicit application and quoted writable command line; environment,
-    // directory, attribute list and exactly the listed inherited handles stay live.
+    // directory, attribute list, inherited-descriptor block and exactly the
+    // listed inherited handles all stay live across this call.
     bool_result(unsafe {
         CreateProcessW(
             application.as_ptr(),
@@ -628,7 +753,7 @@ pub(super) fn spawn(
             WT_EXECUTEONLYONCE,
         )
     })?;
-    Ok((child, parents))
+    Ok((child, parents, extra_parents))
 }
 
 #[cfg(all(test, not(loom)))]
@@ -647,8 +772,8 @@ mod tests {
             spec.stdio = [ProcessStdio::Null; 3];
             spec.windows_hide = true;
             spec.detached = detached;
-            let (mut child, _) =
-                spawn(&spec, [None; 3], driver.notifier()).expect("suspended child");
+            let (mut child, _, _) =
+                spawn(&spec, [None; 3], &[], driver.notifier()).expect("suspended child");
             let mut member = -1;
             assert_ne!(
                 // SAFETY: both owned live handles and writable membership output.
@@ -705,7 +830,7 @@ mod tests {
         spec.args.push("--list".into());
         spec.stdio = [ProcessStdio::Null; 3];
         spec.new_process_group = group;
-        spawn(&spec, [None; 3], driver.notifier())
+        spawn(&spec, [None; 3], &[], driver.notifier())
             .expect("suspended child")
             .0
     }
@@ -902,8 +1027,8 @@ mod tests {
             spec.windows_hide = true;
             spec.args.push("--list".into());
             spec.stdio = [ProcessStdio::Null; 3];
-            let (mut child, _) =
-                spawn(&spec, [None; 3], driver.notifier()).expect("suspended child");
+            let (mut child, _, _) =
+                spawn(&spec, [None; 3], &[], driver.notifier()).expect("suspended child");
             // The child cannot exit while suspended. Removing its wait now forces
             // the exact callback-lag window, independent of thread-pool scheduling.
             child.join().expect("unregister before resume");

@@ -352,6 +352,10 @@ impl Loop {
 
     // processes and signals
     pub fn spawn(&mut self, spec: &ProcessSpec, tok: Token) -> io::Result<Process>;  // handles for stdio pipes
+    // Node's stdio tail: extra child descriptors at fixed numbers (fork()'s IPC
+    // channel at 3), their parent ends written into the caller's slice.
+    pub fn spawn_extra(&mut self, spec: &ProcessSpec, tok: Token,
+                       parents: &mut [Option<Handle>]) -> io::Result<Process>;
     pub fn kill(&mut self, p: Handle, sig: Signal) -> io::Result<()>;
     pub fn signal_start(&mut self, sig: Signal, tok: Token) -> io::Result<Handle>;
 
@@ -373,6 +377,9 @@ pub enum OpResult {
     Cancelled, Closed, Stopped, Err(Error),
 }
 pub struct Error { pub kind: ErrorKind, pub os: Option<i32> }   // host maps to ECONNRESET etc.
+
+pub struct ChildFd { pub number: u32, pub source: ChildFdSource }   // number in 3..=MAX_CHILD_FD
+pub enum ChildFdSource { Null, Pipe, Duplex, Handle(Handle) }       // Duplex is Node's 'pipe'/'ipc'
 ```
 
 ## 7. Platform design
@@ -398,7 +405,7 @@ pub struct Error { pub kind: ErrorKind, pub os: Option<i32> }   // host maps to 
 - **Named pipes:** overlapped `ConnectNamedPipe`/`ReadFile`/`WriteFile`. This is the `pipe_listen`/`pipe_connect` transport (Node IPC uses named pipes on Windows).
 - **Stdio that isn't overlapped** (a handle inherited as a synchronous pipe or file): a dedicated reader thread per handle that posts completions. It isn't possible to reopen such a handle overlapped. libuv does the same.
 - **Console/TTY:** `ReadConsoleInputW` on a reader thread, with VT input and output modes (`ENABLE_VIRTUAL_TERMINAL_PROCESSING`/`_INPUT`). Resize events become a `Signal::WinCh` completion; Perry has no resize support on Windows today (`tty.rs:9–12`).
-- **Processes:** `CreateProcessW` with overlapped pipe handles, a Job Object for kill-tree semantics, and `RegisterWaitForSingleObject` on the process handle to post the exit completion.
+- **Processes:** `CreateProcessW` with overlapped pipe handles, a Job Object for kill-tree semantics, and `RegisterWaitForSingleObject` on the process handle to post the exit completion. Descriptors beyond stdin/stdout/stderr are published through the C run-time inherited-descriptor block in `STARTUPINFOW.lpReserved2` (count, per-descriptor flags from `GetFileType`, then the handles), plus `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`. That is libuv's and Node's own convention, so a child descriptor number — `NODE_CHANNEL_FD=3` — means the same thing here as it does under Node. A child that does not use the C run-time inherits the handles but has no number for them.
 - **Signals:** `SetConsoleCtrlHandler` for CTRL_C, CTRL_BREAK and CTRL_CLOSE, mapped to `SIGINT`/`SIGBREAK`/`SIGHUP`. SIGTERM has no console equivalent; documented as such, matching Perry today (`os/signal.rs:441–531`).
 - **Wake:** `PostQueuedCompletionStatus` with a reserved completion key.
 - **Timer precision:** the default system tick is about 15.6 ms and `GetQueuedCompletionStatusEx` timeouts round to it. Use a **high-resolution waitable timer** (`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`, Windows 10 1803+) armed to the next deadline and associated with the port through dynamically resolved `NtAssociateWaitCompletionPacket`. `GetQueuedCompletionStatusEx` is nonalertable. Cancellation returning `STATUS_PENDING` requires dequeuing the generation-tagged timer packet before reuse. M1 prototyped both APC and NT packet routes; §15 question 3 records the NT packet decision and measured lateness. `timeBeginPeriod` is not an acceptable default because it changes the tick system-wide.
@@ -455,6 +462,8 @@ Two backends, because both versions matter now:
 | Stdio pipes | readiness | readiness | overlapped, or reader thread | `wasi:cli` streams | `wasi:cli` streams | unsupported |
 | TTY | termios + readiness | termios + readiness | console API reader thread, VT modes | size only | size only | unsupported |
 | Child processes | pidfd / SIGCHLD | EVFILT_PROC | RegisterWaitForSingleObject + Job Object | unsupported | unsupported | unsupported |
+| Child descriptors beyond stdio | one `pre_exec` `dup2` per number, sources relocated above every target first | same | C run-time inherited-descriptor block + handle-list attribute | unsupported | unsupported | unsupported |
+| Child session control | `setsid` (`detached`), `setpgid` (`new_process_group`), `TIOCSCTTY` (`controlling_terminal`) | same | detached process group + Job Object; no controlling terminal | unsupported | unsupported | unsupported |
 | Signals | sigaction + self-pipe | EVFILT_SIGNAL | SetConsoleCtrlHandler | unsupported | unsupported | unsupported |
 | Files | blocking pool | blocking pool | blocking pool | `wasi:filesystem` preopens, run in `turn` | `wasi:filesystem` async preopens, run in `turn` | unsupported (no OPFS host mapping defined) |
 | File watch | inotify (recursion by the host) | FSEvents for directories (recursive), kqueue for files | ReadDirectoryChangesW (recursive) | unsupported | unsupported | unsupported |
@@ -511,6 +520,10 @@ and work on any live socket handle, including one produced by `accept`.
 | Microtasks, nextTick | Perry | unchanged |
 | Error text and codes | Perry | Map `Error { kind, os }` to Node's `code`/`errno`/`syscall` |
 | Keep-alive for JS-level resources | Perry | Uses turnloop `alive()` plus its own JS timers until those move (P3) |
+| Child descriptor policy | Perry | Which number is the IPC channel, and the name and value of `NODE_CHANNEL_FD`; turnloop places the descriptor, never names it |
+| Program resolution and shell | Perry | `shell: true`, `execPath`, PATH policy and argv construction |
+| Pty allocation | Perry | `openpty` and its termios; turnloop owns only the child-side `setsid`/`TIOCSCTTY` through `ProcessSpec::controlling_terminal` |
+| Reaping a child turnloop did not spawn | Perry | turnloop reaps only its own children, always by their own identity (`waitpid(pid, …)`, never `-1`), so a host waiter in the same process keeps its own children's status. There is no `adopt_process`; see `docs/lanes/procspec.md` |
 | Thread-pool jobs touching JS | never | Pool jobs are `Send` Rust closures; results convert on the main thread |
 
 **Wiring for P0:**
