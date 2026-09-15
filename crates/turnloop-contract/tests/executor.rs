@@ -5,7 +5,8 @@
         target_vendor = "apple",
         target_os = "linux",
         target_os = "android",
-        target_os = "freebsd"
+        target_os = "freebsd",
+        target_os = "windows"
     )
 ))]
 #[test]

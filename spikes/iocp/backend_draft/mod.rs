@@ -2,9 +2,9 @@
 //! See README.md: these types are internal backend events, not a replacement Loop.
 use crate::{
     integration::EventIntegration,
-    port::{Entry, Port, WAKE, Wait, bool_result},
+    port::{Entry, Port, TIMER, WAKE, Wait, bool_result},
     tcp::Winsock,
-    timer::ApcTimer,
+    timer::PacketTimer,
 };
 use std::{
     cell::UnsafeCell,
@@ -155,7 +155,7 @@ pub struct IocpBackend {
     handles: Box<[HandleSlot]>,
     ready: VecDeque<usize>,
     port: Arc<Port>,
-    timer: ApcTimer,
+    timer: PacketTimer,
     wake: Arc<Wake>,
     event: Option<EventIntegration>,
     pending: usize,
@@ -205,8 +205,8 @@ impl IocpBackend {
             kernel,
             handles,
             ready: VecDeque::with_capacity(operation_capacity),
+            timer: PacketTimer::new(Arc::clone(&port))?,
             port,
-            timer: ApcTimer::new()?,
             wake,
             event: None,
             pending: 0,
@@ -516,7 +516,14 @@ impl IocpBackend {
                     return Err(error);
                 }
                 info.waits = 1;
-                let result = self.port.wait(timeout, true, &mut entries);
+                // High-resolution waitable timers reject APC callbacks on Windows
+                // 11 build 26200. NT packets also avoid executing host APCs here.
+                let wait_timeout = if timeout.is_some_and(|d| !d.is_zero()) {
+                    None
+                } else {
+                    timeout
+                };
+                let result = self.port.wait(wait_timeout, false, &mut entries);
                 let notified = self.wake.state.swap(RUNNING, Ordering::AcqRel) == NOTIFIED;
                 info.notified |= notified;
                 self.timer.cancel()?;
@@ -529,6 +536,11 @@ impl IocpBackend {
         for entry in &entries[..n] {
             if entry.key == WAKE {
                 info.notified = true;
+                continue;
+            }
+            if entry.key == TIMER {
+                // SAFETY: this backend's timer packet was dequeued above.
+                unsafe { self.timer.dequeued() };
                 continue;
             }
             let Some(i) = self

@@ -357,13 +357,17 @@ pub fn refused_connect_once<B: Backend>() {
         l.turn(Timeout::Until(until), &mut out).expect("turn");
         for c in out.drain() {
             assert_eq!(c.token, Token(7));
-            assert!(matches!(
-                c.result,
-                OpResult::Err(Error {
-                    kind: ErrorKind::ConnectionRefused,
-                    ..
-                })
-            ));
+            assert!(
+                matches!(
+                    c.result,
+                    OpResult::Err(Error {
+                        kind: ErrorKind::ConnectionRefused,
+                        ..
+                    })
+                ),
+                "unexpected refused-connect result: {:?}",
+                c.result
+            );
             assert!(c.terminal);
             count += 1;
         }
