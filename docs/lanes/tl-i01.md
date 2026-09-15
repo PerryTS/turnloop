@@ -1,7 +1,9 @@
 # tl-i01 — queued work and OS waits
 
 **Current work:** [tl-i01b](#tl-i01b--approved-nonblocking-discovery-amendment)
-implements the spec-owner-approved outcome 2. The original audit below is historical.
+implements the spec-owner-approved outcome 2 (committed as `c7a2555` + `904e98f`).
+The original tl-i01 audit below is historical; its "not fixed" status and
+"DESIGN unchanged" statements describe the tree before the decision.
 
 Status: **specification decision required; I01 is not fixed**. Base a0fbb1b,
 macOS arm64. The audit reproduced in a shared contract: one queued post delivered
@@ -227,71 +229,204 @@ line. Raw logs and the exact audit script remain under `.tools/tl-i01/`.
 
 ## tl-i01b — approved nonblocking discovery amendment
 
-Status: implementation complete; final verification in progress. The spec owner
-selected refined outcome 2 on 2026-09-15. This supersedes the original tl-i01
-specification blocker and its intentionally failing zero-total-call acceptance.
-The historical evidence and command ledger above are retained.
+Status: **implemented; macOS + WASI 0.2/0.3 runtime verified locally; Linux,
+Windows and web runtime await the integrator's CI.** The spec owner selected
+refined outcome 2 on 2026-09-15; it supersedes the original tl-i01 blocker and
+its zero-total-call acceptance. The historical tl-i01 evidence above is retained.
+A Codex agent started this lane and stopped at its usage limit (checkpoint
+`c7a2555`); Claude reviewed that checkpoint, fixed what it missed and finished
+verification (`904e98f` and this report). Root `LANE_REPORT.md` is byte-identical
+to `origin/main` (`a0fbb1b`).
 
-### Implemented
+### Adopted wording (DESIGN §10 rule 3, D7 steps 1/2/6)
 
-- Amended DESIGN D7/§10 rule 3 with the native-pending/output-reserve condition,
-  zero syscalls for queued pure-core work and the libuv/fairness rationale.
-  Updated revision-2, contribution, integration and p3 accounting restatements.
-- `PollInfo::waits` / `TurnInfo::os_waits` count positive-timeout/infinite native
-  waits; `discovery_polls` counts zero-time native discovery. Their sum keeps the
-  original single-call bound. Epoll/timerfd, kqueue, direct IOCP and WASI p2/p3
-  classify the actual call. Web and IOCP Event-helper queue draining report both
-  zero. No helper waits are attributed to the turning thread.
-- `zero_event_waits` retains its existing raw meaning across **both** categories,
-  including interrupted calls and each backend's private-timeout accounting.
-  Every old no-spin limit is unchanged; invocation bounds/totals use the sum.
-- Tightened the driver guard: queued work with zero native-pending operations
-  skips the backend even if `has_work()` reports cached work. Native discovery
-  through queued post/timer backlogs and native reserve backpressure are retained.
-- Shared post + idle UDP requires zero blocking waits and exactly one discovery
-  poll, then exact-byte I/O. Queued Cancelled/Closed, pure-core work, and sustained
-  producer contracts run on native/WASI/Windows; web has callback equivalents.
-  The sustained producer still requires at least 64 turns and fresh I/O within
-  two seconds. The pre-existing repeating-timer fairness test is unchanged.
-- Native allocation gate retains 1,000 warm-up + 1,000 measured rounds, 3,000
-  completions, capacity-one output and absolute zero allocations. It now also
-  requires 3,000 measured discovery polls and no blocking waits.
-- Added direct kqueue and IOCP/Event counter tests, plus a synthetic driver test
-  that verifies 64 delivered posts and exactly zero backend calls with cached work.
-  Old strict zero-call assertions require both counters zero; Now-only benchmarks
-  now assert discovery counts without changing workload/baselines.
-- Restored root LANE_REPORT.md byte-for-byte from inherited HEAD; lane reporting
-  lives here. No Git writes, dependency updates, policy or baseline changes.
+§10 rule 3 now reads, verbatim from the decision:
 
-### Verification (in progress)
+1. A `turn` makes at most one OS wait.
+2. When completions are already queued, the turn performs **no blocking wait**
+   (positive or infinite timeout).
+3. It may perform **at most one nonblocking native discovery poll** (zero
+   timeout), and **only if native operations are pending** and native output
+   reserve is available.
+4. With queued work and **no** native operations pending, the turn makes **no OS
+   call at all**: pure post/timer/terminal churn costs zero syscalls.
+5. The no-spin rule (4a) is unchanged.
 
-Logs and the exact machine-readable command ledger: `.tools/tl-i01b/`.
-Initial native shared contracts PASS (26 tests) and allocation binary PASS
-(11 tests). Native default workspace Clippy and Windows core/contract/bench
-all-target/all-feature cross-Clippy PASS. Zero-tokio and seven-day soak PASS
-(251 versions, inherited exact rustls exception only).
+It defines *queued work* (completions already queued before the native step:
+posts, blocking-pool and external-wait results, synchronous and terminal
+completions including a timer's `Cancelled`/`Closed`) and *native operations*
+(operations on native handles plus requests a backend accepts natively, i.e.
+WASI 0.2 DNS), names the counters and lists the contract tests. A dated
+rationale paragraph cites libuv's zero-timeout `uv__io_poll` while pending work
+exists and the tl-i01 fairness probes. DESIGN has no change log; the rationale
+paragraph is the record. D7 step 1 (the old `:187` sentence), step 2 and step 6
+(`TurnInfo` fields) restate the rule. Restatements updated: `CONTRIBUTING.md`,
+`docs/BACKEND_REVISION_2.md`, `docs/INTEGRATION_REPORT.md`,
+`docs/upstream/wasi-p3-wait.md`, `backend/mod.rs` rustdoc, `TurnInfo`/`PollInfo`
+docs. The checkpoint's libuv link carried unverifiable line anchors
+(`core.c#L374-L449`); replaced by the libuv loop-API docs and the file link.
 
-Intermediate FAIL: new test used PartialEq on Timeout, which does not implement
-it; changed to matches! without altering behavior. A local multi-file edit twice
-stopped at a missing marker; source inspection completed the remaining edits.
-WASI p3 default initially found the new helper unused with its backend disabled;
-matching its existing backend feature cfg fixed that diagnostic. The full default
-workspace then reached a pre-existing turnloop-io allocation test that imports
-Platform without enabling the experimental backend. Required feature-enabled
-verification is recorded below; no test cfg was weakened.
+### Implemented (checkpoint `c7a2555` + `904e98f`)
 
-Full Windows workspace cross-Clippy FAILed in ring because Windows SDK assert.h
-is unavailable; core/contract/bench all-target checks PASS separately.
+- `PollInfo` split into `waits` / `discovery_polls` (plus unchanged
+  `zero_event_waits`), mirrored in `TurnInfo::os_waits` / `discovery_polls`.
+  Every backend classifies its actual call (table below).
+- Shared regressions on native, WASI 0.2/0.3 and Windows:
+  - `queued_post_idle_io`: post delivered with `os_waits == 0` and
+    `discovery_polls == 1`, then byte-verified UDP read/write.
+  - `queued_core_work`: posts and timer `Cancelled`/`Closed` with no native
+    operation under Now/After/Forever give `(0, 0, 0)`.
+  - `queued_terminals_idle_io`: queued `Cancelled`/`Closed` with capacity-one
+    output, zero waits, one discovery poll each; a due timer beside idle UDP makes
+    one discovery poll.
+  - `sustained_posts_idle_io`: a post replenished before each of at least 64
+    turns, a fresh read inside the unchanged two-second deadline, zero waits,
+    zero discovery once no native operation remains.
+  - The pre-existing repeating-timer fairness test is unchanged.
+- Web callback equivalents: 64 posts beside an idle WebSocket read, then a real
+  exchange and `Closed`, all `(0, 0)`, plus `queued_core_work`.
+- Synthetic driver tests: 64 queued posts with cached backend work and zero
+  backend calls; a natively accepted lookup keeps discovery through queued posts.
+- Direct counter tests: kqueue (zero/finite/infinite × empty/woken), epoll
+  assertions, IOCP direct versus Event-helper drain.
+- Allocation gate `queued_posts_and_terminals_with_idle_udp_allocate_nothing`:
+  1,000 warm-up + 1,000 measured rounds, 3,000 completions beside idle UDP,
+  capacity-one output, zero allocations, and exactly 3,000 discovery polls and 0
+  blocking waits. It runs natively and in the WASI allocation binaries.
 
-Initial Linux whole-workspace cross-checks failed because a local Zig wrapper
-rewrote an output path as well as the target argument; corrected the wrapper to
-translate only --target. No repository build configuration was changed.
+### Counter semantics per backend
 
-### Deviations / open questions / next steps
+`PollInfo::waits` / `TurnInfo::os_waits`: blocking native waits (positive or
+infinite timeout). `PollInfo::discovery_polls` / `TurnInfo::discovery_polls`:
+zero-timeout native polls. Their sum is at most one per turn. `zero_event_waits`
+keeps its revision-2 meaning across both kinds: native calls that returned no
+native I/O or notifier event, including EINTR and private timeout expiry.
+Classification is `PollInfo::native(timeout, empty)` on the effective timeout.
 
-No further DESIGN changes proposed; DESIGN has no separate change log, so its
-dated rationale paragraph records the approved amendment. WASI p3 retains the documented experimental
-cooperative-yield/scheduling limitations; counter separation does not claim to
-resolve them. Windows/Linux runtime and WASI/web/Node runtime are UNRUN here;
-the integrator must run the unchanged required CI matrix. No runtime result is
-inferred from cross-compilation. Complete local matrix and append exact ledger.
+| Backend | `waits` | `discovery_polls` | Neither |
+|---|---|---|---|
+| epoll (`epoll_pwait2`) | timespec > 0 or null | timespec 0 | backend early return with cached work/events |
+| epoll + timerfd fallback | armed timerfd, `epoll_wait(-1)` | `epoll_wait(0)`, preceded by a `timerfd_settime` disarm | same |
+| kqueue | timespec > 0 or null | timespec 0 | same |
+| IOCP direct | GQCSEx `INFINITE` behind the NT high-resolution packet timer | GQCSEx 0 | services/cached results already produced events |
+| IOCP Event helper | never on the turning thread | never | queue drain; the helper's own blocking wait is outside the turn |
+| WASI 0.2 | `wasi:io/poll` with a positive or absent clock pollable | zero-duration clock pollable | cached ready/cancelled/DNS results |
+| WASI 0.3 (experimental) | blocking wait-set step | nonblocking step, including a deadline already completed during setup (cooperative yield stays part of discovery) | cached results |
+| web | never | never | callback/Worker-ring draining |
+
+Driver guard: the backend is called only with native output reserve free
+(`buffered[NATIVE_EVENTS] == 0`) and, when work is queued, only while a native
+operation is pending (`native_pending != 0`); queued turns force a zero
+timeout. On native and WASI backends `has_work()` cannot force a queued call
+without native operations, because a backend that drains stale cached readiness
+falls through to its OS wait. On web the old `has_work()` arm is retained
+(`cfg(turnloop_backend = "web")`): web poll never enters the OS but is what pumps
+Worker/condition rings (`beginTurn`), and `worker_pending` is part of
+`has_work()`. Without that arm, sustained local posts could starve a Worker ring
+retained by a full poster; the checkpoint had removed it for every backend.
+
+### What changed after the checkpoint (`904e98f`)
+
+Review of `c7a2555` found four gaps; all fixed:
+
+1. **Native lookups were not native operations.** `Driver::resolve` allocates a
+   handle-less op, so a lookup the WASI 0.2 backend accepted never counted in
+   `native_pending`. Queued posts then suppressed all discovery. Mutation run with
+   the counting removed: `queued posts starved DNS: turns=689276, posts=689276,
+   discovery_polls=0` (2 s deadline). Fix: an `Op::native` flag set for
+   socket-handle ops and backend-accepted lookups, decremented in `retire`.
+   Regressions: WASI 0.2 `queued_posts_preserve_native_dns_discovery` (64+ turns,
+   post replenished before each, zero blocking waits, loopback `Resolved` within
+   2 s, zero discovery once resolved) and the synthetic
+   `natively_accepted_lookup_is_a_pending_native_operation` (mutation FAIL at
+   turn 0: 0 polls vs 1).
+2. **Web regression**, described above.
+3. **Two revision-2 totals were missed**: `idle_keepalive` in
+   `protocols/turnloop-http/tests/asynchronous.rs` (`waits > 0`) and the Windows
+   busy-pipe allocation gate (`waits > 0`). Both summed `os_waits`, which used to
+   include zero-timeout calls, so both now sum `os_waits + discovery_polls`: the
+   same bound as before, not a loosened one. The four protocol `os_waits == 1`
+   assertions for turns lasting at least 10 ms already mean one blocking wait and
+   stay unchanged.
+4. **DESIGN D7 step 1** (the old `:187` sentence) still said "zero if completions
+   are already queued" without the discovery condition. The libuv link carried
+   line anchors nobody could verify.
+
+Also added: a due timer beside idle UDP makes one discovery poll and no blocking
+wait (`queued_terminals_idle_io`).
+
+**Counter mapping for existing assertions.** An old `os_waits == 0` assertion
+that passed on main meant *no native call of any kind*, so it became
+`(os_waits, discovery_polls) == (0, 0)`. An old `os_waits == 1` on a timed wait
+became `(1, 0, …)`. Per-turn `os_waits <= 1` became the sum `<= 1`. Totals
+`waits >= N` / `> 0` became sums. Now-only benchmarks count `discovery_polls`.
+No numeric bound changed. Only the new I01 regressions, which failed on main by
+design, use `os_waits == 0 && discovery_polls == 1`.
+
+**Prototype withdrawn: due-timer expiry without native operations.** Treating an
+already-due timer as queued work, so that it makes no OS call when no native
+operation is pending, passed macOS contracts and the full WASI 0.2 suite. I
+reverted it for two reasons. First, it is not in the approved wording: queued
+work means completions already queued. Second, IOCP Event-helper mode re-arms
+its deadline timer only after a poll drains the helper's forwarded `TIMER`
+packet (`arm_event_deadline` returns early while `timer_pending`). Skipping that
+poll could leave the next deadline unarmed while a GUI host waits on the Event
+(`gui_event_tracks_timer_reset_and_partial_output`). This cannot be validated
+without Windows. DESIGN now states explicitly that a due expiry is not queued
+work and may spend its one call on a zero-timeout poll.
+
+### Verification (tree `904e98f`, macOS arm64, `CARGO_BUILD_JOBS=4`)
+
+Logs: `.tools/tl-i01b-claude/` (ignored). Plain `cargo` is nightly-2026-08-20;
+WASI 0.3 uses nightly-2026-09-07. wasmtime 46.0.0 (the `scripts/ci/tools.json`
+pin) was linked into `.tools/bin` from an existing local install. Unless marked
+otherwise, the commands below ran on the committed tree. The checkpoint's
+earlier Codex ledger (`.tools/tl-i01b/`) predates these fixes and is superseded.
+
+| Command | Result |
+|---|---|
+| `cargo fmt --check` | **PASS** |
+| `git diff --check a0fbb1b..HEAD`, `python3 scripts/ci/check-paths.py`, `python3 scripts/ci/feature_modes.py` | **PASS** (1452 files; 6 features / 18 native arms) |
+| `cargo test --locked -p turnloop --lib clock_contract -- --test-threads=1` with the lookup counting removed (mutation) | **FAIL** as intended: lookup test, turn 0, 0 polls vs 1 |
+| `cargo test --locked -p turnloop-contract --test wasi --all-features --target wasm32-wasip2 -- queued_posts_preserve_native_dns_discovery --exact` with the lookup counting removed (mutation) | **FAIL** as intended: 689,276 turns, 0 discovery, DNS starved |
+| `python3 scripts/ci/run-tests.py native` (macOS: default, executor, all-features; workspace + every member) | **PASS**, 1467 passed / 0 failed / 92 ignored |
+| ↳ includes `cargo test --locked --workspace -- --test-threads=1` | **PASS**, 259 tests |
+| `cargo test --locked -p turnloop-{http,mongodb,mysql,postgres,smtp} --features turnloop --test asynchronous -- --test-threads=1` | **PASS** (12/3/3/5/3; one Node-fixture test ignored). This ran on the withdrawn due-timer prototype; the all-features native run above re-ran these suites on `904e98f` |
+| `python3 scripts/ci/run-tests.py wasi --target wasm32-wasip2` | **PASS**: core lib 9, contracts 27 debug + 27 release, allocations 10 |
+| `python3 scripts/ci/run-tests.py wasi --target wasm32-wasip3` | **PASS**: core lib 11, contracts 27 + 27, allocations 11 |
+| `cargo clippy --locked --workspace --all-targets [--all-features] -- -D warnings -D clippy::undocumented_unsafe_blocks` (native) | **PASS** both |
+| Same strict flags, `-p turnloop -p turnloop-contract -p turnloop-io --all-targets`: x86_64-unknown-linux-gnu (default, `turnloop/epoll-timerfd`, all-features), aarch64-unknown-linux-gnu all-features, x86_64-pc-windows-msvc (default, all-features), wasm32-wasip2 (default, all-features), wasm32-unknown-unknown (default, all-features), wasm32-wasip3 all-features | **PASS** (11 invocations) |
+| wasm32-wasip3 default, same package set | **FAIL, inherited**: `crates/turnloop-io/tests/streams.rs` imports `backend::Platform` without `wasi-p3-experimental` (file untouched since `a0fbb1b`; CI clippies p3 with `--all-features`). `-p turnloop -p turnloop-contract` and `-p turnloop-io --lib` **PASS** |
+| `cargo clippy --workspace --all-targets --all-features` for wasm32-wasip2 / wasm32-unknown-unknown / wasm32-wasip3 | **FAIL, environment**: `ring` build script needs the wasm C toolchain (`scripts/ci/install-wasm-toolchain.py`), not installed here |
+| `cargo +stable check --locked --workspace --all-targets --all-features` | **PASS** |
+| `RUSTDOCFLAGS=-Dwarnings cargo doc --locked --workspace --all-features --no-deps` | **PASS** |
+| `bash scripts/ci/no-tokio.sh` | **PASS** (all graphs, default + all features) |
+| `python3 scripts/ci/soak.py` | **PASS**: 251 locked versions; inherited rustls 0.23.45 exception only, expires 2026-09-21 |
+| `cargo run --locked --release -p turnloop-bench -- --portable [--instruction-boundaries]` | **PASS** both (Now-only discovery assertions hold) |
+| `python3 scripts/ci/run-tests.py native` on Linux x86_64/arm64 (all modes incl. timerfd/SIGCHLD fallbacks) | **UNRUN**, no host |
+| `python3 scripts/ci/run-tests.py native` on Windows (incl. new IOCP counter test, Event-helper GUI tests, busy-pipe allocation gate) | **UNRUN**, no host |
+| `python3 scripts/ci/run-tests.py web` / `node` (new callback and core-work cases, Worker rings) | **UNRUN**: `wasm-bindgen-test-runner` not installed |
+| `python3 scripts/ci/run-tests.py protocol` / `protocol-wasi` with real servers | **UNRUN**, not affected by the change |
+
+### Needs CI confirmation / open questions
+
+- **Windows:** `direct_discovery_and_event_queue_draining_have_distinct_counts`
+  (direct 0/1/empty, Event-helper drain 0/0/0), the four shared I01 contracts,
+  the GUI Event tests' new `(0, 0)` assertions, and the busy-pipe gate's summed
+  total. These are compiled by cross-clippy only.
+- **Linux:** epoll and timerfd classification (`epoll.rs` unit test), and the
+  shared contracts in all six native modes on both architectures. In timerfd
+  fallback mode one discovery poll costs `timerfd_settime` plus `epoll_wait(0)`,
+  two syscalls; a follow-up could skip the disarm when the timer is not armed.
+- **Web/Node:** `queued_post_with_idle_callback_io_never_waits`,
+  `queued_core_work_makes_no_native_calls`, and the retained web `has_work()`
+  poll for Worker rings.
+- **Spec owner:** should timer *expiry* count as "timer churn"? Today a due
+  timer with no native operation makes one zero-timeout call. See the withdrawn
+  prototype; extending the rule needs an IOCP Event-helper re-arm fix validated
+  on Windows. Unverified side note: the same helper `TIMER`-packet drain is
+  already skipped on main when a timer fires in a queued turn with no native
+  operation. Worth one Windows check.
+- **API:** `TurnInfo` gained a public field (`discovery_polls`, no
+  `#[non_exhaustive]`), and `os_waits` no longer includes zero-timeout calls.
+  Host code that summed waits must add the two counters.
