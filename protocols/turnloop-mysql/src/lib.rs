@@ -31,6 +31,7 @@ pub use mysql_common::{
 use std::fmt;
 mod codec;
 mod wire;
+mod zlib;
 use codec::PacketCodec;
 pub mod pool;
 pub mod types;
