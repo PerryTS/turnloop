@@ -31,6 +31,10 @@ fn fifo_cancel_close() {
     contract::fifo_cancel_close::<Platform>(&root("cancel"));
 }
 #[test]
+fn queued_posts_do_not_starve_requests() {
+    contract::queued_posts_do_not_starve_requests::<Platform>(&root("starvation"));
+}
+#[test]
 fn pooled_lease_wait() {
     contract::pooled_lease_wait::<Platform>(&root("leases"));
 }

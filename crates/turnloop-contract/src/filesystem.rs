@@ -25,7 +25,10 @@ pub fn wait<B: Backend>(l: &mut Driver<B>, op: OpId) -> std::result::Result<FsRe
     loop {
         assert!(l.now() < until, "filesystem completion deadline");
         let info = l.turn(Timeout::Until(until), &mut out).expect("turn");
-        assert!(info.os_waits <= 1);
+        assert!(
+            info.os_waits + info.discovery_polls <= 1,
+            "one native call per turn"
+        );
         let mut drained = out.drain();
         let Some(c) = drained.next() else {
             continue;
@@ -589,6 +592,113 @@ pub fn fifo_cancel_close<B: Backend>(root: &Path) {
     assert!(!l.alive());
 }
 
+/// DESIGN §10 rule 3: a producer that queues a post before every turn cannot
+/// starve filesystem requests. Queued turns never block. Backend-executed (WASI)
+/// requests are native operations and get their discovery step; pool requests
+/// are not, so those turns make no native call at all.
+pub fn queued_posts_do_not_starve_requests<B: Backend>(root: &Path) {
+    let mut l = Driver::<B>::new(config()).expect("loop");
+    let dir = fresh(root, "starvation");
+    std::fs::create_dir(&dir).expect("fixture");
+    let file = dir.join("file");
+    std::fs::write(&file, b"payload").expect("fixture");
+    let poster = l.poster();
+    let mut out = Completions::with_capacity(4);
+    let mut posts = 0u64;
+    let mut serve = |l: &mut Driver<B>, pending: &mut Vec<OpId>, phase: &str| {
+        let until = l.now() + Duration::from_secs(2);
+        let mut turns = 0;
+        let mut results = Vec::new();
+        while !pending.is_empty() {
+            assert!(
+                l.now() < until,
+                "{phase}: starved behind queued posts after {turns} turns: {pending:?}"
+            );
+            poster
+                .post(Token(90), Payload::U64(posts))
+                .expect("replenish");
+            let info = l.turn(Timeout::Now, &mut out).expect("turn");
+            turns += 1;
+            assert_eq!(info.os_waits, 0, "a queued turn never blocks");
+            assert!(info.discovery_polls <= 1);
+            if B::FILESYSTEM == backend::Filesystem::Pool {
+                assert_eq!(info.discovery_polls, 0, "pool results are queued work");
+            }
+            for c in out.drain() {
+                match c.result {
+                    OpResult::Posted(Payload::U64(_)) => posts += 1,
+                    OpResult::Fs(result) => {
+                        let op = c.op.expect("request");
+                        assert!(pending.contains(&op), "exactly once");
+                        pending.retain(|p| *p != op);
+                        results.push((op, result));
+                    }
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+        }
+        results
+    };
+    // Phase 1: only path requests are pending. On WASI they are the backend's
+    // native operations; nothing else would give the backend a turn.
+    let stat = l
+        .fs(
+            FsRequest::Stat {
+                path: path(&file),
+                follow_symlinks: true,
+            },
+            Token(1),
+        )
+        .expect("path request");
+    let mkdir = l
+        .fs(
+            FsRequest::Mkdir {
+                path: path(dir.join("made")),
+                mode: 0o755,
+            },
+            Token(2),
+        )
+        .expect("path mutation");
+    for (op, result) in serve(&mut l, &mut vec![stat, mkdir], "path requests") {
+        match result {
+            FsResult::Metadata(m) if op == stat => assert_eq!(m.size, 7),
+            FsResult::Done if op == mkdir => {}
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert!(dir.join("made").is_dir(), "the mutation ran");
+    // Phase 2: an open and a handle request under the same producer.
+    let open_op = l
+        .fs(
+            FsRequest::Open {
+                path: path(&file),
+                options: FileOptions::default(),
+            },
+            Token(3),
+        )
+        .expect("open");
+    let results = serve(&mut l, &mut vec![open_op], "open");
+    let [(_, FsResult::Opened(handle))] = results.as_slice() else {
+        panic!("open: {results:?}")
+    };
+    let handle = *handle;
+    let fstat = l
+        .fs(FsRequest::Fstat { file: handle }, Token(4))
+        .expect("handle request");
+    let results = serve(&mut l, &mut vec![fstat], "handle request");
+    assert!(matches!(results.as_slice(), [(_, FsResult::Metadata(m))] if m.size == 7));
+    assert!(posts >= 3, "the producer's posts were delivered too");
+    while l
+        .turn(Timeout::Now, &mut out)
+        .expect("drain posts")
+        .completions
+        != 0
+    {}
+    close(&mut l, handle);
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+    assert!(!l.alive());
+}
+
 /// A pooled read waits for a lease without spinning, then completes with real bytes.
 pub fn pooled_lease_wait<B: Backend>(root: &Path) {
     let mut l = Driver::<B>::new(Config {
@@ -866,11 +976,16 @@ pub fn watch_backpressure<B: Backend>(root: &Path) {
     for _ in 0..3 {
         let at = l.now() + Duration::from_millis(20);
         let timer = l.timer(at, None, Token(2)).expect("timer");
-        // Native events may keep waking the loop while the OS delivers them; a
-        // spin is a turn that neither waited nor produced anything.
-        let mut idle = 0;
+        // Native deliveries (FSEvents notifies from its queue) may wake the loop:
+        // such turns block (`os_waits`) or, when the notification landed while the
+        // loop was running, make one zero-timeout discovery poll (`discovery_polls`).
+        // A spin is a turn that made no native call and produced nothing: the
+        // backend claiming work it cannot perform while every lease is held.
+        let (mut spins, mut turns) = (0, 0);
         loop {
             let info = l.turn(Timeout::Until(at), &mut out).expect("turn");
+            assert!(info.os_waits + info.discovery_polls <= 1);
+            turns += 1;
             if let Some(c) = out.drain().next() {
                 assert!(
                     matches!(c.result, OpResult::Timer),
@@ -879,11 +994,15 @@ pub fn watch_backpressure<B: Backend>(root: &Path) {
                 assert!(l.now() >= at);
                 break;
             }
-            idle += usize::from(info.os_waits == 0);
+            spins += usize::from(info.os_waits + info.discovery_polls == 0);
         }
         assert!(
-            idle <= 1,
-            "no spin while every lease is held ({idle} idle turns)"
+            spins <= 1,
+            "no spin while every lease is held ({spins} turns without a native call)"
+        );
+        assert!(
+            turns <= 64,
+            "wakes are bounded by native deliveries, not a poll loop ({turns} turns in 20 ms)"
         );
         close(&mut l, timer);
     }

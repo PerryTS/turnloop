@@ -928,6 +928,17 @@ impl<B: Backend> Driver<B> {
             }
             return Err(e);
         }
+        // DESIGN §10 rule 3: a request the backend executes needs its native step
+        // even while posts are queued, like a natively accepted lookup. Requests on
+        // backend handles are already counted; path requests are counted here. Pool
+        // requests are not native: their results arrive as queued work.
+        if B::FILESYSTEM == Filesystem::Backend {
+            let op = self.ops.get_mut(op.key).expect("accepted request");
+            if !op.native {
+                op.native = true;
+                self.native_pending += 1;
+            }
+        }
         Ok(op)
     }
     /// Whether a request waiting for a pooled lease can start now.
@@ -1517,6 +1528,7 @@ mod clock_contract {
         cached_work: bool,
         lookup: Option<OpId>,
         lookup_ready: bool,
+        file_request: Option<OpId>,
         accept_connect: bool,
         pending: Option<Request>,
         cancellation: Option<OpId>,
@@ -1529,6 +1541,14 @@ mod clock_contract {
     unsafe impl Backend for Host {
         type Wake = NoWake;
         type Detached = ();
+        const FILESYSTEM: Filesystem = Filesystem::Backend;
+        fn fs(&mut self, op: OpId, handle: Option<Handle>, request: FsRequest) -> Result<()> {
+            if handle.is_some() || !matches!(request, FsRequest::Stat { .. }) {
+                return Err(Error::new(ErrorKind::Unsupported));
+            }
+            assert!(self.file_request.replace(op).is_none());
+            Ok(())
+        }
         fn new(_: &Config, _: BufferPool) -> Result<Self> {
             Ok(Self {
                 now: Instant::now(),
@@ -1538,6 +1558,7 @@ mod clock_contract {
                 cached_work: false,
                 lookup: None,
                 lookup_ready: false,
+                file_request: None,
                 accept_connect: false,
                 pending: None,
                 cancellation: None,
@@ -1611,6 +1632,18 @@ mod clock_contract {
         ) -> Result<PollInfo> {
             assert_eq!(timeout, Some(Duration::ZERO));
             self.polls += 1;
+            // Like the WASI backends: accepted filesystem requests run in poll.
+            if let Some(op) = self.file_request.take() {
+                events.push(Event {
+                    op,
+                    terminal: true,
+                    result: Ok(Outcome::Fs {
+                        output: FsOutput::Done,
+                        lease: None,
+                    }),
+                });
+                return Ok(PollInfo::default());
+            }
             if self.lookup_ready
                 && let Some(op) = self.lookup.take()
             {
@@ -1708,6 +1741,61 @@ mod clock_contract {
         }
         assert_eq!((resolved, posts), (1, 7));
         assert!(driver.backend.lookup.is_none());
+    }
+
+    #[test]
+    fn backend_path_request_is_a_pending_native_operation() {
+        let mut driver = Driver::<Host>::new(Config::default()).expect("host loop");
+        let path = FsPath::new("/synthetic").expect("path");
+        let mut out = Completions::with_capacity(1);
+        // Sustained posts: without the native flag, every turn has queued work and
+        // no native operation, so the backend (where the request runs) is skipped.
+        driver
+            .poster()
+            .post(Token(2), Payload::U64(0))
+            .expect("post");
+        let op = driver
+            .fs(
+                FsRequest::Stat {
+                    path,
+                    follow_symlinks: true,
+                },
+                Token(1),
+            )
+            .expect("backend accepts the path request");
+        assert_eq!(driver.native_pending, 1, "path request counted as native");
+        let (mut done, mut posts) = (0, 0);
+        for turn in 0..4 {
+            let polls = driver.backend.polls;
+            let info = driver.turn(Timeout::Now, &mut out).expect("turn");
+            assert_eq!(info.os_waits, 0, "queued turns never block");
+            assert!(info.os_waits + info.discovery_polls <= 1);
+            assert_eq!(
+                driver.backend.polls - polls,
+                usize::from(turn == 0),
+                "one native step while the request is pending, none after"
+            );
+            for c in out.drain() {
+                match c.result {
+                    OpResult::Fs(FsResult::Done) => {
+                        assert_eq!(c.op, Some(op));
+                        done += 1;
+                    }
+                    OpResult::Posted(_) => posts += 1,
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+            driver
+                .poster()
+                .post(Token(2), Payload::U64(turn))
+                .expect("replenish");
+        }
+        assert_eq!(done, 1, "the request completed despite queued posts");
+        assert_eq!(
+            driver.native_pending, 0,
+            "terminal completion retires the flag"
+        );
+        assert!(posts >= 3);
     }
 
     #[test]

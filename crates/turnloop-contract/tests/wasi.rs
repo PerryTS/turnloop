@@ -451,6 +451,10 @@ mod filesystem {
         contract::pooled_lease_wait::<Platform>(root());
     }
     #[test]
+    fn queued_posts_do_not_starve_requests() {
+        contract::queued_posts_do_not_starve_requests::<Platform>(root());
+    }
+    #[test]
     fn capability_scope_and_unsupported_surface() {
         contract::capability_scope::<Platform>(root());
     }
