@@ -6,7 +6,7 @@ clock, schedules a timer or generates entropy. The sans-I/O code forbids unsafe.
 
 ## Getting started on turnloop
 
-Enable `turnloop-postgres = { version = "0.1.0-alpha.1", features = ["turnloop"] }`
+Enable `turnloop-postgres = { version = "0.1.0-alpha.2", features = ["turnloop"] }`
 and use the `asynchronous` module: `Client::connect, query, execute, copy_in/copy_out and notification`. The default feature set remains sans-I/O.
 The adapter reuses `turnloop-io`; the host owns `LocalExecutor` and calls `turn`.
 Spawn local futures through its handle and keep their `JoinHandle`s until completion.

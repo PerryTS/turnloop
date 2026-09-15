@@ -11,7 +11,7 @@ for the precise coverage and remaining conformance work.
 
 ## Getting started on turnloop
 
-Enable `turnloop-mongodb = { version = "0.1.0-alpha.1", features = ["turnloop"] }`
+Enable `turnloop-mongodb = { version = "0.1.0-alpha.2", features = ["turnloop"] }`
 and use the `asynchronous` module: `Client::connect/command/cursor and Cursor::next/close`. The default feature set remains sans-I/O.
 The adapter reuses `turnloop-io`; the host owns `LocalExecutor` and calls `turn`.
 Spawn local futures through its handle and keep their `JoinHandle`s until completion.
