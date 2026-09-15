@@ -96,6 +96,26 @@ an independent signal handle; stop it explicitly when finished with the TTY.
   query `tty_window_size` on notification. The openpty test compares full restored
   termios after XNU applies its pending canonical-input transition.
 
+## Local connection deadlines
+
+`Driver::pipe_connect_until(name, deadline, token)` adds an absolute loop-clock
+connection deadline without changing `Open`, `Operation`, or the backend trait.
+The core reserves its deadline heap at loop construction, exposes it through
+`next_deadline()`, and cancels the native Connect when it expires. TimedOut is
+terminal only after native acknowledgement. A completion collected before expiry
+wins; explicit cancel/close before expiry keeps the usual Cancelled/Closed result.
+Successful, failed and cancelled connects remove their deadlines. Native cancellation
+errors keep their identity and the pending deadline for retry. Existing
+`pipe_connect` remains unbounded and cancellable. Unsupported local transports
+still report Unsupported on WASI/web.
+
+Windows listeners reserve `max(backlog, 1)` pending overlapped instances and re-arm
+fixed slots as accepts are consumed. Busy clients use asynchronous NPFS pipe-wait
+requests so host turn deadlines and cancellation remain effective. Same-port
+accepted/reattached pipes skip registered event waits; foreign-port transfers retain
+the bridge. Tests cover backlog bursts, deadlines, close/drop quiescence and direct
+versus bridged delivery; see [the follow-up report](lanes/iocp-followups.md).
+
 ## External waits
 
 `WaitCondition` wraps host-provided `Arc<AtomicU64>` storage and a notification

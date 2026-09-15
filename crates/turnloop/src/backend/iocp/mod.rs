@@ -35,10 +35,7 @@ use windows_sys::Win32::{
     Foundation::*,
     Networking::WinSock::*,
     Storage::FileSystem::{ReadFile, SetFileCompletionNotificationModes, WriteFile},
-    System::{
-        IO::{CancelIoEx, OVERLAPPED},
-        Pipes::ConnectNamedPipe,
-    },
+    System::IO::{CancelIoEx, OVERLAPPED},
 };
 
 fn invalid() -> Error {
@@ -60,6 +57,7 @@ enum Kind {
     Listener,
     Udp,
     Pipe,
+    PipeConnecting,
     PipeListener,
     Sync,
 }
@@ -67,22 +65,25 @@ enum Kind {
 enum Native {
     Socket(OwnedSocket),
     Handle(OwnedHandle),
+    PipeListener,
 }
 impl Native {
     fn raw(&self) -> HANDLE {
         match self {
             Self::Socket(s) => s.as_raw_socket() as HANDLE,
             Self::Handle(h) => h.as_raw_handle(),
+            Self::PipeListener => ptr::null_mut(),
         }
     }
 }
 /// Owning, quiescent Windows transport. Transfer preserves independent ownership;
-/// a prior IOCP association is routed through overlapped events on the next loop.
+/// an association with a different IOCP is routed through overlapped events.
 #[derive(Debug)]
 pub struct Detached {
     native: Native,
     kind: Kind,
     routed: bool,
+    port: Option<Arc<Port>>,
     mode: Option<u32>,
     console_input: bool,
 }
@@ -92,6 +93,7 @@ impl Detached {
             native,
             kind,
             routed,
+            port: None,
             mode: None,
             console_input: false,
         }
@@ -111,7 +113,8 @@ struct Resource {
     handle: Handle,
     transport: Detached,
     connect: Option<SocketAddr>,
-    name: Option<Vec<u16>>,
+    pipe_connect: Option<pipes::Connect>,
+    listener: Option<pipes::Listener>,
     skip: bool,
     heads: [Option<usize>; 2],
     tails: [Option<usize>; 2],
@@ -138,6 +141,7 @@ struct Pending {
     waiting: bool,
     queued: bool,
     pool_wait: bool,
+    listener_wait: bool,
     cancelled: bool,
     completion: Option<Result<u32>>,
     offset: usize,
@@ -188,6 +192,7 @@ pub struct Iocp {
     workers: Vec<Option<sync_io::Worker>>,
     deadline: Option<Instant>,
     failure: Option<Error>,
+    next_listener_key: usize,
 }
 impl Iocp {
     fn get(&self, h: Handle) -> Result<&Resource> {
@@ -200,21 +205,41 @@ impl Iocp {
     fn install(
         &mut self,
         h: Handle,
-        transport: Detached,
+        mut transport: Detached,
         connect: Option<SocketAddr>,
-        name: Option<Vec<u16>>,
+        pipe_connect: Option<pipes::Connect>,
     ) -> Result<()> {
         if self.resources.get(h.index()).is_none_or(Option::is_some) {
             return Err(invalid());
+        }
+        if let Some(port) = &transport.port {
+            transport.routed = !Arc::ptr_eq(port, &self.port);
         }
         let raw = transport.native.raw();
         let mut skip = false;
         if let Native::Socket(_) = transport.native {
             socket::nonblocking(raw as usize)?;
         }
-        if transport.kind != Kind::Sync && !transport.routed {
-            // SAFETY: freshly created, exclusively owned overlapped resource.
-            unsafe { self.port.associate(raw, 1) }.map_err(Error::from)?;
+        if !matches!(transport.kind, Kind::Sync | Kind::PipeListener) && transport.port.is_none() {
+            // SAFETY: exclusively owned quiescent overlapped handle. An
+            // unknown imported association may reject reassociation; no I/O
+            // was submitted and no pointer is retained by this setup call.
+            match unsafe { self.port.associate(raw, 1) } {
+                Ok(()) => {
+                    transport.routed = false;
+                    transport.port = Some(Arc::clone(&self.port));
+                }
+                Err(error)
+                    if transport.routed
+                        && error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) =>
+                {
+                    // A validated imported overlapped handle already belongs
+                    // to another port. Its immutable association needs routing.
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if !matches!(transport.kind, Kind::Sync | Kind::PipeListener) && !transport.routed {
             let ifs = if matches!(transport.native, Native::Socket(_)) {
                 socket::ifs(raw as usize)?
             } else {
@@ -235,7 +260,8 @@ impl Iocp {
             handle: h,
             transport,
             connect,
-            name,
+            pipe_connect,
+            listener: None,
             skip,
             heads: [None; 2],
             tails: [None; 2],
@@ -246,6 +272,7 @@ impl Iocp {
         if let Some(p) = &mut self.ops[i]
             && !p.queued
             && !p.waiting
+            && !p.listener_wait
         {
             p.queued = true;
             self.ready.push_back(i);
@@ -330,7 +357,7 @@ impl Iocp {
                 p.stage = Stage::Start;
                 p.completion = None;
             }
-            let runnable = !p.waiting && !p.pool_wait;
+            let runnable = !p.waiting && !p.pool_wait && !p.listener_wait;
             if p.pool_wait {
                 self.pool_waiting.push_back(p.request.op);
             }
@@ -418,6 +445,9 @@ impl Iocp {
             return self.ipc_step(i, p);
         }
         let r = self.get(p.request.handle)?;
+        if r.transport.kind == Kind::PipeConnecting {
+            return self.pipe_connect_step(i, p);
+        }
         let raw = r.transport.native.raw();
         let kind = r.transport.kind;
         if let Some(result) = p.completion.take() {
@@ -735,34 +765,64 @@ impl Iocp {
                 } != 0;
                 self.submitted(i, p, ok, bytes, socket::last_error(), Stage::Io)?;
             }
-            Operation::Accept { .. } if kind == Kind::PipeListener => {
-                let next = pipes::instance(r.name.as_ref().expect("pipe name"), false)?;
-                // SAFETY: newly created overlapped pipe is unassociated.
-                unsafe { self.port.associate(next.native.raw(), 1) }.map_err(Error::from)?;
-                // SAFETY: fresh pipe supports skip-success.
-                bool_result(unsafe { SetFileCompletionNotificationModes(next.native.raw(), 1) })?;
-                let r = self.resources[p.request.handle.index()]
+            Operation::Accept { multishot } if kind == Kind::PipeListener => {
+                let listener = self.resources[p.request.handle.index()]
                     .as_mut()
-                    .expect("listener");
-                let mut accepted = std::mem::replace(&mut r.transport, next);
-                accepted.kind = Kind::Pipe;
-                accepted.routed = true;
-                p.accepted = Some(accepted);
-                let k = self.prepare(i, p)?;
-                let accept_raw = self.io_raw(p);
-                // SAFETY: owned overlapped instance and pinned operation.
-                let ok = unsafe { ConnectNamedPipe(accept_raw, k.cast()) } != 0;
-                let error = os_error();
-                if error.os == Some(ERROR_PIPE_CONNECTED as i32) && !ok {
-                    p.stage = Stage::Io;
-                    p.completion = Some(Ok(0));
-                } else {
-                    self.submitted(i, p, ok, 0, error, Stage::Io)?;
+                    .expect("listener")
+                    .listener
+                    .as_mut()
+                    .expect("pipe backlog");
+                if let Some(transport) = listener.accept()? {
+                    return Ok(Some((Outcome::PipeAccepted(transport), !multishot)));
                 }
+                // Listener instances own their kernel operations. This request
+                // waits for a backlog entry, and cancellation needs no native I/O.
+                p.listener_wait = true;
             }
             _ => return Err(unsupported()),
         }
         Ok(None)
+    }
+    fn pipe_connect_step(
+        &mut self,
+        i: usize,
+        p: &mut Pending,
+    ) -> Result<Option<(Outcome<Detached>, bool)>> {
+        if let Some(result) = p.completion.take() {
+            result?;
+        }
+        let r = self.get(p.request.handle)?;
+        match pipes::connect(&r.pipe_connect.as_ref().expect("connect state").name) {
+            Ok(mut transport) => {
+                // SAFETY: newly opened overlapped client, no existing association.
+                unsafe { self.port.associate(transport.native.raw(), 1) }?;
+                // SAFETY: live, uniquely owned named pipe; failure keeps normal packets.
+                let skip =
+                    unsafe { SetFileCompletionNotificationModes(transport.native.raw(), 1) } != 0;
+                transport.port = Some(Arc::clone(&self.port));
+                let r = self.resources[p.request.handle.index()]
+                    .as_mut()
+                    .expect("client");
+                r.transport = transport;
+                r.skip = skip;
+                r.pipe_connect = None;
+                Ok(Some((Outcome::Connected, true)))
+            }
+            Err(error) if error.os == Some(ERROR_PIPE_BUSY as i32) => {
+                let k = self.prepare(i, p)?;
+                let r = self.get(p.request.handle)?;
+                let state = r.pipe_connect.as_ref().expect("connect state");
+                // SAFETY: pinned operation; state owns event and immutable wait buffer
+                // through completion/cancellation. Only availability causes retries.
+                let status = unsafe { state.wait(r.transport.native.raw(), k.cast()) };
+                let ok = status >= 0 && status != STATUS_PENDING;
+                // SAFETY: pure conversion of the native result, including pending.
+                let error = socket::error(unsafe { RtlNtStatusToDosError(status) } as i32);
+                self.submitted(i, p, ok, 0, error, Stage::Io)?;
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
     }
     fn read_ready(
         &mut self,
@@ -840,6 +900,27 @@ impl Iocp {
             return Ok(());
         }
         let base = self.kernel.as_ptr() as usize;
+        let end = base + std::mem::size_of_val(&*self.kernel);
+        if entry.key >= pipes::FIRST_KEY
+            && entry.key < port::STOP
+            && !(base..end).contains(&entry.overlapped)
+        {
+            // Listener keys are never reused in this loop. Cancellation packets
+            // can arrive after release; ignore those without dereferencing them.
+            for resource in self.resources.iter_mut().flatten() {
+                if let Some(listener) = &mut resource.listener
+                    && listener.key() == entry.key
+                {
+                    listener.completed(entry)?;
+                    if let Some(i) = resource.heads[0] {
+                        self.ops[i].as_mut().expect("accept").listener_wait = false;
+                        self.schedule(i);
+                    }
+                    break;
+                }
+            }
+            return Ok(());
+        }
         let stride = size_of::<UnsafeCell<Kernel>>();
         let offset = entry.overlapped.checked_sub(base).ok_or_else(invalid)?;
         if offset % stride != 0 || offset / stride >= self.ops.len() {
@@ -918,6 +999,7 @@ unsafe impl Backend for Iocp {
             workers: (0..config.max_handles).map(|_| None).collect(),
             deadline: None,
             failure: None,
+            next_listener_key: pipes::FIRST_KEY,
         })
     }
     fn set_notifier(&mut self, notifier: Notifier) {
@@ -1048,7 +1130,7 @@ unsafe impl Backend for Iocp {
         Arc::clone(&self.wake)
     }
     fn open(&mut self, h: Handle, spec: Open) -> Result<()> {
-        let (transport, connect, name) = match spec {
+        let (transport, connect, pipe_connect) = match spec {
             Open::Tcp { addr, opts } => {
                 let socket = socket::create(addr.is_ipv6(), false)?;
                 let raw = socket.as_raw_socket() as usize;
@@ -1115,9 +1197,29 @@ unsafe impl Backend for Iocp {
                     return Err(unsupported());
                 }
                 let name = pipes::name(&name)?;
-                (pipes::instance(&name, true)?, None, Some(name))
+                let key = self.next_listener_key;
+                self.next_listener_key = key
+                    .checked_add(1)
+                    .filter(|key| *key < port::STOP)
+                    .ok_or(Error::new(ErrorKind::ResourceLimit))?;
+                let listener =
+                    pipes::Listener::new(name, opts.backlog, Arc::clone(&self.port), key)?;
+                self.install(
+                    h,
+                    Detached::new(Native::PipeListener, Kind::PipeListener, false),
+                    None,
+                    None,
+                )?;
+                self.resources[h.index()]
+                    .as_mut()
+                    .expect("listener")
+                    .listener = Some(listener);
+                return Ok(());
             }
-            Open::Pipe(name) => (pipes::connect(&pipes::name(&name)?)?, None, None),
+            Open::Pipe(name) => {
+                let (transport, state) = pipes::open(pipes::name(&name)?)?;
+                (transport, None, state)
+            }
             Open::Stdio(which) => {
                 let i = match which {
                     Stdio::Stdin => 0,
@@ -1131,7 +1233,7 @@ unsafe impl Backend for Iocp {
                 )
             }
         };
-        self.install(h, transport, connect, name)
+        self.install(h, transport, connect, pipe_connect)
     }
     fn local_addr(&self, h: Handle) -> Result<SocketAddr> {
         let r = self.get(h)?;
@@ -1147,7 +1249,7 @@ unsafe impl Backend for Iocp {
         let r = self.get(request.handle)?;
         let kind = r.transport.kind;
         let valid = match &request.operation {
-            Operation::Connect => matches!(kind, Kind::Tcp | Kind::Pipe),
+            Operation::Connect => matches!(kind, Kind::Tcp | Kind::Pipe | Kind::PipeConnecting),
             Operation::Accept { .. } => matches!(kind, Kind::Listener | Kind::PipeListener),
             Operation::Read { .. } | Operation::Write(_) | Operation::Writev(_) => {
                 matches!(kind, Kind::Tcp | Kind::Pipe | Kind::Sync)
@@ -1195,6 +1297,7 @@ unsafe impl Backend for Iocp {
             waiting: false,
             queued: false,
             pool_wait: false,
+            listener_wait: false,
             cancelled: false,
             completion: None,
             offset: 0,
@@ -1234,6 +1337,7 @@ unsafe impl Backend for Iocp {
             }
         }
         self.ops[op.index()].as_mut().expect("op").cancelled = true;
+        self.ops[op.index()].as_mut().expect("op").listener_wait = false;
         if self.ops[op.index()].as_ref().expect("op").pool_wait {
             self.pool_waiting.retain(|queued| *queued != op);
             self.ops[op.index()].as_mut().expect("op").pool_wait = false;
@@ -1319,7 +1423,7 @@ unsafe impl Backend for Iocp {
     }
     fn detach(&mut self, h: Handle) -> Result<Detached> {
         let r = self.get(h)?;
-        if r.transport.kind == Kind::PipeListener {
+        if matches!(r.transport.kind, Kind::PipeListener | Kind::PipeConnecting) {
             return Err(unsupported());
         }
         if r.heads.iter().any(Option::is_some) {

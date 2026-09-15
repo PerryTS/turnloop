@@ -22,6 +22,24 @@ fn main() {
         }
         "exit" => std::process::exit(23),
         "sleep" => std::thread::sleep(Duration::from_secs(60)),
+        "roundtrip" => {
+            let mut stdout = std::io::stdout().lock();
+            let values = args[2..].iter().cloned().chain([
+                std::env::var_os("TURNLOOP_CHILD_VALUE").expect("child value"),
+                std::env::var_os("TURNLOOP_CHILD_OTHER").expect("child other"),
+                std::env::current_dir()
+                    .expect("cwd")
+                    .canonicalize()
+                    .expect("canonical cwd")
+                    .into_os_string(),
+                std::env::var_os("PATH").unwrap_or_else(|| "<absent>".into()),
+            ]);
+            for value in values {
+                let value = value.to_str().expect("UTF-8 fixture value");
+                writeln!(stdout, "{}", value.len()).expect("field length");
+                stdout.write_all(value.as_bytes()).expect("field bytes");
+            }
+        }
         "environment" => {
             print!(
                 "{}|{}|{}",

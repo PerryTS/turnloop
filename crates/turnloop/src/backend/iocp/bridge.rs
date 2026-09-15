@@ -23,6 +23,8 @@ use windows_sys::Win32::{
 };
 
 pub(super) const KEY: usize = 2;
+#[cfg(test)]
+thread_local! { pub(super) static REGISTRATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 struct Context {
     port: Arc<Port>,
     handle: usize,
@@ -99,6 +101,10 @@ impl Bridge {
         Ok(event)
     }
     pub(super) fn start(&mut self) -> Result<()> {
+        #[cfg(test)]
+        {
+            REGISTRATIONS.with(|n| n.set(n.get() + 1));
+        }
         // SAFETY: context is stable, event is owned, callback executes at most once;
         // finish/drop joins it before either context or kernel storage is reused.
         if unsafe {

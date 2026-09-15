@@ -523,3 +523,79 @@ pub fn ipc_process<B: Backend>(program: &std::ffi::OsStr, name: &PipeName) {
         .close(handle, Token(9))
         .expect("close returned socket");
 }
+
+/// Deadline setup, completion removal and cancellation use the same core on
+/// every native backend, including when the deadline already elapsed at submit.
+pub fn pipe_connect_deadlines<B: Backend>(name: &PipeName) {
+    let mut driver = Driver::<B>::new(Config::default()).expect("loop");
+    let listener = driver
+        .pipe_listen(name, &ListenOpts::default())
+        .expect("listener");
+    driver.accept(listener, Token(1)).expect("accept");
+    let at = driver.now() + Duration::from_secs(5);
+    let client = driver
+        .pipe_connect_until(name, at, Token(2))
+        .expect("deadline connect");
+    assert_eq!(driver.next_deadline(), Some(at));
+    let mut out = Completions::with_capacity(1);
+    let (mut connected, mut accepted) = (0, 0);
+    while connected == 0 || accepted == 0 {
+        assert!(driver.now() < at);
+        driver
+            .turn(Timeout::Until(at), &mut out)
+            .expect("connect before deadline");
+        for c in out.drain() {
+            match c.result {
+                OpResult::Connected => {
+                    assert_eq!(c.handle, Some(client));
+                    connected += 1;
+                }
+                OpResult::PipeAccepted { .. } => accepted += 1,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+    assert_eq!((connected, accepted), (1, 1));
+    assert_eq!(
+        driver.next_deadline(),
+        None,
+        "successful connect retires its deadline"
+    );
+    for cancel in [false, true] {
+        let at = driver.now();
+        let h = driver
+            .pipe_connect_until(name, at, Token(3))
+            .expect("elapsed deadline connect");
+        if cancel {
+            driver
+                .close(h, Token(4))
+                .expect("explicit close wins before expiry");
+        }
+        let until = driver.now() + Duration::from_secs(5);
+        let mut count = 0;
+        while count < if cancel { 2 } else { 1 } {
+            assert!(driver.now() < until);
+            driver
+                .turn(Timeout::Until(until), &mut out)
+                .expect("deadline cancellation");
+            for c in out.drain() {
+                assert_eq!(c.handle, Some(h));
+                assert!(c.terminal);
+                assert!(match (cancel, count) {
+                    (false, 0) => matches!(
+                        c.result,
+                        OpResult::Err(Error {
+                            kind: ErrorKind::TimedOut,
+                            ..
+                        })
+                    ),
+                    (true, 0) => matches!(c.result, OpResult::Cancelled),
+                    (true, 1) => matches!(c.result, OpResult::Closed),
+                    _ => false,
+                });
+                count += 1;
+            }
+        }
+        assert_eq!(driver.next_deadline(), None);
+    }
+}

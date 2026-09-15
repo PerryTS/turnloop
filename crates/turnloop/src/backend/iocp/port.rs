@@ -16,6 +16,7 @@ pub const WAKE: usize = usize::MAX;
 pub const TIMER: usize = usize::MAX - 1;
 pub const STOP: usize = usize::MAX - 2;
 
+#[derive(Debug)]
 pub struct Port(OwnedHandle);
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -73,7 +74,8 @@ impl Port {
     }
 
     /// # Safety
-    /// `handle` must be live, overlapped-capable, and not associated with another port.
+    /// `handle` must be live, overlapped-capable and quiescent. Windows rejects
+    /// a handle associated with another port without changing that association.
     pub unsafe fn associate(&self, handle: HANDLE, key: usize) -> io::Result<()> {
         if key >= STOP {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "reserved key"));
