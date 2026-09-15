@@ -8,10 +8,18 @@ use std::{
     },
 };
 use windows_sys::Win32::System::Console::*;
+use windows_sys::Win32::System::Threading::{INFINITE, Sleep};
 
 static SLOTS: [AtomicPtr<Ticket>; 1024] = [const { AtomicPtr::new(ptr::null_mut()) }; 1024];
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
-static REGISTRATION: Mutex<usize> = Mutex::new(0);
+// Whether `handler` is installed. Installation is permanent, as in libuv's
+// uv__signals_init: SetConsoleCtrlHandler (add or remove) blocks while any control
+// handler is running (windows-2025 run 34934409445), and a subscribed Hup holds its
+// handler forever. Removing it on the last subscription's Drop therefore deadlocked the
+// cleanup a close handler exists to allow. With no subscription the installed handler
+// returns FALSE, exactly as if it were absent, so older and newer host handlers and
+// the default handler still run.
+static REGISTRATION: Mutex<bool> = Mutex::new(false);
 struct Ticket {
     signal: Signal,
     pending: AtomicBool,
@@ -43,13 +51,34 @@ pub(super) fn dispatch(signal: Signal) -> bool {
     handled
 }
 unsafe extern "system" fn handler(control: u32) -> i32 {
+    handle_control(control, || {
+        // Like libuv, keep the control thread alive so a later host turn can
+        // observe Hup before Windows' bounded close timeout expires. This is
+        // outside dispatch's ACTIVE guard: subscription teardown must not wait
+        // for the lifetime of this sleeping control thread.
+        // SAFETY: Sleep has no pointer/lifetime requirements; Windows owns this
+        // handler thread and terminates the process after the close-time budget.
+        unsafe {
+            Sleep(INFINITE);
+        }
+    })
+}
+fn handle_control(control: u32, hold_close: impl FnOnce()) -> i32 {
     let signal = match control {
         CTRL_C_EVENT => Signal::Int,
         CTRL_BREAK_EVENT => Signal::Break,
         CTRL_CLOSE_EVENT => Signal::Hup,
         _ => return 0,
     };
-    i32::from(dispatch(signal))
+    let handled = dispatch(signal);
+    if control == CTRL_CLOSE_EVENT && handled {
+        // Windows dispatches newest handler first. No supported API can both
+        // continue to older unknown host handlers and hold this thread. We match
+        // libuv only when Hup is subscribed; otherwise return FALSE to the host.
+        // https://github.com/libuv/libuv/blob/v1.52.1/src/win/signal.c
+        hold_close();
+    }
+    i32::from(handled)
 }
 impl Subscription {
     pub(super) fn new(signal: Signal, notifier: Notifier) -> Result<Self> {
@@ -59,14 +88,15 @@ impl Subscription {
         ) {
             return Err(unsupported());
         }
-        let mut count = REGISTRATION.lock().unwrap_or_else(|e| e.into_inner());
+        let mut installed = REGISTRATION.lock().unwrap_or_else(|e| e.into_inner());
         let index = SLOTS
             .iter()
             .position(|s| s.load(Ordering::SeqCst).is_null())
             .ok_or(Error::new(ErrorKind::ResourceLimit))?;
-        if *count == 0 {
+        if !*installed {
             // SAFETY: process-lifetime function pointer; handler has no locks or allocations.
             bool_result(unsafe { SetConsoleCtrlHandler(Some(handler), 1) })?;
+            *installed = true;
         }
         let ticket = Box::into_raw(Box::new(Ticket {
             signal,
@@ -74,7 +104,6 @@ impl Subscription {
             notifier,
         }));
         SLOTS[index].store(ticket, Ordering::SeqCst);
-        *count += 1;
         Ok(Self { ticket, index })
     }
     pub(super) fn ready(&self) -> bool {
@@ -91,15 +120,10 @@ impl Subscription {
 }
 impl Drop for Subscription {
     fn drop(&mut self) {
-        let mut count = REGISTRATION.lock().unwrap_or_else(|e| e.into_inner());
+        // The installed handler stays registered (see REGISTRATION); unpublishing
+        // the ticket is enough for it to stop claiming this signal.
+        let _slots = REGISTRATION.lock().unwrap_or_else(|e| e.into_inner());
         SLOTS[self.index].store(ptr::null_mut(), Ordering::SeqCst);
-        *count -= 1;
-        if *count == 0 {
-            // SAFETY: remove only our handler, preserving every host handler.
-            unsafe {
-                SetConsoleCtrlHandler(Some(handler), 0);
-            }
-        }
         while ACTIVE.load(Ordering::SeqCst) != 0 {
             std::thread::yield_now();
         }
@@ -112,6 +136,33 @@ impl Drop for Subscription {
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
+    #[test]
+    fn close_dispatch_releases_tickets_before_holding_the_control_thread() {
+        let driver = crate::Loop::new(crate::Config::default()).expect("notifier owner");
+        let hup = Subscription::new(Signal::Hup, driver.notifier()).expect("Hup");
+        let (entered, receive) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            handle_control(CTRL_CLOSE_EVENT, || {
+                entered.send(()).expect("hold entered after dispatch");
+                wait.recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("test releases hold");
+            })
+        });
+        receive
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("close dispatch ran");
+        assert!(hup.take(), "Hup published before hold");
+        assert!(!hup.take());
+        drop(hup); // must not join the still-held handler thread
+        assert!(!thread.is_finished());
+        release.send(()).expect("release synthetic hold");
+        assert_eq!(thread.join().expect("handler result"), 1);
+        assert_eq!(
+            handle_control(CTRL_CLOSE_EVENT, || panic!("unsubscribed close must chain")),
+            0
+        );
+    }
     #[test]
     fn moved_subscription_keeps_its_published_ticket_alive() {
         let driver = crate::Loop::new(crate::Config::default()).expect("notifier owner");

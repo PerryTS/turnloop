@@ -97,7 +97,10 @@ fn baselines(counter: &Counter) {
     let before = counter.read().expect("counter");
     let mut waits = 0;
     for _ in 0..N {
-        waits += l.turn(Timeout::Now, &mut out).expect("turn").os_waits;
+        waits += l
+            .turn(Timeout::Now, &mut out)
+            .expect("turn")
+            .discovery_polls;
     }
     report("idle_turn", N, before, counter);
     assert_eq!(waits as usize, N);
@@ -323,7 +326,10 @@ fn instruction_boundaries(counter: &Counter) {
             for i in 0..100 {
                 match mode {
                     "idle" => {
-                        waits += l.turn(Timeout::Now, &mut out).expect("idle").os_waits;
+                        waits += l
+                            .turn(Timeout::Now, &mut out)
+                            .expect("idle")
+                            .discovery_polls;
                         assert!(out.is_empty());
                     }
                     "notify" => {

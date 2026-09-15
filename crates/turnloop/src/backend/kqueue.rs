@@ -208,10 +208,7 @@ impl Poller for Kqueue {
         if n < 0 {
             let e = std::io::Error::last_os_error();
             if e.kind() == std::io::ErrorKind::Interrupted {
-                return Ok(PollInfo {
-                    waits: 1,
-                    zero_event_waits: 1,
-                });
+                return Ok(PollInfo::native(timeout, true));
             }
             return Err(e.into());
         }
@@ -230,12 +227,45 @@ impl Poller for Kqueue {
                 },
             });
         }
-        Ok(PollInfo {
-            waits: 1,
-            zero_event_waits: u32::from(n == 0),
-        })
+        Ok(PollInfo::native(timeout, n == 0))
     }
     fn fd(&self) -> RawFd {
         self.wake.fd.as_raw_fd()
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blocking_and_discovery_calls_keep_raw_empty_accounting() {
+        let mut poller = Kqueue::new(4).expect("kqueue");
+        let mut ready = Vec::with_capacity(4);
+        let mut calls = 0;
+        for timeout in [Some(Duration::ZERO), Some(Duration::from_millis(2)), None] {
+            // Infinite calls must be woken; finite/zero calls also exercise empty results.
+            for wake in [false, true] {
+                if timeout.is_none() && !wake {
+                    continue;
+                }
+                if wake {
+                    poller.waker().wake().expect("wake");
+                }
+                let info = poller.wait(timeout, &mut ready).expect("native call");
+                let discovery = timeout == Some(Duration::ZERO);
+                assert_eq!(
+                    (info.waits, info.discovery_polls),
+                    (u32::from(!discovery), u32::from(discovery))
+                );
+                assert_eq!(info.zero_event_waits, u32::from(!wake));
+                assert!(
+                    ready.is_empty(),
+                    "notifier is native work without user readiness"
+                );
+                calls += 1;
+            }
+        }
+        assert_eq!(calls, 5);
     }
 }

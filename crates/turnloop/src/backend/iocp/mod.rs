@@ -190,13 +190,26 @@ pub struct Iocp {
     event: Option<EventIntegration>,
     notifier: Option<Notifier>,
     services: services::Services,
-    workers: Vec<Option<sync_io::Worker>>,
+    workers: Vec<Option<[sync_io::Worker; 2]>>,
     deadline: Option<Instant>,
     failure: Option<Error>,
     next_listener_key: usize,
     watches: watch::Watches,
 }
 impl Iocp {
+    #[cfg(test)]
+    pub(crate) fn fail_event_for_test(&self, code: i32) {
+        self.event
+            .as_ref()
+            .expect("active helper")
+            .fail_and_wait(code);
+    }
+    #[cfg(test)]
+    pub(crate) fn operation_waiting_for_test(&self, op: OpId) -> bool {
+        self.ops[op.index()]
+            .as_ref()
+            .is_some_and(|p| p.request.op == op && p.waiting)
+    }
     fn get(&self, h: Handle) -> Result<&Resource> {
         self.resources
             .get(h.index())
@@ -254,9 +267,13 @@ impl Iocp {
             }
         }
         if transport.kind == Kind::Sync {
-            // Adoption is resource setup. Reserve the worker here so even the
-            // first read after pooled-buffer backpressure needs no allocation.
-            self.workers[h.index()] = Some(sync_io::Worker::new(raw, Arc::clone(&self.port))?);
+            // Reserve both directions and classify once, while still quiescent.
+            // A worker must not query console mode behind the other's idle I/O.
+            self.workers[h.index()] = Some(sync_io::Worker::pair(
+                raw,
+                transport.mode.is_some(),
+                Arc::clone(&self.port),
+            )?);
         }
         self.resources[h.index()] = Some(Resource {
             handle: h,
@@ -569,10 +586,9 @@ impl Iocp {
                 }
             };
             let index = p.request.handle.index();
-            self.workers[index].as_ref().expect("stdio worker").start(
+            self.workers[index].as_ref().expect("stdio workers")[p.direction].start(
                 buffer,
                 len,
-                write,
                 self.kernel_ptr(i),
             );
             p.stage = Stage::Io;
@@ -884,7 +900,7 @@ impl Iocp {
         result
     }
     fn entry(&mut self, entry: &Entry) -> Result<()> {
-        if entry.key == WAKE {
+        if entry.key == WAKE || entry.key == port::STOP {
             return Ok(());
         }
         if entry.key == TIMER {
@@ -940,7 +956,7 @@ impl Iocp {
             Some(
                 self.workers[p.request.handle.index()]
                     .as_ref()
-                    .ok_or_else(invalid)?
+                    .ok_or_else(invalid)?[p.direction]
                     .finish(),
             )
         } else if entry.key == bridge::KEY {
@@ -1136,6 +1152,10 @@ unsafe impl Backend for Iocp {
         Instant::now()
     }
     fn validate_timeout(&self, timeout: Timeout) -> Result<()> {
+        if let Some(event) = &self.event {
+            // Check before the core can deliver already-queued timers/posts.
+            event.check()?;
+        }
         if self.event.is_some() && !matches!(timeout, Timeout::Now) {
             return Err(invalid());
         }
@@ -1300,11 +1320,7 @@ unsafe impl Backend for Iocp {
         if self.ops.get(i).is_none_or(Option::is_some) {
             return Err(invalid());
         }
-        let d = if kind == Kind::Sync {
-            0
-        } else {
-            direction(&request.operation)
-        };
+        let d = direction(&request.operation);
         let r = self.resources[request.handle.index()]
             .as_mut()
             .expect("resource");
@@ -1350,8 +1366,8 @@ unsafe impl Backend for Iocp {
             return Ok(());
         };
         if p.waiting {
-            if let Some(worker) = &self.workers[p.request.handle.index()] {
-                worker.cancel();
+            if let Some(workers) = &self.workers[p.request.handle.index()] {
+                workers[p.direction].cancel();
             } else {
                 // SAFETY: exact live native request; acknowledgement is still required.
                 if unsafe { CancelIoEx(self.io_raw(p), self.kernel_ptr(op.index())) } == 0 {
@@ -1383,6 +1399,9 @@ unsafe impl Backend for Iocp {
         timeout: Option<Duration>,
         events: &mut Vec<Event<Detached>>,
     ) -> Result<PollInfo> {
+        if let Some(event) = &self.event {
+            event.check()?;
+        }
         if let Some(error) = self.failure.take() {
             return Err(error);
         }
@@ -1396,6 +1415,8 @@ unsafe impl Backend for Iocp {
         let mut entries = [Entry::default(); 64];
         let mut cancel_result = Ok(());
         let (n, info) = if let Some(event) = &mut self.event {
+            // The helper owns the blocking port wait on its own thread.
+            // This turn only drains its queue: no native discovery call.
             (event.drain(&mut entries)?, PollInfo::default())
         } else {
             let armed = timeout.is_some_and(|d| !d.is_zero());
@@ -1418,21 +1439,9 @@ unsafe impl Backend for Iocp {
                 // it is not native work. Notifier and I/O packets still count.
                 Wait::Entries(n) => {
                     let timer_only = entries[..n].iter().all(|entry| entry.key == TIMER);
-                    (
-                        n,
-                        PollInfo {
-                            waits: 1,
-                            zero_event_waits: if timer_only { 1 } else { 0 },
-                        },
-                    )
+                    (n, PollInfo::native(timeout, timer_only))
                 }
-                Wait::Timeout | Wait::Apc => (
-                    0,
-                    PollInfo {
-                        waits: 1,
-                        zero_event_waits: 1,
-                    },
-                ),
+                Wait::Timeout | Wait::Apc => (0, PollInfo::native(timeout, true)),
             }
         };
         let entries_result = self.entries(&entries[..n]);
@@ -1468,6 +1477,9 @@ unsafe impl Backend for Iocp {
         self.install(h, transport, None, None)
     }
     fn integration(&mut self) -> Result<Integration> {
+        if let Some(event) = &self.event {
+            event.check()?;
+        }
         if self.event.is_none() {
             self.event = Some(EventIntegration::new(Arc::clone(&self.port))?);
             self.arm_event_deadline()?;
@@ -1505,6 +1517,27 @@ impl Iocp {
 }
 impl Drop for Iocp {
     fn drop(&mut self) {
+        // Join the sole consumer and reclaim every forwarded packet, then use
+        // blocking port waits for cancellation. Never repeatedly poll an empty
+        // helper queue (including after its worker has failed).
+        if let Some(mut event) = self.event.take() {
+            if event.shutdown().is_err() {
+                std::process::abort();
+            }
+            let mut entries = [Entry::default(); 64];
+            loop {
+                let Ok(n) = event.drain_retained(&mut entries) else {
+                    std::process::abort();
+                };
+                if n == 0 {
+                    break;
+                }
+                if self.entries(&entries[..n]).is_err() {
+                    std::process::abort();
+                }
+            }
+        }
+        self.failure = None; // teardown no longer arms host deadlines
         for i in 0..self.ops.len() {
             if let Some(p) = &self.ops[i] {
                 let op = p.request.op;
@@ -1520,14 +1553,6 @@ impl Drop for Iocp {
                 std::process::abort();
             }
             events.clear();
-            if self.event.is_some() {
-                std::thread::yield_now();
-            }
-        }
-        if let Some(event) = &mut self.event
-            && event.shutdown().is_err()
-        {
-            std::process::abort();
         }
     }
 }
@@ -1589,6 +1614,43 @@ fn write_buffers(op: &Operation, mut offset: usize, out: &mut [WSABUF; MAX_IOV])
 mod tests {
     use super::*;
 
+    #[test]
+    fn direct_discovery_and_event_queue_draining_have_distinct_counts() {
+        use windows_sys::Win32::{
+            Foundation::WAIT_OBJECT_0, System::Threading::WaitForSingleObject,
+        };
+        let mut backend = Iocp::new(&Config::default(), BufferPool::new(2, 64)).expect("backend");
+        let mut events = Vec::with_capacity(1);
+        for wake in [false, true] {
+            if wake {
+                backend.port.post(WAKE, 0).expect("wake");
+            }
+            let info = backend
+                .poll(Some(Duration::ZERO), &mut events)
+                .expect("discovery");
+            assert_eq!(
+                (info.waits, info.discovery_polls, info.zero_event_waits),
+                (0, 1, u32::from(!wake))
+            );
+            assert!(events.is_empty());
+        }
+        let Integration::Event(event) = backend.integration().expect("event helper") else {
+            panic!("Event required");
+        };
+        backend.port.post(WAKE, 0).expect("helper packet");
+        // SAFETY: backend owns the event throughout this bounded external wait.
+        let result = unsafe { WaitForSingleObject(event as _, 2000) };
+        assert_eq!(result, WAIT_OBJECT_0, "helper must forward a real packet");
+        let info = backend
+            .poll(Some(Duration::ZERO), &mut events)
+            .expect("helper drain");
+        assert_eq!(
+            (info.waits, info.discovery_polls, info.zero_event_waits),
+            (0, 0, 0)
+        );
+        assert!(events.is_empty());
+    }
+
     // These operations model already-dequeued kernel completions. No native I/O
     // is submitted, so unwind must discard their metadata rather than wait on it.
     pub(super) struct Synthetic {
@@ -1648,7 +1710,7 @@ mod tests {
                     .backend
                     .poll(Some(Duration::ZERO), &mut out)
                     .expect("drain valid packet");
-                assert_eq!(info.waits, 0);
+                assert_eq!((info.waits, info.discovery_polls), (0, 0));
                 assert_eq!(out.len(), 1);
                 assert_eq!(out[0].op, op);
                 assert!(out[0].terminal);

@@ -166,9 +166,13 @@ pub struct TurnInfo {
     pub waited: Duration,
     /// Whether any referenced handle, operation or queued terminal result remains.
     pub alive: bool,
-    /// Actual native wait invocations during this turn, at most one.
+    /// Blocking native waits during this turn (positive timeout or infinite).
     pub os_waits: u32,
-    /// OS waits with no native I/O or notifier events, including interrupted waits.
+    /// Zero-time native discovery polls; `os_waits + discovery_polls <= 1`.
+    /// Callback and IOCP Event-helper queue draining count as neither.
+    pub discovery_polls: u32,
+    /// Empty native wait/discovery calls, including interrupted calls.
+    /// Retains raw accounting across both counters for the no-spin gate.
     /// Private timeout events (such as timerfd expiry) count as zero-event waits.
     pub zero_event_waits: u32,
 }

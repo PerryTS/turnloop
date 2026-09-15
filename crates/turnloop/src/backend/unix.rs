@@ -312,7 +312,19 @@ unsafe impl Backend for Unix {
         if let Some(gid) = spec.gid {
             command.gid(gid);
         }
-        if spec.new_process_group {
+        if spec.detached {
+            // SAFETY: the child hook only calls async-signal-safe setsid and
+            // constructs an OS error without allocation; it captures no state.
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setsid() < 0 {
+                        Err(std::io::Error::last_os_error())
+                    } else {
+                        Ok(())
+                    }
+                });
+            }
+        } else if spec.new_process_group {
             command.process_group(0);
         }
         for (i, stdio) in spec.stdio.iter().enumerate() {
@@ -348,8 +360,12 @@ unsafe impl Backend for Unix {
             child.stderr.take().map(Into::into),
         ];
         let result = (|| {
-            self.services
-                .child(h, child, spec.new_process_group, &mut self.poller)?;
+            self.services.child(
+                h,
+                child,
+                spec.new_process_group || spec.detached,
+                &mut self.poller,
+            )?;
             for (handle, fd) in pipes.into_iter().zip(stdio) {
                 if let (Some(handle), Some(fd)) = (handle, fd) {
                     let transport = super::ipc::classify(fd)?;
@@ -1205,6 +1221,7 @@ mod udp_tests {
                     .expect("new empty socket waits");
                 assert!(events.is_empty(), "old datagram crossed socket lifetime");
                 assert_eq!(info.waits, 1);
+                assert_eq!(info.discovery_polls, 0);
                 assert!(Instant::now() >= at);
                 assert_eq!(peer.send_to(b"new", endpoint).expect("new packet"), 3);
                 backend

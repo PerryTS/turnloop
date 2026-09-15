@@ -692,10 +692,7 @@ unsafe impl Backend for WasiP2 {
         }
         self.run_ready(events);
         self.run_dns(events);
-        Ok(PollInfo {
-            waits: 1,
-            zero_event_waits: u32::from(self.indices.is_empty()),
-        })
+        Ok(PollInfo::native(timeout, self.indices.is_empty()))
     }
     fn release(&mut self, h: Handle) {
         self.files.release(h);

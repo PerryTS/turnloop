@@ -66,6 +66,80 @@ unsafe impl GlobalAlloc for Counting {
 }
 #[global_allocator]
 static ALLOCATOR: Counting = Counting;
+
+#[test]
+fn queued_posts_and_terminals_with_idle_udp_allocate_nothing() {
+    ALLOCS.set(0);
+    ACTIVE.set(true);
+    let calibration = std::hint::black_box(Box::new([0x49_u8; 64]));
+    ACTIVE.set(false);
+    assert_eq!(calibration[63], 0x49);
+    assert_eq!(ALLOCS.get(), 1, "allocator must detect real work");
+    let mut driver = Loop::new(Config::default()).expect("loop");
+    let socket = driver
+        .udp_bind(([127, 0, 0, 1], 0).into(), &UdpOpts::default())
+        .expect("UDP");
+    let read = driver
+        .recv(socket, ReadBuf::Pooled, Token(1))
+        .expect("idle receive");
+    let poster = driver.poster();
+    let mut out = Completions::with_capacity(1);
+    driver
+        .turn(Timeout::Now, &mut out)
+        .expect("arm idle receive");
+    assert!(out.is_empty());
+    for measured in [false, true] {
+        ALLOCS.set(0);
+        ACTIVE.set(measured);
+        let mut delivered = 0;
+        let mut discovery_polls = 0;
+        for sequence in 0..1000 {
+            poster.post(Token(2), Payload::U64(sequence)).expect("post");
+            let info = driver.turn(Timeout::Now, &mut out).expect("post turn");
+            assert_eq!(info.os_waits, 0);
+            assert_eq!(info.discovery_polls, 1);
+            discovery_polls += info.discovery_polls;
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].token, Token(2));
+            assert!(
+                matches!(out[0].result, OpResult::Posted(Payload::U64(value)) if value == sequence)
+            );
+            delivered += 1;
+            let timer = driver
+                .timer(driver.now() + Duration::from_secs(30), None, Token(3))
+                .expect("timer");
+            driver
+                .close(timer, Token(4))
+                .expect("queue terminal results");
+            for token in [Token(3), Token(4)] {
+                let info = driver.turn(Timeout::Now, &mut out).expect("terminal turn");
+                assert_eq!(info.os_waits, 0);
+                assert_eq!(info.discovery_polls, 1);
+                discovery_polls += info.discovery_polls;
+                assert_eq!(out.len(), 1);
+                assert_eq!(out[0].handle, Some(timer));
+                assert_eq!(out[0].token, token);
+                assert!(out[0].terminal);
+                assert!(if token == Token(3) {
+                    matches!(out[0].result, OpResult::Cancelled)
+                } else {
+                    matches!(out[0].result, OpResult::Closed)
+                });
+                delivered += 1;
+            }
+        }
+        ACTIVE.set(false);
+        assert_eq!(delivered, 3000);
+        assert_eq!(discovery_polls, 3000);
+        assert_eq!(
+            ALLOCS.get(),
+            0,
+            "queued posts/terminal results with idle native I/O"
+        );
+    }
+    assert!(driver.cancel(read), "idle receive remained pending");
+}
+
 fn exchange(
     l: &mut Loop,
     a: Handle,
@@ -826,6 +900,7 @@ fn file_readiness_survives_pool_backpressure_without_allocations_or_spin() {
         .turn(Timeout::Until(at), &mut out)
         .expect("pool exhaustion wait");
     assert_eq!(info.os_waits, 1);
+    assert_eq!(info.discovery_polls, 0);
     assert_eq!(info.zero_event_waits, 1);
     assert!(l.now() >= at);
     assert_eq!(out.len(), 1);
@@ -946,6 +1021,7 @@ fn signal_exit_and_external_notification_delivery_allocate_nothing() {
     let mut children = [None; 16];
     for child in &mut children {
         let mut spec = ProcessSpec::new(env!("CARGO_BIN_EXE_native_child"));
+        spec.windows_hide = true;
         spec.args.push("sleep".into());
         *child = Some(l.spawn(&spec, Token(2)).expect("child"));
     }
@@ -1035,7 +1111,10 @@ fn quiet_deadline_waits_have_identical_accounting_without_allocations() {
             let h = l.timer(at, None, token).expect("timer");
             let op = l.timer_op(h).expect("timer operation");
             let info = l.turn(Timeout::Until(at), &mut out).expect("quiet wait");
-            assert_eq!((info.os_waits, info.zero_event_waits), (1, 1));
+            assert_eq!(
+                (info.os_waits, info.discovery_polls, info.zero_event_waits),
+                (1, 0, 1)
+            );
             assert!(l.now() >= at);
             assert_eq!(out.len(), 1);
             assert_eq!(
@@ -1045,7 +1124,10 @@ fn quiet_deadline_waits_have_identical_accounting_without_allocations() {
             assert!(matches!(out[0].result, OpResult::Timer));
             l.close(h, token).expect("close timer");
             let info = l.turn(Timeout::Now, &mut out).expect("queued close");
-            assert_eq!((info.os_waits, info.zero_event_waits), (0, 0));
+            assert_eq!(
+                (info.os_waits, info.discovery_polls, info.zero_event_waits),
+                (0, 0, 0)
+            );
             assert_eq!(out.len(), 1);
             assert!(matches!(out[0].result, OpResult::Closed));
             expiries += 1;
@@ -1205,6 +1287,7 @@ fn windows_kill_repeat_and_immediate_close_allocate_nothing_after_setup() {
     };
     let mut driver = Loop::new(Config::default()).expect("loop");
     let mut spec = ProcessSpec::new(env!("CARGO_BIN_EXE_native_child"));
+    spec.windows_hide = true;
     spec.args.push("sleep".into());
     spec.stdio = [ProcessStdio::Null; 3];
     // Cover a plain process, a process-only kill in a job, and a whole-job kill.
@@ -1314,6 +1397,7 @@ fn windows_child_watch_cancel_exit_and_close_allocate_nothing_after_setup() {
     };
     let mut driver = Loop::new(Config::default()).expect("loop");
     let mut spec = ProcessSpec::new(env!("CARGO_BIN_EXE_native_child"));
+    spec.windows_hide = true;
     spec.args.push("sleep".into());
     spec.stdio = [ProcessStdio::Null; 3];
     let children: [_; 16] =
@@ -1345,7 +1429,7 @@ fn windows_child_watch_cancel_exit_and_close_allocate_nothing_after_setup() {
     let info = driver
         .turn(Timeout::After(Duration::from_secs(2)), &mut out)
         .expect("cancel watch turn");
-    assert_eq!(info.os_waits, 0);
+    assert_eq!((info.os_waits, info.discovery_polls), (0, 0));
     assert_eq!(out.len(), 8);
     for completion in out.drain() {
         let i = completion.token.0 as usize;
@@ -1498,10 +1582,11 @@ fn windows_backlog_accept_rearm_and_busy_deadlines_allocate_nothing() {
         let mut waits = 0;
         loop {
             assert!(client.now() < at + Duration::from_secs(3));
-            waits += client
+            let info = client
                 .turn(Timeout::Until(at + Duration::from_secs(3)), &mut out)
-                .expect("busy wait expiry")
-                .os_waits;
+                .expect("busy wait expiry");
+            // Revision-2 wait counts included zero-time calls: keep that total.
+            waits += info.os_waits + info.discovery_polls;
             if out.is_empty() {
                 continue;
             }
@@ -2007,4 +2092,294 @@ fn steady_watch_batches_allocate_nothing() {
     }
     drop(subject);
     std::fs::remove_dir_all(&dir).expect("cleanup");
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_sync_pipe_character_and_disk_workers_reuse_classification_without_allocating() {
+    use std::{
+        os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
+        ptr,
+        sync::atomic::Ordering,
+    };
+    use windows_sys::Win32::{
+        Storage::FileSystem::{FILE_TYPE_CHAR, FILE_TYPE_DISK, FILE_TYPE_PIPE, GetFileType},
+        System::Pipes::CreatePipe,
+    };
+    let (mut read, mut write) = (ptr::null_mut(), ptr::null_mut());
+    // SAFETY: valid outputs for non-inherited synchronous anonymous pipe ends.
+    assert_ne!(
+        // SAFETY: valid outputs for non-inherited synchronous anonymous pipe ends.
+        unsafe { CreatePipe(&mut read, &mut write, ptr::null(), 4096) },
+        0
+    );
+    // SAFETY: successful CreatePipe transfers two distinct owned handles.
+    let (read, write) = unsafe {
+        (
+            OwnedHandle::from_raw_handle(read),
+            OwnedHandle::from_raw_handle(write),
+        )
+    };
+    let null = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("NUL")
+        .expect("character device");
+    let path = std::env::temp_dir().join(format!("turnloop-sync-kinds-{}", std::process::id()));
+    let disk = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .expect("disk file");
+    for (handle, kind) in [
+        (read.as_raw_handle(), FILE_TYPE_PIPE),
+        (write.as_raw_handle(), FILE_TYPE_PIPE),
+        (null.as_raw_handle(), FILE_TYPE_CHAR),
+        (disk.as_raw_handle(), FILE_TYPE_DISK),
+    ] {
+        // SAFETY: all handles remain owned and quiescent during classification.
+        assert_eq!(unsafe { GetFileType(handle) }, kind);
+    }
+    let mut byte = [0xa5];
+    let mut driver = Loop::new(Config::default()).expect("loop");
+    let mut adopt = |handle| {
+        driver
+            .attach(
+                Detached::from_handle(handle).expect("sync classification"),
+                Token(0),
+            )
+            .expect("adoption")
+    };
+    let read = adopt(read);
+    let write = adopt(write);
+    let null = adopt(null.into());
+    let disk = adopt(disk.into());
+    let mut out = Completions::with_capacity(1);
+    ALL_THREADS_ALLOCS.store(0, Ordering::SeqCst);
+    ALL_THREADS_ACTIVE.store(true, Ordering::SeqCst);
+    let calibration = Box::new([0u8; 1024]);
+    std::hint::black_box(&calibration);
+    ALL_THREADS_ACTIVE.store(false, Ordering::SeqCst);
+    assert!(
+        ALL_THREADS_ALLOCS.load(Ordering::SeqCst) > 0,
+        "allocator calibration"
+    );
+    drop(calibration);
+    let mut completions = [0; 3];
+    for round in 0..129 {
+        ALL_THREADS_ALLOCS.store(0, Ordering::SeqCst);
+        ALL_THREADS_ACTIVE.store(round != 0, Ordering::SeqCst);
+        for (kind, (reader, writer)) in [(read, write), (null, null), (disk, disk)]
+            .into_iter()
+            .enumerate()
+        {
+            // NUL and the regular file return EOF at their current position;
+            // anonymous pipe input stays pending until its separate end writes.
+            // SAFETY: fixed byte stays exclusive until the read acknowledgement.
+            let buffer = unsafe { IoBufMut::from_raw_parts(byte.as_mut_ptr(), 1) };
+            let input = driver
+                .read(reader, ReadBuf::Provided(buffer), Token(1))
+                .expect("read");
+            let deadline = driver.now() + Duration::from_secs(3);
+            if kind != 0 {
+                loop {
+                    assert!(driver.now() < deadline);
+                    driver
+                        .turn(Timeout::Until(deadline), &mut out)
+                        .expect("EOF turn");
+                    if !out.is_empty() {
+                        break;
+                    }
+                }
+                assert_eq!(
+                    (out[0].handle, out[0].op, out[0].token, out[0].terminal),
+                    (Some(reader), Some(input), Token(1), true)
+                );
+                assert!(matches!(out[0].result, OpResult::Eof));
+            }
+            // SAFETY: static immutable payload lives through every acknowledgement.
+            let buffer = unsafe { IoBuf::from_raw_parts(b"X".as_ptr(), 1) };
+            let output = driver
+                .write(writer, WriteBuf::Provided(buffer), Token(2))
+                .expect("write");
+            let (mut reads, mut writes) = (usize::from(kind != 0), 0);
+            while reads != 1 || writes != 1 {
+                assert!(driver.now() < deadline);
+                driver
+                    .turn(Timeout::Until(deadline), &mut out)
+                    .expect("worker turn");
+                for c in out.drain() {
+                    assert!(c.terminal);
+                    match c.result {
+                        OpResult::Read { n: 1, lease: None } => {
+                            assert_eq!(kind, 0);
+                            assert_eq!(
+                                (c.handle, c.op, c.token),
+                                (Some(reader), Some(input), Token(1))
+                            );
+                            assert_eq!(reads, 0);
+                            reads += 1;
+                        }
+                        OpResult::Wrote(1) => {
+                            assert_eq!(
+                                (c.handle, c.op, c.token),
+                                (Some(writer), Some(output), Token(2))
+                            );
+                            assert_eq!(writes, 0);
+                            writes += 1;
+                        }
+                        other => panic!("unexpected worker result: {other:?}"),
+                    }
+                }
+            }
+            if kind == 0 {
+                assert_eq!(byte, *b"X");
+            }
+            if round != 0 {
+                completions[kind] += reads + writes;
+            }
+        }
+        ALL_THREADS_ACTIVE.store(false, Ordering::SeqCst);
+        assert_eq!(
+            ALL_THREADS_ALLOCS.load(Ordering::SeqCst),
+            0,
+            "all worker threads reuse classification"
+        );
+    }
+    assert_eq!(completions, [256; 3]);
+    drop(driver);
+    assert_eq!(
+        std::fs::read(&path).expect("actual disk bytes"),
+        [b'X'; 129]
+    );
+    std::fs::remove_file(path).expect("remove fixture");
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_duplex_fifos_make_independent_progress_without_allocating() {
+    use std::sync::atomic::Ordering;
+    ALL_THREADS_ALLOCS.store(0, Ordering::SeqCst);
+    ALL_THREADS_ACTIVE.store(true, Ordering::SeqCst);
+    let calibration = Box::new([0u8; 1024]);
+    std::hint::black_box(&calibration);
+    ALL_THREADS_ACTIVE.store(false, Ordering::SeqCst);
+    assert!(
+        ALL_THREADS_ALLOCS.load(Ordering::SeqCst) > 0,
+        "allocator calibration"
+    );
+    drop(calibration);
+    let mut input = [0xa5; 32]; // fixed until every request completes / driver drops
+    let output: [u8; 32] = std::array::from_fn(|i| i as u8);
+    let reply: [u8; 32] = std::array::from_fn(|i| 255 - i as u8);
+    let (mut driver, client, server) = turnloop_contract::native_surface::synchronous_duplex_pair();
+    let mut out = Completions::with_capacity(1);
+    let mut verified = 0;
+    for round in 0..9 {
+        input.fill(0xa5);
+        ALL_THREADS_ALLOCS.store(0, Ordering::SeqCst);
+        ALL_THREADS_ACTIVE.store(round != 0, Ordering::SeqCst);
+        let reads: [_; 32] = std::array::from_fn(|i| {
+            // SAFETY: disjoint one-byte buffers stay exclusive through completion.
+            let buf = unsafe { IoBufMut::from_raw_parts(input.as_mut_ptr().add(i), 1) };
+            driver
+                .read(client, ReadBuf::Provided(buf), Token(i as u64))
+                .expect("queued duplex read")
+        });
+        // No peer writes exist yet. Every client read is deliberately idle.
+        driver
+            .turn(Timeout::Now, &mut out)
+            .expect("start idle reader");
+        assert!(out.is_empty());
+        let writes: [_; 32] = std::array::from_fn(|i| {
+            // SAFETY: immutable fixed output remains live through completion/drop.
+            let buf = unsafe { IoBuf::from_raw_parts(output.as_ptr().add(i), 1) };
+            driver
+                .write(client, WriteBuf::Provided(buf), Token(100 + i as u64))
+                .expect("queued duplex write")
+        });
+        driver
+            .read(server, ReadBuf::Pooled, Token(200))
+            .expect("server receives writes");
+        let (mut wrote, mut received) = (0, 0);
+        let deadline = driver.now() + Duration::from_secs(5);
+        while wrote < 32 || received < 32 {
+            assert!(driver.now() < deadline, "idle read blocked duplex writes");
+            driver
+                .turn(Timeout::Until(deadline), &mut out)
+                .expect("independent write progress");
+            for c in out.drain() {
+                match c.result {
+                    OpResult::Wrote(1) => {
+                        assert_eq!(
+                            (c.handle, c.op, c.token, c.terminal),
+                            (
+                                Some(client),
+                                Some(writes[wrote]),
+                                Token(100 + wrote as u64),
+                                true
+                            )
+                        );
+                        wrote += 1;
+                    }
+                    OpResult::Read {
+                        n,
+                        lease: Some(bytes),
+                    } => {
+                        assert_eq!(c.handle, Some(server));
+                        assert!(n > 0 && received + n <= 32);
+                        assert_eq!(bytes.as_slice(), &output[received..received + n]);
+                        received += n;
+                        if received < 32 {
+                            driver
+                                .read(server, ReadBuf::Pooled, Token(200))
+                                .expect("more server bytes");
+                        }
+                    }
+                    other => panic!("read completed before any reply: {other:?}"),
+                }
+            }
+        }
+        // SAFETY: fixed immutable reply remains live until its completion.
+        let buf = unsafe { IoBuf::from_raw_parts(reply.as_ptr(), reply.len()) };
+        let reply_op = driver
+            .write(server, WriteBuf::Provided(buf), Token(201))
+            .expect("reply after writes");
+        let (mut read, mut replied) = (0, false);
+        while read < 32 || !replied {
+            assert!(driver.now() < deadline);
+            driver
+                .turn(Timeout::Until(deadline), &mut out)
+                .expect("FIFO replies");
+            for c in out.drain() {
+                match c.result {
+                    OpResult::Read { n: 1, lease: None } => {
+                        assert_eq!(
+                            (c.handle, c.op, c.token, c.terminal),
+                            (Some(client), Some(reads[read]), Token(read as u64), true)
+                        );
+                        read += 1;
+                    }
+                    OpResult::Wrote(32) => {
+                        assert!(!replied);
+                        assert_eq!((c.handle, c.op), (Some(server), Some(reply_op)));
+                        replied = true;
+                    }
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+        }
+        ALL_THREADS_ACTIVE.store(false, Ordering::SeqCst);
+        assert_eq!(
+            ALL_THREADS_ALLOCS.load(Ordering::SeqCst),
+            0,
+            "both synchronous workers allocate nothing"
+        );
+        assert_eq!(input, reply);
+        if round != 0 {
+            verified += read + wrote;
+        }
+    }
+    assert_eq!(verified, 512);
 }

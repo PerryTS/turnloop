@@ -49,6 +49,10 @@ struct Op {
     external_wait: bool,
     /// A typed filesystem request (pool service or backend, per `B::FILESYSTEM`).
     fs: bool,
+    /// Counted in `native_pending`: a socket-handle operation or a request the
+    /// backend accepted natively (such as WASI DNS). DESIGN §10 rule 3 keys
+    /// queued-turn discovery on these operations.
+    native: bool,
     job_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     previous: Option<OpId>,
     next: Option<OpId>,
@@ -201,6 +205,9 @@ impl<B: Backend> Driver<B> {
             return Err(Error::new(ErrorKind::ResourceLimit));
         }
         let previous = h.and_then(|h| self.handles.get(h.key).and_then(|r| r.tail));
+        let native = h
+            .and_then(|h| self.handles.get(h.key))
+            .is_some_and(|r| matches!(r.kind, Kind::Socket));
         let key = self
             .ops
             .insert(Op {
@@ -212,6 +219,7 @@ impl<B: Backend> Driver<B> {
                 job_cancel: None,
                 external_wait: false,
                 fs: false,
+                native,
                 previous,
                 next: None,
             })
@@ -230,15 +238,13 @@ impl<B: Backend> Driver<B> {
             }
             r.tail = Some(id);
             r.pending += 1;
-            if matches!(r.kind, Kind::Socket) {
-                self.native_pending += 1;
-            }
             if r.referenced {
                 self.refs += 1;
             }
         } else {
             self.refs += 1;
         }
+        self.native_pending += usize::from(native);
         self.outstanding += 1;
         Ok(OpId {
             owner: self.owner,
@@ -248,6 +254,9 @@ impl<B: Backend> Driver<B> {
     fn retire(&mut self, id: OpId) -> Option<Op> {
         let op = self.ops.remove(id.key)?;
         self.connect_deadlines.cancel(id.key);
+        if op.native {
+            self.native_pending -= 1;
+        }
         if let Some(previous) = op.previous {
             self.ops.get_mut(previous.key).expect("previous").next = op.next;
         }
@@ -263,9 +272,6 @@ impl<B: Backend> Driver<B> {
                     r.tail = op.previous;
                 }
                 r.pending -= 1;
-                if matches!(r.kind, Kind::Socket) {
-                    self.native_pending -= 1;
-                }
                 if r.referenced {
                     self.refs -= 1;
                 }
@@ -1012,7 +1018,12 @@ impl<B: Backend> Driver<B> {
     pub fn resolve(&mut self, request: crate::DnsRequest, token: Token) -> Result<OpId> {
         let op = self.new_op(None, token)?;
         match self.backend.resolve(op, &request) {
-            Ok(()) => Ok(op),
+            Ok(()) => {
+                // A natively accepted lookup needs backend discovery like socket I/O.
+                self.ops.get_mut(op.key).expect("new lookup").native = true;
+                self.native_pending += 1;
+                Ok(op)
+            }
             Err(e) => {
                 self.retire(op);
                 self.outstanding -= 1;
@@ -1190,10 +1201,22 @@ impl<B: Backend> Driver<B> {
         let queued =
             !self.queued.is_empty() || !self.poster.is_empty() || !self.work_port.is_empty();
         let mut waits = 0;
+        let mut discovery_polls = 0;
         let mut zero_event_waits = 0;
-        if self.buffered[NATIVE_EVENTS] == 0
-            && (!queued || self.native_pending != 0 || self.backend.has_work())
-        {
+        // DESIGN §10 rule 3. Queued work forbids a blocking wait (the timeout is
+        // forced to zero below) and permits one zero-time native discovery poll
+        // only with native operations pending and native output reserve free.
+        // Without native operations, queued work makes no backend call: a native
+        // backend could otherwise enter the OS after draining stale cached
+        // readiness, so has_work() deliberately cannot force the call.
+        #[cfg(not(turnloop_backend = "web"))]
+        let native_step = !queued || self.native_pending != 0;
+        // Web polling only drains host callbacks and Worker/condition rings and
+        // never enters the OS. Keep draining that cached host work (for example a
+        // Worker ring retained by a full poster) through sustained queued work.
+        #[cfg(turnloop_backend = "web")]
+        let native_step = !queued || self.native_pending != 0 || self.backend.has_work();
+        if self.buffered[NATIVE_EVENTS] == 0 && native_step {
             let mut timeout = deadline.map(|d| d.saturating_duration_since(start));
             if timeout == Some(Duration::ZERO) || queued || notified || !self.notifier.park() {
                 timeout = Some(Duration::ZERO);
@@ -1202,6 +1225,7 @@ impl<B: Backend> Driver<B> {
             self.notifier.running();
             let poll = poll?;
             waits = poll.waits;
+            discovery_polls = poll.discovery_polls;
             zero_event_waits = poll.zero_event_waits;
             // Taking/replacing the preallocated vector preserves storage and allows
             // completion handling to mutate the backend when accepting a socket.
@@ -1327,6 +1351,7 @@ impl<B: Backend> Driver<B> {
             waited: self.backend.now().saturating_duration_since(start),
             alive: self.alive(),
             os_waits: waits,
+            discovery_polls,
             zero_event_waits,
         })
     }
@@ -1373,6 +1398,103 @@ impl<B: Backend> Drop for Driver<B> {
     }
 }
 
+#[cfg(all(test, windows, not(loom)))]
+mod iocp_failure_tests {
+    use super::*;
+    use windows_sys::Win32::{
+        Foundation::{ERROR_INVALID_HANDLE, WAIT_OBJECT_0},
+        System::Threading::WaitForSingleObject,
+    };
+
+    #[test]
+    fn pump_failure_repeats_before_queued_work_and_drop_joins_pending_io() {
+        let (done, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut bytes = [0xa5; 32]; // remains pinned until driver destruction
+            let mut driver = Loop::new(Config::default()).expect("loop");
+            let listener = driver
+                .tcp_listen(([127, 0, 0, 1], 0).into(), &ListenOpts::default())
+                .expect("listener");
+            let peer = std::net::TcpStream::connect(driver.local_addr(listener).expect("address"))
+                .expect("peer");
+            driver.accept(listener, Token(1)).expect("accept");
+            let deadline = driver.now() + Duration::from_secs(5);
+            let mut out = Completions::with_capacity(1);
+            let stream = loop {
+                assert!(driver.now() < deadline);
+                driver
+                    .turn(Timeout::Until(deadline), &mut out)
+                    .expect("accept turn");
+                if let Some(c) = out.drain().next() {
+                    let OpResult::Accepted { conn, .. } = c.result else {
+                        panic!("{c:?}")
+                    };
+                    break conn;
+                }
+            };
+            // SAFETY: fixed exclusive bytes outlive driver on success and unwind.
+            let buffer = unsafe { IoBufMut::from_raw_parts(bytes.as_mut_ptr(), bytes.len()) };
+            let read = driver
+                .read(stream, ReadBuf::Provided(buffer), Token(2))
+                .expect("idle read");
+            driver
+                .turn(Timeout::Now, &mut out)
+                .expect("start real pending I/O");
+            assert!(out.is_empty());
+            assert!(
+                driver.backend.operation_waiting_for_test(read),
+                "subject reached native wait"
+            );
+            let Integration::Event(event) = driver.integration().expect("helper") else {
+                panic!("event")
+            };
+            let timer = driver
+                .timer(driver.now(), None, Token(3))
+                .expect("ready timer");
+            driver
+                .close(timer, Token(4))
+                .expect("queued cancellation and close");
+            assert!(!driver.queued.is_empty(), "core fast path subject");
+            driver
+                .backend
+                .fail_event_for_test(ERROR_INVALID_HANDLE as i32);
+            let expected: Error =
+                std::io::Error::from_raw_os_error(ERROR_INVALID_HANDLE as i32).into();
+            for _ in 0..8 {
+                assert_eq!(
+                    driver
+                        .turn(Timeout::Now, &mut out)
+                        .expect_err("persistent pump error"),
+                    expected
+                );
+                assert!(out.is_empty());
+                assert_eq!(
+                    driver.integration().expect_err("integration keeps failure"),
+                    expected
+                );
+                assert_eq!(
+                    // SAFETY: borrowed event is owned by the still-live loop.
+                    unsafe { WaitForSingleObject(event as _, 1000) },
+                    WAIT_OBJECT_0
+                );
+            }
+            drop(driver); // joins pump, cancels and drains the live native read
+            assert_eq!(bytes, [0xa5; 32]);
+            bytes.fill(0x5a);
+            drop(peer);
+            assert_eq!(bytes, [0x5a; 32]);
+            done.send(8).expect("completed teardown marker");
+        });
+        assert_eq!(
+            receive
+                .recv_timeout(Duration::from_secs(15))
+                .expect("drop watchdog"),
+            8
+        );
+        worker.join().expect("failure regression thread");
+    }
+}
+
 #[cfg(all(test, not(loom), not(turnloop_backend = "web")))]
 mod clock_contract {
     use super::*;
@@ -1392,6 +1514,9 @@ mod clock_contract {
         deadline: Option<Instant>,
         changes: usize,
         polls: usize,
+        cached_work: bool,
+        lookup: Option<OpId>,
+        lookup_ready: bool,
         accept_connect: bool,
         pending: Option<Request>,
         cancellation: Option<OpId>,
@@ -1410,6 +1535,9 @@ mod clock_contract {
                 deadline: None,
                 changes: 0,
                 polls: 0,
+                cached_work: false,
+                lookup: None,
+                lookup_ready: false,
                 accept_connect: false,
                 pending: None,
                 cancellation: None,
@@ -1453,6 +1581,10 @@ mod clock_contract {
                 Err(Error::new(ErrorKind::Unsupported))
             }
         }
+        fn resolve(&mut self, op: OpId, _: &crate::DnsRequest) -> Result<()> {
+            assert!(self.lookup.replace(op).is_none());
+            Ok(())
+        }
         fn cancel(&mut self, op: OpId) -> Result<()> {
             self.cancel_calls += 1;
             if let Some(error) = self.cancel_error {
@@ -1470,7 +1602,7 @@ mod clock_contract {
             }
         }
         fn has_work(&self) -> bool {
-            false
+            self.cached_work
         }
         fn poll(
             &mut self,
@@ -1479,6 +1611,22 @@ mod clock_contract {
         ) -> Result<PollInfo> {
             assert_eq!(timeout, Some(Duration::ZERO));
             self.polls += 1;
+            if self.lookup_ready
+                && let Some(op) = self.lookup.take()
+            {
+                events.push(Event {
+                    op,
+                    terminal: true,
+                    result: Ok(Outcome::Resolved(vec![SocketAddr::from((
+                        [127, 0, 0, 1],
+                        80,
+                    ))])),
+                });
+                return Ok(PollInfo {
+                    discovery_polls: 1,
+                    ..PollInfo::default()
+                });
+            }
             if self.acknowledge
                 && let Some(op) = self.cancellation.take()
             {
@@ -1502,6 +1650,66 @@ mod clock_contract {
             Ok(Integration::HostCallback)
         }
     }
+    #[test]
+    fn queued_core_work_skips_backend_even_with_cached_work() {
+        let mut driver = Driver::<Host>::new(Config::default()).expect("host loop");
+        driver.backend.cached_work = true;
+        let mut out = Completions::with_capacity(1);
+        let mut delivered = 0;
+        for _ in 0..64 {
+            driver
+                .poster()
+                .post(Token(1), Payload::U64(42))
+                .expect("post");
+            let info = driver.turn(Timeout::Now, &mut out).expect("queued turn");
+            assert_eq!(info.completions, 1);
+            assert_eq!(out[0].token, Token(1));
+            assert!(matches!(out[0].result, OpResult::Posted(Payload::U64(42))));
+            assert_eq!((info.os_waits, info.discovery_polls), (0, 0));
+            delivered += 1;
+        }
+        assert_eq!(delivered, 64);
+        assert_eq!(driver.backend.polls, 0, "backend must not be called");
+    }
+
+    #[test]
+    fn natively_accepted_lookup_is_a_pending_native_operation() {
+        let mut driver = Driver::<Host>::new(Config::default()).expect("host loop");
+        let request = crate::DnsRequest {
+            host: "localhost".into(),
+            port: 80,
+        };
+        let lookup = driver.resolve(request, Token(1)).expect("native lookup");
+        let mut out = Completions::with_capacity(1);
+        let (mut posts, mut resolved) = (0, 0);
+        for turn in 0..8 {
+            driver
+                .poster()
+                .post(Token(2), Payload::U64(turn))
+                .expect("post");
+            // Discovery runs through queued posts while the lookup is pending.
+            driver.backend.lookup_ready = turn == 3;
+            let polls = driver.backend.polls;
+            let info = driver.turn(Timeout::Now, &mut out).expect("turn");
+            assert_eq!(info.os_waits, 0);
+            let expected = usize::from(turn <= 3);
+            assert_eq!(driver.backend.polls - polls, expected, "turn {turn}");
+            for c in out.drain() {
+                match c.result {
+                    OpResult::Resolved(addresses) => {
+                        assert_eq!(c.op, Some(lookup));
+                        assert_eq!(addresses, [SocketAddr::from(([127, 0, 0, 1], 80))]);
+                        resolved += 1;
+                    }
+                    OpResult::Posted(_) => posts += 1,
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+        }
+        assert_eq!((resolved, posts), (1, 7));
+        assert!(driver.backend.lookup.is_none());
+    }
+
     #[test]
     fn connection_deadline_waits_for_acknowledgement_and_retains_cancellation_errors() {
         let mut driver = Driver::<Host>::new(Config::default()).expect("host loop");

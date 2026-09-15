@@ -29,7 +29,8 @@ about the tested runtime, not a universal scheduler bound.
    (component `thread-yield`) before its one nonblocking poll when I/O is pending.
    There is no specified maximum work or scheduling delay before that yield
    returns. Thus one poll per turn does not establish a bounded `Now` return.
-   `PollInfo.waits` counts the wait-set operation; it does not claim that yield
+   `PollInfo.waits` counts blocking wait-set steps; `discovery_polls` counts
+   nonblocking steps. Neither counter claims that yield
    is free, instantaneous, or a second bounded OS wait.
 2. **Deadline composition.** A blocking wait joins a clock task at the precise
    deadline. Guest work is bounded, but there is no proof that a ready clock wins

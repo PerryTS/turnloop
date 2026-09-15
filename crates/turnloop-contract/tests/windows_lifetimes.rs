@@ -86,6 +86,7 @@ fn kill_then_close_children_completes_once() {
     let mut completed = 0;
     for group in [false, true] {
         let mut spec = ProcessSpec::new(env!("CARGO_BIN_EXE_native_child"));
+        spec.windows_hide = true;
         spec.args.push("sleep".into());
         spec.stdio = [ProcessStdio::Null; 3];
         spec.new_process_group = group;
@@ -122,6 +123,7 @@ fn close_after_raw_child_wait_before_servicing_exit() {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut driver = Loop::new(Config::default()).expect("loop");
     let mut spec = ProcessSpec::new(env!("CARGO_BIN_EXE_native_child"));
+    spec.windows_hide = true;
     spec.args.push("exit".into());
     spec.stdio = [ProcessStdio::Null; 3];
     let child = driver
@@ -163,6 +165,7 @@ fn batch_programs_are_rejected_before_spawn() {
         std::fs::write(&path, "@echo executed>\"%~dp0marker\"\r\n").expect("batch fixture");
         for program in [path.as_os_str(), std::ffi::OsStr::new(&name)] {
             let mut spec = ProcessSpec::new(program);
+            spec.windows_hide = true;
             spec.env
                 .push(("PATH".into(), directory.as_os_str().to_owned()));
             spec.args.push("\"&echo injected".into());
@@ -454,6 +457,7 @@ fn cancelled_child_watch_completes_while_child_is_alive() {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut driver = Loop::new(Config::default()).expect("loop");
     let mut spec = ProcessSpec::new(env!("CARGO_BIN_EXE_native_child"));
+    spec.windows_hide = true;
     spec.args.push("sleep".into());
     spec.stdio = [ProcessStdio::Null; 3];
     let child = driver.spawn(&spec, Token(1)).expect("sleeping child");
@@ -471,7 +475,11 @@ fn cancelled_child_watch_completes_while_child_is_alive() {
     let info = driver
         .turn(Timeout::After(Duration::from_secs(2)), &mut out)
         .expect("one cancellation turn");
-    assert_eq!(info.os_waits, 0, "cancelled watch is immediately ready");
+    assert_eq!(
+        (info.os_waits, info.discovery_polls),
+        (0, 0),
+        "cancelled watch is immediately ready"
+    );
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].handle, Some(child.handle));
     assert_eq!(out[0].token, Token(1));
@@ -713,7 +721,10 @@ fn busy_pipe_connect_parks_expires_cancels_and_retries() {
     let info = client
         .turn(Timeout::Until(at), &mut out)
         .expect("pending availability wait");
-    assert_eq!((info.os_waits, info.zero_event_waits), (1, 1));
+    assert_eq!(
+        (info.os_waits, info.discovery_polls, info.zero_event_waits),
+        (1, 0, 1)
+    );
     assert!(client.now() >= at && out.is_empty());
     server
         .accept(listener, Token(4))
@@ -777,6 +788,7 @@ fn close_live_child_with_exit_watch_reaps_before_closed() {
     for group in [false, true] {
         let mut driver = Loop::new(Config::default()).expect("loop");
         let mut spec = ProcessSpec::new(env!("CARGO_BIN_EXE_native_child"));
+        spec.windows_hide = true;
         spec.args.push("sleep".into());
         spec.stdio = [ProcessStdio::Null; 3];
         spec.new_process_group = group;
@@ -804,6 +816,7 @@ fn loop_drop_terminates_live_children_and_releases_their_handles() {
     let cycle = || {
         let mut driver = Loop::new(Config::default()).expect("loop");
         let mut spec = ProcessSpec::new(env!("CARGO_BIN_EXE_native_child"));
+        spec.windows_hide = true;
         spec.args.push("sleep".into());
         spec.stdio = [ProcessStdio::Null; 3];
         let waits: [OwnedHandle; 8] = std::array::from_fn(|i| {
@@ -868,6 +881,7 @@ fn child_argv_environment_and_directory_roundtrip_exactly() {
     let value = "value with spaces, \"quotes\", 日本語 🦀 and trailing\\";
     let mut driver = Loop::new(Config::default()).expect("loop");
     let mut spec = ProcessSpec::new(env!("CARGO_BIN_EXE_native_child"));
+    spec.windows_hide = true;
     spec.args.push("roundtrip".into());
     spec.args.extend(arguments.iter().map(Into::into));
     spec.env_clear = true;
@@ -1118,7 +1132,10 @@ fn listener_reuse_and_busy_connect_drop_release_native_handles() {
             let info = client
                 .turn(Timeout::Until(at), &mut out)
                 .expect("park availability before drop");
-            assert_eq!((info.os_waits, info.zero_event_waits), (1, 1));
+            assert_eq!(
+                (info.os_waits, info.discovery_polls, info.zero_event_waits),
+                (1, 0, 1)
+            );
             assert!(client.now() >= at && out.is_empty());
             drop(client); // must cancel/drain the pending FSCTL before freeing its input
             server
@@ -1156,4 +1173,850 @@ fn listener_reuse_and_busy_connect_drop_release_native_handles() {
         assert_eq!(handles(), baseline, "listener or availability handle leak");
     }
     assert_eq!(drops, 32);
+}
+
+// Pins identity and guarantees cleanup even if an assertion fails.
+struct LiveProcess(OwnedHandle);
+impl LiveProcess {
+    fn open(pid: u32) -> Self {
+        use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE};
+        // SAFETY: fixture parent keeps this child alive until our acknowledgement.
+        let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, 0, pid) };
+        assert!(
+            !raw.is_null(),
+            "pin process {pid}: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: successful OpenProcess transfers unique ownership.
+        Self(unsafe { OwnedHandle::from_raw_handle(raw) })
+    }
+    fn wait(&self, timeout: u32) -> u32 {
+        // SAFETY: owned process handle pins identity through bounded wait.
+        unsafe { WaitForSingleObject(self.0.as_raw_handle(), timeout) }
+    }
+}
+impl Drop for LiveProcess {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Threading::TerminateProcess;
+        if self.wait(0) == WAIT_TIMEOUT {
+            // SAFETY: only the test-created process identified by this owned handle.
+            unsafe {
+                TerminateProcess(self.0.as_raw_handle(), 1);
+            }
+            assert_eq!(self.wait(10_000), WAIT_OBJECT_0, "fixture cleanup");
+        }
+    }
+}
+
+struct FixtureParent(std::process::Child);
+impl Drop for FixtureParent {
+    fn drop(&mut self) {
+        if self.0.try_wait().expect("fixture parent status").is_none() {
+            self.0.kill().expect("fixture parent cleanup");
+            self.0.wait().expect("fixture parent reap");
+        }
+    }
+}
+
+#[test]
+fn parent_death_kills_only_non_detached_children() {
+    use std::io::BufRead;
+    let _guard = HANDLES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut checked = 0;
+    for detached in [false, true] {
+        for exit in [false, true] {
+            let mut parent = FixtureParent(
+                std::process::Command::new(env!("CARGO_BIN_EXE_native_child"))
+                    .args([
+                        "lifetime-parent",
+                        if detached { "detached" } else { "attached" },
+                        if exit { "exit" } else { "kill" },
+                    ])
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::inherit())
+                    .spawn()
+                    .expect("fixture parent"),
+            );
+            let stdout = parent.0.stdout.take().expect("parent stdout");
+            let (send, receive) = std::sync::mpsc::channel();
+            let reader = std::thread::spawn(move || {
+                let mut line = String::new();
+                std::io::BufReader::new(stdout)
+                    .read_line(&mut line)
+                    .expect("ready line");
+                send.send(line).expect("ready notification");
+            });
+            let line = receive
+                .recv_timeout(Duration::from_secs(10))
+                .expect("spawn watchdog");
+            reader.join().expect("identity reader");
+            let pid: u32 = line
+                .trim()
+                .strip_prefix("child:")
+                .expect("executed spawn marker")
+                .parse()
+                .expect("child PID");
+            let child = LiveProcess::open(pid);
+            assert_eq!(
+                child.wait(0),
+                WAIT_TIMEOUT,
+                "child must be live before parent exit"
+            );
+            if exit {
+                parent
+                    .0
+                    .stdin
+                    .take()
+                    .expect("parent stdin")
+                    .write_all(b"x")
+                    .expect("allow exit");
+            } else {
+                parent.0.kill().expect("abrupt parent death");
+            }
+            assert_eq!(
+                // SAFETY: std Child owns this handle until after the wait.
+                unsafe { WaitForSingleObject(parent.0.as_raw_handle(), 10_000) },
+                WAIT_OBJECT_0
+            );
+            let status = parent.0.wait().expect("parent exit status");
+            if exit {
+                assert_eq!(status.code(), Some(23));
+            }
+            if detached {
+                assert_eq!(
+                    child.wait(200),
+                    WAIT_TIMEOUT,
+                    "detached child survives parent death"
+                );
+            } else {
+                assert_eq!(
+                    child.wait(10_000),
+                    WAIT_OBJECT_0,
+                    "lifetime job must terminate child"
+                );
+            }
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 4);
+}
+
+#[test]
+fn normal_leader_exit_keeps_grandchildren_alive_through_close_and_drop() {
+    let _guard = HANDLES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut checked = 0;
+    for group in [false, true] {
+        for consume_exit in [false, true] {
+            for close in [false, true] {
+                let (mut input, mut writer) = (ptr::null_mut(), ptr::null_mut());
+                assert_ne!(
+                    // SAFETY: initialized outputs for a non-inheritable synchronous pipe.
+                    unsafe { CreatePipe(&mut input, &mut writer, ptr::null(), 0) },
+                    0
+                );
+                // SAFETY: successful CreatePipe transfers two independent owners.
+                let (input, writer) = unsafe {
+                    (
+                        OwnedHandle::from_raw_handle(input),
+                        OwnedHandle::from_raw_handle(writer),
+                    )
+                };
+                let mut writer = std::fs::File::from(writer);
+                let mut driver = Loop::new(Config::default()).expect("loop");
+                let control = driver
+                    .attach(Detached::from_handle(input).expect("input pipe"), Token(0))
+                    .expect("control pipe");
+                let mut spec = ProcessSpec::new(env!("CARGO_BIN_EXE_native_child"));
+                spec.args.push("orphan-leader".into());
+                spec.windows_hide = true;
+                spec.new_process_group = group;
+                spec.stdio = [
+                    ProcessStdio::Handle(control),
+                    ProcessStdio::Pipe,
+                    ProcessStdio::Null,
+                ];
+                let child = driver.spawn(&spec, Token(1)).expect("orphan leader");
+                let leader = LiveProcess::open(child.pid);
+                driver
+                    .read_start(child.stdout.expect("stdout"), Token(2))
+                    .expect("leader marker");
+                let mut out = Completions::with_capacity(1);
+                let mut marker = Vec::new();
+                let deadline = driver.now() + Duration::from_secs(10);
+                while !marker.contains(&b'\n') {
+                    assert!(driver.now() < deadline);
+                    driver
+                        .turn(Timeout::Until(deadline), &mut out)
+                        .expect("leader ready turn");
+                    for c in out.drain() {
+                        let OpResult::Read {
+                            n,
+                            lease: Some(bytes),
+                        } = c.result
+                        else {
+                            panic!("{c:?}")
+                        };
+                        assert!(n > 0);
+                        marker.extend_from_slice(bytes.as_slice());
+                    }
+                }
+                let pid: u32 = std::str::from_utf8(&marker)
+                    .expect("marker UTF8")
+                    .trim()
+                    .strip_prefix("grandchild:")
+                    .expect("spawn ran")
+                    .parse()
+                    .expect("PID");
+                let grandchild = LiveProcess::open(pid);
+                assert_eq!(grandchild.wait(0), WAIT_TIMEOUT);
+                assert_eq!(leader.wait(0), WAIT_TIMEOUT);
+                writer.write_all(b"x").expect("allow normal leader exit");
+                assert_eq!(leader.wait(10_000), WAIT_OBJECT_0);
+                if consume_exit {
+                    let mut exits = 0;
+                    while exits == 0 {
+                        assert!(driver.now() < deadline);
+                        driver
+                            .turn(Timeout::Until(deadline), &mut out)
+                            .expect("exit turn");
+                        for c in out.drain() {
+                            match c.result {
+                                OpResult::Exited(status) => {
+                                    assert_eq!(status.code, Some(23));
+                                    exits += 1;
+                                }
+                                OpResult::Eof => {}
+                                other => panic!("unexpected {other:?}"),
+                            }
+                        }
+                    }
+                    assert_eq!(exits, 1);
+                }
+                if close {
+                    driver
+                        .close(child.handle, Token(3))
+                        .expect("close exited leader");
+                    let mut closed = 0;
+                    while closed == 0 {
+                        assert!(driver.now() < deadline);
+                        driver
+                            .turn(Timeout::Until(deadline), &mut out)
+                            .expect("close turn");
+                        for c in out.drain() {
+                            match c.result {
+                                OpResult::Closed => {
+                                    assert_eq!(c.handle, Some(child.handle));
+                                    closed += 1;
+                                }
+                                OpResult::Eof | OpResult::Cancelled => {}
+                                other => panic!("unexpected {other:?}"),
+                            }
+                        }
+                    }
+                    assert_eq!(closed, 1);
+                }
+                drop(driver);
+                assert_eq!(
+                    grandchild.wait(200),
+                    WAIT_TIMEOUT,
+                    "normal leader release killed grandchild"
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert_eq!(checked, 8);
+}
+
+#[test]
+fn idle_synchronous_pipe_reader_does_not_spin() {
+    let _guard = HANDLES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (mut driver, client, _server) =
+        turnloop_contract::native_surface::synchronous_duplex_pair();
+    let read = driver
+        .read(client, ReadBuf::Pooled, Token(90))
+        .expect("idle read");
+    let mut out = Completions::with_capacity(1);
+    let (mut expiries, mut waits) = (0, 0);
+    for micros in [500, 2_000, 10_000] {
+        for _ in 0..20 {
+            let at = driver.now() + Duration::from_micros(micros);
+            let timer = driver.timer(at, None, Token(91)).expect("timer");
+            let (mut turns, mut empty_waits) = (0, 0);
+            loop {
+                turns += 1;
+                assert!(turns <= 2, "idle synchronous read caused timer spin");
+                let info = driver
+                    .turn(Timeout::Until(at), &mut out)
+                    .expect("timer turn");
+                assert!(info.os_waits <= 1);
+                waits += info.os_waits;
+                empty_waits += info.zero_event_waits;
+                assert!(empty_waits <= 1);
+                if !out.is_empty() {
+                    assert_eq!(out.len(), 1);
+                    assert_eq!((out[0].handle, out[0].token), (Some(timer), Token(91)));
+                    assert!(matches!(out[0].result, OpResult::Timer));
+                    assert!(driver.now() >= at);
+                    expiries += 1;
+                    break;
+                }
+            }
+            driver.close(timer, Token(92)).expect("release timer");
+            driver.turn(Timeout::Now, &mut out).expect("timer closed");
+            assert_eq!(out.len(), 1);
+            assert!(matches!(out[0].result, OpResult::Closed));
+        }
+    }
+    assert_eq!(expiries, 60);
+    assert!(waits >= 60);
+    assert!(
+        driver.cancel(read),
+        "read stayed pending through all deadlines"
+    );
+    let deadline = driver.now() + Duration::from_secs(3);
+    loop {
+        assert!(driver.now() < deadline);
+        driver
+            .turn(Timeout::Until(deadline), &mut out)
+            .expect("read cancellation");
+        if !out.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(out.len(), 1);
+    assert_eq!(
+        (out[0].op, out[0].token, out[0].terminal),
+        (Some(read), Token(90), true)
+    );
+    assert!(matches!(out[0].result, OpResult::Cancelled));
+}
+
+/// Raw kernel control for the synchronous duplex worker design, independent of turnloop.
+/// Windows serializes all I/O on a synchronous file object: WriteFile on a duplicate of
+/// the same pipe endpoint waits (with no IRP of its own, so CancelSynchronousIo cannot
+/// reach it) until the idle ReadFile leaves the kernel. Cancelling the idle read releases
+/// the write and consumes no bytes. GetConsoleMode on a pipe fails without joining that
+/// queue; sem-fix1's hypothesis that it was the blocking call did not hold on windows-2025.
+#[test]
+fn synchronous_pipe_write_waits_behind_idle_read_until_the_read_is_cancelled() {
+    use std::{io::Read, sync::mpsc, time::Instant};
+    use windows_sys::Win32::{
+        Foundation::{
+            ERROR_NOT_FOUND, ERROR_OPERATION_ABORTED, ERROR_PIPE_CONNECTED, GENERIC_READ,
+            GENERIC_WRITE, GetLastError, INVALID_HANDLE_VALUE,
+        },
+        Storage::FileSystem::{
+            CreateFileW, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
+        },
+        System::{
+            Console::GetConsoleMode,
+            IO::CancelSynchronousIo,
+            Pipes::{
+                ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
+            },
+            Threading::GetThreadIOPendingFlag,
+        },
+    };
+    let _guard = HANDLES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let name: Vec<u16> = format!(r"\\.\pipe\turnloop-sync-serialize-{}", std::process::id())
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    // SAFETY: terminated private name; one synchronous duplex instance, no inheritance.
+    let raw = unsafe {
+        CreateNamedPipeW(
+            name.as_ptr(),
+            PIPE_ACCESS_DUPLEX,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+            1,
+            4096,
+            4096,
+            0,
+            ptr::null(),
+        )
+    };
+    assert_ne!(raw, INVALID_HANDLE_VALUE);
+    // SAFETY: successful create transferred unique ownership.
+    let mut server = std::fs::File::from(unsafe { OwnedHandle::from_raw_handle(raw) });
+    // SAFETY: terminated private name; synchronous client with both data directions.
+    let raw = unsafe {
+        CreateFileW(
+            name.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            0,
+            ptr::null(),
+            OPEN_EXISTING,
+            0,
+            ptr::null_mut(),
+        )
+    };
+    assert_ne!(raw, INVALID_HANDLE_VALUE);
+    // SAFETY: successful create transferred unique ownership.
+    let client = std::fs::File::from(unsafe { OwnedHandle::from_raw_handle(raw) });
+    // SAFETY: both ends already open, so synchronous connect cannot wait for a client.
+    if unsafe { ConnectNamedPipe(server.as_raw_handle(), ptr::null_mut()) } == 0 {
+        // SAFETY: immediately inspect this thread's last error.
+        assert_eq!(unsafe { GetLastError() }, ERROR_PIPE_CONNECTED);
+    }
+    fn io_pending(thread: &std::thread::JoinHandle<()>) -> bool {
+        let mut pending = 0;
+        // SAFETY: the join handle pins the thread; the output is valid.
+        assert_ne!(
+            // SAFETY: the join handle pins the thread; the output is valid.
+            unsafe { GetThreadIOPendingFlag(thread.as_raw_handle(), &mut pending) },
+            0
+        );
+        pending != 0
+    }
+    type Raw = (i32, u32, u32, [u8; 4]);
+    let spawn_read = |file: std::fs::File| {
+        let (done, result) = mpsc::channel::<Raw>();
+        let thread = std::thread::spawn(move || {
+            let mut bytes = [0u8; 4];
+            let mut count = 0;
+            // SAFETY: owned synchronous handle and exclusive buffer until the call returns.
+            let ok = unsafe {
+                ReadFile(
+                    file.as_raw_handle(),
+                    bytes.as_mut_ptr(),
+                    4,
+                    &mut count,
+                    ptr::null_mut(),
+                )
+            };
+            // SAFETY: this thread's last error, read immediately after the call.
+            let last = unsafe { GetLastError() };
+            let error = if ok == 0 { last } else { 0 };
+            done.send((ok, error, count, bytes)).expect("read result");
+        });
+        (thread, result)
+    };
+    let (read_thread, read_done) = spawn_read(client.try_clone().expect("reader duplicate"));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !io_pending(&read_thread) {
+        assert!(
+            Instant::now() < deadline,
+            "raw ReadFile never entered kernel I/O"
+        );
+        std::thread::sleep(Duration::from_millis(1)); // test synchronization only
+    }
+    // Control I/O on a pipe fails promptly rather than queueing behind the read.
+    let query = client.try_clone().expect("query duplicate");
+    let (queried, query_done) = mpsc::channel();
+    let query_thread = std::thread::spawn(move || {
+        let mut mode = 0;
+        // SAFETY: owned duplicate and valid output, probing beside the idle read.
+        queried
+            .send(unsafe { GetConsoleMode(query.as_raw_handle(), &mut mode) })
+            .expect("query completed");
+    });
+    let query_result = query_done.recv_timeout(Duration::from_secs(2));
+    let writer = client.try_clone().expect("writer duplicate");
+    let (written, write_done) = mpsc::channel::<Raw>();
+    let write_thread = std::thread::spawn(move || {
+        let mut count = 0;
+        // SAFETY: owned synchronous handle and immutable byte until the call returns.
+        let ok = unsafe {
+            WriteFile(
+                writer.as_raw_handle(),
+                [0x33].as_ptr(),
+                1,
+                &mut count,
+                ptr::null_mut(),
+            )
+        };
+        // SAFETY: this thread's last error, read immediately after the call.
+        let last = unsafe { GetLastError() };
+        let error = if ok == 0 { last } else { 0 };
+        written
+            .send((ok, error, count, [0; 4]))
+            .expect("write result");
+    });
+    let before_cancel = write_done.recv_timeout(Duration::from_millis(500));
+    let writer_pending = io_pending(&write_thread);
+    // SAFETY: the join handle pins the writer thread for this call.
+    let cancel_writer = unsafe { CancelSynchronousIo(write_thread.as_raw_handle()) };
+    // SAFETY: this thread's last error, read immediately after the call.
+    let cancel_writer_error = unsafe { GetLastError() };
+    // Release the serialization exactly as the read worker's preemption does. The
+    // cancellation is retried only while the read has not yet been cancelled.
+    // SAFETY: the join handle pins the reader thread for this call.
+    assert_ne!(
+        // SAFETY: the join handle pins the reader thread for this call.
+        unsafe { CancelSynchronousIo(read_thread.as_raw_handle()) },
+        0,
+        "idle ReadFile is cancellable"
+    );
+    let read = read_done
+        .recv_timeout(Duration::from_secs(5))
+        .expect("cancelled read returned");
+    let write = write_done.recv_timeout(Duration::from_secs(5));
+    read_thread.join().expect("read joined");
+    query_thread.join().expect("query joined");
+    // Evidence assertions follow cleanup of every thread that could still be blocked.
+    let write = write.expect("write released by the read cancellation");
+    write_thread.join().expect("write joined");
+    assert_eq!(
+        query_result.expect("GetConsoleMode did not wait behind the read"),
+        0,
+        "pipe is not a console"
+    );
+    assert!(
+        matches!(before_cancel, Err(mpsc::RecvTimeoutError::Timeout)),
+        "WriteFile completed beside an idle ReadFile on one synchronous object"
+    );
+    assert!(
+        !writer_pending,
+        "the waiting writer holds no kernel request"
+    );
+    assert_eq!(
+        (cancel_writer, cancel_writer_error),
+        (0, ERROR_NOT_FOUND),
+        "CancelSynchronousIo cannot release a writer waiting behind the read"
+    );
+    assert_eq!(
+        (read.0, read.1, read.2),
+        (0, ERROR_OPERATION_ABORTED, 0),
+        "idle read aborted without data"
+    );
+    assert_eq!(
+        (write.0, write.2),
+        (1, 1),
+        "write completed after the read left"
+    );
+    let mut byte = [0];
+    server
+        .read_exact(&mut byte)
+        .expect("raw write reached peer");
+    assert_eq!(byte, [0x33]);
+    // The aborted read consumed nothing: a reissued read receives every later byte.
+    server.write_all(&[0x77, 0x78]).expect("peer bytes");
+    let (reissued, reissued_done) = spawn_read(client.try_clone().expect("reissue duplicate"));
+    let reissued_result = reissued_done
+        .recv_timeout(Duration::from_secs(5))
+        .expect("reissued read");
+    reissued.join().expect("reissued joined");
+    assert_eq!(
+        (
+            reissued_result.0,
+            reissued_result.2,
+            &reissued_result.3[..2]
+        ),
+        (1, 2, &[0x77, 0x78][..])
+    );
+}
+
+#[test]
+fn duplex_writes_preempt_reads_at_every_entry_point_without_losing_bytes() {
+    let _guard = HANDLES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (mut driver, client, server) = turnloop_contract::native_surface::synchronous_duplex_pair();
+    let mut out = Completions::with_capacity(4);
+    let mut checked = [0; 3];
+    for i in 0..384usize {
+        let byte = i as u8;
+        let reply = !byte;
+        let read = driver
+            .read(client, ReadBuf::Pooled, Token(1))
+            .expect("client read");
+        let mut events = [0; 4]; // client wrote, server read, server wrote, client read
+        let collect =
+            |driver: &mut Loop, out: &mut Completions, events: &mut [usize; 4], write: OpId| {
+                for c in out.drain() {
+                    assert!(c.terminal);
+                    match (c.handle, c.result) {
+                        (Some(h), OpResult::Wrote(1)) if h == client => {
+                            assert_eq!(c.op, Some(write));
+                            events[0] += 1;
+                        }
+                        (
+                            Some(h),
+                            OpResult::Read {
+                                n: 1,
+                                lease: Some(bytes),
+                            },
+                        ) if h == server => {
+                            assert_eq!(bytes.as_slice(), [byte]);
+                            events[1] += 1;
+                            driver
+                                .write(server, WriteBuf::Owned(vec![reply]), Token(4))
+                                .expect("peer reply");
+                        }
+                        (Some(h), OpResult::Wrote(1)) if h == server => events[2] += 1,
+                        (
+                            Some(h),
+                            OpResult::Read {
+                                n: 1,
+                                lease: Some(bytes),
+                            },
+                        ) if h == client => {
+                            assert_eq!(c.op, Some(read));
+                            assert_eq!(bytes.as_slice(), [reply], "read lost or reordered bytes");
+                            events[3] += 1;
+                        }
+                        (handle, result) => panic!("unexpected {handle:?} {result:?}"),
+                    }
+                }
+            };
+        // Pattern 0 queues both requests for one turn, so the write worker preempts a
+        // read that may not have reached the kernel yet. Pattern 1 starts the read one
+        // turn earlier, racing its kernel entry. Pattern 2 lets the read settle idle.
+        let pattern = i % 3;
+        if pattern != 0 {
+            driver.turn(Timeout::Now, &mut out).expect("start read");
+            assert!(out.is_empty(), "no peer bytes yet");
+            if pattern == 2 {
+                std::thread::sleep(Duration::from_millis(2)); // test synchronization only
+            }
+        }
+        let write = driver
+            .write(client, WriteBuf::Owned(vec![byte]), Token(2))
+            .expect("client write");
+        driver
+            .read(server, ReadBuf::Pooled, Token(3))
+            .expect("server read");
+        let deadline = driver.now() + Duration::from_secs(5);
+        while events != [1; 4] {
+            assert!(
+                driver.now() < deadline,
+                "preemption pattern {pattern} stalled: {events:?}"
+            );
+            driver
+                .turn(Timeout::Until(deadline), &mut out)
+                .expect("preemption turn");
+            collect(&mut driver, &mut out, &mut events, write);
+            assert!(events.iter().all(|count| *count <= 1));
+        }
+        checked[pattern] += 1;
+    }
+    assert_eq!(checked, [128; 3]);
+}
+
+#[test]
+fn duplex_cancellation_is_per_direction_and_close_drop_join_both_workers() {
+    let _guard = HANDLES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut checked = 0;
+    for cancel_write in [false, true] {
+        for close in [false, true] {
+            for _ in 0..8 {
+                let mut input = [0xa5; 2];
+                let mut payload = vec![0x33; 1024 * 1024]; // exceeds the unconsumed pipe quota
+                let (mut driver, client, server) =
+                    turnloop_contract::native_surface::synchronous_duplex_pair();
+                // SAFETY: first byte remains exclusive until completion or driver drop.
+                let buf = unsafe { IoBufMut::from_raw_parts(input.as_mut_ptr(), 1) };
+                let read = driver
+                    .read(client, ReadBuf::Provided(buf), Token(1))
+                    .expect("idle read");
+                // SAFETY: immutable allocation stays fixed through cancellation/drop.
+                let buf = unsafe { IoBuf::from_raw_parts(payload.as_ptr(), payload.len()) };
+                let write = driver
+                    .write(client, WriteBuf::Provided(buf), Token(2))
+                    .expect("blocked write");
+                let mut out = Completions::with_capacity(1);
+                driver
+                    .turn(Timeout::Now, &mut out)
+                    .expect("start both workers");
+                assert!(out.is_empty(), "neither direction has peer progress");
+                let deadline = driver.now() + Duration::from_secs(5);
+                let mut drained = 0;
+                if !cancel_write {
+                    // Starting a request does not schedule its worker thread. Before the
+                    // read's cancellation, pin the state under test: peer bytes prove the
+                    // write is inside WriteFile, still blocked on the rest of 1 MiB.
+                    driver
+                        .read(server, ReadBuf::Pooled, Token(5))
+                        .expect("first surviving write bytes");
+                    while drained == 0 {
+                        assert!(driver.now() < deadline, "write never reached the peer");
+                        driver
+                            .turn(Timeout::Until(deadline), &mut out)
+                            .expect("write enters the kernel");
+                        for c in out.drain() {
+                            let OpResult::Read {
+                                n,
+                                lease: Some(bytes),
+                            } = c.result
+                            else {
+                                panic!("before cancellation: {:?}", c.result);
+                            };
+                            assert_eq!(c.handle, Some(server));
+                            assert!(bytes.as_slice().iter().all(|byte| *byte == 0x33));
+                            drained += n;
+                        }
+                    }
+                    assert!(drained < payload.len());
+                }
+                let cancelled = if cancel_write { write } else { read };
+                assert!(driver.cancel(cancelled), "cancel one direction");
+                let mut acks = 0;
+                while acks == 0 {
+                    assert!(
+                        driver.now() < deadline,
+                        "per-direction cancellation watchdog"
+                    );
+                    driver
+                        .turn(Timeout::Until(deadline), &mut out)
+                        .expect("cancel acknowledgement");
+                    for c in out.drain() {
+                        assert_eq!(c.op, Some(cancelled));
+                        assert!(c.terminal && matches!(c.result, OpResult::Cancelled));
+                        acks += 1;
+                    }
+                }
+                assert_eq!(acks, 1);
+                let expected_read = if cancel_write {
+                    read
+                } else {
+                    // SAFETY: cancelled read acknowledged; a separate exclusive byte.
+                    let buf = unsafe { IoBufMut::from_raw_parts(input.as_mut_ptr().add(1), 1) };
+                    driver
+                        .read(client, ReadBuf::Provided(buf), Token(3))
+                        .expect("new read beside blocked write")
+                };
+                driver
+                    .write(server, WriteBuf::Owned(vec![0x77]), Token(4))
+                    .expect("peer response");
+                // cancel_write: the preempted idle read resumes once the write's
+                // cancellation is acknowledged. Otherwise the blocked write survived the
+                // read's cancellation and must deliver every byte. Windows serializes all
+                // I/O on one synchronous file object, and a write waiting for the peer to
+                // drain holds it (synchronous_pipe_write_waits_behind_idle_read_until_the_
+                // read_is_cancelled; sync_io.rs), so the new read completes only after it.
+                let (mut reads, mut responses) = (0, 0);
+                let mut wrote = cancel_write;
+                if cancel_write {
+                    drained = payload.len();
+                } else {
+                    driver
+                        .read(server, ReadBuf::Pooled, Token(5))
+                        .expect("peer drains the surviving write");
+                }
+                let mut trace = Vec::new(); // failure context: completion order
+                while reads == 0 || responses == 0 || !wrote || drained < payload.len() {
+                    assert!(
+                        driver.now() < deadline,
+                        "cancel_write={cancel_write}: {trace:?}"
+                    );
+                    driver
+                        .turn(Timeout::Until(deadline), &mut out)
+                        .expect("other direction survives cancellation");
+                    for c in out.drain() {
+                        trace.push(match &c.result {
+                            OpResult::Read { n, .. } => format!("{:?}:Read({n})", c.token),
+                            other => format!("{:?}:{other:?}", c.token),
+                        });
+                        match c.result {
+                            OpResult::Read { n: 1, lease: None } => {
+                                assert_eq!(c.op, Some(expected_read));
+                                assert!(
+                                    wrote,
+                                    "read overtook the write it queued behind: close={close} {trace:?}"
+                                );
+                                reads += 1;
+                            }
+                            OpResult::Read {
+                                n,
+                                lease: Some(bytes),
+                            } => {
+                                assert!(!cancel_write);
+                                assert_eq!(c.handle, Some(server));
+                                assert!(n > 0 && drained + n <= payload.len());
+                                assert!(bytes.as_slice().iter().all(|byte| *byte == 0x33));
+                                drained += n;
+                                if drained < payload.len() {
+                                    driver
+                                        .read(server, ReadBuf::Pooled, Token(5))
+                                        .expect("more surviving write bytes");
+                                }
+                            }
+                            OpResult::Wrote(1) => {
+                                assert_eq!(c.handle, Some(server));
+                                responses += 1;
+                            }
+                            OpResult::Wrote(n) if n == payload.len() => {
+                                assert!(!cancel_write && !wrote);
+                                assert_eq!((c.handle, c.op), (Some(client), Some(write)));
+                                wrote = true;
+                            }
+                            other => panic!("cross-direction cancellation: {other:?}"),
+                        }
+                    }
+                }
+                assert_eq!((reads, responses, drained), (1, 1, payload.len()));
+                let expected = if cancel_write {
+                    [0x77, 0xa5]
+                } else {
+                    [0xa5, 0x77]
+                };
+                assert_eq!(input, expected);
+                // Both directions also retain queued operations during close/drop.
+                for i in 0..2 {
+                    // SAFETY: disjoint input bytes remain fixed until driver destruction.
+                    let buf = unsafe { IoBufMut::from_raw_parts(input.as_mut_ptr().add(i), 1) };
+                    driver
+                        .read(client, ReadBuf::Provided(buf), Token(10 + i as u64))
+                        .expect("pending/queued reads");
+                    // SAFETY: immutable shared payload remains live through all acknowledgements.
+                    let buf = unsafe { IoBuf::from_raw_parts(payload.as_ptr(), payload.len()) };
+                    driver
+                        .write(client, WriteBuf::Provided(buf), Token(20 + i as u64))
+                        .expect("pending/queued writes");
+                }
+                driver
+                    .turn(Timeout::Now, &mut out)
+                    .expect("start teardown subjects");
+                assert!(out.is_empty());
+                if close {
+                    driver
+                        .close(client, Token(30))
+                        .expect("close both directions");
+                    let mut cancellations = 0;
+                    let mut closed = 0;
+                    while closed == 0 {
+                        assert!(driver.now() < deadline);
+                        driver
+                            .turn(Timeout::Until(deadline), &mut out)
+                            .expect("duplex close acknowledgements");
+                        for c in out.drain() {
+                            assert_eq!(c.handle, Some(client));
+                            assert!(c.terminal);
+                            match c.result {
+                                OpResult::Cancelled => cancellations += 1,
+                                OpResult::Closed => {
+                                    // Pending/queued reads and writes; phase one's write
+                                    // was cancelled or completed above.
+                                    assert_eq!(cancellations, 4);
+                                    closed += 1;
+                                }
+                                other => panic!("unexpected close {other:?}"),
+                            }
+                        }
+                    }
+                    assert_eq!(closed, 1);
+                }
+                drop(driver);
+                assert_eq!(input, expected);
+                input.fill(0x5a);
+                payload.fill(0x99);
+                assert_eq!(input, [0x5a; 2]);
+                assert!(payload.iter().all(|byte| *byte == 0x99));
+                checked += 1;
+            }
+        }
+    }
+    assert_eq!(checked, 32);
 }

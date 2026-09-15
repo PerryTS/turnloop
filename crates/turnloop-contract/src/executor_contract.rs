@@ -245,6 +245,7 @@ pub fn udp_stdio_and_join_cancel<B: backend::Backend>(program: &std::ffi::OsStr)
         ex.turn(Timeout::Until(until)).expect("UDP turn");
     }
     let mut spec = ProcessSpec::new(program);
+    spec.windows_hide = true;
     spec.args.push("copy".into());
     spec.stdio = [ProcessStdio::Pipe, ProcessStdio::Pipe, ProcessStdio::Null];
     let child = ex.driver().spawn(&spec, Token(1)).expect("stdio child");

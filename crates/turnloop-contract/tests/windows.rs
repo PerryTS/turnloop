@@ -9,6 +9,10 @@ contract!(
     bounded_turn,
     notify_parked,
     notify_running,
+    queued_core_work,
+    queued_post_idle_io,
+    queued_terminals_idle_io,
+    sustained_posts_idle_io,
     cancel_close_ordering,
     refused_connect_once,
     ref_unref,
@@ -119,7 +123,8 @@ fn gui_event_receives_cross_thread_posts() {
         WAIT_OBJECT_0
     );
     let mut out = Completions::default();
-    driver.turn(Timeout::Now, &mut out).expect("turn");
+    let info = driver.turn(Timeout::Now, &mut out).expect("turn");
+    assert_eq!((info.os_waits, info.discovery_polls), (0, 0));
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].token, Token(42));
     assert!(matches!(out[0].result, OpResult::Posted(Payload::U64(99))));
@@ -152,7 +157,8 @@ fn gui_event_tracks_timer_reset_and_partial_output() {
                 unsafe { MsgWaitForMultipleObjectsEx(1, &event, 2000, 0, 0) },
                 WAIT_OBJECT_0
             );
-            driver.turn(Timeout::Now, &mut out).expect("GUI turn");
+            let info = driver.turn(Timeout::Now, &mut out).expect("GUI turn");
+            assert_eq!((info.os_waits, info.discovery_polls), (0, 0));
             if !out.is_empty() {
                 assert!(driver.now() >= deadline);
                 assert_eq!(out.len(), 1);

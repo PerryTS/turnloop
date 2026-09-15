@@ -11,7 +11,7 @@ use std::{
     path::PathBuf,
     ptr,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
@@ -19,7 +19,58 @@ use windows_sys::Win32::{
     Foundation::*,
     Storage::FileSystem::*,
     System::{Console::*, JobObjects::*, Pipes::*, Threading::*},
+    UI::WindowsAndMessaging::{SW_HIDE, SW_SHOWDEFAULT},
 };
+
+fn job(limits: u32) -> Result<OwnedHandle> {
+    // SAFETY: unnamed, non-inheritable job with unique ownership.
+    let job = unsafe { owned(CreateJobObjectW(ptr::null(), ptr::null())) }?;
+    // SAFETY: initialized C structure for the requested information class.
+    let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+    info.BasicLimitInformation.LimitFlags = limits;
+    // SAFETY: live job and correctly sized initialized information structure.
+    bool_result(unsafe {
+        SetInformationJobObject(
+            job.as_raw_handle(),
+            JobObjectExtendedLimitInformation,
+            ptr::from_ref(&info).cast(),
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    })?;
+    Ok(job)
+}
+
+fn lifetime_job() -> Result<&'static OwnedHandle> {
+    // Like libuv, retain one non-inheritable handle until process death, rather
+    // than releasing a kill-on-close job when an individual leader exits. Silent
+    // breakaway excludes grandchildren unless explicitly added by this process.
+    // https://github.com/libuv/libuv/blob/v1.52.1/src/win/process.c
+    static JOB: OnceLock<Result<OwnedHandle>> = OnceLock::new();
+    JOB.get_or_init(|| {
+        job(JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            | JOB_OBJECT_LIMIT_BREAKAWAY_OK
+            | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK
+            | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION)
+    })
+    .as_ref()
+    .map_err(|error| *error)
+}
+
+fn creation_flags(spec: &ProcessSpec) -> u32 {
+    let mut flags = CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT;
+    if spec.windows_hide
+        && !spec
+            .stdio
+            .iter()
+            .any(|stdio| matches!(stdio, ProcessStdio::Inherit | ProcessStdio::Handle(_)))
+    {
+        flags |= CREATE_NO_WINDOW;
+    }
+    if spec.detached {
+        flags |= DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+    }
+    flags
+}
 
 fn wide(value: &OsStr) -> Result<Vec<u16>> {
     let mut value: Vec<u16> = value.encode_wide().collect();
@@ -363,7 +414,9 @@ impl Child {
         if self.status.is_some() {
             return Ok(());
         }
-        if self.ready() {
+        // A callback can lag behind actual exit. Closing that leader must not
+        // become an implicit tree kill while grandchildren are still running.
+        if self.ready() || self.exited_now() {
             self.status()?;
             return Ok(());
         }
@@ -375,9 +428,21 @@ impl Child {
             result => result,
         }
     }
+    fn exited_now(&self) -> bool {
+        // SAFETY: owned process pins the identity; this is a nonblocking query.
+        let exited =
+            unsafe { WaitForSingleObject(self.process.as_raw_handle(), 0) } == WAIT_OBJECT_0;
+        if exited {
+            self.context.ready.store(true, Ordering::Release);
+        }
+        exited
+    }
 }
 impl Drop for Child {
     fn drop(&mut self) {
+        if self.status.is_none() && self.exited_now() && self.status().is_err() {
+            std::process::abort();
+        }
         if self.status.is_none() {
             if !self.terminating && self.job_assigned {
                 let _ = self.kill(Signal::Kill, true);
@@ -471,29 +536,27 @@ pub(super) fn spawn(
     // SAFETY: initialized C startup and result structures with correct cb.
     let mut startup: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
     startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
-    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    startup.StartupInfo.wShowWindow = if spec.windows_hide {
+        SW_HIDE
+    } else {
+        SW_SHOWDEFAULT
+    } as u16;
     startup.StartupInfo.hStdInput = handles[0];
     startup.StartupInfo.hStdOutput = handles[1];
     startup.StartupInfo.hStdError = handles[2];
     startup.lpAttributeList = attributes.0.as_mut_ptr().cast();
-    let job = if spec.new_process_group {
-        // SAFETY: newly created unnamed job, unique ownership.
-        let job = unsafe { owned(CreateJobObjectW(ptr::null(), ptr::null())) }?;
-        // SAFETY: initialized C structure for exactly the requested information class.
-        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        // SAFETY: valid job, information pointer and exact byte size.
-        bool_result(unsafe {
-            SetInformationJobObject(
-                job.as_raw_handle(),
-                JobObjectExtendedLimitInformation,
-                ptr::from_ref(&limits).cast(),
-                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            )
-        })?;
-        Some(job)
+    let job = if spec.new_process_group || spec.detached {
+        // Explicit tree control is separate from parent lifetime. Releasing this
+        // job after a normal leader exit must leave its descendants running.
+        Some(job(JOB_OBJECT_LIMIT_BREAKAWAY_OK)?)
     } else {
         None
+    };
+    let lifetime = if spec.detached {
+        None
+    } else {
+        Some(lifetime_job()?)
     };
     // SAFETY: plain writable process output structure.
     let mut info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
@@ -506,10 +569,7 @@ pub(super) fn spawn(
             ptr::null(),
             ptr::null(),
             1,
-            CREATE_SUSPENDED
-                | CREATE_UNICODE_ENVIRONMENT
-                | EXTENDED_STARTUPINFO_PRESENT
-                | CREATE_NO_WINDOW,
+            creation_flags(spec),
             environment.as_ptr().cast(),
             cwd.as_ref().map_or(ptr::null(), |v| v.as_ptr()),
             &startup.StartupInfo,
@@ -537,6 +597,18 @@ pub(super) fn spawn(
             pid: info.dwProcessId,
         }
     };
+    if let Some(job) = lifetime {
+        // SAFETY: child is suspended and both handles are owned. Like libuv,
+        // tolerate host job restrictions, without claiming assignment succeeded.
+        if unsafe { AssignProcessToJobObject(job.as_raw_handle(), child.process.as_raw_handle()) }
+            == 0
+        {
+            let error = os_error();
+            if error.os != Some(ERROR_ACCESS_DENIED as i32) {
+                return Err(error);
+            }
+        }
+    }
     if let Some(job) = &child.job {
         // SAFETY: child still suspended, so no descendant can escape job assignment.
         bool_result(unsafe {
@@ -564,6 +636,51 @@ mod tests {
     use super::*;
     use std::cell::Cell;
 
+    #[test]
+    fn detached_children_skip_lifetime_job_but_keep_explicit_group_kill() {
+        let driver = crate::Loop::new(crate::Config::default()).expect("notifier owner");
+        let lifetime = lifetime_job().expect("lifetime job");
+        let mut checked = 0;
+        for detached in [false, true] {
+            let mut spec = ProcessSpec::new(std::env::current_exe().expect("executable"));
+            spec.args.push("--list".into());
+            spec.stdio = [ProcessStdio::Null; 3];
+            spec.windows_hide = true;
+            spec.detached = detached;
+            let (mut child, _) =
+                spawn(&spec, [None; 3], driver.notifier()).expect("suspended child");
+            let mut member = -1;
+            assert_ne!(
+                // SAFETY: both owned live handles and writable membership output.
+                unsafe {
+                    IsProcessInJob(
+                        child.process.as_raw_handle(),
+                        lifetime.as_raw_handle(),
+                        &mut member,
+                    )
+                },
+                0
+            );
+            assert_eq!(member, i32::from(!detached));
+            assert_unsignaled(&mut child);
+            if detached {
+                assert!(child.job_assigned);
+                child.kill(Signal::Kill, true).expect("detached group kill");
+            } else {
+                child
+                    .kill(Signal::Kill, false)
+                    .expect("ordinary child kill");
+            }
+            assert_eq!(
+                // SAFETY: owned child process and bounded wait for actual termination.
+                unsafe { WaitForSingleObject(child.process.as_raw_handle(), 5000) },
+                WAIT_OBJECT_0
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 2);
+    }
+
     thread_local! {
         static TERMINATIONS: Cell<[usize; 2]> = const { Cell::new([0; 2]) };
         static EXIT_QUERIES: Cell<usize> = const { Cell::new(0) };
@@ -584,6 +701,7 @@ mod tests {
 
     fn suspended(driver: &crate::Loop, group: bool) -> Child {
         let mut spec = ProcessSpec::new(std::env::current_exe().expect("test executable"));
+        spec.windows_hide = true;
         spec.args.push("--list".into());
         spec.stdio = [ProcessStdio::Null; 3];
         spec.new_process_group = group;
@@ -781,6 +899,7 @@ mod tests {
             // Listing the unit-test binary exits normally without running any
             // nested tests and needs no external fixture or shell argument rules.
             let mut spec = ProcessSpec::new(std::env::current_exe().expect("test executable"));
+            spec.windows_hide = true;
             spec.args.push("--list".into());
             spec.stdio = [ProcessStdio::Null; 3];
             let (mut child, _) =

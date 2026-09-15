@@ -9,7 +9,8 @@ No tag or commit is created from this read-only Git checkout.
 
 The full contract is rustdoc on `turnloop::backend::Backend`. Generational
 `Handle`/`OpId`, buffer ownership, cancellation acknowledgements, bounded output,
-notifier parking and the single-wait/no-spin rules are unchanged.
+notifier parking and the no-spin rule are unchanged. The spec-owner-approved
+tl-i01b amendment below refines the single-wait rule.
 
 | Addition | Purpose and required behavior |
 |---|---|
@@ -41,6 +42,41 @@ and `ExternalWait`. A process is still an ordinary referenced handle after its
 exit completion; close it, or unref it when the host does not want it keeping the
 loop alive. `signal_stop` emits `Stopped` then `Closed`. A resize subscription is
 an independent signal handle; stop it explicitly when finished with the TTY.
+
+## Blocking waits and nonblocking discovery (tl-i01b)
+
+DESIGN D7 and §10 rule 3 permit at most one OS wait per turn. Queued work
+(posts, blocking-pool and external-wait results, synchronous or terminal
+completions) prohibits positive-timeout or infinite waits.
+One zero-time native discovery poll is permitted only with native operations
+pending and native output reserve available. Queued work with no native operation
+pending makes no OS call. This retains fresh-I/O fairness through sustained
+queued posts/timers, as libuv does with its zero-timeout `uv__io_poll`.
+
+The driver enforces the skip; backends need no new method. On native and WASI
+backends a queued turn with no native operation never calls `poll`,
+even when `has_work()` reports stale cached readiness, because draining it could
+fall through to the OS. The web backend's poll only drains host callbacks and
+Worker/condition rings and never enters the OS, so it keeps revision 2's policy of
+polling for cached host work. A lookup accepted by `Backend::resolve` (WASI 0.2)
+counts as a pending native operation, like socket I/O.
+
+`PollInfo::waits` and `TurnInfo::os_waits` now count only blocking waits;
+`discovery_polls` counts zero-time native polls in both types. The two counters
+sum to at most one. Callers that meant all invocations must add them; Now-only
+benchmarks use `discovery_polls`. `zero_event_waits` retains its revision-2 meaning:
+raw empty native calls **across both categories**, including EINTR and private
+timeout events, never inferred from user completions. The no-spin gates retain
+all previous numerical bounds and count both invocation categories.
+
+Epoll (including timerfd), kqueue, direct IOCP and WASI p2 classify the effective
+native timeout. WASI p3 classifies its actual wait-set step (wait versus poll),
+including a deadline already completed during setup. Its existing cooperative
+host yield remains part of discovery; the documented experimental scheduler
+limitations remain. Web callback draining and IOCP Event-helper queue draining
+report zero in both counters: neither performs a native wait/discovery call on
+the turning thread. The opted-in helper's independent waits are outside the turn,
+just as the GUI host's external wait is. No default helper or new collection API.
 
 ## Native implementation and ownership
 
@@ -161,6 +197,33 @@ including when cancelled before the first poll. `LocalExecutor` and adapters are
 `!Send`; cloneable wake endpoints remain thread safe.
 
 ## Windows and WASM integration
+
+`ProcessSpec::windows_hide` defaults false and is ignored on Unix. On Windows it
+selects SW_HIDE; CREATE_NO_WINDOW additionally requires no inherited stdio.
+`ProcessSpec::detached` defaults false, creates a new Unix session/process group
+or Windows detached process/group, and excludes Windows children from the
+process-wide lifetime job. It does not imply unref or relinquish loop ownership:
+explicit close and loop Drop still terminate live owned children. WASI/web still
+reject process spawning with Unsupported.
+
+Windows lifetime jobs retain a single non-inheritable handle until parent death,
+using libuv's silent-breakaway policy. Separate explicit tree-control jobs do not
+use KILL_ON_JOB_CLOSE; releasing a normally exited leader preserves grandchildren.
+Synchronous Windows handles have independent read/write FIFOs and workers,
+including per-direction cancellation and quiescence before Closed/Drop. No
+cross-direction ordering of regular-file offsets is promised on Windows.
+
+CTRL_CLOSE follows libuv: an unsubscribed event returns FALSE to older host
+handlers; subscribed Hup is queued before the handler thread sleeps for Windows'
+bounded close period. That subscribed case prevents older handlers from running
+under Windows' newest-first dispatch. The supported API cannot both continue the
+chain and hold the handler thread. The host must exit within the OS close budget.
+
+An Event helper pump error remains visible on every later turn/integration call,
+including the core's queued-work path. Teardown joins the helper, recovers its
+retained packets and drains cancellation with blocking port waits; unrecoverable
+port failure aborts instead of spinning or freeing kernel-owned buffers. See
+[the issue #11 decisions and verification](lanes/iocp-semantics.md).
 
 The production Windows IOCP backend implements these resource/operation shapes:
 named pipe accept/connect, duplicate stdio, duplicated sockets/handles, process waits and Job
