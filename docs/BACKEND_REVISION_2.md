@@ -71,7 +71,11 @@ all previous numerical bounds and count both invocation categories.
 
 Epoll (including timerfd), kqueue, direct IOCP and WASI p2 classify the effective
 native timeout. WASI p3 classifies its actual wait-set step (wait versus poll),
-including a deadline already completed during setup. Its existing cooperative
+including a deadline already completed during setup. A backend's own deadline
+source is never native work (tl-i02): epoll drops its timerfd readiness, IOCP its
+deadline packet, WASI p2 the deadline pollable it appends after the owned handles
+and WASI p3 the deadline subtask it joins to the wait set, so a timeout-only wake
+is a zero-event call. Socket, DNS and notifier events in the same call still count. Its existing cooperative
 host yield remains part of discovery; the documented experimental scheduler
 limitations remain. Web callback draining and IOCP Event-helper queue draining
 report zero in both counters: neither performs a native wait/discovery call on

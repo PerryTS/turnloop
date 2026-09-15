@@ -1107,54 +1107,43 @@ fn signal_exit_and_external_notification_delivery_allocate_nothing() {
     l.signal_stop(signal, Token(4)).expect("stop");
 }
 
-#[cfg(not(target_os = "wasi"))]
 #[test]
 fn quiet_deadline_waits_have_identical_accounting_without_allocations() {
     let mut l = Loop::new(Config::default()).expect("loop");
     let mut out = Completions::with_capacity(1);
-    let mut expiries = 0;
     ALLOCS.with(|v| v.set(0));
     ACTIVE.with(|v| v.set(true));
-    for duration in [
-        Duration::from_micros(500),
-        Duration::from_millis(2),
-        Duration::from_millis(10),
-    ] {
-        for _ in 0..20 {
-            let at = l.now() + duration;
-            let token = Token(expiries);
-            let h = l.timer(at, None, token).expect("timer");
-            let op = l.timer_op(h).expect("timer operation");
-            let info = l.turn(Timeout::Until(at), &mut out).expect("quiet wait");
-            assert_eq!(
-                (info.os_waits, info.discovery_polls, info.zero_event_waits),
-                (1, 0, 1)
-            );
-            assert!(l.now() >= at);
-            assert_eq!(out.len(), 1);
-            assert_eq!(
-                (out[0].handle, out[0].op, out[0].token),
-                (Some(h), Some(op), token)
-            );
-            assert!(matches!(out[0].result, OpResult::Timer));
-            l.close(h, token).expect("close timer");
-            let info = l.turn(Timeout::Now, &mut out).expect("queued close");
-            assert_eq!(
-                (info.os_waits, info.discovery_polls, info.zero_event_waits),
-                (0, 0, 0)
-            );
-            assert_eq!(out.len(), 1);
-            assert!(matches!(out[0].result, OpResult::Closed));
-            expiries += 1;
-        }
-    }
+    let idle = turnloop_contract::quiet_deadlines(&mut l, &mut out, false);
     ACTIVE.with(|v| v.set(false));
-    assert_eq!(expiries, 60);
     assert_eq!(
         ALLOCS.with(Cell::get),
         0,
-        "deadline waits reuse reserved storage"
+        "idle deadline waits reuse reserved storage"
     );
+    // Registering an idle native operation must not change the accounting, and
+    // must not make the same deadline waits allocate.
+    let (_, _sender, receiver) = turnloop_contract::pair(&mut l);
+    let read = l
+        .read(receiver, ReadBuf::Pooled, Token(2))
+        .expect("idle read");
+    l.turn(Timeout::Now, &mut out).expect("arm the idle read");
+    assert!(out.is_empty(), "the registered read must stay idle");
+    ALLOCS.with(|v| v.set(0));
+    ACTIVE.with(|v| v.set(true));
+    let registered = turnloop_contract::quiet_deadlines(&mut l, &mut out, true);
+    ACTIVE.with(|v| v.set(false));
+    assert_eq!(
+        idle, registered,
+        "registered-but-idle services changed quiet-deadline accounting"
+    );
+    assert_eq!(idle, [60, 0, 60, 60]);
+    eprintln!("quiet deadline allocations: idle={idle:?} registered={registered:?}");
+    assert_eq!(
+        ALLOCS.with(Cell::get),
+        0,
+        "deadline waits beside an idle native operation reuse reserved storage"
+    );
+    assert!(l.cancel(read), "the registered read stayed pending");
 }
 
 #[cfg(target_os = "wasi")]

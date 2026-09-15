@@ -49,8 +49,12 @@
 //!   counts positive-timeout/infinite waits; `discovery_polls` counts zero-time
 //!   native polls. Their sum is at most one. `zero_event_waits`
 //!   counts raw empty calls across both counters, including EINTR.
-//!   Private timeout events (e.g. timerfd expiry) count as zero-event waits, just
-//!   like a timed OS wait returning zero; never infer this from user completions.
+//!   Private timeout events count as zero-event waits, just like a timed OS wait
+//!   returning zero; never infer this from user completions. Every backend that
+//!   implements its timeout with a private wakeup source normalizes it: epoll's
+//!   timerfd, the IOCP deadline packet, the WASI 0.2 deadline pollable and the
+//!   WASI 0.3 deadline subtask. Real I/O or notifier events arriving in the same
+//!   call still make it non-empty.
 //! * Cached readiness ending in EAGAIN with no completion must retain the original
 //!   timeout for the one permitted OS wait. It must not force a zero-timeout turn.
 //! * `has_work` covers queued completions and cached runnable I/O. `wake` is called
@@ -253,7 +257,10 @@ pub struct PollInfo {
     pub discovery_polls: u32,
     /// Native wait/discovery invocations with no I/O or notifier events, including EINTR.
     /// Bounded by `waits + discovery_polls`; retains revision-2 raw empty-poll accounting.
-    /// Private timeout events, such as timerfd expiry, are not native work.
+    /// Private timeout events are not native work: epoll's timerfd, the IOCP
+    /// deadline packet, the WASI 0.2 deadline pollable and the WASI 0.3 deadline
+    /// subtask all count as zero-event calls, while simultaneous I/O or notifier
+    /// events keep the call non-empty.
     pub zero_event_waits: u32,
 }
 

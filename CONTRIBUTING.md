@@ -120,7 +120,10 @@ work test `os_waits == 0` and `discovery_polls <= 1` (exactly 1 where the backen
 no cached work); require both zero without native operations. For all-call totals
 and bounds use their sum. Preserve the raw `zero_event_waits` counter across both
 categories and every §10 rule 4a no-spin bound. Callback/Event-helper queue draining
-is neither kind of native call.
+is neither kind of native call. A wake produced only by the backend's own deadline
+source (timerfd, IOCP deadline packet, WASI deadline pollable/subtask) is a
+zero-event call, not native work; simultaneous I/O or notifier events keep it
+non-empty.
 See [Backend revision 2](docs/BACKEND_REVISION_2.md#blocking-waits-and-nonblocking-discovery-tl-i01b).
 
 ## Workspace discovery and test metadata

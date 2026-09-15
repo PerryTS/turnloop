@@ -235,6 +235,10 @@ mod native {
         no_spin::<B>();
     }
     #[test]
+    fn quiet_deadlines_account_identically_idle_and_registered() {
+        quiet_deadline_accounting::<B>();
+    }
+    #[test]
     fn timer_bounds() {
         timer_precision::<B>();
     }
@@ -1290,6 +1294,164 @@ pub fn io_and_posts_progress_with_repeating_timers<B: Backend>() {
     assert!(received, "posts must progress through a timer backlog");
     assert!(timers > 0);
     assert_eq!((read, wrote), (64, 1));
+}
+
+/// Run the three design delays (0.5 ms, 2 ms, 10 ms) twenty times each against
+/// `l`, reusing the caller's storage, and return
+/// `[os_waits, discovery_polls, zero_event_waits, expiries]`.
+///
+/// DESIGN §10 rules 3, 4 and 4a. A deadline with nothing else ready is *one*
+/// native call that observes *no* native event, and the timer is the only
+/// completion. A backend that reported its own private timeout source as native
+/// work would record `zero_event_waits == 0` here: epoll normalizes its timerfd,
+/// IOCP its deadline packet, WASI 0.2 its deadline pollable and WASI 0.3 its
+/// deadline subtask. Each of the sixty measured expiries is a real blocking
+/// wait; a round whose own setup outran the delay is already due at turn entry,
+/// which DESIGN rule 3 lets spend its one call on a zero-timeout poll instead,
+/// so it is asserted in that shape and re-run rather than measured (a cold or
+/// preempted process does that a few times; sixteen consecutive failures mean
+/// the delay itself can no longer be measured). `native_pending` states whether a
+/// native operation is registered, the only thing allowed to differ afterwards:
+/// the queued `Closed` turn may then spend its one call on a discovery poll.
+pub fn quiet_deadlines<B: Backend>(
+    l: &mut Driver<B>,
+    out: &mut Completions,
+    native_pending: bool,
+) -> [u32; 4] {
+    let mut totals = [0; 4];
+    let mut late = Duration::ZERO;
+    for delay in [
+        Duration::from_micros(500),
+        Duration::from_millis(2),
+        Duration::from_millis(10),
+    ] {
+        for round in 0..20 {
+            let token = Token(500 + delay.as_micros() as u64 + round);
+            let mut measured = false;
+            let mut attempt = 0;
+            while !measured {
+                attempt += 1;
+                assert!(
+                    attempt <= 16,
+                    "{delay:?}: the timer setup never finished inside its own delay"
+                );
+                let at = l.now() + delay;
+                let h = l.timer(at, None, token).expect("timer");
+                let op = l.timer_op(h).expect("timer operation");
+                let info = l.turn(Timeout::Until(at), out).expect("quiet wait");
+                // One native call, and it observed no native event at all.
+                assert_eq!(
+                    (info.os_waits + info.discovery_polls, info.zero_event_waits),
+                    (1, 1),
+                    "{delay:?} deadline: one native call observing no native event"
+                );
+                // A blocking wait is the measurable case. A preempted setup that
+                // outran its own delay leaves the expiry already due at turn
+                // entry, which DESIGN rule 3 lets spend the one call on a
+                // zero-timeout poll; that round is re-run, never counted, so a
+                // backend that only ever polls can never reach sixty expiries.
+                let quiet = info.os_waits == 1;
+                // Exactly one turn per expiry: the completion is already here.
+                assert_eq!(out.len(), 1, "{delay:?} deadline needed a second turn");
+                assert_eq!(
+                    (out[0].handle, out[0].op, out[0].token),
+                    (Some(h), Some(op), token)
+                );
+                assert!(matches!(out[0].result, OpResult::Timer));
+                // The host deadline is honoured exactly, with no wait floor
+                // rounding it up: sub-millisecond delays expire like the others.
+                assert!(l.now() >= at, "{delay:?} deadline fired early");
+                late = late.max(l.now().saturating_duration_since(at));
+                assert!(
+                    l.now().saturating_duration_since(at) < Duration::from_millis(100),
+                    "{delay:?} deadline overshot its wait"
+                );
+                if quiet {
+                    totals[0] += info.os_waits;
+                    totals[1] += info.discovery_polls;
+                    totals[2] += info.zero_event_waits;
+                    totals[3] += 1;
+                    measured = true;
+                }
+                l.close(h, token).expect("close timer");
+                let info = l.turn(Timeout::Now, out).expect("queued close");
+                assert_eq!(info.os_waits, 0, "a queued close must not block");
+                assert!(
+                    info.discovery_polls <= u32::from(native_pending),
+                    "queued close polled without a pending native operation"
+                );
+                assert!(info.zero_event_waits <= info.discovery_polls);
+                assert_eq!(out.len(), 1);
+                assert!(matches!(out[0].result, OpResult::Closed));
+            }
+        }
+    }
+    // Never print here: allocation gates call this with their counter armed.
+    assert!(late < Duration::from_millis(100));
+    totals
+}
+
+/// DESIGN §10 rule 4a and the `PollInfo` contract: quiet deadline accounting is
+/// the same whether the loop is idle or has registered-but-idle native services.
+pub fn quiet_deadline_accounting<B: Backend>() {
+    let mut l = Driver::<B>::new(Config::default()).expect("loop");
+    let mut out = Completions::with_capacity(1);
+    let idle = quiet_deadlines(&mut l, &mut out, false);
+    let (_, sender, receiver) = pair(&mut l);
+    let read = l
+        .read(receiver, ReadBuf::Pooled, Token(2))
+        .expect("idle read");
+    // Submit the read before measuring: the registered phase must differ from the
+    // idle one by a pending native operation only, not by a first-submission turn.
+    let info = l.turn(Timeout::Now, &mut out).expect("arm the idle read");
+    assert!(out.is_empty(), "the registered read must stay idle");
+    assert_eq!(info.os_waits, 0, "a zero timeout never blocks");
+    let registered = quiet_deadlines(&mut l, &mut out, true);
+    assert_eq!(
+        idle, registered,
+        "registered-but-idle services changed quiet-deadline accounting"
+    );
+    assert_eq!(
+        idle,
+        [60, 0, 60, 60],
+        "sixty expiries, each one blocking wait that saw no native event"
+    );
+    // The same registered read now takes real bytes inside a deadline-bounded
+    // wait. Normalizing the private deadline must not empty a call that found
+    // native work: this is the control the accounting above needs.
+    l.write(sender, WriteBuf::Owned(vec![0x2a]), Token(3))
+        .expect("write");
+    let until = l.now() + Duration::from_secs(5);
+    let (mut calls, mut empty, mut bytes, mut wrote) = (0, 0, 0, 0);
+    while bytes == 0 || wrote == 0 {
+        assert!(l.now() < until, "the loopback exchange stalled");
+        let info = l.turn(Timeout::Until(until), &mut out).expect("exchange");
+        assert!(info.os_waits + info.discovery_polls <= 1);
+        calls += info.os_waits + info.discovery_polls;
+        empty += info.zero_event_waits;
+        for c in out.drain() {
+            match c.result {
+                OpResult::Wrote(1) => wrote += 1,
+                OpResult::Read {
+                    n: 1,
+                    lease: Some(b),
+                } => {
+                    assert_eq!(c.op, Some(read), "the idle read survived every expiry");
+                    assert_eq!(b.as_slice(), [0x2a]);
+                    bytes += 1;
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+    assert!(calls > 0, "the exchange must make a native call");
+    assert_eq!(
+        empty, 0,
+        "a native call that carried real I/O is not a zero-event wait"
+    );
+    eprintln!(
+        "quiet deadlines idle={idle:?} registered={registered:?}; exchange calls={calls} empty={empty}"
+    );
 }
 
 /// DESIGN §10 rule 4a: an idle registered stream must not turn timers into polling.

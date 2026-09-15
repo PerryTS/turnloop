@@ -17,6 +17,7 @@ contract!(
     refused_connect_once,
     ref_unref,
     no_spin,
+    quiet_deadline_accounting,
     timer_precision,
     udp_round_trip,
     detach_inflight,
