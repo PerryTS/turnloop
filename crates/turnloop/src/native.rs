@@ -164,6 +164,9 @@ pub struct Process {
     /// Readable parent end of child stderr, if requested.
     pub stderr: Option<Handle>,
 }
+// Parent ends of extra descriptors are reported through the caller's slice in
+// `Driver::spawn_extra`, which keeps this identity Copy and the driver free of
+// a per-spawn allocation of its own.
 
 /// Portable signal names. Unsupported mappings return an error.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

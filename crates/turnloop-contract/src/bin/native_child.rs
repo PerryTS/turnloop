@@ -98,6 +98,7 @@ fn main() {
         // Both extra descriptors carry bytes in both directions. The channel
         // number is read out of the environment exactly as Node reads
         // NODE_CHANNEL_FD, so this proves the handoff, not a hard-coded 3.
+        #[cfg(any(unix, windows))]
         "channel" => {
             let channel = numbered_fd("NODE_CHANNEL_FD");
             let extra = numbered_fd("TURNLOOP_EXTRA_FD");
@@ -112,6 +113,7 @@ fn main() {
             std::io::stdout().flush().expect("flush transcript");
         }
         // One-way pipe, null device and an adopted parent transport.
+        #[cfg(any(unix, windows))]
         "extra-sources" => {
             let (one_way, null, adopted) = (fd_stream(3), fd_stream(4), fd_stream(5));
             write_all(one_way, b"three");
@@ -390,6 +392,7 @@ unsafe extern "C" {
     fn _get_osfhandle(fd: i32) -> isize;
 }
 
+#[cfg(any(unix, windows))]
 fn fd_stream(fd: i32) -> FdStream {
     #[cfg(unix)]
     {
@@ -404,11 +407,13 @@ fn fd_stream(fd: i32) -> FdStream {
     }
 }
 
+#[cfg(any(unix, windows))]
 fn numbered_fd(variable: &str) -> FdStream {
     let value = std::env::var(variable).unwrap_or_else(|_| panic!("{variable} is unset"));
     fd_stream(value.parse().expect("descriptor number"))
 }
 
+#[cfg(any(unix, windows))]
 fn read_once(stream: FdStream, buffer: &mut [u8]) -> usize {
     #[cfg(unix)]
     {
@@ -445,6 +450,7 @@ fn read_once(stream: FdStream, buffer: &mut [u8]) -> usize {
     }
 }
 
+#[cfg(any(unix, windows))]
 fn read_exact(stream: FdStream, buffer: &mut [u8]) {
     let mut filled = 0;
     while filled < buffer.len() {
@@ -454,6 +460,7 @@ fn read_exact(stream: FdStream, buffer: &mut [u8]) {
     }
 }
 
+#[cfg(any(unix, windows))]
 fn write_all(stream: FdStream, mut bytes: &[u8]) {
     while !bytes.is_empty() {
         #[cfg(unix)]
