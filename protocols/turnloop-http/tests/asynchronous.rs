@@ -1736,7 +1736,7 @@ fn linger_deadline_with_silent_peer(options: server::Options, stop_by: Option<Du
 fn http_linger_timeout_closes_silent_peer_without_spinning() {
     linger_deadline_with_silent_peer(
         server::Options {
-            linger_timeout: Duration::from_millis(200),
+            linger_timeout: Duration::from_millis(500),
         },
         None,
     );

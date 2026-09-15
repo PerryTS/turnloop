@@ -193,7 +193,7 @@ fn lingering_close_deadline_closes_silent_peer_without_spinning() {
     let client_h = h.clone();
     let listener = Listener::bind(&h, "127.0.0.1:0".parse().expect("address")).expect("listen");
     let address = listener.local_addr().expect("address");
-    const LINGER: Duration = Duration::from_millis(200);
+    const LINGER: Duration = Duration::from_millis(500);
     let mut server = executor
         .spawn_local(async move {
             let mut s = listener.accept().await.expect("accept");
