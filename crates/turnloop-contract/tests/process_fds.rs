@@ -25,6 +25,8 @@ struct Seen {
     wrote: usize,
     cancelled: usize,
     closed: usize,
+    /// Terminal lifecycle results in arrival order, as `(handle, Cancelled?)`.
+    terminals: Vec<(u64, bool)>,
 }
 
 struct Rig {
@@ -75,8 +77,22 @@ impl Rig {
                 OpResult::Exited(status) => {
                     assert!(self.seen.exit.replace(status).is_none(), "exit is once");
                 }
-                OpResult::Cancelled => self.seen.cancelled += 1,
-                OpResult::Closed => self.seen.closed += 1,
+                OpResult::Cancelled => {
+                    assert!(c.op.is_some(), "a cancellation names its operation");
+                    assert!(c.terminal);
+                    self.seen.cancelled += 1;
+                    self.seen
+                        .terminals
+                        .push((c.handle.expect("handle").key(), true));
+                }
+                OpResult::Closed => {
+                    assert!(c.op.is_none(), "Closed is the handle's own result");
+                    assert!(c.terminal);
+                    self.seen.closed += 1;
+                    self.seen
+                        .terminals
+                        .push((c.handle.expect("handle").key(), false));
+                }
                 other => panic!("unexpected completion {other:?}"),
             }
         }
@@ -121,9 +137,11 @@ impl Rig {
         }
         self.seen.exit.expect("child exit")
     }
-    /// Close a handle and require exactly one Cancelled/Closed pair for it.
+    /// Close a handle and require `ops` cancellations, then exactly one Closed,
+    /// in that order and only once.
     fn close_completely(&mut self, h: Handle, ops: usize) {
         let (cancelled, closed) = (self.seen.cancelled, self.seen.closed);
+        let before = self.seen.terminals.len();
         self.driver.close(h, Token(92)).expect("close");
         let deadline = self.driver.now() + LIMIT;
         while self.seen.closed == closed {
@@ -135,6 +153,14 @@ impl Rig {
             cancelled + ops,
             "one Cancelled per outstanding operation"
         );
+        let mine: Vec<bool> = self.seen.terminals[before..]
+            .iter()
+            .filter(|(key, _)| *key == h.key())
+            .map(|(_, cancelled)| *cancelled)
+            .collect();
+        let mut expected = vec![true; ops];
+        expected.push(false);
+        assert_eq!(mine, expected, "cancellations precede the single Closed");
     }
 }
 

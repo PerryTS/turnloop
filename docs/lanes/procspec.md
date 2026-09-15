@@ -165,7 +165,7 @@ completion, and `parents` is left all `None`:
 | how the child sees a number | the descriptor number itself | a C run-time descriptor, published in `STARTUPINFOW.lpReserved2` | `Unsupported` (no processes) |
 | `Duplex` | `socketpair(AF_UNIX, SOCK_STREAM)`, as libuv creates every child pipe | duplex named-pipe instance: `PIPE_ACCESS_DUPLEX` for the overlapped parent end, `GENERIC_READ\|GENERIC_WRITE` synchronous for the child | — |
 | `Pipe` | `pipe2(O_CLOEXEC)`, or `pipe` + `FD_CLOEXEC` on Darwin | `PIPE_ACCESS_INBOUND` named-pipe instance | — |
-| `Null` | `/dev/null`, `O_RDWR` | `NUL`, `GENERIC_READ\|GENERIC_WRITE` | — |
+| `Null` | `/dev/null`, `O_RDWR\|O_CLOEXEC` | `NUL`, `GENERIC_READ\|GENERIC_WRITE` | — |
 | `Handle(h)` | `F_DUPFD_CLOEXEC` of the loop's transport | `DuplicateHandle` with inheritance | — |
 | placement | one `pre_exec` hook `dup2`s each source onto its number | the inherited-descriptor block plus `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` | — |
 | `controlling_terminal` | `setsid` then `TIOCSCTTY` on descriptor 0 | `Unsupported` | `Unsupported` |
@@ -206,8 +206,9 @@ in a child here as it does under Node, and `_get_osfhandle(3)` in the child
 returns the inherited handle. A child that does not use the C run-time inherits
 the handles but has no number for them; that is the same limitation libuv has.
 
-**Windows `Handle(h)` caveat.** A loop-owned transport is overlapped, and a
-duplicate of it in the child is overlapped too. A child that reads it with plain
+**Windows `Handle(h)` caveat.** A transport the loop created itself — a named
+pipe or a socket — is overlapped, and a duplicate of it in the child is
+overlapped too. A child that reads it with plain
 blocking calls will not work; it must use overlapped I/O, or the host must pass
 a synchronous handle it adopted (`Detached::from_handle` on a `CreatePipe` end,
 which is what the contract test does). libuv's `UV_INHERIT_STREAM` has the same
@@ -237,9 +238,12 @@ Windows unless noted:
   reads 4 to end-of-file, which is what the null device must do.
 - `close_orders_cancel_before_closed_for_a_child_holding_extra_descriptors` —
   closing a live child with two extra descriptors yields exactly one
-  `Cancelled` then one `Closed`, no exit is reported for the cancelled watch,
-  the child is reaped (`ECHILD` on Unix), the extras close independently, and a
-  further turn produces nothing.
+  `Cancelled` then one `Closed`, in that order per handle (the rig records
+  terminal results in arrival order and compares the sequence, rather than only
+  counting them), with `op` present on the cancellation and absent on the
+  `Closed`. No exit is reported for the cancelled watch, the child is reaped
+  (`ECHILD` on Unix), the extras close independently, and a further turn
+  produces nothing.
 - `rejected_descriptor_plans_create_nothing` — every rejection above, each
   asserting `!driver.alive()` and an untouched `parents` slice afterwards.
 - `a_failed_exec_is_reported_even_at_the_lowest_free_descriptor_numbers` (Unix)
@@ -289,10 +293,11 @@ private path.
 | `cargo test -p turnloop-contract --test process_fds -- --test-threads=1` (macOS arm64) | PASS (8/8) |
 | `cargo test -p turnloop-contract --test allocations extra_child_descriptor -- --test-threads=1` (macOS arm64) | PASS |
 | `cargo test --workspace --no-fail-fast -- --test-threads=1` (macOS arm64) | PASS |
-| `cargo test --workspace --no-fail-fast -- --test-threads=1` (Linux x86_64, build box) | PASS for everything in this lane (`process_fds` 7/7 native-portable, allocation gate ok). One pre-existing, unrelated failure: `filesystem::permission_denied_is_reported`, because that box runs as root and root ignores the read-only mode bit. |
+| `cargo test --workspace --no-fail-fast -- --test-threads=1` (Linux x86_64, build box) | PASS for everything in this lane. One pre-existing, unrelated failure: `filesystem::permission_denied_is_reported`, because that box runs as root and root ignores the read-only mode bit; CI's Linux arms, which are not root, pass it. |
+| `cargo test -p turnloop-contract --test process_fds --test allocations -- --test-threads=1` (Linux x86_64, build box, final commit) | PASS (8/8 and 16/16) |
 | `bash scripts/ci/no-tokio.sh` | PASS (15 policy rows) |
 | `python3 scripts/ci/soak.py` | PASS (251 locked versions, 1 active security exception) |
-| `python3 scripts/ci/run-tests.py wasi --target wasm32-wasip2` | UNRUN locally (no Wasmtime on this host); the same suite runs in CI's `wasi (wasm32-wasip2)` job — PASS |
+| `bash scripts/ci/install-wasmtime.sh` then `python3 scripts/ci/run-tests.py wasi --target wasm32-wasip2` | PASS (11 + 43 + 43 + 13 tests) |
 | CI on `lane/procspec`, run `35013478648` (all four OS arms, Windows x86_64 runtime in three feature modes) | PASS |
 | CI on `lane/procspec`, final run `FINAL_RUN` | FINAL_RESULT |
 
