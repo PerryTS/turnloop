@@ -32,11 +32,26 @@ static ALL_THREADS_ACTIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 #[cfg(windows)]
 static ALL_THREADS_ALLOCS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-fn record() {
+/// The first counted allocations on any thread: (OS thread id, size, align).
+/// Recorded without allocating, printed by gates that fail, to name the source.
+#[cfg(windows)]
+static ALL_THREADS_SEEN: [[std::sync::atomic::AtomicUsize; 3]; 8] =
+    [const { [const { std::sync::atomic::AtomicUsize::new(0) }; 3] }; 8];
+fn record(layout: Layout) {
     #[cfg(windows)]
     if ALL_THREADS_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
-        ALL_THREADS_ALLOCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        use std::sync::atomic::Ordering::Relaxed;
+        let n = ALL_THREADS_ALLOCS.fetch_add(1, Relaxed);
+        if let Some(slot) = ALL_THREADS_SEEN.get(n) {
+            // SAFETY: GetCurrentThreadId takes no arguments and cannot fail.
+            let thread = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+            slot[0].store(thread as usize, Relaxed);
+            slot[1].store(layout.size(), Relaxed);
+            slot[2].store(layout.align(), Relaxed);
+        }
     }
+    #[cfg(not(windows))]
+    let _ = layout;
     if ACTIVE.try_with(Cell::get).unwrap_or(false) {
         let _ = ALLOCS.try_with(|n| n.set(n.get() + 1));
     }
@@ -45,17 +60,17 @@ fn record() {
 // access already initialized thread-local Cells and never allocate themselves.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        record();
+        record(layout);
         // SAFETY: GlobalAlloc's caller supplies a valid layout, forwarded unchanged.
         unsafe { System.alloc(layout) }
     }
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        record();
+        record(layout);
         // SAFETY: GlobalAlloc's caller supplies a valid layout, forwarded unchanged.
         unsafe { System.alloc_zeroed(layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        record();
+        record(Layout::from_size_align(size, layout.align()).unwrap_or(layout));
         // SAFETY: pointer/layout and new size are forwarded under GlobalAlloc's contract.
         unsafe { System.realloc(ptr, layout, size) }
     }
@@ -1837,6 +1852,37 @@ fn count_all_threads(enabled: bool) {
     }
     let _ = enabled;
 }
+/// Describe counted allocations on any thread (Windows), for failure messages.
+fn all_thread_report() -> String {
+    #[cfg(windows)]
+    {
+        use std::sync::atomic::Ordering::SeqCst;
+        // SAFETY: GetCurrentThreadId takes no arguments and cannot fail.
+        let current = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+        let n = ALL_THREADS_ALLOCS.load(SeqCst).min(ALL_THREADS_SEEN.len());
+        let seen: Vec<_> = ALL_THREADS_SEEN[..n]
+            .iter()
+            .map(|s| {
+                let thread = s[0].load(SeqCst);
+                format!(
+                    "thread {thread}{} size {} align {}",
+                    if thread == current as usize {
+                        " (test)"
+                    } else {
+                        ""
+                    },
+                    s[1].load(SeqCst),
+                    s[2].load(SeqCst)
+                )
+            })
+            .collect();
+        format!("first counted allocations: [{}]", seen.join(", "))
+    }
+    #[cfg(not(windows))]
+    {
+        String::new()
+    }
+}
 fn all_thread_allocations() -> usize {
     #[cfg(windows)]
     {
@@ -1998,10 +2044,11 @@ fn steady_typed_file_requests_allocate_nothing() {
         0,
         "typed write/read/pooled read/fstat/stat/truncate allocations"
     );
+    let report = all_thread_report();
     assert_eq!(
         all_thread_allocations(),
         0,
-        "pool-thread allocations for the same requests"
+        "pool-thread allocations for the same requests; {report}"
     );
     assert_eq!(counts, [200; 6], "every subject executed");
     l.close(h, Token(8)).expect("close");
@@ -2078,7 +2125,8 @@ fn steady_watch_batches_allocate_nothing() {
     assert_eq!(
         all_thread_allocations(),
         0,
-        "watch allocations on any thread"
+        "watch allocations on any thread; {}",
+        all_thread_report()
     );
     assert!(
         batches >= 100 && records >= 100,
