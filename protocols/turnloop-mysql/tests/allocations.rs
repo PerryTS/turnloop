@@ -114,6 +114,7 @@ fn warm_ping_and_compressed_ping_allocate_nothing() {
                 run();
             }
         });
+        println!("compression={compression}: 1000 measured pings, {count} allocations");
         assert_eq!(count, 0, "compression={compression}");
         assert_eq!(complete, 1010);
         // Rows use metadata and a compressed 512-byte value from the independent
@@ -196,6 +197,9 @@ fn warm_ping_and_compressed_ping_allocate_nothing() {
                 run();
             }
         });
+        println!(
+            "compression={compression}: 1000 measured queries, {rows} rows, {count} allocations"
+        );
         assert_eq!(count, 0, "row compression={compression}");
         assert_eq!(rows, 1010);
         assert_eq!(complete, 1010);

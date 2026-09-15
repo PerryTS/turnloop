@@ -2,7 +2,7 @@
 //! creates a zlib encoder/decoder per frame; this one resets retained states.
 use crate::{Error, Result};
 use bytes::{Buf, BytesMut};
-use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
+use flate2::{Compress, Compression, Decompress, FlushDecompress, Status};
 const CHUNK: usize = 0xff_ffff;
 fn length(b: &[u8]) -> usize {
     b[0] as usize | ((b[1] as usize) << 8) | ((b[2] as usize) << 16)
@@ -47,7 +47,8 @@ impl PacketCodec {
             output: BytesMut::with_capacity(8192),
             encoded: Vec::new(),
             decoded: Vec::new(),
-            encoder: Compress::new(level, true),
+            // Raw deflate: zlib.rs writes the RFC 1950 wrapper per frame.
+            encoder: Compress::new(level, false),
             decoder: Decompress::new(true),
         }));
         self.seq = 0;
@@ -60,18 +61,12 @@ impl PacketCodec {
             c.output.clear();
             encode_plain(&mut self.seq, src, &mut c.output);
             for chunk in c.output.chunks(CHUNK) {
-                c.encoder.reset();
-                c.encoded.resize(chunk.len() + chunk.len() / 1000 + 128, 0);
-                let status = c
-                    .encoder
-                    .compress(chunk, &mut c.encoded, FlushCompress::Finish)
-                    .map_err(|_| Error::Protocol("compression failed"))?;
-                if status != Status::StreamEnd || c.encoder.total_in() != chunk.len() as u64 {
-                    return Err(Error::Protocol("incomplete compression"));
-                }
-                let size = c.encoder.total_out() as usize;
-                let (payload, plain) = if size < chunk.len() {
-                    (&c.encoded[..size], chunk.len())
+                // One retained deflate state, one zlib stream per frame; see zlib.rs.
+                c.encoded.clear();
+                crate::zlib::append_stream(&mut c.encoder, chunk, &mut c.encoded)
+                    .map_err(Error::Protocol)?;
+                let (payload, plain) = if c.encoded.len() < chunk.len() {
+                    (&c.encoded[..], chunk.len())
                 } else {
                     (chunk, 0)
                 };
@@ -217,6 +212,29 @@ mod tests {
         let mut decoder = PacketCodec::default();
         decoder.compress(Compression::fast());
         assert!(decoder.decode(&mut bad, &mut Vec::new()).is_err());
+    }
+    /// One retained deflate state must still emit one independently decodable
+    /// RFC 1950 stream per frame (`src/zlib.rs`). mysql_common's compressed codec
+    /// is an independent implementation and never sees our encoder's state.
+    #[test]
+    fn consecutive_compressed_frames_decode_with_the_upstream_codec() {
+        let mut encoder = PacketCodec::default();
+        encoder.compress(Compression::fast());
+        let mut upstream = mysql_common::proto::codec::PacketCodec::default();
+        upstream.compress(Compression::fast());
+        let mut decoded = 0;
+        for round in 0..32_u8 {
+            let body = vec![b'a' + round % 26; 4096];
+            let mut bytes = BytesMut::new();
+            encoder.encode(&mut &body[..], &mut bytes).unwrap();
+            assert!(bytes.len() < body.len() / 4, "round {round} must compress");
+            let mut output = Vec::new();
+            assert!(upstream.decode(&mut bytes, &mut output).unwrap());
+            assert_eq!(output, body, "round {round}");
+            assert!(bytes.is_empty(), "round {round} left trailing bytes");
+            decoded += 1;
+        }
+        assert_eq!(decoded, 32);
     }
     #[test]
     fn full_fragment_requires_empty_terminator() {

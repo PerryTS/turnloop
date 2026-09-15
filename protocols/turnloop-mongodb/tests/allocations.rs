@@ -63,6 +63,7 @@ fn measure(compressed: bool, coordinator: bool) {
     use turnloop_mongodb::operation::*;
     let mut operation = Operation::new();
     let mut rows = 0;
+    let mut commands = 0;
     let mut run = |round| {
         cmd.find("db", "items", &filter, None).unwrap();
         if coordinator {
@@ -100,6 +101,16 @@ fn measure(compressed: bool, coordinator: bool) {
             c.command(round, cmd.raw(), &[], now).unwrap();
         }
         let req = wire::i32_at(c.transmit(), 4).unwrap();
+        // The measured subject must be the compressed encoder in compressed mode.
+        assert_eq!(
+            wire::i32_at(c.transmit(), 12).unwrap(),
+            if compressed {
+                wire::OP_COMPRESSED
+            } else {
+                wire::OP_MSG
+            }
+        );
+        commands += 1;
         let n = c.transmit().len();
         c.consume_transmit(n).unwrap();
         wire::encode(&mut reply, 77, req, 0, &result, &[], 10000).unwrap();
@@ -136,6 +147,13 @@ fn measure(compressed: bool, coordinator: bool) {
         }
     });
     assert_eq!(rows, 2004);
+    assert_eq!(
+        commands, 1002,
+        "two warm-ups plus every measured command ran"
+    );
+    println!(
+        "zlib={compressed} operation={coordinator}: 1000 measured commands, 2000 measured rows, {allocations} allocations"
+    );
     assert_eq!(
         allocations, 0,
         "1000 warmed commands/2000 rows allocated {allocations} times (zlib={compressed}, operation={coordinator})"

@@ -29,6 +29,7 @@ pub mod topology;
 pub use time::Instant;
 pub mod uri;
 pub mod wire;
+mod zlib;
 pub use connection::{Connection, ConnectionEvent};
 pub use error::{Error, ErrorKind, Result};
 

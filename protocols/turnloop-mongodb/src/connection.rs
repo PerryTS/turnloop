@@ -64,7 +64,8 @@ impl Connection {
             decoder: Decoder::new(wire::DEFAULT_MAX_MESSAGE),
             expanded: Vec::with_capacity(8192),
             compressed: Vec::with_capacity(8192),
-            compressor: flate2::Compress::new(flate2::Compression::default(), true),
+            // Raw deflate: zlib.rs writes the RFC 1950 wrapper per message.
+            compressor: flate2::Compress::new(flate2::Compression::default(), false),
             decompressor: flate2::Decompress::new(true),
             zlib: false,
             events: VecDeque::with_capacity(8),
@@ -175,20 +176,9 @@ impl Connection {
             self.compressed
                 .extend_from_slice(&((self.tx.len() - 16) as i32).to_le_bytes());
             self.compressed.push(2);
-            self.compressor.reset();
-            self.compressed
-                .reserve(self.tx.len() + self.tx.len() / 100 + 256);
-            let status = self
-                .compressor
-                .compress_vec(
-                    &self.tx[16..],
-                    &mut self.compressed,
-                    flate2::FlushCompress::Finish,
-                )
-                .map_err(|_| Error::protocol("Compression failed"))?;
-            if status != flate2::Status::StreamEnd {
-                return Err(Error::protocol("Compression buffer exhausted"));
-            }
+            // One retained deflate state, one zlib stream per message; see zlib.rs.
+            crate::zlib::append_stream(&mut self.compressor, &self.tx[16..], &mut self.compressed)
+                .map_err(Error::protocol)?;
             let n = self.compressed.len() as i32;
             self.compressed[..4].copy_from_slice(&n.to_le_bytes());
             std::mem::swap(&mut self.tx, &mut self.compressed);

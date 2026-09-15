@@ -777,3 +777,93 @@ fn discarded_lease_preserves_other_connections_and_generation() {
         "stale lease rejected"
     );
 }
+/// One retained deflate state must still emit one independently decodable RFC 1950
+/// stream per command (`src/zlib.rs`). Every round is decoded by a fresh upstream
+/// decoder that never saw the previous message, exactly as a server does.
+#[test]
+fn compressed_commands_are_independent_zlib_streams() {
+    use std::io::Read;
+    let mut compressed =
+        Connection::new(Options::parse("mongodb://localhost/?compressors=zlib").unwrap());
+    let mut plain = ready();
+    compressed.connected(clock::now(), "").unwrap();
+    let req = Message::parse(compressed.transmit(), wire::DEFAULT_MAX_MESSAGE)
+        .unwrap()
+        .request_id;
+    let n = compressed.transmit().len();
+    compressed.consume_transmit(n).unwrap();
+    let mut hello = Vec::new();
+    wire::encode(
+        &mut hello,
+        2,
+        req,
+        0,
+        &raw(&doc! {"ok":1,"maxWireVersion":27,"compression":["zlib"]}),
+        &[],
+        wire::DEFAULT_MAX_MESSAGE,
+    )
+    .unwrap();
+    feed(&mut compressed, &hello);
+    assert!(matches!(
+        compressed.poll_event(),
+        Some(ConnectionEvent::Ready)
+    ));
+    let mut decoded_rounds = 0;
+    let mut shrank = 0;
+    for round in 0..64_u64 {
+        // Repetitive filters make real deflate output smaller than the input.
+        let body = raw(&doc! {
+            "find":"items","$db":"db","filter":{"tag":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+            "comment":format!("round {round} aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        });
+        compressed.command(round, &body, &[], clock::now()).unwrap();
+        plain.command(round, &body, &[], clock::now()).unwrap();
+        let framed = compressed.transmit().to_vec();
+        let expected = plain.transmit().to_vec();
+        assert_eq!(wire::i32_at(&framed, 12).unwrap(), wire::OP_COMPRESSED);
+        assert_eq!(wire::i32_at(&framed, 0).unwrap() as usize, framed.len());
+        assert_eq!(wire::i32_at(&framed, 16).unwrap(), wire::OP_MSG);
+        let size = wire::i32_at(&framed, 20).unwrap() as usize;
+        assert_eq!(size, expected.len() - 16);
+        assert_eq!(framed[24], 2, "zlib compressor id");
+        if framed.len() < expected.len() {
+            shrank += 1;
+        }
+        let mut body_out = Vec::new();
+        let read = flate2::read::ZlibDecoder::new(&framed[25..])
+            .read_to_end(&mut body_out)
+            .unwrap();
+        assert_eq!(read, size, "round {round} declared size");
+        // The decompressed payload must be the exact OP_MSG an uncompressed
+        // connection sends, header excluded.
+        assert_eq!(body_out, expected[16..], "round {round} payload");
+        decoded_rounds += 1;
+        for (c, reply_to) in [
+            (&mut compressed, wire::i32_at(&framed, 4).unwrap()),
+            (&mut plain, wire::i32_at(&expected, 4).unwrap()),
+        ] {
+            let n = c.transmit().len();
+            c.consume_transmit(n).unwrap();
+            let mut reply = Vec::new();
+            wire::encode(
+                &mut reply,
+                900,
+                reply_to,
+                0,
+                &raw(&doc! {"ok":1}),
+                &[],
+                wire::DEFAULT_MAX_MESSAGE,
+            )
+            .unwrap();
+            feed(c, &reply);
+            assert!(matches!(
+                c.poll_event(),
+                Some(ConnectionEvent::Reply { token }) if token == round
+            ));
+            assert_eq!(c.reply().unwrap().get_i32("ok").unwrap(), 1);
+            c.release_reply().unwrap();
+        }
+    }
+    assert_eq!(decoded_rounds, 64, "every round must be decoded");
+    assert_eq!(shrank, 64, "every round must actually compress");
+}
