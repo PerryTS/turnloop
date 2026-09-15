@@ -113,14 +113,14 @@ completed. Unread bytes are therefore in the server's receive buffer at close ti
 | `…::http1_idle_keepalive_lingers_at_shutdown` | idle keep-alive connection at `stop()` half-closes and drains a request racing the stop |
 | `…::http_linger_timeout_closes_silent_peer_without_spinning` | peer never closes: server closes at `sent + 500 ms`, ≤ 1 turn and ≤ 1 zero-event wait for the expiry |
 | `…::http_stop_by_deadline_ends_lingering_connection` | 60 s linger ended by `stop_by(now + 100 ms)`; `run_ready()` shows exactly the lingering task woken; ≤ 2 turns, ≤ 2 zero-event waits |
-| `turnloop-http/server_allocations` (new harness=false gate, `integration-tests`) | HTTP/1 and HTTP/2 discard phase (half-close done → close): 0 allocations over ~256 separate reads, 1,024 bytes |
+| `turnloop-http/server_allocations` (new harness=false gate, `integration-tests`) | HTTP/1 and HTTP/2 discard phase (half-close done → close): 0 allocations, 1,024 bytes, ≥ 256 reads (the peer lock-steps each chunk on the server's discard progress) |
 | `turnloop-websocket/asynchronous::server_close_lingers_until_client_eof` | server `close()` after the closing handshake drains late client bytes; client reads EOF |
 | `turnloop-io/streams::half_close_keeps_reading_until_peer_eof` | EOF delivered, idempotent shutdown, writes rejected, reads continue |
 | `…::lingering_close_discards_peer_input_until_eof` | `Lingered { end: Eof, discarded: 3072 }` |
 | `…::lingering_close_deadline_closes_silent_peer_without_spinning` | `end: Deadline` at the deadline, ≤ 1 turn / ≤ 1 zero-event wait |
 | `…::lingering_close_deadline_bounds_a_stalled_half_close` | a peer that never reads: `TimedOut` at the deadline instead of hanging |
 | `…::half_close_is_unsupported_on_datagram_adapters` | UDP: `Unsupported`, `LingerEnd::Unsupported` |
-| `turnloop-io/allocations::lingering_close_discards_without_allocating` | whole `linger_close` (half-close, 238–256 separate reads, timer, close) after a warm-up connection: 0 allocations |
+| `turnloop-io/allocations::lingering_close_discards_without_allocating` | whole `linger_close` (half-close, ≥ 256 lock-stepped reads, timer, close) after a warm-up connection: 0 allocations |
 | `turnloop-tls/asynchronous::tls_half_close_sends_close_notify_and_keeps_decrypting` | close_notify reaches the peer as EOF, server still decrypts the peer's later data |
 
 Existing Node/curl interop tests are unchanged and pass.
@@ -174,6 +174,45 @@ The linger-timeout tests were widened from 200 ms to 500 ms after the runs above
 for slow-runner headroom (the settle turns must not overrun the deadline); the
 affected io/http/tls/websocket suites were re-run afterwards: **PASS**.
 
+## CI iteration 1 (PR #23, run 34940794647)
+
+Two failures; everything else (macOS, Windows, WASI 0.2, web, h2spec) was green.
+
+1. **`test-native (ubuntu-24.04[-arm], all-features)`: `server_allocations`
+   "http1 discard reads coalesced".** Root cause: the gate paced late bytes with
+   200 µs sleeps and assumed the kernel would deliver most chunks as separate reads
+   (≥ 128 of 256). Linux coalesced more (the passing default-mode run already showed
+   146). Not a product defect: bytes and allocations were right. Fix: both
+   allocation gates now lock-step. A transparent server-transport wrapper publishes
+   the completed half-close and discarded bytes; the peer sends each 4-byte chunk
+   only after the previous one was discarded. That forces one read per chunk on
+   every kernel, so the bound is now `reads ≥ 256` (stronger), `discarded == 1024`
+   and `allocations == 0` (unchanged). Re-checked with an injected per-read `Box`:
+   both gates report 256 allocations.
+2. **`protocol-wasi (wasm32-wasip3)`: `http_linger_timeout_closes_silent_peer_without_spinning`.**
+   Reproduced locally with the pinned p3 toolchain, wasi-sdk 34 and Wasmtime 46:
+   11 of 12 runs panicked at `assert!(gate.shut.get(), "the peer's EOF came from the
+   server's half-close")`, about 6 ms into the test, so not a timer bound. Root cause:
+   the WASI 0.3 backend closes the send stream (the peer reads EOF at once) and
+   completes `Shutdown` only when that stream's result future resolves in a later
+   wait-set step, so the peer can finish before the server observes its own
+   half-close. That is correct half-close behaviour; the test assumed ordering.
+   Fix: the host turns until the server's half-close is acknowledged before settling
+   and measuring. The turnloop-io silent-peer test had the same latent assumption
+   (it passed CI by luck): its server now half-closes explicitly and publishes that,
+   and the host waits for it. The no-spin bounds (`turns < 2`, `≤ 1` zero-event wait;
+   `stop_by`: `< 3`, `≤ 2`) are unchanged on every target.
+
+Local re-verification after the fix:
+
+| Command | Result |
+|---|---|
+| p3 `cargo +nightly-2026-09-07 test -p turnloop-http --test asynchronous --all-features --target wasm32-wasip3 -- linger stop_by` ×15 | **PASS** 15/15 (7 tests each) |
+| `python3 scripts/ci/run-tests.py protocol-wasi --target wasm32-wasip3 --package turnloop-io --package turnloop-tls --package turnloop-http --package turnloop-websocket` | **PASS**, same 11 suites as p2; io gate 256 reads, 0 allocations |
+| `python3 scripts/ci/run-tests.py protocol-wasi --target wasm32-wasip2 --package turnloop-io --package turnloop-http` | **PASS** |
+| `cargo +nightly-2026-09-07 clippy --locked --workspace --all-targets --all-features --target wasm32-wasip3 -- -D warnings -D clippy::undocumented_unsafe_blocks` | **PASS** |
+| native `cargo fmt --check`, strict clippy (default, all-features), io streams/allocations, http asynchronous/server_allocations | **PASS** |
+
 ## Follow-ups / not covered
 
 - HTTP/2 protocol-error closes (`Http2::event` drops the transport after flushing
@@ -181,8 +220,7 @@ affected io/http/tls/websocket suites were re-run afterwards: **PASS**.
   transport on error, which changes client semantics too.
 - `Shutdown::stop_by` bounds lingering only, not in-flight requests.
 - `server_allocations` is registered as a native `integration-tests` suite only, not
-  in `wasi-tests` (WASI 0.3 is unverified locally); the turnloop-io discard gate
-  already runs on WASI.
+  in `wasi-tests`; the turnloop-io discard gate already runs on WASI 0.2 and 0.3.
 - Linux, Windows (IOCP `SD_SEND`, named-pipe `Unsupported`), WASI 0.3 and web runtime
   behaviour is covered only by CI; the macOS RST reproduction is the local evidence.
   Without the fix the reset should surface on Linux and Windows too (as `ECONNRESET`

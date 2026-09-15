@@ -1688,10 +1688,15 @@ fn linger_deadline_with_silent_peer(options: server::Options, stop_by: Option<Du
         executor.turn(Timeout::Until(end)).expect("turn");
     }
     let (_silent_peer, sent) = finish(&mut client);
-    assert!(
-        gate.shut.get(),
-        "the peer's EOF came from the server's half-close"
-    );
+    // The peer's EOF is the server's half-close, but the server may observe its
+    // own shutdown acknowledgement later: WASI 0.3 closes the send stream (the
+    // peer reads EOF) and completes Shutdown only once that stream's result
+    // future resolves in a later wait-set step. Deliver it before measuring.
+    while !gate.shut.get() {
+        assert!(!server.is_finished(), "server ended before its half-close");
+        assert!(executor.driver().now() < end);
+        executor.turn(Timeout::Until(end)).expect("turn");
+    }
     for _ in 0..3 {
         executor.turn(Timeout::Now).expect("settle queued events");
     }

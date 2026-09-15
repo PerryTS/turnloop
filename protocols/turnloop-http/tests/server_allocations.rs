@@ -6,7 +6,7 @@
 mod native {
     use std::{
         alloc::{GlobalAlloc, Layout, System},
-        cell::Cell,
+        cell::{Cell, RefCell},
         future::Future,
         io,
         pin::Pin,
@@ -58,15 +58,37 @@ mod native {
     static ALLOCATOR: Counter = Counter;
 
     const LATE: usize = 256;
-    /// Discard-phase accounting shared by the server transport and the host.
+    /// Discard-phase accounting shared by the server transport and its peer.
     #[derive(Default)]
     pub struct Phase {
         measure: Cell<bool>,
         lingering: Cell<bool>,
+        /// Completed half-closes; each resets the discard counters.
+        shutdowns: Cell<u32>,
+        peer: RefCell<Option<Waker>>,
         pub reads: Cell<u64>,
         pub discarded: Cell<u64>,
         pub allocations: Cell<usize>,
         pub measured: Cell<bool>,
+    }
+    impl Phase {
+        fn wake_peer(&self) {
+            if let Some(waker) = self.peer.borrow_mut().take() {
+                waker.wake();
+            }
+        }
+        /// Peer side: wait until the server-side accounting satisfies `ready`.
+        async fn until(&self, ready: impl Fn(&Self) -> bool) {
+            std::future::poll_fn(|cx| {
+                if ready(self) {
+                    Poll::Ready(())
+                } else {
+                    *self.peer.borrow_mut() = Some(cx.waker().clone());
+                    Poll::Pending
+                }
+            })
+            .await
+        }
     }
     /// Starts counting when the server's half-close completes and stops when its
     /// lingering close reaches `poll_close`, so exactly the discard phase counts.
@@ -87,6 +109,7 @@ mod native {
                 this.phase
                     .discarded
                     .set(this.phase.discarded.get() + *n as u64);
+                this.phase.wake_peer();
             }
             result
         }
@@ -120,9 +143,15 @@ mod native {
         fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             let this = self.get_mut();
             std::task::ready!(HalfClose::poll_shutdown(Pin::new(&mut this.inner), cx))?;
-            if !this.phase.lingering.replace(true) && this.phase.measure.get() {
-                COUNT.store(0, Ordering::Relaxed);
-                ACTIVE.store(true, Ordering::Relaxed);
+            if !this.phase.lingering.replace(true) {
+                this.phase.reads.set(0);
+                this.phase.discarded.set(0);
+                this.phase.shutdowns.set(this.phase.shutdowns.get() + 1);
+                this.phase.wake_peer();
+                if this.phase.measure.get() {
+                    COUNT.store(0, Ordering::Relaxed);
+                    ACTIVE.store(true, Ordering::Relaxed);
+                }
             }
             Poll::Ready(Ok(()))
         }
@@ -133,9 +162,17 @@ mod native {
             _ => panic!("task incomplete"),
         }
     }
-    /// Read the whole response (through the server's half-close), then send
-    /// paced late bytes the server only discards, then close.
-    async fn peer(h: &ExecutorHandle<Platform>, address: std::net::SocketAddr, request: &[u8]) {
+    /// Read the whole response (through the server's half-close), then send late
+    /// bytes the server only discards, then close. Lock-step: each chunk is sent
+    /// only after the server discarded the previous one, so every chunk is its own
+    /// discard read regardless of how the kernel would coalesce paced writes.
+    async fn peer(
+        h: &ExecutorHandle<Platform>,
+        address: std::net::SocketAddr,
+        request: &[u8],
+        phase: &Phase,
+        round: u32,
+    ) {
         let mut stream = h
             .connect(address, Default::default())
             .await
@@ -151,10 +188,11 @@ mod native {
             total += n;
         }
         assert!(total > 0, "final response");
-        // One small write per timer tick keeps the server's discard reads separate.
-        for _ in 0..LATE {
+        // The server may observe its shutdown acknowledgement after our EOF.
+        phase.until(|p| p.shutdowns.get() > round).await;
+        for chunk in 1..=LATE as u64 {
             write_all(&mut stream, b"late").await.expect("late bytes");
-            h.sleep(Duration::from_micros(200)).await.expect("pace");
+            phase.until(|p| p.discarded.get() >= 4 * chunk).await;
         }
         close(&mut stream).await.expect("close");
     }
@@ -230,11 +268,6 @@ mod native {
                         !server_phase.lingering.get(),
                         "lingering close reached close"
                     );
-                    if round == 1 {
-                        return;
-                    }
-                    server_phase.reads.set(0);
-                    server_phase.discarded.set(0);
                 }
             })
             .expect("spawn");
@@ -243,10 +276,11 @@ mod native {
         } else {
             b"GET / HTTP/1.1\r\nhost: localhost\r\n\r\n".to_vec()
         };
+        let peer_phase = phase.clone();
         let mut client = executor
             .spawn_local(async move {
-                for _ in 0..2 {
-                    peer(&client_h, address, &request).await;
+                for round in 0..2 {
+                    peer(&client_h, address, &request, &peer_phase, round).await;
                 }
             })
             .expect("spawn");
@@ -264,10 +298,14 @@ fn main() {
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     for (name, h2) in [("http1", false), ("http2", true)] {
         let phase = native::lingering_discard_allocates_zero(h2);
-        // The subject ran: many separate discard reads covering every late byte.
+        // The subject ran: at least one discard read per lock-stepped chunk,
+        // covering every late byte, all inside the measured window.
         assert!(phase.measured.get(), "{name} discard phase was measured");
         assert_eq!(phase.discarded.get(), 4 * 256, "{name} discarded bytes");
-        assert!(phase.reads.get() >= 128, "{name} discard reads coalesced");
+        assert!(
+            phase.reads.get() >= 256,
+            "{name} one discard read per chunk"
+        );
         assert_eq!(
             phase.allocations.get(),
             0,

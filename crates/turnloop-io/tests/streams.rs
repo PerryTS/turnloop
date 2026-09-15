@@ -194,11 +194,17 @@ fn lingering_close_deadline_closes_silent_peer_without_spinning() {
     let listener = Listener::bind(&h, "127.0.0.1:0".parse().expect("address")).expect("listen");
     let address = listener.local_addr().expect("address");
     const LINGER: Duration = Duration::from_millis(500);
+    let half_closed = std::rc::Rc::new(std::cell::Cell::new(false));
+    let server_half_closed = half_closed.clone();
     let mut server = executor
         .spawn_local(async move {
             let mut s = listener.accept().await.expect("accept");
             write_all(&mut s, b"final").await.expect("write");
             let at = h.now() + LINGER;
+            // Half-close first so the host can tell when the server itself has
+            // observed it; linger_close then finds the half-close complete.
+            shutdown(&mut s).await.expect("half-close");
+            server_half_closed.set(true);
             let mut scratch = [0; 64];
             let lingered = linger_close(&mut s, &mut scratch, Some(at))
                 .await
@@ -224,10 +230,16 @@ fn lingering_close_deadline_closes_silent_peer_without_spinning() {
         executor.turn(Timeout::Until(end)).expect("turn");
     }
     let _silent_peer = finish(&mut client);
-    // The client saw the half-close, so the server is now waiting on its idle
-    // read and the linger timer. Settle residual discovery from the exchange, as
-    // the keep-alive no-spin tests do; the remaining wait must block until the
-    // deadline: at most two turns and one zero-event wait for the one expiry.
+    // The client saw the half-close. The server may observe its acknowledgement
+    // later (WASI 0.3 completes Shutdown after the send stream's result), so
+    // deliver it; the server then waits on its idle read and the linger timer.
+    while !half_closed.get() {
+        assert!(executor.driver().now() < end);
+        executor.turn(Timeout::Until(end)).expect("turn");
+    }
+    // Settle residual discovery from the exchange, as the keep-alive no-spin
+    // tests do; the remaining wait must block until the deadline: at most two
+    // turns and one zero-event wait for the one expiry.
     for _ in 0..3 {
         executor.turn(Timeout::Now).expect("settle queued events");
     }

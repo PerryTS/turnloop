@@ -171,23 +171,110 @@ mod native {
             _ => panic!("client incomplete"),
         }
     }
+    /// Server-side progress the peer lock-steps on, so the gate never depends on
+    /// how a kernel coalesces paced writes into reads.
+    #[derive(Default)]
+    struct Progress {
+        shutdowns: std::cell::Cell<u32>,
+        read: std::cell::Cell<u64>,
+        peer: std::cell::RefCell<Option<Waker>>,
+    }
+    impl Progress {
+        fn wake_peer(&self) {
+            if let Some(waker) = self.peer.borrow_mut().take() {
+                waker.wake();
+            }
+        }
+        async fn until(&self, ready: impl Fn(&Self) -> bool) {
+            std::future::poll_fn(|cx| {
+                if ready(self) {
+                    Poll::Ready(())
+                } else {
+                    *self.peer.borrow_mut() = Some(cx.waker().clone());
+                    Poll::Pending
+                }
+            })
+            .await
+        }
+    }
+    /// Transparent server transport that publishes half-close and read progress.
+    struct Observed {
+        inner: AsyncIo<Platform>,
+        progress: std::rc::Rc<Progress>,
+        shut: bool,
+    }
+    impl AsyncRead for Observed {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bytes: &mut [u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            let result = Pin::new(&mut this.inner).poll_read(cx, bytes);
+            if let Poll::Ready(Ok(n @ 1..)) = &result {
+                this.progress.read.set(this.progress.read.get() + *n as u64);
+                this.progress.wake_peer();
+            }
+            result
+        }
+    }
+    impl AsyncWrite for Observed {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.get_mut().inner).poll_write(cx, bytes)
+        }
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        }
+        fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_close(cx)
+        }
+    }
+    impl HalfClose for Observed {
+        type Backend = Platform;
+        fn executor(&self) -> Option<ExecutorHandle<Platform>> {
+            HalfClose::executor(&self.inner)
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            std::task::ready!(HalfClose::poll_shutdown(Pin::new(&mut this.inner), cx))?;
+            if !std::mem::replace(&mut this.shut, true) {
+                // Once per connection: its discard count starts here.
+                this.progress.read.set(0);
+                this.progress
+                    .shutdowns
+                    .set(this.progress.shutdowns.get() + 1);
+                this.progress.wake_peer();
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
     /// Lingering close over real TCP: the half-close, every discard read of late
     /// peer bytes, the deadline timer and the final close allocate nothing once a
     /// first identical connection has warmed the executor and driver tables.
     pub fn lingering_close_discards_without_allocating() {
-        const LATE: usize = 256;
+        const LATE: u64 = 256;
         let mut executor = LocalExecutor::<Platform>::new(Config::default()).expect("executor");
         let h = executor.handle();
         let client_h = h.clone();
         let listener =
             Listener::bind(&h, "127.0.0.1:0".parse().expect("address")).expect("listener");
         let address = listener.local_addr().expect("address");
+        let progress = std::rc::Rc::new(Progress::default());
+        let server_progress = progress.clone();
         let server = executor
             .spawn_local(async move {
                 let mut scratch = [0; 64];
                 let mut measured = None;
                 for round in 0..2 {
-                    let mut stream = listener.accept().await.expect("accept");
+                    let mut stream = Observed {
+                        inner: listener.accept().await.expect("accept"),
+                        progress: server_progress.clone(),
+                        shut: false,
+                    };
                     write_all(&mut stream, b"final")
                         .await
                         .expect("final response");
@@ -207,14 +294,14 @@ mod native {
                         measured = Some((lingered, COUNT.load(Ordering::Relaxed)));
                     }
                     assert_eq!(lingered.end, LingerEnd::Eof);
-                    assert_eq!(lingered.discarded, 4 * LATE as u64);
+                    assert_eq!(lingered.discarded, 4 * LATE);
                 }
                 measured.expect("measured round")
             })
             .expect("spawn");
         let client = executor
             .spawn_local(async move {
-                for _ in 0..2 {
+                for round in 0..2 {
                     let mut stream = client_h
                         .connect(address, Default::default())
                         .await
@@ -229,14 +316,13 @@ mod native {
                         n += got;
                     }
                     assert_eq!(&bytes[..n], b"final");
-                    // One small write per timer tick keeps the server's reads
-                    // separate: steady-state discard reads, not one coalesced read.
-                    for _ in 0..LATE {
+                    // The server may observe its half-close after our EOF.
+                    progress.until(|p| p.shutdowns.get() > round).await;
+                    // Lock-step: the next chunk goes out only after the server
+                    // discarded the previous one, so each chunk is its own read.
+                    for chunk in 1..=LATE {
                         write_all(&mut stream, b"late").await.expect("late bytes");
-                        client_h
-                            .sleep(Duration::from_micros(200))
-                            .await
-                            .expect("pace");
+                        progress.until(|p| p.read.get() >= 4 * chunk).await;
                     }
                     close(&mut stream).await.expect("close");
                 }
@@ -258,10 +344,11 @@ mod native {
                 Poll::Ready(Ok(v)) => v,
                 _ => panic!("server incomplete"),
             };
-        // The subject ran: many separate discard reads, each byte accounted for.
+        // The subject ran: at least one discard read per lock-stepped chunk, every
+        // byte accounted for, all inside the measured window.
         assert!(
-            lingered.reads >= LATE as u64 / 2,
-            "discard reads coalesced: {lingered:?}"
+            lingered.reads >= LATE,
+            "one discard read per chunk: {lingered:?}"
         );
         assert_eq!(allocations, 0, "lingering close allocates: {lingered:?}");
         println!(
