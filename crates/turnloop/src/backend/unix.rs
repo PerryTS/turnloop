@@ -501,6 +501,13 @@ unsafe impl Backend for Unix {
             return self.watches.submit(&request);
         }
         let r = self.get(h)?;
+        if matches!(request.operation, Operation::Shutdown)
+            && matches!(r.transport.kind, Kind::Stream | Kind::File)
+        {
+            // Only sockets have an independent write direction. A tty, FIFO or
+            // regular file cannot half-close; closing it is the caller's choice.
+            return Err(Error::new(ErrorKind::Unsupported));
+        }
         if r.transport.kind == Kind::File {
             let fd = r.transport.fd.try_clone().map_err(Error::from)?;
             return self.files.submit(request, fd);
@@ -856,7 +863,8 @@ fn execute(
             Ok(Some((Outcome::Wrote(n as usize), true)))
         }
         Operation::Shutdown => {
-            // SAFETY: fd is a live TCP socket; SHUT_WR is a valid shutdown direction.
+            // SAFETY: fd is a live TCP or Unix-domain stream socket (submit rejects
+            // other kinds); SHUT_WR is a valid shutdown direction.
             if unsafe { libc::shutdown(fd, libc::SHUT_WR) } < 0 {
                 return Err(last_error());
             }

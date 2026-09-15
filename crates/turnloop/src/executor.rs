@@ -429,6 +429,8 @@ impl<B: Backend> ExecutorHandle<B> {
             peer: None,
             read: None,
             write: None,
+            shutdown: None,
+            write_shut: false,
             closed: false,
         }
     }
@@ -595,12 +597,18 @@ impl<T> Drop for JoinHandle<T> {
 /// A Pending poll never consumes the current write slice, so it may be replaced.
 /// UDP writes accept one complete datagram or reject it if staging is too small;
 /// UDP reads expose payload bytes without the sender address.
+///
+/// [`AsyncIo::poll_shutdown`] half-closes a stream: the write direction ends while
+/// reads continue until the peer's EOF, and the handle stays open until
+/// `poll_close` or drop. `poll_close` still fully closes the handle.
 pub struct AsyncIo<B: Backend> {
     shared: Rc<Shared<B>>,
     handle: Handle,
     peer: Option<SocketAddr>,
     read: Option<Key>,
     write: Option<Key>,
+    shutdown: Option<Key>,
+    write_shut: bool,
     closed: bool,
 }
 impl<B: Backend> Unpin for AsyncIo<B> {}
@@ -608,6 +616,85 @@ impl<B: Backend> AsyncIo<B> {
     /// Borrow the underlying loop handle for configuration or address queries.
     pub fn handle(&self) -> Handle {
         self.handle
+    }
+    /// The executor that owns this stream's handle, for deadlines and timers on
+    /// the same loop (for example a lingering close). Cloning allocates nothing.
+    pub fn executor(&self) -> ExecutorHandle<B> {
+        ExecutorHandle {
+            shared: self.shared.clone(),
+        }
+    }
+    /// Whether [`AsyncIo::poll_shutdown`] has completed: writes now fail with
+    /// `BrokenPipe`, while reads continue until the peer's EOF.
+    pub fn is_write_shut(&self) -> bool {
+        self.write_shut
+    }
+    /// Gracefully end the write direction without closing the handle.
+    ///
+    /// Flushes accepted writes first, then submits the backend's stream shutdown
+    /// after them: TCP `shutdown(SHUT_WR)` on epoll/kqueue, `shutdown(SD_SEND)` on
+    /// IOCP, `shutdown(send)` on WASI 0.2 and closing the send stream on WASI 0.3.
+    /// The peer reads EOF after every byte written before it. Reads on this adapter
+    /// continue until the peer's own EOF, so a server can drain unread peer input
+    /// instead of closing with bytes unread (which sends RST, and on macOS and
+    /// Windows discards data the peer has not read yet). Close or drop afterwards.
+    ///
+    /// Repeated calls after completion return `Ok`. Transports that cannot
+    /// half-close return `io::ErrorKind::Unsupported`: UDP adapters, Windows named
+    /// pipes and console/synchronous handles, and non-socket Unix descriptors (ttys,
+    /// FIFOs, regular files). WASI stdout and stderr close their output stream; a
+    /// web WebSocket starts its close handshake. A pending poll never loses
+    /// progress: the submitted shutdown stays owned by this adapter until it
+    /// completes.
+    pub fn poll_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.write_shut {
+            return Poll::Ready(Ok(()));
+        }
+        if self.closed {
+            return Poll::Ready(Err(io::ErrorKind::NotConnected.into()));
+        }
+        if self.peer.is_some() {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "a datagram adapter has no stream write direction to shut down",
+            )));
+        }
+        std::task::ready!(Pin::new(&mut *self).poll_flush(cx))?;
+        let key = match self.shutdown {
+            Some(key) => key,
+            None => {
+                let key = self.shared.reserve(cx).map_err(io_error)?;
+                let result = self
+                    .shared
+                    .driver
+                    .borrow_mut()
+                    .shutdown(self.handle, key.token());
+                match result {
+                    Ok(op) => {
+                        self.shared.slots.borrow_mut()[key.index].op = Some(op);
+                        self.shutdown = Some(key);
+                        key
+                    }
+                    Err(e) => {
+                        self.shared.free(key);
+                        return Poll::Ready(Err(shutdown_error(e)));
+                    }
+                }
+            }
+        };
+        let Some(result) = self.shared.result(key, cx) else {
+            return Poll::Pending;
+        };
+        self.shared.free(key);
+        self.shutdown = None;
+        Poll::Ready(match result {
+            OpResult::Shutdown => {
+                self.write_shut = true;
+                Ok(())
+            }
+            OpResult::Err(e) => Err(shutdown_error(e)),
+            _ => Err(io_error(Error::new(ErrorKind::Cancelled))),
+        })
     }
     fn start_read(&mut self, cx: &Context<'_>, length: usize) -> Result<Key> {
         let key = self.shared.reserve(cx)?;
@@ -647,6 +734,16 @@ fn io_error(error: Error) -> io::Error {
         io::Error::from_raw_os_error(os)
     } else {
         io::Error::other(error)
+    }
+}
+/// Keep the portable categories a lingering close branches on.
+fn shutdown_error(error: Error) -> io::Error {
+    match (error.os, error.kind) {
+        (None, ErrorKind::Unsupported) => io::Error::new(io::ErrorKind::Unsupported, error),
+        (None, ErrorKind::InvalidInput) => io::Error::new(io::ErrorKind::InvalidInput, error),
+        (None, ErrorKind::BrokenPipe) => io::Error::new(io::ErrorKind::BrokenPipe, error),
+        (None, ErrorKind::ConnectionReset) => io::Error::new(io::ErrorKind::ConnectionReset, error),
+        _ => io_error(error),
     }
 }
 impl<B: Backend> AsyncRead for AsyncIo<B> {
@@ -710,7 +807,7 @@ impl<B: Backend> AsyncWrite for AsyncIo<B> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        if self.closed {
+        if self.closed || self.write_shut || self.shutdown.is_some() {
             return Poll::Ready(Err(io_error(Error::new(ErrorKind::BrokenPipe))));
         }
         // A Pending call must not consume the current caller's bytes. Drain the
@@ -811,6 +908,9 @@ impl<B: Backend> Drop for AsyncIo<B> {
             self.shared.abandon(key);
         }
         if let Some(key) = self.write.take() {
+            self.shared.abandon(key);
+        }
+        if let Some(key) = self.shutdown.take() {
             self.shared.abandon(key);
         }
         if !self.closed {

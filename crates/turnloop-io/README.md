@@ -25,6 +25,23 @@ one absolute backend-clock deadline for a whole exchange.
 5. Allocate retained buffers at connection creation/warm-up, never per I/O call.
    Application-owned headers/messages and crypto state have separate accounting.
 
+## Half-close and lingering close
+
+`close` releases the whole transport. `shutdown` (the `HalfClose` trait, implemented
+by `AsyncIo`, `TlsStream` and `Transport`) flushes accepted writes and ends only the
+write direction: TLS sends close_notify, then TCP `shutdown(SHUT_WR)` (IOCP
+`SD_SEND`, WASI `shutdown(send)`). Reads continue until the peer's EOF and the handle
+stays open until `close` or drop. UDP, Windows named pipes and non-socket Unix
+descriptors return `Unsupported`.
+
+A server should not close a socket while peer bytes are unread: that sends RST, and
+on macOS and Windows a received RST discards data the peer has not read yet (the
+tail of the final response). `linger_close(stream, scratch, deadline)` flushes and
+half-closes, reads and discards into caller-retained scratch until the peer's EOF
+or the deadline, then closes. It waits only on one read and one executor timer (no
+spin) and allocates nothing per read; `Lingered` reports how it ended and how many
+bytes were discarded.
+
 Native TCP/pipes and WASI sockets use the identical generic stream code. Browser
 raw sockets/listeners return Unsupported; browser HTTP uses host fetch. Windows
 uses the production Backend implementation when integrated.

@@ -8,7 +8,7 @@ use std::{
     pin::Pin,
     task::{Context, Poll},
 };
-use turnloop_io::{AsyncRead, AsyncWrite, Backend, ExecutorHandle, Instant, Stream};
+use turnloop_io::{AsyncRead, AsyncWrite, Backend, ExecutorHandle, HalfClose, Instant, Stream};
 
 /// Certificate verification and wall time supplied by the embedding host.
 #[derive(Clone)]
@@ -105,6 +105,24 @@ impl<S: Stream> AsyncWrite for Transport<S> {
             Self::Plain(s) => Pin::new(s).poll_close(cx),
             Self::Tls(s) => Pin::new(&mut **s).poll_close(cx),
             Self::Closed => Poll::Ready(Ok(())),
+        }
+    }
+}
+impl<S: HalfClose> HalfClose for Transport<S> {
+    type Backend = S::Backend;
+    fn executor(&self) -> Option<ExecutorHandle<S::Backend>> {
+        match self {
+            Self::Plain(s) => s.executor(),
+            Self::Tls(s) => s.executor(),
+            Self::Closed => None,
+        }
+    }
+    /// Half-close the active transport: TLS sends close_notify first.
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_shutdown(cx),
+            Self::Tls(s) => Pin::new(&mut **s).poll_shutdown(cx),
+            Self::Closed => Poll::Ready(Err(io::ErrorKind::NotConnected.into())),
         }
     }
 }
@@ -267,7 +285,9 @@ fn step<E: Endpoint>(
 }
 /// An async client or server TLS connection. Construction completes the handshake
 /// under a single absolute deadline. Drop aborts the owned transport; `close`
-/// flushes close_notify first. Retained storage is bounded per connection.
+/// flushes close_notify first. [`HalfClose::poll_shutdown`] flushes close_notify
+/// and then half-closes the transport while decrypting reads continue until the
+/// peer's close_notify or EOF. Retained storage is bounded per connection.
 pub struct TlsStream<S> {
     stream: S,
     session: Session,
@@ -449,6 +469,14 @@ impl<S: Stream> AsyncWrite for TlsStream<S> {
         if bytes.is_empty() {
             return Poll::Ready(Ok(0));
         }
+        if self.buffers.close_sent {
+            // No application data may follow close_notify. Refuse before
+            // encrypting, so a rejected record never blocks later reads.
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "TLS close_notify already sent",
+            )));
+        }
         self.get_mut().poll_drive(cx, &Intent::Write(bytes))
     }
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -459,5 +487,20 @@ impl<S: Stream> AsyncWrite for TlsStream<S> {
         std::task::ready!(this.poll_drive(cx, &Intent::Close))?;
         std::task::ready!(this.poll_output(cx))?;
         Pin::new(&mut this.stream).poll_close(cx)
+    }
+}
+impl<S: HalfClose> HalfClose for TlsStream<S> {
+    type Backend = S::Backend;
+    fn executor(&self) -> Option<ExecutorHandle<S::Backend>> {
+        self.stream.executor()
+    }
+    /// Send and flush close_notify, then half-close the transport (TCP `SHUT_WR`).
+    /// The handle stays open: reads keep decrypting until the peer's close_notify
+    /// or EOF. Repeated polls after completion return `Ok`.
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        std::task::ready!(this.poll_drive(cx, &Intent::Close))?;
+        std::task::ready!(this.poll_output(cx))?;
+        Pin::new(&mut this.stream).poll_shutdown(cx)
     }
 }

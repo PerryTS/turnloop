@@ -106,6 +106,91 @@ fn async_tls_alpn_fragmented_plaintext_and_close_notify() {
     assert_eq!(finish(&mut s), finish(&mut c));
 }
 #[test]
+fn tls_half_close_sends_close_notify_and_keeps_decrypting() {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("certificate");
+    let server = ServerConfig::new(
+        vec![cert.cert.der().clone()],
+        PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()).into(),
+        vec![b"h2".to_vec()],
+        NOW,
+    )
+    .expect("server config");
+    let client = ClientConfig::new(
+        ClientOptions {
+            ca: Some(vec![cert.cert.der().clone()]),
+            alpn: vec![b"h2".to_vec()],
+            ..Default::default()
+        },
+        NOW,
+    )
+    .expect("client config");
+    let mut executor = LocalExecutor::<Platform>::new(Config::default()).expect("executor");
+    let h = executor.handle();
+    let h2 = h.clone();
+    let listener = Listener::bind(&h, "127.0.0.1:0".parse().expect("address")).expect("listener");
+    let address = listener.local_addr().expect("address");
+    let end = h.now() + Duration::from_secs(5);
+    async fn read_to_end<S: Stream>(stream: &mut S) -> Vec<u8> {
+        let mut received = Vec::new();
+        let mut bytes = [0; 256];
+        loop {
+            let n = read(stream, &mut bytes).await.expect("clean TLS EOF");
+            if n == 0 {
+                return received;
+            }
+            received.extend_from_slice(&bytes[..n]);
+        }
+    }
+    let mut s = executor
+        .spawn_local(async move {
+            let stream = listener.accept().await.expect("accept");
+            let mut tls = TlsStream::accept(stream, &server, &h, end, NOW)
+                .await
+                .expect("server handshake");
+            write_all(&mut tls, b"final").await.expect("write");
+            // close_notify, then TCP SHUT_WR; the handle and decryption stay open.
+            shutdown(&mut tls).await.expect("TLS half-close");
+            shutdown(&mut tls).await.expect("repeated half-close");
+            assert!(tls.get_ref().is_write_shut());
+            assert!(write_all(&mut tls, b"x").await.is_err());
+            let late = read_to_end(&mut tls).await;
+            close(&mut tls).await.expect("close");
+            late
+        })
+        .expect("spawn");
+    let mut c = executor
+        .spawn_local(async move {
+            let stream = h2
+                .connect(address, Default::default())
+                .await
+                .expect("connect");
+            let mut tls = TlsStream::connect(
+                stream,
+                &client,
+                ServerName::try_from("localhost").expect("name"),
+                &h2,
+                end,
+                NOW,
+            )
+            .await
+            .expect("client handshake");
+            // EOF here is the server's close_notify.
+            let response = read_to_end(&mut tls).await;
+            write_all(&mut tls, b"late")
+                .await
+                .expect("write to a half-closed peer");
+            close(&mut tls).await.expect("close notify");
+            response
+        })
+        .expect("spawn");
+    while !s.is_finished() || !c.is_finished() {
+        assert!(executor.driver().now() < end);
+        executor.turn(Timeout::Until(end)).expect("turn");
+    }
+    assert_eq!(finish(&mut c), b"final");
+    assert_eq!(finish(&mut s), b"late");
+}
+#[test]
 fn silent_peer_handshake_deadline() {
     let mut executor = LocalExecutor::<Platform>::new(Config::default()).expect("executor");
     let h = executor.handle();

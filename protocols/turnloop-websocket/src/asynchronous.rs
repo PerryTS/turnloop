@@ -5,7 +5,7 @@ use turnloop_http::{
     asynchronous::Http1,
     http1::{BodyLength, Event, Mode},
 };
-use turnloop_io::{Backend, CloseOnDrop, ExecutorHandle, Instant, Stream};
+use turnloop_io::{Backend, CloseOnDrop, ExecutorHandle, HalfClose, Instant, Stream};
 /// A framed connection with one retained input/output buffer. A cancelled frame
 /// operation closes the stream, preventing partial frames from being replayed.
 pub struct WebSocketStream<S> {
@@ -150,8 +150,14 @@ impl<S: Stream> WebSocketStream<S> {
             self.input.extend_from_slice(&bytes[..n]);
         }
     }
-    /// Send close, await its peer acknowledgement under the supplied deadline,
-    /// then close the underlying stream (including TLS close_notify when present).
+}
+impl<S: HalfClose> WebSocketStream<S> {
+    /// Send close and await the peer's close under the supplied deadline, then
+    /// close the underlying stream with a lingering close bounded by the same
+    /// deadline: half-close (TLS close_notify first), discard peer bytes until its
+    /// EOF, then close. A server's TCP close therefore never resets a peer that
+    /// still has unread frames; a client waits for the server's close, as RFC 6455
+    /// section 7.1.1 recommends. Only the close handshake can time out.
     pub async fn close<B: Backend>(
         &mut self,
         executor: &ExecutorHandle<B>,
@@ -164,16 +170,26 @@ impl<S: Stream> WebSocketStream<S> {
                     break;
                 }
             }
-            if let Some(stream) = &mut self.stream {
-                turnloop_io::close(stream).await?;
-            }
-            self.closed = true;
             Ok(())
         })
         .await;
         if result.is_err() {
             self.stream.take();
+            return result;
         }
-        result
+        self.closed = true;
+        if let Some(stream) = &mut self.stream {
+            // The retained frame buffer is the discard scratch; no allocation.
+            self.input.clear();
+            self.input.resize(self.input.capacity(), 0);
+            if turnloop_io::linger_close(stream, &mut self.input, Some(deadline))
+                .await
+                .is_err()
+            {
+                self.stream.take();
+            }
+            self.input.clear();
+        }
+        Ok(())
     }
 }

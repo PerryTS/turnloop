@@ -1158,3 +1158,677 @@ fn graceful_goaway_drains_existing_pooled_request() {
     assert_eq!(finish(&mut server), 11);
     assert_eq!(finish(&mut client), 11);
 }
+
+// Lingering close. A server that closes with unread peer bytes sends RST instead
+// of FIN; the peer then reads ECONNRESET instead of EOF, and on macOS and Windows
+// the reset can discard response bytes it has not read yet (issue #21). These
+// tests hold every peer read until the server has finished its final close or
+// half-close, and make the peer's late bytes unread at that moment, so they
+// observe the reset deterministically rather than by timing luck.
+const LINGER_BODY: usize = 32 * 1024;
+const TLS_NOW: u64 = 1_789_344_000;
+type Wire = turnloop_tls::asynchronous::Transport<AsyncIo<Platform>>;
+fn linger_body() -> Vec<u8> {
+    (0..LINGER_BODY).map(|i| (i % 251) as u8).collect()
+}
+/// Rendezvous between a server transport and its test peer. The server holds its
+/// first close or half-close until the peer has sent bytes the server's protocol
+/// never reads, so they sit unread in the server's receive buffer when it closes.
+#[derive(Default)]
+struct CloseGate {
+    closing: std::cell::Cell<bool>,
+    late_sent: std::cell::Cell<bool>,
+    shut: std::cell::Cell<bool>,
+    released: std::cell::Cell<bool>,
+    discarded: std::cell::Cell<usize>,
+    server: std::cell::RefCell<Option<Waker>>,
+    peer: std::cell::RefCell<Option<Waker>>,
+}
+impl CloseGate {
+    fn wake(slot: &std::cell::RefCell<Option<Waker>>) {
+        if let Some(waker) = slot.borrow_mut().take() {
+            waker.wake();
+        }
+    }
+    async fn peer_until(&self, ready: impl Fn(&Self) -> bool) {
+        std::future::poll_fn(|cx| {
+            if ready(self) {
+                Poll::Ready(())
+            } else {
+                *self.peer.borrow_mut() = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        })
+        .await
+    }
+    fn late_bytes_sent(&self) {
+        self.late_sent.set(true);
+        Self::wake(&self.server);
+    }
+}
+/// Server-side transport that applies the gate to both `poll_close` (a server
+/// without lingering) and `poll_shutdown` (a lingering server), and counts bytes
+/// read after the server's write side ended.
+struct Gated<S> {
+    inner: S,
+    gate: std::rc::Rc<CloseGate>,
+}
+impl<S> Gated<S> {
+    fn poll_gate(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        if !self.gate.closing.replace(true) {
+            CloseGate::wake(&self.gate.peer);
+        }
+        if self.gate.late_sent.get() {
+            Poll::Ready(())
+        } else {
+            *self.gate.server.borrow_mut() = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+    fn ended_writes(&self, released: bool) {
+        self.gate.shut.set(true);
+        self.gate.released.set(self.gate.released.get() || released);
+        CloseGate::wake(&self.gate.peer);
+    }
+}
+impl<S: Stream> AsyncRead for Gated<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &mut [u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let result = Pin::new(&mut this.inner).poll_read(cx, bytes);
+        if let (true, Poll::Ready(Ok(n))) = (this.gate.shut.get(), &result) {
+            this.gate.discarded.set(this.gate.discarded.get() + n);
+        }
+        result
+    }
+}
+impl<S: Stream> AsyncWrite for Gated<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, bytes)
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        std::task::ready!(this.poll_gate(cx));
+        std::task::ready!(Pin::new(&mut this.inner).poll_close(cx))?;
+        this.ended_writes(true);
+        Poll::Ready(Ok(()))
+    }
+}
+impl<S: HalfClose> HalfClose for Gated<S> {
+    type Backend = S::Backend;
+    fn executor(&self) -> Option<ExecutorHandle<S::Backend>> {
+        self.inner.executor()
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        std::task::ready!(this.poll_gate(cx));
+        std::task::ready!(Pin::new(&mut this.inner).poll_shutdown(cx))?;
+        this.ended_writes(false);
+        Poll::Ready(Ok(()))
+    }
+}
+struct LingerPeer {
+    server: Option<turnloop_tls::ServerConfig>,
+    client: Option<turnloop_tls::ClientConfig>,
+}
+impl LingerPeer {
+    fn new(tls: bool, alpn: &[u8]) -> Self {
+        if !tls {
+            return Self {
+                server: None,
+                client: None,
+            };
+        }
+        use turnloop_tls::rustls::pki_types::PrivatePkcs8KeyDer;
+        let cert =
+            rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("certificate");
+        Self {
+            server: Some(
+                turnloop_tls::ServerConfig::new(
+                    vec![cert.cert.der().clone()],
+                    PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()).into(),
+                    vec![alpn.to_vec()],
+                    TLS_NOW,
+                )
+                .expect("server TLS config"),
+            ),
+            client: Some(
+                turnloop_tls::ClientConfig::new(
+                    turnloop_tls::ClientOptions {
+                        ca: Some(vec![cert.cert.der().clone()]),
+                        alpn: vec![alpn.to_vec()],
+                        ..Default::default()
+                    },
+                    TLS_NOW,
+                )
+                .expect("client TLS config"),
+            ),
+        }
+    }
+}
+async fn accept_wire(
+    listener: &Listener<Platform>,
+    tls: Option<turnloop_tls::ServerConfig>,
+    h: &ExecutorHandle<Platform>,
+    end: Instant,
+) -> Wire {
+    let stream = listener.accept().await.expect("accept");
+    match tls {
+        Some(config) => turnloop_tls::asynchronous::Transport::Tls(Box::new(
+            turnloop_tls::TlsStream::accept(stream, &config, h, end, TLS_NOW)
+                .await
+                .expect("server handshake"),
+        )),
+        None => turnloop_tls::asynchronous::Transport::Plain(stream),
+    }
+}
+async fn connect_wire(
+    address: std::net::SocketAddr,
+    tls: Option<turnloop_tls::ClientConfig>,
+    h: &ExecutorHandle<Platform>,
+    end: Instant,
+) -> Wire {
+    let stream = h
+        .connect(address, Default::default())
+        .await
+        .expect("connect");
+    match tls {
+        Some(config) => turnloop_tls::asynchronous::Transport::Tls(Box::new(
+            turnloop_tls::TlsStream::connect(
+                stream,
+                &config,
+                "localhost".try_into().expect("server name"),
+                h,
+                end,
+                TLS_NOW,
+            )
+            .await
+            .expect("client handshake"),
+        )),
+        None => turnloop_tls::asynchronous::Transport::Plain(stream),
+    }
+}
+/// Every byte until a clean EOF. `ECONNRESET` here is the bug under test.
+async fn read_until_eof<S: Stream>(stream: &mut S) -> Vec<u8> {
+    let mut received = Vec::new();
+    let mut bytes = [0; 4096];
+    loop {
+        let n = read(stream, &mut bytes)
+            .await
+            .unwrap_or_else(|e| panic!("reset before EOF after {} bytes: {e}", received.len()));
+        if n == 0 {
+            return received;
+        }
+        received.extend_from_slice(&bytes[..n]);
+    }
+}
+fn run_until<T, U>(
+    executor: &mut LocalExecutor<Platform>,
+    a: &mut turnloop::executor::JoinHandle<T>,
+    b: &mut turnloop::executor::JoinHandle<U>,
+) {
+    let end = executor.driver().now() + Duration::from_secs(10);
+    while !a.is_finished() || !b.is_finished() {
+        assert!(executor.driver().now() < end, "lingering exchange hung");
+        executor.turn(Timeout::Until(end)).expect("turn");
+    }
+}
+
+const PIPELINED: &[u8] = b"GET /pipelined HTTP/1.1\r\nhost: localhost\r\n\r\n";
+fn http1_final_response_survives_pipelined_request(tls: bool) {
+    let mut executor = LocalExecutor::<Platform>::new(Config::default()).expect("executor");
+    let h = executor.handle();
+    let sh = h.clone();
+    let listener = Listener::bind(&h, "127.0.0.1:0".parse().expect("address")).expect("listen");
+    let address = listener.local_addr().expect("address");
+    let peers = LingerPeer::new(tls, b"http/1.1");
+    let (server_tls, client_tls) = (peers.server, peers.client);
+    let gate = std::rc::Rc::new(CloseGate::default());
+    let server_gate = gate.clone();
+    let end = h.now() + Duration::from_secs(10);
+    let mut server = executor
+        .spawn_local(async move {
+            let wire = accept_wire(&listener, server_tls, &sh, end).await;
+            let body = linger_body();
+            let mut heads = 0;
+            let gated = Gated {
+                inner: wire,
+                gate: server_gate,
+            };
+            server::http1(gated, server::Shutdown::default(), |event, out| {
+                match event {
+                    Event::Head(head) => {
+                        assert_eq!(head.target, "/first", "pipelined request must stay unread");
+                        heads += 1;
+                        let head = Head {
+                            keep_alive: false,
+                            ..response()
+                        };
+                        out.start(&head, BodyLength::Known(LINGER_BODY as u64))?;
+                        out.body(&body)?;
+                    }
+                    Event::End => out.finish(&[])?,
+                    _ => {}
+                }
+                Ok(())
+            })
+            .await
+            .expect("final response and lingering close");
+            heads
+        })
+        .expect("spawn");
+    let mut client = executor
+        .spawn_local(async move {
+            let mut wire = connect_wire(address, client_tls, &h, end).await;
+            write_all(&mut wire, b"GET /first HTTP/1.1\r\nhost: localhost\r\n\r\n")
+                .await
+                .expect("request");
+            // Read nothing until the server finished writing and began to close.
+            gate.peer_until(|g| g.closing.get()).await;
+            write_all(&mut wire, PIPELINED)
+                .await
+                .expect("pipelined request");
+            gate.late_bytes_sent();
+            gate.peer_until(|g| g.shut.get()).await;
+            let response = read_until_eof(&mut wire).await;
+            // TLS: close_notify is a write, which fails on a connection already reset.
+            close(&mut wire)
+                .await
+                .expect("the server is still open for our close");
+            (response, gate)
+        })
+        .expect("spawn");
+    run_until(&mut executor, &mut server, &mut client);
+    let (response, gate) = finish(&mut client);
+    assert_eq!(finish(&mut server), 1);
+    let head_end = response
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("response head")
+        + 4;
+    let head = std::str::from_utf8(&response[..head_end]).expect("ASCII head");
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(head.contains("connection: close"), "{head}");
+    assert_eq!(
+        &response[head_end..],
+        linger_body(),
+        "every body byte arrives"
+    );
+    assert_eq!(
+        gate.discarded.get(),
+        PIPELINED.len(),
+        "server drained the pipelined request"
+    );
+    assert!(gate.released.get(), "server closed after its peer's EOF");
+}
+#[test]
+fn http1_lingering_close_delivers_response_before_pipelined_request() {
+    http1_final_response_survives_pipelined_request(false);
+}
+#[test]
+fn https1_lingering_close_delivers_response_before_pipelined_request() {
+    http1_final_response_survives_pipelined_request(true);
+}
+
+/// SETTINGS acknowledgement, connection WINDOW_UPDATE and PING: frames an HTTP/2
+/// client commonly sends after the server's final response and GOAWAY.
+const LATE_H2_FRAMES: &[u8] = &[
+    0, 0, 0, 4, 1, 0, 0, 0, 0, // SETTINGS ACK
+    0, 0, 4, 8, 0, 0, 0, 0, 0, 0, 1, 0, 0, // WINDOW_UPDATE stream 0, +65536
+    0, 0, 8, 6, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, // PING
+];
+fn http2_final_response_survives_unread_frames(tls: bool) {
+    let mut executor = LocalExecutor::<Platform>::new(Config::default()).expect("executor");
+    let h = executor.handle();
+    let sh = h.clone();
+    let listener = Listener::bind(&h, "127.0.0.1:0".parse().expect("address")).expect("listen");
+    let address = listener.local_addr().expect("address");
+    let peers = LingerPeer::new(tls, b"h2");
+    let (server_tls, client_tls) = (peers.server, peers.client);
+    let gate = std::rc::Rc::new(CloseGate::default());
+    let server_gate = gate.clone();
+    let end = h.now() + Duration::from_secs(10);
+    let mut server = executor
+        .spawn_local(async move {
+            let wire = accept_wire(&listener, server_tls, &sh, end).await;
+            let body = linger_body();
+            let signal = server::Shutdown::default();
+            let stop = signal.clone();
+            let mut responses = 0;
+            let gated = Gated {
+                inner: wire,
+                gate: server_gate,
+            };
+            server::http2(gated, signal, |core, event| {
+                if let http2::Event::Headers {
+                    stream, end_stream, ..
+                } = event
+                {
+                    assert!(end_stream);
+                    let length = LINGER_BODY.to_string();
+                    core.send_headers(
+                        stream,
+                        &[
+                            Header::new(":status", "200"),
+                            Header::new("content-length", length),
+                        ],
+                        false,
+                    )
+                    .map_err(std::io::Error::other)?;
+                    let mut sent = 0;
+                    while sent < body.len() {
+                        let n = core
+                            .send_data(stream, &body[sent..], true)
+                            .map_err(std::io::Error::other)?;
+                        assert!(n > 0, "initial flow-control window covers the body");
+                        sent += n;
+                    }
+                    responses += 1;
+                    // GOAWAY, drain, then close: the final response of this connection.
+                    stop.stop();
+                }
+                Ok(())
+            })
+            .await
+            .expect("final response and lingering close");
+            responses
+        })
+        .expect("spawn");
+    let mut client = executor
+        .spawn_local(async move {
+            let mut wire = connect_wire(address, client_tls, &h, end).await;
+            let mut core =
+                http2::Connection::new(http2::Role::Client, Default::default()).expect("h2");
+            core.open(
+                &[
+                    Header::new(":method", "GET"),
+                    Header::new(":scheme", if tls { "https" } else { "http" }),
+                    Header::new(":authority", "localhost"),
+                    Header::new(":path", "/"),
+                ],
+                true,
+            )
+            .expect("request");
+            drain(&mut wire, &mut core)
+                .await
+                .expect("preface and request");
+            // Read nothing (not even SETTINGS) until the server drained and closes.
+            gate.peer_until(|g| g.closing.get()).await;
+            write_all(&mut wire, LATE_H2_FRAMES)
+                .await
+                .expect("late control frames");
+            gate.late_bytes_sent();
+            gate.peer_until(|g| g.shut.get()).await;
+            let wire_bytes = read_until_eof(&mut wire).await;
+            close(&mut wire)
+                .await
+                .expect("the server is still open for our close");
+            let (mut status, mut body, mut goaway, mut ended) = (None, Vec::new(), None, false);
+            let mut pos = 0;
+            while pos < wire_bytes.len() {
+                let step = core.receive(&wire_bytes[pos..]).expect("server frames");
+                assert!(step.consumed > 0 || step.event.is_some(), "truncated frame");
+                pos += step.consumed;
+                match step.event {
+                    Some(http2::Event::Headers { headers, .. }) => {
+                        status = headers
+                            .into_iter()
+                            .find(|h| h.name == ":status")
+                            .map(|h| h.value);
+                    }
+                    Some(http2::Event::Data {
+                        bytes, end_stream, ..
+                    }) => {
+                        body.extend_from_slice(bytes);
+                        ended |= end_stream;
+                    }
+                    Some(http2::Event::Goaway { code, .. }) => goaway = Some(code),
+                    _ => {}
+                }
+            }
+            assert_eq!(status.as_deref(), Some(b"200".as_slice()));
+            assert_eq!(goaway, Some(0), "graceful GOAWAY precedes EOF");
+            assert!(ended, "END_STREAM arrives");
+            (body, gate)
+        })
+        .expect("spawn");
+    run_until(&mut executor, &mut server, &mut client);
+    let (body, gate) = finish(&mut client);
+    assert_eq!(finish(&mut server), 1);
+    assert_eq!(body, linger_body(), "every DATA byte arrives");
+    assert_eq!(
+        gate.discarded.get(),
+        LATE_H2_FRAMES.len(),
+        "server drained late frames"
+    );
+    assert!(gate.released.get(), "server closed after its peer's EOF");
+}
+#[test]
+fn http2_lingering_close_delivers_response_despite_unread_frames() {
+    http2_final_response_survives_unread_frames(false);
+}
+#[test]
+fn https2_lingering_close_delivers_response_despite_unread_frames() {
+    http2_final_response_survives_unread_frames(true);
+}
+
+/// A peer that reads the final response but never closes: the server closes at
+/// its linger deadline (or an earlier `stop_by` deadline) and never spins.
+fn linger_deadline_with_silent_peer(options: server::Options, stop_by: Option<Duration>) {
+    let mut executor = LocalExecutor::<Platform>::new(Config::default()).expect("executor");
+    let h = executor.handle();
+    let sh = h.clone();
+    let listener = Listener::bind(&h, "127.0.0.1:0".parse().expect("address")).expect("listen");
+    let address = listener.local_addr().expect("address");
+    let gate = std::rc::Rc::new(CloseGate::default());
+    // Nothing late to send: the half-close proceeds at once.
+    gate.late_sent.set(true);
+    let server_gate = gate.clone();
+    let signal = server::Shutdown::with_options(options);
+    assert_eq!(signal.options(), options);
+    let service_signal = signal.clone();
+    let mut server = executor
+        .spawn_local(async move {
+            let stream = listener.accept().await.expect("accept");
+            let gated = Gated {
+                inner: stream,
+                gate: server_gate,
+            };
+            server::http1(gated, service_signal, |event, out| {
+                match event {
+                    Event::Head(_) => out.start(
+                        &Head {
+                            keep_alive: false,
+                            ..response()
+                        },
+                        BodyLength::Known(4),
+                    )?,
+                    Event::End => {
+                        out.body(b"done")?;
+                        out.finish(&[])?;
+                    }
+                    _ => {}
+                }
+                Ok(())
+            })
+            .await
+            .expect("lingering close");
+            sh.now()
+        })
+        .expect("spawn");
+    let mut client = executor
+        .spawn_local(async move {
+            let mut stream = h
+                .connect(address, Default::default())
+                .await
+                .expect("connect");
+            let sent = h.now();
+            write_all(&mut stream, b"GET / HTTP/1.1\r\nhost: localhost\r\n\r\n")
+                .await
+                .expect("request");
+            let response = read_until_eof(&mut stream).await;
+            assert!(response.ends_with(b"done"));
+            // Keep the connection open and silent.
+            (stream, sent)
+        })
+        .expect("spawn");
+    let end = executor.driver().now() + Duration::from_secs(10);
+    while !client.is_finished() {
+        assert!(executor.driver().now() < end);
+        executor.turn(Timeout::Until(end)).expect("turn");
+    }
+    let (_silent_peer, sent) = finish(&mut client);
+    // The peer's EOF is the server's half-close, but the server may observe its
+    // own shutdown acknowledgement later: WASI 0.3 closes the send stream (the
+    // peer reads EOF) and completes Shutdown only once that stream's result
+    // future resolves in a later wait-set step. Deliver it before measuring.
+    while !gate.shut.get() {
+        assert!(!server.is_finished(), "server ended before its half-close");
+        assert!(executor.driver().now() < end);
+        executor.turn(Timeout::Until(end)).expect("turn");
+    }
+    for _ in 0..3 {
+        executor.turn(Timeout::Now).expect("settle queued events");
+    }
+    assert!(!server.is_finished(), "closed before the linger deadline");
+    let mut floor = sent + options.linger_timeout;
+    // One turn waits for the single expiry, with at most one zero-event wait.
+    let (mut turn_limit, mut empty_limit) = (2, 1);
+    if let Some(delay) = stop_by {
+        let at = executor.driver().now() + delay;
+        signal.stop_by(at);
+        assert_eq!(signal.deadline(), Some(at));
+        // A later deadline never extends an earlier one.
+        signal.stop_by(at + Duration::from_secs(60));
+        assert_eq!(signal.deadline(), Some(at));
+        floor = at;
+        // The deadline change woke exactly the lingering service; polling it
+        // re-arms its timer. The wait below is then the same single expiry.
+        assert_eq!(executor.run_ready(), 1, "stop_by must wake the linger");
+        assert!(!server.is_finished());
+        // Replacing the timer queues its Cancelled/Closed completions beside the
+        // pending read: one nonblocking turn with at most one empty discovery poll
+        // (DESIGN section 10, rule 3) delivers them before the single expiry wait.
+        (turn_limit, empty_limit) = (3, 2);
+    }
+    let (mut turns, mut empty) = (0, 0);
+    while !server.is_finished() {
+        assert!(turns < turn_limit, "lingering close spun");
+        let info = executor.turn(Timeout::Until(end)).expect("turn");
+        turns += 1;
+        empty += info.zero_event_waits;
+    }
+    assert!(
+        empty <= empty_limit,
+        "zero-event waits while lingering: {empty}"
+    );
+    let closed_at = finish(&mut server);
+    assert!(closed_at >= floor, "closed before the deadline");
+    assert!(gate.released.get(), "deadline closed the socket");
+    assert_eq!(gate.discarded.get(), 0);
+}
+#[test]
+fn http_linger_timeout_closes_silent_peer_without_spinning() {
+    linger_deadline_with_silent_peer(
+        server::Options {
+            linger_timeout: Duration::from_millis(500),
+        },
+        None,
+    );
+}
+#[test]
+fn http_stop_by_deadline_ends_lingering_connection() {
+    // The linger timeout alone would hold the connection for a minute.
+    linger_deadline_with_silent_peer(
+        server::Options {
+            linger_timeout: Duration::from_secs(60),
+        },
+        Some(Duration::from_millis(100)),
+    );
+}
+
+#[test]
+fn http1_idle_keepalive_lingers_at_shutdown() {
+    let mut executor = LocalExecutor::<Platform>::new(Config::default()).expect("executor");
+    let h = executor.handle();
+    let listener = Listener::bind(&h, "127.0.0.1:0".parse().expect("address")).expect("listen");
+    let address = listener.local_addr().expect("address");
+    let gate = std::rc::Rc::new(CloseGate::default());
+    let server_gate = gate.clone();
+    let signal = server::Shutdown::default();
+    let stop = signal.clone();
+    let mut server = executor
+        .spawn_local(async move {
+            let stream = listener.accept().await.expect("accept");
+            let gated = Gated {
+                inner: stream,
+                gate: server_gate,
+            };
+            let mut heads = 0;
+            server::http1(gated, signal, |event, out| {
+                match event {
+                    Event::Head(_) => {
+                        heads += 1;
+                        out.start(&response(), BodyLength::Known(4))?;
+                    }
+                    Event::End => {
+                        out.body(b"idle")?;
+                        out.finish(&[])?;
+                    }
+                    _ => {}
+                }
+                Ok(())
+            })
+            .await
+            .expect("idle connection closes gracefully at shutdown");
+            heads
+        })
+        .expect("spawn");
+    let mut client = executor
+        .spawn_local(async move {
+            let mut stream = h
+                .connect(address, Default::default())
+                .await
+                .expect("connect");
+            write_all(&mut stream, b"GET / HTTP/1.1\r\nhost: localhost\r\n\r\n")
+                .await
+                .expect("request");
+            let mut response = Vec::new();
+            let mut bytes = [0; 256];
+            while !response.ends_with(b"\r\n\r\nidle") {
+                let n = read(&mut stream, &mut bytes).await.expect("response");
+                assert!(n > 0, "keep-alive response must not close");
+                response.extend_from_slice(&bytes[..n]);
+            }
+            // The connection is idle between requests when shutdown arrives.
+            stop.stop();
+            gate.peer_until(|g| g.closing.get()).await;
+            write_all(&mut stream, PIPELINED)
+                .await
+                .expect("request racing the shutdown");
+            gate.late_bytes_sent();
+            gate.peer_until(|g| g.shut.get()).await;
+            assert!(
+                read_until_eof(&mut stream).await.is_empty(),
+                "a request that raced shutdown is never answered"
+            );
+            close(&mut stream).await.expect("close");
+            gate
+        })
+        .expect("spawn");
+    run_until(&mut executor, &mut server, &mut client);
+    let gate = finish(&mut client);
+    assert_eq!(finish(&mut server), 1);
+    assert_eq!(gate.discarded.get(), PIPELINED.len());
+    assert!(gate.released.get());
+}

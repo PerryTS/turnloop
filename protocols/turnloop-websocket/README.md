@@ -19,8 +19,10 @@ an HTTP upgrade on a connected TCP, pipe or TLS stream; supply a fresh random
 nonce, subprotocol list, executor handle and absolute deadline. `accept` performs
 the server upgrade. Both preserve coalesced first-frame bytes. Await `send` and
 `receive`; ping/pong and close replies flush before received messages are returned.
-`close` waits for the peer under a deadline. Dropping a pending frame operation
-closes the stream. The host keeps turning its LocalExecutor.
+`close` waits for the peer under a deadline, then closes the transport with a
+lingering close under the same deadline (half-close, discard until the peer's EOF),
+so a late peer frame cannot turn the close into a reset. Dropping a pending frame
+operation closes the stream. The host keeps turning its LocalExecutor.
 
 ```sh
 cargo run -p turnloop-websocket --features turnloop --example echo_server -- 127.0.0.1:8080
