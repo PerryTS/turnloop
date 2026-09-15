@@ -267,10 +267,11 @@ impl Iocp {
         if transport.kind == Kind::Sync {
             // Reserve both directions and classify once, while still quiescent.
             // A worker must not query console mode behind the other's idle I/O.
-            self.workers[h.index()] = Some([
-                sync_io::Worker::new(raw, transport.mode.is_some(), Arc::clone(&self.port))?,
-                sync_io::Worker::new(raw, transport.mode.is_some(), Arc::clone(&self.port))?,
-            ]);
+            self.workers[h.index()] = Some(sync_io::Worker::pair(
+                raw,
+                transport.mode.is_some(),
+                Arc::clone(&self.port),
+            )?);
         }
         self.resources[h.index()] = Some(Resource {
             handle: h,
@@ -586,7 +587,6 @@ impl Iocp {
             self.workers[index].as_ref().expect("stdio workers")[p.direction].start(
                 buffer,
                 len,
-                write,
                 self.kernel_ptr(i),
             );
             p.stage = Stage::Io;

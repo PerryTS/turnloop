@@ -1489,18 +1489,26 @@ fn idle_synchronous_pipe_reader_does_not_spin() {
     assert!(matches!(out[0].result, OpResult::Cancelled));
 }
 
+/// Raw kernel control for the synchronous duplex worker design, independent of turnloop.
+/// Windows serializes all I/O on a synchronous file object: WriteFile on a duplicate of
+/// the same pipe endpoint waits (with no IRP of its own, so CancelSynchronousIo cannot
+/// reach it) until the idle ReadFile leaves the kernel. Cancelling the idle read releases
+/// the write and consumes no bytes. GetConsoleMode on a pipe fails without joining that
+/// queue; sem-fix1's hypothesis that it was the blocking call did not hold on windows-2025.
 #[test]
-fn synchronous_pipe_mode_query_blocks_but_direct_write_makes_progress() {
+fn synchronous_pipe_write_waits_behind_idle_read_until_the_read_is_cancelled() {
     use std::{io::Read, sync::mpsc, time::Instant};
     use windows_sys::Win32::{
         Foundation::{
-            ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE, GetLastError, INVALID_HANDLE_VALUE,
+            ERROR_NOT_FOUND, ERROR_OPERATION_ABORTED, ERROR_PIPE_CONNECTED, GENERIC_READ,
+            GENERIC_WRITE, GetLastError, INVALID_HANDLE_VALUE,
         },
         Storage::FileSystem::{
             CreateFileW, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
         },
         System::{
             Console::GetConsoleMode,
+            IO::CancelSynchronousIo,
             Pipes::{
                 ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
             },
@@ -1510,7 +1518,7 @@ fn synchronous_pipe_mode_query_blocks_but_direct_write_makes_progress() {
     let _guard = HANDLES
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let name: Vec<u16> = format!(r"\\.\pipe\turnloop-sync-query-{}", std::process::id())
+    let name: Vec<u16> = format!(r"\\.\pipe\turnloop-sync-serialize-{}", std::process::id())
         .encode_utf16()
         .chain(Some(0))
         .collect();
@@ -1550,75 +1558,61 @@ fn synchronous_pipe_mode_query_blocks_but_direct_write_makes_progress() {
         // SAFETY: immediately inspect this thread's last error.
         assert_eq!(unsafe { GetLastError() }, ERROR_PIPE_CONNECTED);
     }
-    // This is a raw kernel control, independent of turnloop and its worker code.
-    let reader = client.try_clone().expect("reader duplicate");
-    let query = client.try_clone().expect("query duplicate");
-    let writer = client.try_clone().expect("writer duplicate");
-    let read_thread = std::thread::spawn(move || {
-        let mut byte = [0];
-        let mut count = 0;
-        // SAFETY: owned synchronous handle and exclusive one-byte buffer until return.
-        let ok = unsafe {
-            ReadFile(
-                reader.as_raw_handle(),
-                byte.as_mut_ptr(),
-                1,
-                &mut count,
-                ptr::null_mut(),
-            )
-        };
-        assert_ne!(ok, 0, "raw ReadFile: {}", std::io::Error::last_os_error());
-        assert_eq!(count, 1);
-        byte
-    });
-    // Always release the raw reader before a failed assertion unwinds. The
-    // one-byte response fits the otherwise empty server-to-client pipe quota.
-    struct ReleaseRead(Option<std::fs::File>);
-    impl Drop for ReleaseRead {
-        fn drop(&mut self) {
-            if let Some(mut server) = self.0.take() {
-                let _ = server.write_all(&[0x77]);
-            }
-        }
-    }
-    let mut release = ReleaseRead(Some(server));
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut pending_probes = 0;
-    loop {
+    fn io_pending(thread: &std::thread::JoinHandle<()>) -> bool {
         let mut pending = 0;
-        // SAFETY: join handle pins the reader thread; output is valid.
+        // SAFETY: the join handle pins the thread; the output is valid.
         assert_ne!(
-            // SAFETY: join handle pins the reader thread; output is valid.
-            unsafe { GetThreadIOPendingFlag(read_thread.as_raw_handle(), &mut pending) },
+            // SAFETY: the join handle pins the thread; the output is valid.
+            unsafe { GetThreadIOPendingFlag(thread.as_raw_handle(), &mut pending) },
             0
         );
-        pending_probes += 1;
-        if pending != 0 {
-            break;
-        }
+        pending != 0
+    }
+    type Raw = (i32, u32, u32, [u8; 4]);
+    let spawn_read = |file: std::fs::File| {
+        let (done, result) = mpsc::channel::<Raw>();
+        let thread = std::thread::spawn(move || {
+            let mut bytes = [0u8; 4];
+            let mut count = 0;
+            // SAFETY: owned synchronous handle and exclusive buffer until the call returns.
+            let ok = unsafe {
+                ReadFile(
+                    file.as_raw_handle(),
+                    bytes.as_mut_ptr(),
+                    4,
+                    &mut count,
+                    ptr::null_mut(),
+                )
+            };
+            // SAFETY: this thread's last error, read immediately after the call.
+            let last = unsafe { GetLastError() };
+            let error = if ok == 0 { last } else { 0 };
+            done.send((ok, error, count, bytes)).expect("read result");
+        });
+        (thread, result)
+    };
+    let (read_thread, read_done) = spawn_read(client.try_clone().expect("reader duplicate"));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !io_pending(&read_thread) {
         assert!(
             Instant::now() < deadline,
             "raw ReadFile never entered kernel I/O"
         );
         std::thread::sleep(Duration::from_millis(1)); // test synchronization only
     }
-    let (started, start) = mpsc::channel();
+    // Control I/O on a pipe fails promptly rather than queueing behind the read.
+    let query = client.try_clone().expect("query duplicate");
     let (queried, query_done) = mpsc::channel();
     let query_thread = std::thread::spawn(move || {
-        started.send(()).expect("query started");
         let mut mode = 0;
-        // SAFETY: owned duplicate and valid output, deliberately probing behind idle I/O.
-        let result = unsafe { GetConsoleMode(query.as_raw_handle(), &mut mode) };
-        queried.send(result).expect("query completed");
+        // SAFETY: owned duplicate and valid output, probing beside the idle read.
+        queried
+            .send(unsafe { GetConsoleMode(query.as_raw_handle(), &mut mode) })
+            .expect("query completed");
     });
-    start
-        .recv_timeout(Duration::from_secs(5))
-        .expect("query thread ran");
-    let blocked_query = matches!(
-        query_done.recv_timeout(Duration::from_millis(100)),
-        Err(mpsc::RecvTimeoutError::Timeout)
-    );
-    let (written, write_done) = mpsc::channel();
+    let query_result = query_done.recv_timeout(Duration::from_secs(2));
+    let writer = client.try_clone().expect("writer duplicate");
+    let (written, write_done) = mpsc::channel::<Raw>();
     let write_thread = std::thread::spawn(move || {
         let mut count = 0;
         // SAFETY: owned synchronous handle and immutable byte until the call returns.
@@ -1631,47 +1625,172 @@ fn synchronous_pipe_mode_query_blocks_but_direct_write_makes_progress() {
                 ptr::null_mut(),
             )
         };
-        let result = if ok == 0 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(count)
-        };
-        written.send(result).expect("write completed");
+        // SAFETY: this thread's last error, read immediately after the call.
+        let last = unsafe { GetLastError() };
+        let error = if ok == 0 { last } else { 0 };
+        written
+            .send((ok, error, count, [0; 4]))
+            .expect("write result");
     });
-    let before_reply = write_done.recv_timeout(Duration::from_secs(2));
-    // Cleanup precedes assertions about progress, even if WriteFile itself stalled.
-    server = release.0.take().expect("server retained");
-    server.write_all(&[0x77]).expect("release raw read");
-    assert_eq!(read_thread.join().expect("read joined"), [0x77]);
+    let before_cancel = write_done.recv_timeout(Duration::from_millis(500));
+    let writer_pending = io_pending(&write_thread);
+    // SAFETY: the join handle pins the writer thread for this call.
+    let cancel_writer = unsafe { CancelSynchronousIo(write_thread.as_raw_handle()) };
+    // SAFETY: this thread's last error, read immediately after the call.
+    let cancel_writer_error = unsafe { GetLastError() };
+    // Release the serialization exactly as the read worker's preemption does. The
+    // cancellation is retried only while the read has not yet been cancelled.
+    // SAFETY: the join handle pins the reader thread for this call.
+    assert_ne!(
+        // SAFETY: the join handle pins the reader thread for this call.
+        unsafe { CancelSynchronousIo(read_thread.as_raw_handle()) },
+        0,
+        "idle ReadFile is cancellable"
+    );
+    let read = read_done
+        .recv_timeout(Duration::from_secs(5))
+        .expect("cancelled read returned");
+    let write = write_done.recv_timeout(Duration::from_secs(5));
+    read_thread.join().expect("read joined");
     query_thread.join().expect("query joined");
+    // Evidence assertions follow cleanup of every thread that could still be blocked.
+    let write = write.expect("write released by the read cancellation");
     write_thread.join().expect("write joined");
-    let progressed = before_reply.is_ok();
-    let count = match before_reply {
-        Ok(result) => result,
-        Err(mpsc::RecvTimeoutError::Timeout) => write_done.recv().expect("released write"),
-        Err(error) => panic!("raw writer disconnected: {error}"),
-    }
-    .expect("raw write succeeded");
-    assert_eq!(count, 1);
+    assert_eq!(
+        query_result.expect("GetConsoleMode did not wait behind the read"),
+        0,
+        "pipe is not a console"
+    );
+    assert!(
+        matches!(before_cancel, Err(mpsc::RecvTimeoutError::Timeout)),
+        "WriteFile completed beside an idle ReadFile on one synchronous object"
+    );
+    assert!(
+        !writer_pending,
+        "the waiting writer holds no kernel request"
+    );
+    assert_eq!(
+        (cancel_writer, cancel_writer_error),
+        (0, ERROR_NOT_FOUND),
+        "CancelSynchronousIo cannot release a writer waiting behind the read"
+    );
+    assert_eq!(
+        (read.0, read.1, read.2),
+        (0, ERROR_OPERATION_ABORTED, 0),
+        "idle read aborted without data"
+    );
+    assert_eq!(
+        (write.0, write.2),
+        (1, 1),
+        "write completed after the read left"
+    );
     let mut byte = [0];
     server
         .read_exact(&mut byte)
         .expect("raw write reached peer");
     assert_eq!(byte, [0x33]);
-    assert!(pending_probes > 0);
-    assert!(
-        blocked_query,
-        "GetConsoleMode did not reproduce the serialization point"
-    );
+    // The aborted read consumed nothing: a reissued read receives every later byte.
+    server.write_all(&[0x77, 0x78]).expect("peer bytes");
+    let (reissued, reissued_done) = spawn_read(client.try_clone().expect("reissue duplicate"));
+    let reissued_result = reissued_done
+        .recv_timeout(Duration::from_secs(5))
+        .expect("reissued read");
+    reissued.join().expect("reissued joined");
     assert_eq!(
-        query_done.recv().expect("released query"),
-        0,
-        "pipe is not a console"
+        (
+            reissued_result.0,
+            reissued_result.2,
+            &reissued_result.3[..2]
+        ),
+        (1, 2, &[0x77, 0x78][..])
     );
-    assert!(
-        progressed,
-        "raw WriteFile blocked behind idle ReadFile (different kernel cause)"
-    );
+}
+
+#[test]
+fn duplex_writes_preempt_reads_at_every_entry_point_without_losing_bytes() {
+    let _guard = HANDLES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (mut driver, client, server) = turnloop_contract::native_surface::synchronous_duplex_pair();
+    let mut out = Completions::with_capacity(4);
+    let mut checked = [0; 3];
+    for i in 0..384usize {
+        let byte = i as u8;
+        let reply = !byte;
+        let read = driver
+            .read(client, ReadBuf::Pooled, Token(1))
+            .expect("client read");
+        let mut events = [0; 4]; // client wrote, server read, server wrote, client read
+        let collect =
+            |driver: &mut Loop, out: &mut Completions, events: &mut [usize; 4], write: OpId| {
+                for c in out.drain() {
+                    assert!(c.terminal);
+                    match (c.handle, c.result) {
+                        (Some(h), OpResult::Wrote(1)) if h == client => {
+                            assert_eq!(c.op, Some(write));
+                            events[0] += 1;
+                        }
+                        (
+                            Some(h),
+                            OpResult::Read {
+                                n: 1,
+                                lease: Some(bytes),
+                            },
+                        ) if h == server => {
+                            assert_eq!(bytes.as_slice(), [byte]);
+                            events[1] += 1;
+                            driver
+                                .write(server, WriteBuf::Owned(vec![reply]), Token(4))
+                                .expect("peer reply");
+                        }
+                        (Some(h), OpResult::Wrote(1)) if h == server => events[2] += 1,
+                        (
+                            Some(h),
+                            OpResult::Read {
+                                n: 1,
+                                lease: Some(bytes),
+                            },
+                        ) if h == client => {
+                            assert_eq!(c.op, Some(read));
+                            assert_eq!(bytes.as_slice(), [reply], "read lost or reordered bytes");
+                            events[3] += 1;
+                        }
+                        (handle, result) => panic!("unexpected {handle:?} {result:?}"),
+                    }
+                }
+            };
+        // Pattern 0 queues both requests for one turn, so the write worker preempts a
+        // read that may not have reached the kernel yet. Pattern 1 starts the read one
+        // turn earlier, racing its kernel entry. Pattern 2 lets the read settle idle.
+        let pattern = i % 3;
+        if pattern != 0 {
+            driver.turn(Timeout::Now, &mut out).expect("start read");
+            assert!(out.is_empty(), "no peer bytes yet");
+            if pattern == 2 {
+                std::thread::sleep(Duration::from_millis(2)); // test synchronization only
+            }
+        }
+        let write = driver
+            .write(client, WriteBuf::Owned(vec![byte]), Token(2))
+            .expect("client write");
+        driver
+            .read(server, ReadBuf::Pooled, Token(3))
+            .expect("server read");
+        let deadline = driver.now() + Duration::from_secs(5);
+        while events != [1; 4] {
+            assert!(
+                driver.now() < deadline,
+                "preemption pattern {pattern} stalled: {events:?}"
+            );
+            driver
+                .turn(Timeout::Until(deadline), &mut out)
+                .expect("preemption turn");
+            collect(&mut driver, &mut out, &mut events, write);
+            assert!(events.iter().all(|count| *count <= 1));
+        }
+        checked[pattern] += 1;
+    }
+    assert_eq!(checked, [128; 3]);
 }
 
 #[test]
@@ -1733,8 +1852,22 @@ fn duplex_cancellation_is_per_direction_and_close_drop_join_both_workers() {
                 driver
                     .write(server, WriteBuf::Owned(vec![0x77]), Token(4))
                     .expect("peer response");
+                // cancel_write: the preempted idle read resumes once the write's
+                // cancellation is acknowledged. Otherwise the blocked write survived the
+                // read's cancellation and must deliver every byte. Windows serializes all
+                // I/O on one synchronous file object, and a write waiting for the peer to
+                // drain holds it (synchronous_pipe_write_waits_behind_idle_read_until_the_
+                // read_is_cancelled; sync_io.rs), so the new read completes only after it.
                 let (mut reads, mut responses) = (0, 0);
-                while reads == 0 || responses == 0 {
+                let (mut drained, mut wrote) = if cancel_write {
+                    (payload.len(), true)
+                } else {
+                    driver
+                        .read(server, ReadBuf::Pooled, Token(5))
+                        .expect("peer drains the surviving write");
+                    (0, false)
+                };
+                while reads == 0 || responses == 0 || !wrote || drained < payload.len() {
                     assert!(driver.now() < deadline);
                     driver
                         .turn(Timeout::Until(deadline), &mut out)
@@ -1743,17 +1876,38 @@ fn duplex_cancellation_is_per_direction_and_close_drop_join_both_workers() {
                         match c.result {
                             OpResult::Read { n: 1, lease: None } => {
                                 assert_eq!(c.op, Some(expected_read));
+                                assert!(wrote, "read overtook the write it queued behind");
                                 reads += 1;
+                            }
+                            OpResult::Read {
+                                n,
+                                lease: Some(bytes),
+                            } => {
+                                assert!(!cancel_write);
+                                assert_eq!(c.handle, Some(server));
+                                assert!(n > 0 && drained + n <= payload.len());
+                                assert!(bytes.as_slice().iter().all(|byte| *byte == 0x33));
+                                drained += n;
+                                if drained < payload.len() {
+                                    driver
+                                        .read(server, ReadBuf::Pooled, Token(5))
+                                        .expect("more surviving write bytes");
+                                }
                             }
                             OpResult::Wrote(1) => {
                                 assert_eq!(c.handle, Some(server));
                                 responses += 1;
                             }
+                            OpResult::Wrote(n) if n == payload.len() => {
+                                assert!(!cancel_write && !wrote);
+                                assert_eq!((c.handle, c.op), (Some(client), Some(write)));
+                                wrote = true;
+                            }
                             other => panic!("cross-direction cancellation: {other:?}"),
                         }
                     }
                 }
-                assert_eq!((reads, responses), (1, 1));
+                assert_eq!((reads, responses, drained), (1, 1, payload.len()));
                 let expected = if cancel_write {
                     [0x77, 0xa5]
                 } else {
@@ -1794,7 +1948,9 @@ fn duplex_cancellation_is_per_direction_and_close_drop_join_both_workers() {
                             match c.result {
                                 OpResult::Cancelled => cancellations += 1,
                                 OpResult::Closed => {
-                                    assert_eq!(cancellations, if cancel_write { 4 } else { 5 });
+                                    // Pending/queued reads and writes; phase one's write
+                                    // was cancelled or completed above.
+                                    assert_eq!(cancellations, 4);
                                     closed += 1;
                                 }
                                 other => panic!("unexpected close {other:?}"),

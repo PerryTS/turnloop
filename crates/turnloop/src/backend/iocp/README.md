@@ -56,24 +56,37 @@ I/O before releasing caller memory.
 - Standard streams are duplicated, preserving the host originals. Synchronous
   handles reserve two workers at adoption, one per direction. Reads and writes
   have independent FIFOs and cancellation state. Workers reuse the console
-  classification captured at quiescent adoption: a per-operation GetConsoleMode
-  is itself I/O and can wait behind an idle pipe read before WriteFile is reached.
-  No worker allocation or classification syscall is needed per operation.
-  Duplex pipe contracts require writes to progress before the peer replies to
-  idle reads. Anonymous pipe ends are one-way; console input and screen output
-  use separate native objects. Synchronous regular files preserve their shared
-  file position, with no cross-direction ordering promise; reads at EOF complete
-  rather than waiting for appended data. Other synchronous character devices
-  use ReadFile/WriteFile with their native driver's serialization/cancellation
-  semantics. Separate queues do not promise concurrent kernel I/O for arbitrary
-  device drivers. NUL exercises the ordinary character-device path; serial-port
-  and third-party hardware-driver runtime behavior is not covered by that test.
-  See [sem-fix1 evidence and Windows runtime handoff](../../../../../docs/lanes/iocp-semantics.md#sem-fix1).
+  classification captured at quiescent adoption; no worker allocation or
+  classification syscall is needed per operation.
+  Windows serializes all I/O on one synchronous file object: WriteFile on the
+  same pipe endpoint waits, with no kernel request of its own and so beyond
+  CancelSynchronousIo, until an idle ReadFile returns. For synchronous pipes the
+  write worker therefore preempts an idle read with CancelSynchronousIo, and the
+  read worker reissues the same request after the write. A cancelled pipe read
+  has consumed no bytes, so read FIFO order, exactly-once completion and data are
+  preserved, and duplex writes progress before the peer replies. A write waiting
+  for the peer to drain its buffer still owns the object: reads on that endpoint
+  complete only after it finishes or is cancelled. Writes are never preempted,
+  because a cancelled partially consumed pipe write reports zero bytes.
+  ReOpenFile cannot obtain an independent overlapped object for pipe ends
+  (ERROR_PIPE_BUSY), and FSCTL_PIPE_ASSIGN_EVENT is not supported. libuv's
+  non-overlapped pipes are subject to the same kernel constraint.
+  Anonymous pipe ends are one-way; console input and screen output use separate
+  native objects and are not preempted. Synchronous regular files preserve their
+  shared file position, with no cross-direction ordering promise; reads at EOF
+  complete rather than waiting for appended data. Other synchronous character
+  devices use ReadFile/WriteFile with their native driver's serialization and
+  cancellation semantics, without preemption. NUL exercises the ordinary
+  character-device path; serial-port and third-party hardware-driver runtime
+  behavior is not covered by that test.
+  See [sem-fix2 evidence](../../../../../docs/lanes/iocp-semantics.md#sem-fix2).
   Imported handles are classified by native file mode before submission;
   overlapped pipes join this IOCP or route an existing foreign association, and
   other overlapped files are unsupported.
   One process-wide cancellation helper handles the race before a worker enters
-  ReadFile, without blocking turns or polling idle handles. Console input workers
+  ReadFile, without blocking turns or polling idle handles. A cancellation that
+  reports success just after kernel entry can be lost; the helper and the write
+  preemption re-issue it after at most 10 ms while the worker is still inside I/O. Console input workers
   translate key records to UTF-8 and dispatch resize records to WinCh subscribers.
   Resize delivery requires the console input reader to be active. Captured console
   modes are restored on close/drop; input and output VT modes are distinguished.
