@@ -36,6 +36,10 @@ pub struct Detached {
     pub(super) kind: Kind,
     pub(super) original_flags: Option<i32>,
     original_mode: Option<libc::termios>,
+    /// A listener's per-connection defaults, applied to each socket it accepts.
+    /// It travels with the listener across detach/attach, so a listener handed to
+    /// another loop keeps configuring its connections there.
+    accept_defaults: AcceptDefaults,
 }
 impl std::fmt::Debug for Detached {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -57,6 +61,7 @@ impl Detached {
             kind,
             original_flags: None,
             original_mode,
+            accept_defaults: AcceptDefaults::EMPTY,
         }
     }
     /// Adopt an owned Unix descriptor, classifying stream/file/TTY or socket.
@@ -127,6 +132,18 @@ impl Unix {
             .and_then(Option::as_ref)
             .filter(|r| r.handle == h)
             .ok_or(Error::new(ErrorKind::NotFound))
+    }
+    /// The descriptor behind a socket handle. Process, signal and watch handles
+    /// and adopted files/terminals are not sockets and say so.
+    fn socket_fd(&self, h: Handle) -> Result<std::os::fd::RawFd> {
+        if self.services.contains(h) || self.watches.contains(h) {
+            return Err(Error::new(ErrorKind::Unsupported));
+        }
+        let r = self.get(h)?;
+        if matches!(r.transport.kind, Kind::File | Kind::Stream) {
+            return Err(Error::new(ErrorKind::Unsupported));
+        }
+        Ok(r.transport.fd.as_raw_fd())
     }
     fn install(&mut self, h: Handle, transport: Detached, connect: Option<Addr>) -> Result<()> {
         if self.resources.get(h.index()).is_none_or(Option::is_some) {
@@ -432,6 +449,7 @@ unsafe impl Backend for Unix {
                 return self.install(h, transport, Some(addr));
             }
             Open::PipeListener { name, opts } => {
+                super::sockopt::validate_accept_defaults(opts.accept_defaults, false)?;
                 let (transport, _) = super::ipc::open(&name, Some(opts))?;
                 return self.install(h, transport, None);
             }
@@ -446,14 +464,34 @@ unsafe impl Backend for Unix {
             }
             other => other,
         };
-        let (addr, kind, reuse, backlog, nodelay) = match spec {
-            Open::Tcp { addr, opts } => (addr, Kind::Tcp, false, 0, opts.nodelay),
-            Open::Listener { addr, opts } => {
-                (addr, Kind::Listener, opts.reuse_port, opts.backlog, false)
-            }
-            Open::Udp { addr, opts } => (addr, Kind::Udp, opts.reuse_port, 0, false),
+        let (addr, kind, reuse, backlog, nodelay, accept_defaults) = match spec {
+            Open::Tcp { addr, opts } => (
+                addr,
+                Kind::Tcp,
+                false,
+                0,
+                opts.nodelay,
+                AcceptDefaults::EMPTY,
+            ),
+            Open::Listener { addr, opts } => (
+                addr,
+                Kind::Listener,
+                opts.reuse_port,
+                opts.backlog,
+                false,
+                opts.accept_defaults,
+            ),
+            Open::Udp { addr, opts } => (
+                addr,
+                Kind::Udp,
+                opts.reuse_port,
+                0,
+                false,
+                AcceptDefaults::EMPTY,
+            ),
             _ => unreachable!("native open handled above"),
         };
+        super::sockopt::validate_accept_defaults(accept_defaults, kind == Kind::Listener)?;
         if backlog > i32::MAX as u32 {
             return Err(Error::new(ErrorKind::InvalidInput));
         }
@@ -483,14 +521,18 @@ unsafe impl Backend for Unix {
         if nodelay {
             socket::option(fd.as_raw_fd(), libc::IPPROTO_TCP, libc::TCP_NODELAY, 1)?;
         }
-        self.install(
-            h,
-            Detached::new(fd, kind),
-            (kind == Kind::Tcp).then(|| Addr::new(addr)),
-        )
+        let mut transport = Detached::new(fd, kind);
+        transport.accept_defaults = accept_defaults;
+        self.install(h, transport, (kind == Kind::Tcp).then(|| Addr::new(addr)))
     }
     fn local_addr(&self, h: Handle) -> Result<SocketAddr> {
         socket::local_addr(self.get(h)?.transport.fd.as_raw_fd())
+    }
+    fn set_option(&mut self, h: Handle, option: SocketOption) -> Result<()> {
+        super::sockopt::set(self.socket_fd(h)?, option)
+    }
+    fn get_option(&self, h: Handle, kind: SocketOptionKind) -> Result<SocketOption> {
+        super::sockopt::get(self.socket_fd(h)?, kind)
     }
     fn submit(&mut self, request: Request) -> Result<()> {
         let h = request.handle;
@@ -757,6 +799,10 @@ fn execute(
                 )));
             }
             let (fd, peer) = socket::accept(fd)?;
+            // Before the connection becomes visible to the host. A rejected
+            // default fails this accept and drops the socket; it is never
+            // reported as an accepted-but-unconfigured connection.
+            super::sockopt::apply_accept_defaults(fd.as_raw_fd(), r.transport.accept_defaults)?;
             Ok(Some((
                 Outcome::Accepted {
                     transport: Detached::new(fd, Kind::Tcp),

@@ -1,5 +1,11 @@
 //! Browser/Node host callbacks. The owner calls only turn(Now). See
 //! docs/wasm.md for scheduling, cancellation, and the host allocation boundary.
+//!
+//! Socket options are `Unsupported` here, from the Backend trait's own defaults:
+//! a browser host exposes `fetch` and `WebSocket`, not a socket, so there is no
+//! `TCP_NODELAY`, keep-alive schedule, linger, buffer size or group membership to
+//! set or read. `ListenOpts` never reaches this backend either, because listening
+//! sockets are themselves unsupported (DESIGN §7.5).
 use crate::{
     backend::{Backend, Event, Operation, Outcome, PollInfo, Request, Wake},
     *,

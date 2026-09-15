@@ -1,6 +1,6 @@
 //! Backend-neutral identifiers, errors, deadlines and socket options.
 use crate::Instant;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
@@ -177,29 +177,193 @@ impl Default for Config {
     }
 }
 #[derive(Clone, Copy, Debug, Default)]
-/// TCP connection options applied when creating the socket.
+/// TCP connection options applied when creating the socket. Anything a host
+/// needs to change later goes through `Loop::set_option` and
+/// [`SocketOption`] instead.
 pub struct TcpOpts {
     /// Disable the TCP Nagle algorithm for latency-sensitive small writes.
     pub nodelay: bool,
 }
 #[derive(Clone, Copy, Debug)]
-/// Listener backlog and optional kernel reuse-port configuration.
+/// Listener backlog, kernel reuse-port configuration and accepted-socket defaults.
+///
+/// Address reuse is bind-time only and stays here rather than in
+/// [`SocketOption`]: `SO_REUSEPORT` is `reuse_port`, and `SO_REUSEADDR` is applied
+/// by the backend to every TCP listener it binds (TIME_WAIT rebinding). Neither
+/// can be changed on a socket that is already bound, so neither is an option.
 pub struct ListenOpts {
     /// Enable SO_REUSEPORT when supported; macOS does not promise balanced accepts.
     pub reuse_port: bool,
     /// Maximum pending connection backlog requested from the OS.
     pub backlog: u32,
+    /// Options applied to every connection this listener accepts.
+    pub accept_defaults: AcceptDefaults,
 }
 impl Default for ListenOpts {
     fn default() -> Self {
         Self {
             reuse_port: false,
             backlog: 128,
+            accept_defaults: AcceptDefaults::EMPTY,
         }
     }
 }
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+/// Options a listener applies to every connection it accepts.
+///
+/// **When they are applied:** by the accepting loop, on the accepted socket,
+/// after the OS accept succeeds and *before* the `Accepted` completion reaches
+/// the host. A host therefore never observes an unconfigured connection, and
+/// never needs a `set_option` round trip per connection.
+///
+/// **What "cheaply" means:** each field costs at most one `setsockopt` on the new
+/// socket. Anything that would need a syscall per accepted byte, a kernel query
+/// or a second handle is not a default and belongs in [`Loop::set_option`].
+///
+/// A backend that cannot apply a requested default rejects the *listener* when it
+/// is created, rather than ignoring the request once per connection. If the OS
+/// rejects a default while applying it to a live accepted socket, that accept
+/// operation fails with the OS error and the connection is closed.
+///
+/// [`Loop::set_option`]: crate::Driver::set_option
+pub struct AcceptDefaults {
+    /// Disable Nagle coalescing on each accepted connection (`TCP_NODELAY`).
+    pub nodelay: bool,
+    /// Enable keep-alive probes on each accepted connection, with this schedule.
+    pub keep_alive: Option<KeepAlive>,
+}
+impl AcceptDefaults {
+    /// Apply nothing: every accepted socket keeps the platform defaults.
+    pub const EMPTY: Self = Self {
+        nodelay: false,
+        keep_alive: None,
+    };
+    /// Whether any default would need to be applied to an accepted socket.
+    pub const fn is_empty(self) -> bool {
+        !self.nodelay && self.keep_alive.is_none()
+    }
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+/// TCP keep-alive probe schedule. Each `None` keeps the platform default.
+///
+/// Native platforms express the schedule in whole seconds, so a duration is
+/// rounded **up** to the next whole second and a zero duration is rejected as
+/// `InvalidInput`. WASI takes the duration unrounded.
+pub struct KeepAlive {
+    /// Connection idle time before the first probe is sent.
+    pub idle: Option<Duration>,
+    /// Interval between probes once probing has started.
+    pub interval: Option<Duration>,
+    /// Unanswered probes before the connection is dropped.
+    pub count: Option<u32>,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// A multicast group and the local interface that should carry it.
+pub struct MulticastGroup {
+    /// Group address. Its family must match the socket's own family.
+    pub group: IpAddr,
+    /// Local interface index, or zero for the kernel's default interface.
+    ///
+    /// An IPv6 group accepts any index on every native platform. An IPv4 group
+    /// accepts a nonzero index only on Linux (`ip_mreqn`); elsewhere a nonzero
+    /// index is reported `Unsupported` rather than silently ignored.
+    pub interface: u32,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// A socket option that can be changed after the socket exists.
+///
+/// Bind-time-only options are deliberately absent: `SO_REUSEPORT`/`SO_REUSEADDR`
+/// live in [`ListenOpts`] and [`UdpOpts`], because the OS accepts them only on an
+/// unbound socket. [`Ipv6Only`](Self::Ipv6Only) is the borderline case: it is
+/// kept here so it can be *read* on any socket, but every platform rejects
+/// setting it after bind, and turnloop binds listeners and UDP sockets when they
+/// are created.
+///
+/// A backend with no equivalent for a variant reports `Unsupported`. It never
+/// accepts the call and ignores it.
+pub enum SocketOption {
+    /// `TCP_NODELAY`: send small writes immediately instead of coalescing them.
+    NoDelay(bool),
+    /// `SO_KEEPALIVE` and its probe schedule; `None` disables probing.
+    ///
+    /// The switch and each schedule value are separate kernel settings, and every
+    /// value is validated before any of them is written. If the OS still rejects
+    /// one after the switch was set, the error is reported and the socket keeps
+    /// whatever the OS left: read it back rather than assuming a rollback.
+    /// Disabling clears the switch and leaves the schedule alone, as the OS does.
+    KeepAlive(Option<KeepAlive>),
+    /// `SO_LINGER`: `Some(d)` blocks the close until queued data is delivered or
+    /// `d` elapses, and `Some(Duration::ZERO)` discards it and resets the
+    /// connection. `None` restores the platform default (a graceful background
+    /// close). The duration has one-second granularity, rounded up.
+    Linger(Option<Duration>),
+    /// `SO_RCVBUF`: requested receive-buffer bytes.
+    ///
+    /// **The final size is the kernel's choice, not the request.** The contract
+    /// is only that the socket ends up with *at least* what was asked for, so
+    /// read it back rather than assuming an exact value:
+    ///
+    /// * **Linux** doubles the request and clamps it to `net.core.rmem_max`
+    ///   (asking 262144 on a stock kernel reports 524288).
+    /// * **macOS/BSD** normally keep the request exactly, but start much higher
+    ///   than Linux: an accepted loopback socket defaults to around 408300 bytes.
+    /// * **Windows** rounds up to its own granularity and may keep an auto-tuned
+    ///   receive window that is larger than the request.
+    /// * **WASI** forwards to the host socket, so it inherits that host's policy.
+    RecvBufferSize(u32),
+    /// `SO_SNDBUF`: requested send-buffer bytes. The final size is the kernel's
+    /// choice with the same per-platform rounding as
+    /// [`RecvBufferSize`](Self::RecvBufferSize); read it back.
+    SendBufferSize(u32),
+    /// `IP_TTL` / `IPV6_UNICAST_HOPS`: hop limit for outgoing unicast packets.
+    Ttl(u32),
+    /// `IPV6_V6ONLY`: refuse IPv4-mapped peers on an IPv6 socket. Bind-time on
+    /// every platform, so setting it on a bound socket fails.
+    Ipv6Only(bool),
+    /// `SO_BROADCAST`: permit datagrams addressed to a broadcast address.
+    Broadcast(bool),
+    /// `IP_MULTICAST_TTL` / `IPV6_MULTICAST_HOPS`: outgoing multicast hop limit.
+    MulticastTtl(u32),
+    /// `IP_MULTICAST_LOOP` / `IPV6_MULTICAST_LOOP`: deliver this socket's own
+    /// multicast sends back to local members.
+    MulticastLoop(bool),
+    /// `IP_ADD_MEMBERSHIP` / `IPV6_JOIN_GROUP`: start receiving this group.
+    MulticastJoin(MulticastGroup),
+    /// `IP_DROP_MEMBERSHIP` / `IPV6_LEAVE_GROUP`: stop receiving this group.
+    MulticastLeave(MulticastGroup),
+}
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+/// Names a readable socket option for `Loop::get_option`.
+///
+/// Group membership has no getter: the OS exposes no per-socket membership
+/// query, so [`SocketOption::MulticastJoin`] and
+/// [`SocketOption::MulticastLeave`] have no kind here rather than a kind that
+/// would have to answer `Unsupported` everywhere.
+pub enum SocketOptionKind {
+    /// Read [`SocketOption::NoDelay`].
+    NoDelay,
+    /// Read [`SocketOption::KeepAlive`], including the schedule the OS holds.
+    KeepAlive,
+    /// Read [`SocketOption::Linger`].
+    Linger,
+    /// Read [`SocketOption::RecvBufferSize`] as the OS actually kept it.
+    RecvBufferSize,
+    /// Read [`SocketOption::SendBufferSize`] as the OS actually kept it.
+    SendBufferSize,
+    /// Read [`SocketOption::Ttl`].
+    Ttl,
+    /// Read [`SocketOption::Ipv6Only`].
+    Ipv6Only,
+    /// Read [`SocketOption::Broadcast`].
+    Broadcast,
+    /// Read [`SocketOption::MulticastTtl`].
+    MulticastTtl,
+    /// Read [`SocketOption::MulticastLoop`].
+    MulticastLoop,
+}
 #[derive(Clone, Copy, Debug, Default)]
-/// UDP binding options.
+/// UDP binding options. Reuse is bind-time only and stays here, not in
+/// [`SocketOption`]; everything changeable on a live socket is an option.
 pub struct UdpOpts {
     /// Enable SO_REUSEPORT when supported; macOS does not promise balanced accepts.
     /// Defaults to false: a live UDP endpoint cannot be shared by another bind.

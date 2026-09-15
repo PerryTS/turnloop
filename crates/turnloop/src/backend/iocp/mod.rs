@@ -9,6 +9,7 @@ mod process;
 mod services;
 mod signals;
 mod socket;
+mod sockopt;
 mod sync_io;
 mod timer;
 mod watch;
@@ -87,6 +88,10 @@ pub struct Detached {
     port: Option<Arc<Port>>,
     mode: Option<u32>,
     console_input: bool,
+    /// A listener's per-connection defaults, applied to each socket it accepts.
+    /// It travels with the listener across detach/attach, so a listener handed to
+    /// another loop keeps configuring its connections there.
+    accept_defaults: AcceptDefaults,
 }
 impl Detached {
     fn new(native: Native, kind: Kind, routed: bool) -> Self {
@@ -97,6 +102,7 @@ impl Detached {
             port: None,
             mode: None,
             console_input: false,
+            accept_defaults: AcceptDefaults::EMPTY,
         }
     }
 }
@@ -209,6 +215,18 @@ impl Iocp {
         self.ops[op.index()]
             .as_ref()
             .is_some_and(|p| p.request.op == op && p.waiting)
+    }
+    /// The Winsock socket behind a handle. Process, signal and watch handles, named
+    /// pipes and adopted files/consoles are not sockets and say so.
+    fn socket_of(&self, h: Handle) -> Result<usize> {
+        if self.services.contains(h) || self.watches.contains(h) {
+            return Err(unsupported());
+        }
+        let r = self.get(h)?;
+        match r.transport.native {
+            Native::Socket(_) => Ok(r.transport.native.raw() as usize),
+            _ => Err(unsupported()),
+        }
     }
     fn get(&self, h: Handle) -> Result<&Resource> {
         self.resources
@@ -469,6 +487,7 @@ impl Iocp {
         }
         let raw = r.transport.native.raw();
         let kind = r.transport.kind;
+        let defaults = r.transport.accept_defaults;
         if let Some(result) = p.completion.take() {
             let bytes = match result {
                 Ok(bytes) => bytes as usize,
@@ -513,6 +532,10 @@ impl Iocp {
                                 size_of::<usize>() as i32,
                             )
                         })?;
+                        // Before the connection becomes visible to the host, and
+                        // after the accept context makes the socket queryable. A
+                        // rejected default fails this accept and drops the socket.
+                        sockopt::apply_accept_defaults(transport.native.raw() as usize, defaults)?;
                         let peer = socket::address(transport.native.raw() as usize, true)?;
                         Outcome::Accepted { transport, peer }
                     } else {
@@ -1211,17 +1234,16 @@ unsafe impl Backend for Iocp {
                 if opts.reuse_port {
                     return Err(unsupported());
                 }
+                sockopt::validate_accept_defaults(opts.accept_defaults, Kind::Listener)?;
                 let socket = socket::create(addr.is_ipv6(), false)?;
                 let raw = socket.as_raw_socket() as usize;
                 socket::option(raw, SO_EXCLUSIVEADDRUSE, 1)?;
                 socket::bind_to(raw, addr)?;
                 // SAFETY: bound socket; backlog is bounded to the signed API range.
                 socket::check(unsafe { listen(raw, opts.backlog.min(i32::MAX as u32) as i32) })?;
-                (
-                    Detached::new(Native::Socket(socket), Kind::Listener, false),
-                    None,
-                    None,
-                )
+                let mut transport = Detached::new(Native::Socket(socket), Kind::Listener, false);
+                transport.accept_defaults = opts.accept_defaults;
+                (transport, None, None)
             }
             Open::Udp { addr, opts } => {
                 if opts.reuse_port {
@@ -1239,6 +1261,7 @@ unsafe impl Backend for Iocp {
                 if opts.reuse_port {
                     return Err(unsupported());
                 }
+                sockopt::validate_accept_defaults(opts.accept_defaults, Kind::PipeListener)?;
                 let name = pipes::name(&name)?;
                 let key = self.next_listener_key;
                 self.next_listener_key = key
@@ -1284,6 +1307,12 @@ unsafe impl Backend for Iocp {
             return Err(unsupported());
         }
         socket::address(r.transport.native.raw() as usize, false)
+    }
+    fn set_option(&mut self, h: Handle, option: SocketOption) -> Result<()> {
+        sockopt::set(self.socket_of(h)?, option)
+    }
+    fn get_option(&self, h: Handle, kind: SocketOptionKind) -> Result<SocketOption> {
+        sockopt::get(self.socket_of(h)?, kind)
     }
     fn submit(&mut self, request: Request) -> Result<()> {
         if self.services.contains(request.handle) {

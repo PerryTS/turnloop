@@ -80,6 +80,18 @@
 //!   Windows' explicitly requested Integration::Event helper is the D7 exception.
 //! * Unsupported platforms/capabilities return errors; no fake successful I/O.
 //!
+//! # Socket options (§7.7)
+//!
+//! * `set_option`/`get_option` are synchronous and produce no Event. They run
+//!   entirely inside the call, touch no operation storage, and must not allocate.
+//! * A backend reports `Unsupported` for an option its platform lacks. It must
+//!   never accept and ignore one: a host reads a lie back from `get_option`, and
+//!   "the option is on" is a security- and latency-relevant claim.
+//! * `ListenOpts::accept_defaults` is applied by the accepting backend to each
+//!   accepted transport before its `Accepted`/`PipeAccepted` Outcome is produced,
+//!   so the core hands the host an already-configured connection. A backend that
+//!   cannot apply a requested default rejects the listener in `open`.
+//!
 //! # Filesystem (§7.6 Files)
 //!
 //! * `FILESYSTEM` selects where typed `FsRequest`s run. `Pool` (native default):
@@ -345,6 +357,23 @@ pub unsafe trait Backend: Sized + 'static {
     fn tty_set_mode(&mut self, _handle: Handle, _mode: crate::TtyMode) -> Result<()> {
         Err(Error::new(crate::ErrorKind::Unsupported))
     }
+    /// Apply one socket option to a live resource, synchronously, through the OS.
+    /// No Request is accepted and no Event is produced. A platform without an
+    /// equivalent returns Unsupported; silently ignoring an option is forbidden,
+    /// because a host cannot tell an ignored option from an applied one.
+    fn set_option(&mut self, _handle: Handle, _option: crate::SocketOption) -> Result<()> {
+        Err(Error::new(crate::ErrorKind::Unsupported))
+    }
+    /// Read one socket option from the OS. Backends never answer from a cache of
+    /// what was set: the kernel may round, clamp or double a request, and the
+    /// caller is entitled to the value the kernel actually holds.
+    fn get_option(
+        &self,
+        _handle: Handle,
+        _kind: crate::SocketOptionKind,
+    ) -> Result<crate::SocketOption> {
+        Err(Error::new(crate::ErrorKind::Unsupported))
+    }
     /// Query current terminal dimensions.
     fn tty_window_size(&self, _handle: Handle) -> Result<crate::WindowSize> {
         Err(Error::new(crate::ErrorKind::Unsupported))
@@ -408,6 +437,8 @@ mod kqueue;
 mod poller;
 #[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
 mod socket;
+#[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
+mod sockopt;
 #[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
 pub mod unix;
 #[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
