@@ -32,10 +32,15 @@ pub struct Completion {
 #[derive(Debug)]
 /// Host-visible I/O, timer, process, service and lifecycle results.
 pub enum OpResult {
-    /// Coalesced filesystem watch invalidation.
-    Watch(crate::WatchEvent),
-    /// Typed filesystem operation result.
+    /// A typed filesystem result.
     Fs(crate::FsResult),
+    /// Nonterminal batch of filesystem watch records; parse with `WatchEvents`.
+    Watch {
+        /// Initialized record bytes, in native event order.
+        events: BufLease,
+        /// Events were lost before this batch; rescan the watched scope.
+        overflow: bool,
+    },
     /// Completion of a registered host wait condition.
     ExternalWait(crate::WaitResult),
     /// Child exit, after reaping; produced exactly once per accepted spawn.

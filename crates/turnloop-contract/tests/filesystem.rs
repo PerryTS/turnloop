@@ -1,310 +1,304 @@
+//! Native typed filesystem requests and watches (DESIGN D8, §7.6 Files).
 #![cfg(all(not(loom), any(unix, windows)))]
 use std::{
+    path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
-use turnloop::*;
-fn config() -> Config {
-    Config {
-        max_handles: 16,
-        max_operations: 32,
-        events_per_turn: 8,
-        ..Config::default()
-    }
+use turnloop::{backend::Platform, *};
+use turnloop_contract::filesystem as contract;
+
+fn root(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("turnloop-fs-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("test root");
+    dir
 }
-fn next(l: &mut Loop, out: &mut Completions) -> Completion {
-    let until = l.now() + Duration::from_secs(5);
-    loop {
-        assert!(l.now() < until, "filesystem completion deadline");
-        let info = l.turn(Timeout::Until(until), out).expect("turn");
-        assert!(info.os_waits <= 1);
-        if let Some(c) = out.drain().next() {
-            return c;
-        }
-    }
-}
-fn done(l: &mut Loop, out: &mut Completions, op: OpId) -> FsResult {
-    let c = next(l, out);
-    assert_eq!(c.op, Some(op));
-    assert!(c.terminal);
-    match c.result {
-        OpResult::Fs(r) => r,
-        r => panic!("unexpected {r:?}"),
-    }
-}
-fn path(name: &str) -> FsPath {
-    FsPath::new(std::env::temp_dir().join(format!("turnloop-i06-{}-{name}", std::process::id())))
-        .expect("path")
-}
-fn write(l: &mut Loop, h: Handle, bytes: &'static [u8], offset: Option<u64>) -> OpId {
-    // SAFETY: immutable static bytes outlive all operations.
-    let buffer = WriteBuf::Provided(unsafe { IoBuf::from_raw_parts(bytes.as_ptr(), bytes.len()) });
-    l.fs(
-        FsRequest::Write {
-            file: h,
-            buffer,
-            offset,
-        },
-        Token(2),
-    )
-    .expect("write")
+
+#[test]
+fn bytes_metadata_namespace() {
+    contract::bytes_metadata_namespace::<Platform>(&root("namespace"));
 }
 #[test]
-fn bytes_metadata_cursor_namespace_and_directory_pages() {
-    let mut l = Loop::new(config()).expect("loop");
-    let mut out = Completions::with_capacity(1);
-    let dir = path("directory");
-    let p = FsPath::new(dir.as_path().join("file")).expect("path");
-    let q = FsPath::new(dir.as_path().join("renamed")).expect("path");
-    let op = l
-        .fs(
-            FsRequest::Mkdir {
-                path: dir.clone(),
-                mode: 0o700,
-            },
-            Token(1),
-        )
-        .expect("mkdir");
-    assert!(matches!(done(&mut l, &mut out, op), FsResult::Done));
-    let (h, op) = l
-        .file_open(
-            p.clone(),
-            FileOptions {
-                write: true,
-                create: true,
-                exclusive: true,
-                ..FileOptions::default()
-            },
-            Token(1),
-        )
-        .expect("open");
-    assert!(matches!(done(&mut l, &mut out, op), FsResult::Opened));
-    let op = write(&mut l, h, b"abc", None);
-    assert!(matches!(done(&mut l, &mut out, op), FsResult::Wrote(3)));
-    let op = write(&mut l, h, b"Z", Some(1));
-    assert!(matches!(done(&mut l, &mut out, op), FsResult::Wrote(1)));
-    let op = write(&mut l, h, b"def", None);
-    assert!(matches!(done(&mut l, &mut out, op), FsResult::Wrote(3)));
-    let mut bytes = [0; 6];
-    // SAFETY: bytes stays live and is inspected only after its terminal completion.
-    let buffer = unsafe { IoBufMut::from_raw_parts(bytes.as_mut_ptr(), bytes.len()) };
-    let op = l
-        .fs(
-            FsRequest::Read {
-                file: h,
-                buffer,
-                offset: Some(0),
-            },
-            Token(3),
-        )
-        .expect("read");
-    assert!(matches!(done(&mut l, &mut out, op), FsResult::Read(6)));
-    assert_eq!(&bytes, b"aZcdef");
-    for data_only in [true, false] {
-        let op = l
-            .fs(FsRequest::Sync { file: h, data_only }, Token(4))
-            .expect("sync");
-        assert!(matches!(done(&mut l, &mut out, op), FsResult::Done));
+fn errors() {
+    contract::errors::<Platform>(&root("errors"));
+}
+#[test]
+fn fifo_cancel_close() {
+    contract::fifo_cancel_close::<Platform>(&root("cancel"));
+}
+#[test]
+fn pooled_lease_wait() {
+    contract::pooled_lease_wait::<Platform>(&root("leases"));
+}
+#[test]
+fn watch_directory() {
+    contract::watch_directory::<Platform>(&root("watch-dir"));
+}
+#[test]
+fn watch_file() {
+    contract::watch_file::<Platform>(&root("watch-file"));
+}
+#[test]
+fn watch_backpressure() {
+    contract::watch_backpressure::<Platform>(&root("watch-pressure"));
+}
+#[test]
+fn watch_recursive() {
+    contract::watch_recursive::<Platform>(&root("watch-tree"));
+}
+
+/// Hold every shared pool thread so queued requests provably have not started.
+struct Hold {
+    released: Arc<AtomicBool>,
+    jobs: Vec<OpId>,
+}
+impl Hold {
+    fn new(l: &mut Loop) -> Self {
+        let entered = Arc::new(AtomicUsize::new(0));
+        let released = Arc::new(AtomicBool::new(false));
+        let threads = Config::default().blocking_pool.threads;
+        let jobs = (0..threads)
+            .map(|_| {
+                let (entered, released) = (entered.clone(), released.clone());
+                l.blocking(
+                    move || {
+                        entered.fetch_add(1, Ordering::Release);
+                        while !released.load(Ordering::Acquire) {
+                            std::thread::park_timeout(Duration::from_millis(1));
+                        }
+                        Ok(Payload::U64(1))
+                    },
+                    Token(1000),
+                )
+                .expect("pool job")
+            })
+            .collect();
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        while entered.load(Ordering::Acquire) != threads {
+            assert!(std::time::Instant::now() < until, "pool threads started");
+            std::thread::yield_now();
+        }
+        Self { released, jobs }
     }
-    let op = l.fs(FsRequest::Fstat(h), Token(5)).expect("fstat");
-    let FsResult::Metadata(m) = done(&mut l, &mut out, op) else {
-        panic!("metadata")
-    };
-    assert_eq!(m.size, 6);
-    assert_eq!(m.kind, FileType::File);
-    assert!(m.modified.is_some());
-    assert!(m.inode.is_some());
-    let op = l
-        .fs(FsRequest::Truncate { file: h, size: 2 }, Token(6))
-        .expect("truncate");
-    assert!(matches!(done(&mut l, &mut out, op), FsResult::Done));
-    let op = l
-        .fs(
+}
+impl Drop for Hold {
+    fn drop(&mut self) {
+        self.released.store(true, Ordering::Release);
+    }
+}
+
+/// Queue exhaustion rejects before acceptance; every accepted request completes once.
+#[test]
+fn pool_backpressure_rejects_before_acceptance() {
+    let dir = root("backpressure");
+    let mut l = Loop::new(Config::default()).expect("loop");
+    let hold = Hold::new(&mut l);
+    let target = FsPath::new(&dir).expect("path");
+    let capacity = Config::default().blocking_pool.queue_capacity;
+    let mut accepted = Vec::new();
+    let rejected = loop {
+        match l.fs(
             FsRequest::Stat {
-                path: p.clone(),
+                path: target.clone(),
                 follow_symlinks: true,
             },
-            Token(7),
-        )
-        .expect("stat");
-    let FsResult::Metadata(m) = done(&mut l, &mut out, op) else {
-        panic!("stat")
+            Token(accepted.len() as u64),
+        ) {
+            Ok(op) => accepted.push(op),
+            Err(e) => break e,
+        }
+        assert!(accepted.len() <= capacity, "queue bound enforced");
     };
-    assert_eq!(m.size, 2);
-    let mut listing = [0; 64];
-    // SAFETY: listing is retained exclusively until directory completion.
-    let buffer = unsafe { IoBufMut::from_raw_parts(listing.as_mut_ptr(), listing.len()) };
-    let op = l
-        .fs(
-            FsRequest::ReadDir {
-                path: dir.clone(),
-                buffer,
-                cookie: 0,
-            },
-            Token(8),
-        )
-        .expect("readdir");
-    let FsResult::Directory { bytes, cookie, eof } = done(&mut l, &mut out, op) else {
-        panic!("directory")
-    };
-    assert_eq!(cookie, 1);
-    assert!(eof);
-    assert_eq!(&listing[..bytes], b"\x04\0\x01file");
-    l.close(h, Token(9)).expect("close");
-    assert!(matches!(next(&mut l, &mut out).result, OpResult::Closed));
-    let op = l
-        .fs(
-            FsRequest::Rename {
-                from: p,
-                to: q.clone(),
-            },
-            Token(10),
-        )
-        .expect("rename");
-    assert!(matches!(done(&mut l, &mut out, op), FsResult::Done));
-    assert_eq!(std::fs::read(q.as_path()).expect("actual bytes"), b"aZ");
-    let op = l.fs(FsRequest::Unlink(q), Token(11)).expect("unlink");
-    assert!(matches!(done(&mut l, &mut out, op), FsResult::Done));
-    let op = l.fs(FsRequest::Rmdir(dir), Token(12)).expect("rmdir");
-    assert!(matches!(done(&mut l, &mut out, op), FsResult::Done));
+    assert_eq!(rejected.kind, ErrorKind::ResourceLimit);
+    assert_eq!(
+        accepted.len(),
+        capacity,
+        "every reserved queue slot was usable"
+    );
+    assert!(
+        l.blocking(|| Ok(Payload::U64(2)), Token(2000)).is_err(),
+        "reservations also bound host jobs"
+    );
+    let jobs = hold.jobs.clone();
+    drop(hold);
+    let mut out = Completions::default();
+    let mut seen = vec![false; capacity];
+    let mut blocking = 0;
+    let until = l.now() + Duration::from_secs(30);
+    while seen.iter().any(|s| !s) || blocking < jobs.len() {
+        assert!(l.now() < until);
+        l.turn(Timeout::Until(until), &mut out).expect("turn");
+        for c in out.drain() {
+            match c.result {
+                OpResult::Fs(FsResult::Metadata(m)) => {
+                    assert_eq!(m.kind, FileType::Directory);
+                    let i = c.token.0 as usize;
+                    assert_eq!(c.op, Some(accepted[i]));
+                    assert!(!seen[i], "exactly once");
+                    seen[i] = true;
+                }
+                OpResult::Blocking(Payload::U64(1)) => blocking += 1,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
     assert!(!l.alive());
+    // Capacity is available again.
+    let op = l
+        .fs(
+            FsRequest::Stat {
+                path: target,
+                follow_symlinks: true,
+            },
+            Token(1),
+        )
+        .expect("released reservations");
+    assert!(contract::wait(&mut l, op).is_ok());
+    std::fs::remove_dir_all(&dir).expect("cleanup");
 }
+
+/// Cancelling an unstarted request completes it at once, releases its queue
+/// reservation and starts its FIFO successor; the started head reports Cancelled.
 #[test]
-fn fifo_close_cancellation_and_no_access_after_terminal() {
-    let mut l = Loop::new(config()).expect("loop");
-    let mut out = Completions::with_capacity(1);
-    let p = path("cancel");
-    let (h, op) = l
-        .file_open(
-            p.clone(),
-            FileOptions {
-                write: true,
-                create: true,
-                truncate: true,
-                ..FileOptions::default()
+fn cancellation_withdraws_unstarted_and_reports_started() {
+    let dir = root("withdraw");
+    let file = FsPath::new(dir.join("file")).expect("path");
+    std::fs::write(file.as_path(), b"0123456789").expect("fixture");
+    let mut l = Loop::new(Config::default()).expect("loop");
+    let op = l
+        .fs(
+            FsRequest::Open {
+                path: file.clone(),
+                options: FileOptions::default(),
             },
             Token(1),
         )
         .expect("open");
-    done(&mut l, &mut out, op);
-    // Hold every shared pool thread, proving the read never starts before cancellation.
-    let entered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let released = Arc::new(AtomicBool::new(false));
-    let mut jobs = Vec::new();
-    for _ in 0..4 {
-        let e = entered.clone();
-        let r = released.clone();
-        jobs.push(
-            l.blocking(
-                move || {
-                    e.fetch_add(1, Ordering::Release);
-                    while !r.load(Ordering::Acquire) {
-                        std::thread::park_timeout(Duration::from_millis(1));
-                    }
-                    Ok(Payload::U64(1))
-                },
-                Token(0),
-            )
-            .expect("pool job"),
-        );
-    }
-    struct Release(Arc<AtomicBool>);
-    impl Drop for Release {
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::Release);
-        }
-    }
-    let guard = Release(released.clone());
-    let until = std::time::Instant::now() + Duration::from_secs(5);
-    while entered.load(Ordering::Acquire) != 4 {
-        assert!(std::time::Instant::now() < until);
-        std::thread::yield_now();
-    }
-    let first = write(&mut l, h, b"unwritten", None);
-    let mut bytes = [0x5a; 32];
-    // SAFETY: bytes is retained untouched through the cancellation and loop drop.
-    let buffer = unsafe { IoBufMut::from_raw_parts(bytes.as_mut_ptr(), bytes.len()) };
-    let second = l
-        .fs(
-            FsRequest::Read {
-                file: h,
-                buffer,
-                offset: None,
-            },
-            Token(3),
-        )
-        .expect("read");
-    l.close(h, Token(4)).expect("close");
-    assert!(l.fs(FsRequest::Fstat(h), Token(5)).is_err());
-    drop(guard);
-    let mut cancellations = Vec::new();
-    let mut closed = false;
-    let mut blocks = 0;
-    while !closed || blocks < 4 {
-        let c = next(&mut l, &mut out);
-        match c.result {
-            OpResult::Cancelled => cancellations.push(c.op.expect("op")),
-            OpResult::Closed => {
-                assert_eq!(cancellations, [first, second]);
-                closed = true;
-            }
-            OpResult::Blocking(Payload::U64(1)) => blocks += 1,
-            r => panic!("{r:?}"),
-        }
-    }
-    assert_eq!(bytes, [0x5a; 32]);
-    bytes.fill(0xa5);
-    drop(l);
-    assert_eq!(bytes, [0xa5; 32]);
-    assert_eq!(std::fs::read(p.as_path()).expect("file"), b"");
-    std::fs::remove_file(p.as_path()).expect("cleanup");
-}
-#[cfg(unix)]
-#[test]
-fn permission_errors_and_lstat_are_real() {
-    use std::os::unix::fs::PermissionsExt;
-    let p = path("permission");
-    let link = path("symlink");
-    std::fs::write(p.as_path(), b"secret").expect("fixture");
-    std::os::unix::fs::symlink(p.as_path(), link.as_path()).expect("symlink");
-    let mut l = Loop::new(config()).expect("loop");
-    let mut out = Completions::with_capacity(1);
-    let op = l
-        .fs(
-            FsRequest::Stat {
-                path: link.clone(),
-                follow_symlinks: false,
-            },
-            Token(1),
-        )
-        .expect("lstat");
-    let FsResult::Metadata(m) = done(&mut l, &mut out, op) else {
-        panic!("metadata")
+    let Ok(FsResult::Opened(h)) = contract::wait(&mut l, op) else {
+        panic!("open")
     };
-    assert_eq!(m.kind, FileType::Symlink);
-    std::fs::set_permissions(p.as_path(), std::fs::Permissions::from_mode(0)).expect("permissions");
-    let (h, op) = l
-        .file_open(p.clone(), FileOptions::default(), Token(2))
-        .expect("open accepted");
-    let c = next(&mut l, &mut out);
-    assert_eq!(c.op, Some(op));
-    // This suite requires an unprivileged runner; root must not count this as a permission test pass.
-    assert!(
-        matches!(
-            c.result,
-            OpResult::Err(Error {
-                kind: ErrorKind::PermissionDenied,
-                os: Some(_)
-            })
-        ),
-        "{c:?}"
+    let hold = Hold::new(&mut l);
+    let mut head_bytes = [0u8; 4];
+    let mut middle_bytes = [0xee; 4];
+    let mut tail_bytes = [0u8; 4];
+    let read = |bytes: &mut [u8], offset| FsRequest::Read {
+        file: h,
+        // SAFETY: each array outlives its request and is read only after completion.
+        buffer: ReadBuf::Provided(unsafe {
+            IoBufMut::from_raw_parts(bytes.as_mut_ptr(), bytes.len())
+        }),
+        offset: Some(offset),
+    };
+    let head = l.fs(read(&mut head_bytes, 0), Token(2)).expect("head");
+    let middle = l.fs(read(&mut middle_bytes, 4), Token(3)).expect("middle");
+    let tail = l.fs(read(&mut tail_bytes, 6), Token(4)).expect("tail");
+    assert!(l.cancel(middle), "unstarted request cancels");
+    assert!(!l.cancel(middle), "cancellation is idempotent");
+    assert!(l.cancel(head), "queued head cancels");
+    let mut out = Completions::default();
+    l.turn(Timeout::Now, &mut out).expect("withdrawn results");
+    let mut results: Vec<_> = out.drain().map(|c| (c.op, c.result)).collect();
+    // The head was handed to the (held) pool; only the middle request is withdrawn.
+    assert_eq!(results.len(), 1, "{results:?}");
+    let (op, result) = results.pop().expect("middle");
+    assert_eq!(op, Some(middle));
+    assert!(matches!(result, OpResult::Cancelled));
+    drop(hold);
+    let until = l.now() + Duration::from_secs(10);
+    let mut order = Vec::new();
+    while order.len() < 6 {
+        assert!(l.now() < until);
+        l.turn(Timeout::Until(until), &mut out).expect("turn");
+        for c in out.drain() {
+            match c.result {
+                OpResult::Blocking(_) => order.push(None),
+                OpResult::Cancelled => order.push(Some(c.op.expect("head"))),
+                OpResult::Fs(FsResult::Read { n: 4, .. }) => {
+                    assert_eq!(c.op, Some(tail));
+                    order.push(c.op);
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+    let requests: Vec<_> = order.into_iter().flatten().collect();
+    assert_eq!(
+        requests,
+        [head, tail],
+        "FIFO successor runs after the cancelled head"
     );
-    l.close(h, Token(3)).expect("close");
-    assert!(matches!(next(&mut l, &mut out).result, OpResult::Closed));
-    std::fs::set_permissions(p.as_path(), std::fs::Permissions::from_mode(0o600)).expect("restore");
-    std::fs::remove_file(p.as_path()).expect("cleanup");
-    std::fs::remove_file(link.as_path()).expect("cleanup link");
+    assert_eq!(
+        middle_bytes, [0xee; 4],
+        "withdrawn request never touched its buffer"
+    );
+    assert_eq!(&tail_bytes, b"6789");
+    l.close(h, Token(5)).expect("close");
+    l.turn(Timeout::Now, &mut out).expect("closed");
+    assert!(matches!(out[0].result, OpResult::Closed));
+    assert!(!l.alive());
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+}
+
+/// Permission errors are real OS denials (requires an unprivileged runner).
+#[test]
+fn permission_denied_is_reported() {
+    let dir = root("permission");
+    let file = dir.join("locked");
+    std::fs::write(&file, b"secret").expect("fixture");
+    let mut l = Loop::new(contract::config()).expect("loop");
+    let locked = FsPath::new(&file).expect("path");
+    let r = contract::run(
+        &mut l,
+        FsRequest::Chmod {
+            target: FsTarget::Path {
+                path: locked.clone(),
+                follow_symlinks: true,
+            },
+            mode: 0o444,
+        },
+    );
+    assert!(matches!(r, Ok(FsResult::Done)), "{r:?}");
+    let e = contract::run(
+        &mut l,
+        FsRequest::Open {
+            path: locked.clone(),
+            options: FileOptions {
+                read: false,
+                write: true,
+                ..FileOptions::default()
+            },
+        },
+    )
+    .expect_err("read-only file rejects writers");
+    assert_eq!(e.kind, ErrorKind::PermissionDenied, "{e:?}");
+    assert!(e.os.is_some());
+    let e = contract::run(
+        &mut l,
+        FsRequest::Access {
+            path: locked.clone(),
+            mode: AccessMode {
+                write: true,
+                ..AccessMode::default()
+            },
+        },
+    )
+    .expect_err("access reports the denial");
+    assert_eq!(e.kind, ErrorKind::PermissionDenied, "{e:?}");
+    let r = contract::run(
+        &mut l,
+        FsRequest::Chmod {
+            target: FsTarget::Path {
+                path: locked,
+                follow_symlinks: true,
+            },
+            mode: 0o644,
+        },
+    );
+    assert!(matches!(r, Ok(FsResult::Done)), "{r:?}");
+    assert!(!l.alive());
+    std::fs::remove_dir_all(&dir).expect("cleanup");
 }

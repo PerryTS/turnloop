@@ -70,6 +70,22 @@
 //!   it as a flag/host scheduler token. No backend creates a loop-driving thread.
 //!   Windows' explicitly requested Integration::Event helper is the D7 exception.
 //! * Unsupported platforms/capabilities return errors; no fake successful I/O.
+//!
+//! # Filesystem (§7.6 Files)
+//!
+//! * `FILESYSTEM` selects where typed `FsRequest`s run. `Pool` (native default):
+//!   the core runs them on the shared blocking pool and never calls the backend.
+//!   `Backend` (WASI): `fs` accepts them under the ordinary Request rules, with a
+//!   FIFO per handle, and yields `Outcome::Fs`. A request that opens binds its
+//!   native object to the supplied new handle only on success; after a failed or
+//!   cancelled open the core calls `release` for that never-visible handle.
+//! * `fs_watch` binds a native watch to a new handle; the core then submits one
+//!   multishot `Operation::WatchFs`. Each nonterminal `Outcome::Watch` carries a
+//!   pooled lease of records (see `WatchEvents`). Pool exhaustion retains events
+//!   in bounded per-watch storage; lost events set `overflow`. No backend thread
+//!   is created: native watch sources are registered with the loop's own wait,
+//!   except where the OS delivers on its own threads (FSEvents dispatch queues).
+pub use crate::fs::FsOutput;
 use crate::{
     BufLease, BufferPool, Config, Error, Handle, Integration, OpId, Open, ReadBuf, Result,
     WriteBuf, WriteVectored,
@@ -136,6 +152,8 @@ pub enum Operation {
     RecvFrom(ReadBuf),
     /// Complete a stream write-side shutdown after preceding queued writes.
     Shutdown,
+    /// Multishot delivery of the filesystem watch bound by `Backend::fs_watch`.
+    WatchFs,
 }
 #[derive(Debug)]
 /// Backend completion awaiting translation into a host-visible completion.
@@ -193,8 +211,32 @@ pub enum Outcome<D> {
     },
     /// Complete a stream write-side shutdown after preceding queued writes.
     Shutdown,
+    /// A batch of filesystem watch records.
+    Watch {
+        /// Initialized `WatchEvents` records.
+        events: BufLease,
+        /// Native events were lost before this batch; rescan the watched scope.
+        overflow: bool,
+    },
+    /// A typed filesystem result from a `Filesystem::Backend` backend.
+    Fs {
+        /// The typed result; `Opened` refers to the request's new handle.
+        output: FsOutput,
+        /// The pooled lease holding result bytes, when one was requested.
+        lease: Option<BufLease>,
+    },
     /// The operation was cancelled and its native buffer access has ended.
     Cancelled,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Where typed filesystem requests execute (see the module documentation).
+pub enum Filesystem {
+    /// The core runs them on the shared native blocking pool.
+    Pool,
+    /// The backend accepts them through `Backend::fs`.
+    Backend,
+    /// No filesystem: `Loop::fs` returns Unsupported.
+    Unsupported,
 }
 #[derive(Clone, Copy, Debug, Default)]
 /// Instrumentation for the single bounded backend wait.
@@ -215,8 +257,28 @@ pub unsafe trait Backend: Sized + 'static {
     type Wake: Wake;
     /// Owning transferable representation of an unregistered resource.
     type Detached: Send + 'static;
+    /// Where typed filesystem requests run for this backend.
+    const FILESYSTEM: Filesystem = if cfg!(target_arch = "wasm32") {
+        Filesystem::Unsupported
+    } else {
+        Filesystem::Pool
+    };
     /// Construct backend storage and native wait resources with the supplied shared read pool.
     fn new(config: &Config, pool: BufferPool) -> Result<Self>;
+    /// Accept a typed filesystem request (only with `Filesystem::Backend`). `handle`
+    /// is the request's file handle, or the new handle for an open.
+    fn fs(&mut self, _op: OpId, _handle: Option<Handle>, _request: crate::FsRequest) -> Result<()> {
+        Err(Error::new(crate::ErrorKind::Unsupported))
+    }
+    /// Bind a native filesystem watch to a new handle, retaining nothing on error.
+    fn fs_watch(
+        &mut self,
+        _handle: Handle,
+        _path: &crate::FsPath,
+        _options: crate::WatchOptions,
+    ) -> Result<()> {
+        Err(Error::new(crate::ErrorKind::Unsupported))
+    }
     /// Give process-wide services this loop's parking-aware notification endpoint.
     fn set_notifier(&mut self, _notifier: crate::Notifier) {}
     /// Spawn and bind the child and requested parent pipe handles atomically.
@@ -345,3 +407,5 @@ mod signals;
 
 #[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
 mod files;
+#[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
+mod watch;

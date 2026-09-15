@@ -1,5 +1,7 @@
 //! Lazily started process-wide bounded pool, with a completion port per loop.
 use crate::{BlockingResult, Error, ErrorKind, Notifier, OpId, Payload, Result, queue::Queue};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::atomic::AtomicUsize;
 use std::{
     net::{SocketAddr, ToSocketAddrs},
     sync::{
@@ -34,7 +36,8 @@ pub struct DnsRequest {
 }
 pub(crate) enum WorkOutput {
     ExternalWait(crate::WaitResult),
-    Fs(crate::FsResult),
+    #[cfg(not(target_arch = "wasm32"))]
+    Fs(crate::fs::Reply),
     Blocking(Payload),
     Resolved(Vec<SocketAddr>),
 }
@@ -109,11 +112,13 @@ mod native {
     }
     enum Task {
         Boxed(Job),
-        #[cfg(not(target_arch = "wasm32"))]
         Reusable(Arc<dyn ReusableWork>),
     }
     struct State {
         jobs: Mutex<VecDeque<Task>>,
+        // Queue capacity promised to accepted operations that will push later.
+        // Modified only while holding `jobs`: queued + reserved <= queue_capacity.
+        reserved: AtomicUsize,
         ready: Condvar,
         stopping: AtomicBool,
     }
@@ -125,6 +130,7 @@ mod native {
     fn start(config: PoolConfig) -> Result<Pool> {
         let state = Arc::new(State {
             jobs: Mutex::new(VecDeque::with_capacity(config.queue_capacity)),
+            reserved: AtomicUsize::new(0),
             ready: Condvar::new(),
             stopping: AtomicBool::new(false),
         });
@@ -151,10 +157,8 @@ mod native {
                             }
                             jobs.pop_front().expect("nonempty job queue")
                         };
-                        #[cfg(not(target_arch = "wasm32"))]
                         let job = match job {
                             Task::Boxed(job) => job,
-                            #[cfg(not(target_arch = "wasm32"))]
                             Task::Reusable(work) => {
                                 work.run();
                                 continue;
@@ -206,7 +210,7 @@ mod native {
             .jobs
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if jobs.len() == pool.config.queue_capacity {
+        if jobs.len() + pool.state.reserved.load(Ordering::Relaxed) >= pool.config.queue_capacity {
             return Err(Error::new(ErrorKind::ResourceLimit));
         }
         jobs.push_back(Task::Boxed(Job {
@@ -219,8 +223,7 @@ mod native {
         pool.state.ready.notify_one();
         Ok(())
     }
-    #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn reusable(config: PoolConfig, work: Arc<dyn ReusableWork>) -> Result<()> {
+    fn pool(config: PoolConfig) -> Result<&'static Pool> {
         if config.threads == 0 || config.queue_capacity == 0 {
             return Err(Error::new(ErrorKind::InvalidInput));
         }
@@ -231,17 +234,60 @@ mod native {
         if pool.config != config {
             return Err(Error::new(ErrorKind::InvalidInput));
         }
-        let mut jobs = pool
-            .state
+        Ok(pool)
+    }
+    fn lock(pool: &Pool) -> std::sync::MutexGuard<'_, VecDeque<Task>> {
+        pool.state
             .jobs
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if jobs.len() == pool.config.queue_capacity {
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    #[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
+    pub(crate) fn reusable(config: PoolConfig, work: Arc<dyn ReusableWork>) -> Result<()> {
+        let pool = pool(config)?;
+        let mut jobs = lock(pool);
+        if jobs.len() + pool.state.reserved.load(Ordering::Relaxed) >= pool.config.queue_capacity {
             return Err(Error::new(ErrorKind::ResourceLimit));
         }
         jobs.push_back(Task::Reusable(work));
         pool.state.ready.notify_one();
         Ok(())
+    }
+    /// Promise one queue slot to an accepted operation (ResourceLimit when full).
+    pub(crate) fn reserve(config: PoolConfig) -> Result<()> {
+        let pool = pool(config)?;
+        let jobs = lock(pool);
+        let reserved = pool.state.reserved.load(Ordering::Relaxed);
+        if jobs.len() + reserved >= pool.config.queue_capacity {
+            return Err(Error::new(ErrorKind::ResourceLimit));
+        }
+        pool.state.reserved.store(reserved + 1, Ordering::Relaxed);
+        Ok(())
+    }
+    /// Return an unused reservation (the operation ended before it was queued).
+    pub(crate) fn unreserve() {
+        let pool = POOL
+            .get()
+            .and_then(|p| p.as_ref().ok())
+            .expect("reserved pool");
+        let _jobs = lock(pool);
+        let reserved = pool.state.reserved.load(Ordering::Relaxed);
+        pool.state.reserved.store(reserved - 1, Ordering::Relaxed);
+    }
+    /// Queue reusable work into its reservation. Never fails and never grows the
+    /// preallocated queue, because the reservation already counted this slot.
+    pub(crate) fn push_reserved(work: Arc<dyn ReusableWork>) {
+        let pool = POOL
+            .get()
+            .and_then(|p| p.as_ref().ok())
+            .expect("reserved pool");
+        let mut jobs = lock(pool);
+        let reserved = pool.state.reserved.load(Ordering::Relaxed);
+        pool.state.reserved.store(reserved - 1, Ordering::Relaxed);
+        debug_assert!(jobs.len() < pool.config.queue_capacity);
+        jobs.push_back(Task::Reusable(work));
+        drop(jobs);
+        pool.state.ready.notify_one();
     }
 }
 pub(crate) fn submit(
@@ -333,5 +379,7 @@ mod models {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
 pub(crate) use native::reusable;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use native::{push_reserved, reserve, unreserve};

@@ -1,5 +1,6 @@
 use crate::{
-    backend::{Backend, Event, Operation, Outcome, Request},
+    backend::{Backend, Event, Filesystem, Operation, Outcome, Request},
+    fs::FsOutput,
     table::Table,
     timer::DriverTimerQueue as TimerQueue,
     *,
@@ -20,8 +21,8 @@ const POST_EVENTS: usize = 2;
 #[derive(Clone, Copy)]
 enum Kind {
     Socket,
+    /// A typed file or directory handle served by the native pool service.
     File,
-    Watch,
     Timer {
         op: Option<OpId>,
         repeat: Option<Duration>,
@@ -29,6 +30,8 @@ enum Kind {
 }
 struct Resource {
     kind: Kind,
+    /// Reserved by an in-flight open; addressable only after `Opened`.
+    hidden: bool,
     referenced: bool,
     pending: usize,
     closing: Option<Token>,
@@ -44,6 +47,8 @@ struct Op {
     timed_out: bool,
     stop: bool,
     external_wait: bool,
+    /// A typed filesystem request (pool service or backend, per `B::FILESYSTEM`).
+    fs: bool,
     job_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     previous: Option<OpId>,
     next: Option<OpId>,
@@ -71,8 +76,6 @@ pub struct Driver<B: Backend> {
     work_port: std::sync::Arc<crate::blocking::WorkPort>,
     #[cfg(not(target_arch = "wasm32"))]
     files: crate::fs::Service,
-    #[cfg(not(target_arch = "wasm32"))]
-    watches: crate::fs::Watches,
     owner: u64,
     thread: ThreadId,
     handles: Table<Resource>,
@@ -107,10 +110,8 @@ impl<B: Backend> Driver<B> {
             .and_then(|n| n.checked_add(config.max_operations))
             .and_then(|n| n.checked_add(config.max_handles))
             .ok_or(Error::new(ErrorKind::InvalidInput))?;
-        let mut backend = B::new(
-            &config,
-            BufferPool::new(config.pooled_buffers, config.pooled_buffer_size),
-        )?;
+        let buffers = BufferPool::new(config.pooled_buffers, config.pooled_buffer_size);
+        let mut backend = B::new(&config, buffers.clone())?;
         let notifier = Notifier::new(backend.waker());
         backend.set_notifier(notifier.clone());
         let poster = Poster::new(config.post_capacity, notifier.clone());
@@ -129,13 +130,11 @@ impl<B: Backend> Driver<B> {
         };
         Ok(Self {
             backend,
-            #[cfg(not(target_arch = "wasm32"))]
-            watches: crate::fs::Watches::new(&config, notifier.clone()),
             notifier,
             poster,
             external: false,
             #[cfg(not(target_arch = "wasm32"))]
-            files: crate::fs::Service::new(&config, work_port.clone()),
+            files: crate::fs::Service::new(&config, work_port.clone(), buffers),
             work_port,
             owner,
             thread: thread::current().id(),
@@ -170,6 +169,7 @@ impl<B: Backend> Driver<B> {
         }
         self.handles
             .get(h.key)
+            .filter(|r| !r.hidden)
             .ok_or(Error::new(ErrorKind::NotFound))
     }
     fn new_handle(&mut self, kind: Kind) -> Result<Handle> {
@@ -177,6 +177,7 @@ impl<B: Backend> Driver<B> {
             .handles
             .insert(Resource {
                 kind,
+                hidden: false,
                 referenced: true,
                 pending: 0,
                 closing: None,
@@ -185,7 +186,7 @@ impl<B: Backend> Driver<B> {
                 tail: None,
             })
             .ok_or(Error::new(ErrorKind::ResourceLimit))?;
-        if matches!(kind, Kind::Socket | Kind::File | Kind::Watch) {
+        if matches!(kind, Kind::Socket | Kind::File) {
             self.refs += 1;
         }
         Ok(Handle {
@@ -208,6 +209,7 @@ impl<B: Backend> Driver<B> {
                 stop: false,
                 job_cancel: None,
                 external_wait: false,
+                fs: false,
                 previous,
                 next: None,
             })
@@ -365,9 +367,7 @@ impl<B: Backend> Driver<B> {
     pub fn set_ref(&mut self, h: Handle, referenced: bool) -> Result<()> {
         let r = self.resource(h)?;
         let weight = r.pending
-            + usize::from(
-                matches!(r.kind, Kind::Socket | Kind::File | Kind::Watch) || r.closing.is_some(),
-            );
+            + usize::from(matches!(r.kind, Kind::Socket | Kind::File) || r.closing.is_some());
         if r.referenced != referenced {
             if referenced {
                 self.refs += weight;
@@ -764,25 +764,13 @@ impl<B: Backend> Driver<B> {
                 true,
             );
         } else {
-            if op.handle.is_some_and(|h| {
-                self.handles
-                    .get(h.key)
-                    .is_some_and(|r| matches!(r.kind, Kind::Watch))
-            }) {
-                if self.cancel_watch(op.handle.expect("watch handle")).is_err() {
-                    return false;
-                }
-            } else if op.external_wait {
+            if op.external_wait {
                 crate::external_wait::cancel(id);
                 #[cfg(target_arch = "wasm32")]
                 self.backend.deadline_changed(self.next_deadline());
-            } else if op.handle.is_some_and(|h| {
-                self.handles
-                    .get(h.key)
-                    .is_some_and(|r| matches!(r.kind, Kind::File))
-            }) || self.is_fs_op(id)
-            {
-                self.cancel_fs(id);
+            } else if op.fs && B::FILESYSTEM == Filesystem::Pool {
+                #[cfg(not(target_arch = "wasm32"))]
+                self.files.cancel(id);
             } else if let Some(cancel) = op.job_cancel {
                 cancel.store(true, Ordering::Release);
             } else if self.backend.cancel(id).is_err() {
@@ -808,7 +796,7 @@ impl<B: Backend> Driver<B> {
         if r.closing.is_some() {
             return Err(Error::new(ErrorKind::InvalidInput));
         }
-        if !matches!(r.kind, Kind::File | Kind::Watch) {
+        if !matches!(r.kind, Kind::File) {
             self.backend.prepare_close(h)?;
         }
         let r = self.handles.get_mut(h.key).expect("validated");
@@ -879,169 +867,136 @@ impl<B: Backend> Driver<B> {
         self.backend.deadline_changed(self.next_deadline());
         Ok(op)
     }
-    /// Watch native root invalidations. macOS/FSEvents and Windows support recursive
-    /// scope; Linux/inotify and BSD/kqueue reject recursive=true. WASI/web are Unsupported.
-    /// Watch events are coalesced; use Stat plus host timers for Node watchFile policy.
+    /// Submit a typed filesystem request; see [`FsRequest`] for ordering and
+    /// ownership. Native targets run it on the shared blocking pool, where queue
+    /// exhaustion rejects the request with ResourceLimit before acceptance. Requests
+    /// naming a handle need a visible, open file handle that is not closing.
+    pub fn fs(&mut self, request: FsRequest, token: Token) -> Result<OpId> {
+        if B::FILESYSTEM == Filesystem::Unsupported {
+            return Err(Error::new(ErrorKind::Unsupported));
+        }
+        let kind = if B::FILESYSTEM == Filesystem::Pool {
+            Kind::File
+        } else {
+            Kind::Socket
+        };
+        let target = request.handle();
+        if let Some(h) = target {
+            let r = self.resource(h)?;
+            if r.closing.is_some()
+                || std::mem::discriminant(&r.kind) != std::mem::discriminant(&kind)
+            {
+                return Err(Error::new(ErrorKind::InvalidInput));
+            }
+        }
+        let opened = if request.opens() {
+            let h = self.new_handle(kind)?;
+            self.handles.get_mut(h.key).expect("new handle").hidden = true;
+            Some(h)
+        } else {
+            None
+        };
+        let handle = opened.or(target);
+        let op = match self.new_op(handle, token) {
+            Ok(op) => op,
+            Err(e) => {
+                if let Some(h) = opened {
+                    self.discard_hidden(h, false);
+                }
+                return Err(e);
+            }
+        };
+        self.ops.get_mut(op.key).expect("new request").fs = true;
+        let accepted = match B::FILESYSTEM {
+            #[cfg(not(target_arch = "wasm32"))]
+            Filesystem::Pool => self.files.submit(op, handle, request),
+            _ => self.backend.fs(op, handle, request),
+        };
+        if let Err(e) = accepted {
+            self.retire(op);
+            self.outstanding -= 1;
+            if let Some(h) = opened {
+                self.discard_hidden(h, false);
+            }
+            return Err(e);
+        }
+        Ok(op)
+    }
+    /// Whether a request waiting for a pooled lease can start now.
+    fn files_waiting(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.files.has_work()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            false
+        }
+    }
+    /// Remove a handle that never became visible, releasing any native object.
+    fn discard_hidden(&mut self, h: Handle, native: bool) {
+        let r = self.handles.remove(h.key).expect("hidden handle");
+        debug_assert!(r.hidden);
+        if r.referenced {
+            self.refs -= 1;
+        }
+        if native {
+            match r.kind {
+                #[cfg(not(target_arch = "wasm32"))]
+                Kind::File => self.files.release(h),
+                _ => self.backend.release(h),
+            }
+        }
+    }
+    /// Deliver a typed filesystem terminal result, publishing or discarding an
+    /// opened handle. A failed or cancelled open never exposes its handle.
+    fn finish_fs(&mut self, id: OpId, result: OpResult) {
+        let Some(h) = self.ops.get(id.key).and_then(|op| op.handle) else {
+            self.finish(id, result, true);
+            return;
+        };
+        if !self.handles.get(h.key).is_some_and(|r| r.hidden) {
+            self.finish(id, result, true);
+            return;
+        }
+        if matches!(result, OpResult::Fs(FsResult::Opened(_))) {
+            self.handles.get_mut(h.key).expect("hidden handle").hidden = false;
+            self.finish(id, result, true);
+            return;
+        }
+        self.finish(id, result, true);
+        let q = self.queued.back_mut().expect("queued open result");
+        debug_assert_eq!(q.completion.op, Some(id));
+        q.completion.handle = None;
+        self.discard_hidden(h, true);
+    }
+    /// Watch a file or directory with the platform's native API: inotify (Linux),
+    /// FSEvents for directories and kqueue for files (macOS), kqueue (BSD/iOS),
+    /// ReadDirectoryChangesW (Windows). Nonterminal `OpResult::Watch` batches follow
+    /// until `fs_watch_stop` (Stopped, then Closed) or `close` (Cancelled, then Closed).
+    /// WASI and the web return Unsupported. Node `watchFile` is a host timer plus `Stat`.
     pub fn fs_watch(
         &mut self,
         path: &FsPath,
-        recursive: bool,
+        options: WatchOptions,
         token: Token,
-    ) -> Result<(Handle, OpId)> {
-        #[cfg(target_arch = "wasm32")]
+    ) -> Result<Handle> {
+        let h = self.new_handle(Kind::Socket)?;
+        if let Err(e) = self
+            .backend
+            .fs_watch(h, path, options)
+            .and_then(|()| self.submit(h, Operation::WatchFs, token).map(|_| ()))
         {
-            let _ = (path, recursive, token);
-            Err(Error::new(ErrorKind::Unsupported))
+            self.backend.release(h);
+            self.handles.remove(h.key);
+            self.refs -= 1;
+            return Err(e);
         }
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let h = self.new_handle(Kind::Watch)?;
-            let op = match self.new_op(Some(h), token) {
-                Ok(op) => op,
-                Err(e) => {
-                    self.handles.remove(h.key);
-                    self.refs -= 1;
-                    return Err(e);
-                }
-            };
-            if let Err(e) = self.watches.start(h, op, path, recursive) {
-                self.retire(op);
-                self.outstanding -= 1;
-                self.handles.remove(h.key);
-                self.refs -= 1;
-                return Err(e);
-            }
-            Ok((h, op))
-        }
+        Ok(h)
     }
-    fn cancel_watch(&mut self, h: Handle) -> Result<()> {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            self.watches.cancel(h)
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            let _ = h;
-            Err(Error::new(ErrorKind::Unsupported))
-        }
-    }
-    fn watch_work(&self) -> bool {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            self.watches.has_work()
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            false
-        }
-    }
-    fn poll_watches(&mut self) {
-        #[cfg(not(target_arch = "wasm32"))]
-        for _ in 0..self.config.events_per_turn {
-            if self.buffered[NATIVE_EVENTS] == self.config.events_per_turn {
-                break;
-            }
-            let Some((id, event)) = self.watches.poll() else {
-                break;
-            };
-            let Some(op) = self.ops.get(id.key) else {
-                continue;
-            };
-            match event {
-                Some(event) if !op.cancel => self.finish(id, OpResult::Watch(event), false),
-                None => {
-                    let result = if op.stop {
-                        OpResult::Stopped
-                    } else if op.cancel {
-                        OpResult::Cancelled
-                    } else {
-                        OpResult::Err(Error::new(ErrorKind::NotFound))
-                    };
-                    self.finish(id, result, true);
-                }
-                _ => {}
-            }
-        }
-    }
-    /// Open a regular file asynchronously. The returned handle is reserved immediately;
-    /// close it even if the Opened completion reports an error or cancellation.
-    /// Reads/writes submitted before Opened are serialized behind the open.
-    pub fn file_open(
-        &mut self,
-        path: FsPath,
-        options: FileOptions,
-        token: Token,
-    ) -> Result<(Handle, OpId)> {
-        #[cfg(target_arch = "wasm32")]
-        {
-            let _ = (path, options, token);
-            Err(Error::new(ErrorKind::Unsupported))
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let h = self.new_handle(Kind::File)?;
-            let op = match self.new_op(Some(h), token) {
-                Ok(op) => op,
-                Err(e) => {
-                    self.handles.remove(h.key);
-                    self.refs -= 1;
-                    return Err(e);
-                }
-            };
-            self.files.open(op, h, path, options);
-            Ok((h, op))
-        }
-    }
-    /// Submit a typed filesystem operation. Per-file operations are FIFO; independent
-    /// path requests can run concurrently. Close uses the ordinary close(handle) API.
-    pub fn fs(&mut self, request: FsRequest, token: Token) -> Result<OpId> {
-        #[cfg(target_arch = "wasm32")]
-        {
-            let _ = (request, token);
-            Err(Error::new(ErrorKind::Unsupported))
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let h = request.handle();
-            if let Some(h) = h {
-                let r = self.resource(h)?;
-                if !matches!(r.kind, Kind::File) || r.closing.is_some() {
-                    return Err(Error::new(ErrorKind::InvalidInput));
-                }
-            }
-            let op = self.new_op(h, token)?;
-            self.files.submit(op, request);
-            Ok(op)
-        }
-    }
-    fn is_fs_op(&self, op: OpId) -> bool {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            self.files.contains(op)
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            let _ = op;
-            false
-        }
-    }
-    fn cancel_fs(&mut self, op: OpId) {
-        #[cfg(not(target_arch = "wasm32"))]
-        self.files.cancel(op);
-        #[cfg(target_arch = "wasm32")]
-        let _ = op;
-    }
-    fn complete_fs(&mut self, op: OpId) {
-        #[cfg(not(target_arch = "wasm32"))]
-        self.files.complete(op);
-        #[cfg(target_arch = "wasm32")]
-        let _ = op;
-    }
-    fn release_file(&mut self, h: Handle) {
-        #[cfg(not(target_arch = "wasm32"))]
-        self.files.release(h);
-        #[cfg(target_arch = "wasm32")]
-        let _ = h;
+    /// Stop a filesystem watch, delivering Stopped before the final Closed.
+    pub fn fs_watch_stop(&mut self, h: Handle, token: Token) -> Result<()> {
+        self.signal_stop(h, token)
     }
     /// Submit an owned Send closure to the bounded shared blocking pool.
     pub fn blocking<F: FnOnce() -> BlockingResult + Send + 'static>(
@@ -1104,7 +1059,7 @@ impl<B: Backend> Driver<B> {
             !self.queued.is_empty()
                 || !self.poster.is_empty()
                 || !self.work_port.is_empty()
-                || self.watch_work()
+                || self.files_waiting()
                 || self.backend.has_work(),
         )?;
         Ok(integration)
@@ -1133,15 +1088,11 @@ impl<B: Backend> Driver<B> {
             if let Some(h) = closed
                 && let Some(r) = self.handles.remove(h.key)
             {
-                if matches!(r.kind, Kind::Socket) {
-                    self.backend.release(h);
-                }
-                if matches!(r.kind, Kind::File) {
-                    self.release_file(h);
-                }
-                #[cfg(not(target_arch = "wasm32"))]
-                if matches!(r.kind, Kind::Watch) {
-                    self.watches.release(h);
+                match r.kind {
+                    Kind::Socket => self.backend.release(h),
+                    #[cfg(not(target_arch = "wasm32"))]
+                    Kind::File => self.files.release(h),
+                    _ => {}
                 }
                 if r.referenced {
                     self.refs -= 1;
@@ -1156,6 +1107,19 @@ impl<B: Backend> Driver<B> {
         let Some(op) = self.ops.get(e.op.key).cloned() else {
             return;
         };
+        if op.fs && e.terminal {
+            let result = if op.cancel {
+                OpResult::Cancelled
+            } else {
+                match e.result {
+                    Ok(Outcome::Fs { output, lease }) => fs_result(op.handle, output, lease),
+                    Err(e) => OpResult::Err(e),
+                    Ok(_) => OpResult::Err(Error::new(ErrorKind::Other)),
+                }
+            };
+            self.finish_fs(e.op, result);
+            return;
+        }
         let result = if op.cancel {
             if !e.terminal {
                 return;
@@ -1193,6 +1157,8 @@ impl<B: Backend> Driver<B> {
                 Ok(Outcome::Wrote(n)) => OpResult::Wrote(n),
                 Ok(Outcome::RecvFrom { n, from, lease }) => OpResult::RecvFrom { n, from, lease },
                 Ok(Outcome::Shutdown) => OpResult::Shutdown,
+                Ok(Outcome::Watch { events, overflow }) => OpResult::Watch { events, overflow },
+                Ok(Outcome::Fs { output, lease }) => fs_result(op.handle, output, lease),
                 Ok(Outcome::Cancelled) => OpResult::Cancelled,
             }
         };
@@ -1203,6 +1169,9 @@ impl<B: Backend> Driver<B> {
         self.assert_owner();
         self.backend.validate_timeout(timeout)?;
         out.clear();
+        // Leases released by the host since the last turn can start waiting requests.
+        #[cfg(not(target_arch = "wasm32"))]
+        self.files.retry();
         let notified = self.notifier.begin();
         let start = self.backend.now();
         self.expire_connects(start)?;
@@ -1212,11 +1181,8 @@ impl<B: Backend> Driver<B> {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
-        self.poll_watches();
-        let queued = !self.queued.is_empty()
-            || !self.poster.is_empty()
-            || !self.work_port.is_empty()
-            || self.watch_work();
+        let queued =
+            !self.queued.is_empty() || !self.poster.is_empty() || !self.work_port.is_empty();
         let mut waits = 0;
         let mut zero_event_waits = 0;
         if self.buffered[NATIVE_EVENTS] == 0
@@ -1279,12 +1245,24 @@ impl<B: Backend> Driver<B> {
             let Some(work) = self.work_port.pop() else {
                 break;
             };
-            if self.is_fs_op(work.op) {
-                self.complete_fs(work.op);
-            }
             let Some(op) = self.ops.get(work.op.key) else {
                 continue;
             };
+            #[cfg(not(target_arch = "wasm32"))]
+            if op.fs {
+                let (cancel, handle) = (op.cancel, op.handle);
+                let (lease, metadata) = self.files.complete(work.op);
+                let result = match work.result {
+                    _ if cancel => OpResult::Cancelled,
+                    Ok(crate::blocking::WorkOutput::Fs(reply)) => {
+                        fs_result(handle, reply.output(metadata), lease)
+                    }
+                    Ok(_) => OpResult::Err(Error::new(ErrorKind::Other)),
+                    Err(e) => OpResult::Err(e),
+                };
+                self.finish_fs(work.op, result);
+                continue;
+            }
             let result = if op.cancel {
                 if op.stop {
                     OpResult::Stopped
@@ -1293,7 +1271,10 @@ impl<B: Backend> Driver<B> {
                 }
             } else {
                 match work.result {
-                    Ok(crate::blocking::WorkOutput::Fs(r)) => OpResult::Fs(r),
+                    #[cfg(not(target_arch = "wasm32"))]
+                    Ok(crate::blocking::WorkOutput::Fs(_)) => {
+                        OpResult::Err(Error::new(ErrorKind::Other))
+                    }
                     Ok(crate::blocking::WorkOutput::ExternalWait(r)) => OpResult::ExternalWait(r),
                     Ok(crate::blocking::WorkOutput::Blocking(p)) => OpResult::Blocking(p),
                     Ok(crate::blocking::WorkOutput::Resolved(a)) => OpResult::Resolved(a),
@@ -1322,14 +1303,16 @@ impl<B: Backend> Driver<B> {
                 false,
             );
         }
-        self.poll_watches();
+        // Cancelled or failed reads may have returned leases during this turn.
+        #[cfg(not(target_arch = "wasm32"))]
+        self.files.retry();
         self.drain(out);
         if self.external {
             self.notifier.external_park(
                 !self.queued.is_empty()
                     || !self.poster.is_empty()
                     || !self.work_port.is_empty()
-                    || self.watch_work()
+                    || self.files_waiting()
                     || self.backend.has_work(),
             )?;
         }
@@ -1341,6 +1324,33 @@ impl<B: Backend> Driver<B> {
             zero_event_waits,
         })
     }
+}
+
+/// Attach the lease and convert a worker or backend filesystem result.
+fn fs_result(handle: Option<Handle>, output: FsOutput, mut lease: Option<BufLease>) -> OpResult {
+    let mut fill = |n: usize| {
+        if let Some(lease) = &mut lease {
+            lease.set_len(n);
+        }
+    };
+    OpResult::Fs(match output {
+        FsOutput::Opened => FsResult::Opened(handle.expect("open request handle")),
+        FsOutput::Read(n) => {
+            fill(n);
+            FsResult::Read { n, lease }
+        }
+        FsOutput::Wrote(n) => FsResult::Wrote(n),
+        FsOutput::Metadata(m) => FsResult::Metadata(m),
+        FsOutput::Directory { n, eof } => {
+            fill(n);
+            FsResult::Directory { n, lease, eof }
+        }
+        FsOutput::Bytes(n) => {
+            fill(n);
+            FsResult::Bytes { n, lease }
+        }
+        FsOutput::Done => FsResult::Done,
+    })
 }
 
 impl<B: Backend> Drop for Driver<B> {
