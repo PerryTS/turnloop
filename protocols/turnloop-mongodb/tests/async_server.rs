@@ -84,7 +84,7 @@ fn real_async_auth_tls_sdam_pool_cursor_retry_and_primary_stepdown() {
         let mut cursor=c.cursor(&raw(doc!{"find":"items","filter":{},"batchSize":1,"$db":"async_lane"}),at).await.expect("cursor");let mut rows=0;while let Some(row)=cursor.next(at).await.expect("cursor next"){assert!(row.get_i32("value").expect("value")>=42);rows+=1;}assert_eq!(rows,3);cursor.close(at).await.expect("close cursor");
         let before=c.heartbeat_count();h.sleep(Duration::from_millis(1100)).await.expect("heartbeat timer");assert!(c.heartbeat_count()>before);assert_eq!(c.server_count(),3);
         let mut before_primary=String::new();c.command(&raw(doc!{"hello":1,"$db":"admin"}),&[],OperationKind::RunCommand,at,|r|{before_primary=r.get_str("me").expect("primary me").to_owned();Ok(())}).await.expect("hello");
-        let step=c.command(&raw(doc!{"replSetStepDown":5,"force":true,"$db":"admin"}),&[],OperationKind::RunCommand,at,|_|Ok(())).await;if let Err(e) = step {
+        let step=c.command(&raw(doc!{"replSetStepDown":60,"force":true,"$db":"admin"}),&[],OperationKind::RunCommand,at,|_|Ok(())).await;if let Err(e) = step {
             let mongo = e.get_ref().and_then(|e| e.downcast_ref::<turnloop_mongodb::Error>()).expect("MongoDB step-down error");
             assert!(matches!(mongo.kind, turnloop_mongodb::ErrorKind::Network) || matches!(mongo.code,Some(91|189|11600|11602)), "unexpected step-down failure: {e}");
         }
