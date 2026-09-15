@@ -45,11 +45,21 @@ an independent signal handle; stop it explicitly when finished with the TTY.
 
 ## Blocking waits and nonblocking discovery (tl-i01b)
 
-DESIGN D7 and §10 rule 3 permit at most one native wait/discovery call per turn.
-Queued completions prohibit positive-timeout or infinite waits. One zero-time
-native discovery poll is permitted only with native operations pending and native
-output reserve available. Queued work with no native operations makes no OS call.
-This retains fresh-I/O fairness through sustained queued posts/timers.
+DESIGN D7 and §10 rule 3 permit at most one OS wait per turn. Queued work
+(posts, blocking-pool and external-wait results, synchronous or terminal
+completions) prohibits positive-timeout or infinite waits.
+One zero-time native discovery poll is permitted only with native operations
+pending and native output reserve available. Queued work with no native operation
+pending makes no OS call. This retains fresh-I/O fairness through sustained
+queued posts/timers, as libuv does with its zero-timeout `uv__io_poll`.
+
+The driver enforces the skip; backends need no new method. On native and WASI
+backends a queued turn with no native operation never calls `poll`,
+even when `has_work()` reports stale cached readiness, because draining it could
+fall through to the OS. The web backend's poll only drains host callbacks and
+Worker/condition rings and never enters the OS, so it keeps revision 2's policy of
+polling for cached host work. A lookup accepted by `Backend::resolve` (WASI 0.2)
+counts as a pending native operation, like socket I/O.
 
 `PollInfo::waits` and `TurnInfo::os_waits` now count only blocking waits;
 `discovery_polls` counts zero-time native polls in both types. The two counters

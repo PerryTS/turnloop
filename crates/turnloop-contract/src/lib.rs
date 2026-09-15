@@ -909,7 +909,8 @@ pub fn ready_timer_liveness<B: Backend>() {
     }
     assert_eq!((cancelled, closed), (1, 1));
 }
-/// Queued core work never calls the native poller without native operations.
+/// DESIGN §10.3: queued core work (posts, timer Cancelled/Closed results) makes
+/// no native call at all when no native operation is pending.
 pub fn queued_core_work<B: Backend>() {
     let mut driver = Driver::<B>::new(Config::default()).expect("loop");
     let mut out = Completions::with_capacity(1);
@@ -1092,6 +1093,21 @@ pub fn queued_terminals_idle_io<B: Backend>() {
         discovery_polls, 2,
         "both queued terminal turns discover idle I/O"
     );
+    // A due timer is not queued work: with native I/O pending its zero effective
+    // wait is one discovery poll, never a blocking wait.
+    let due = driver
+        .timer(driver.now(), None, Token(4))
+        .expect("due timer");
+    let info = driver.turn(Timeout::Forever, &mut out).expect("due timer");
+    assert_eq!((info.os_waits, info.discovery_polls), (0, 1));
+    discovery_polls += info.discovery_polls;
+    assert_eq!((out.len(), out[0].handle), (1, Some(due)));
+    assert!(matches!(out[0].result, OpResult::Timer));
+    driver.close(due, Token(5)).expect("close due timer");
+    let info = driver.turn(Timeout::Forever, &mut out).expect("due close");
+    assert_eq!((info.os_waits, info.discovery_polls), (0, 1));
+    discovery_polls += info.discovery_polls;
+    assert!(matches!(out[0].result, OpResult::Closed));
     assert!(driver.cancel(read), "UDP remained pending throughout");
     eprintln!(
         "queued terminals with idle UDP: delivered=2, waits={waits}, discovery_polls={discovery_polls}"

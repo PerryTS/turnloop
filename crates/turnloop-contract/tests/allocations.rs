@@ -1579,10 +1579,11 @@ fn windows_backlog_accept_rearm_and_busy_deadlines_allocate_nothing() {
         let mut waits = 0;
         loop {
             assert!(client.now() < at + Duration::from_secs(3));
-            waits += client
+            let info = client
                 .turn(Timeout::Until(at + Duration::from_secs(3)), &mut out)
-                .expect("busy wait expiry")
-                .os_waits;
+                .expect("busy wait expiry");
+            // Revision-2 wait counts included zero-time calls: keep that total.
+            waits += info.os_waits + info.discovery_polls;
             if out.is_empty() {
                 continue;
             }

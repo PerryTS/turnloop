@@ -34,11 +34,13 @@
 //!
 //! * `poll` appends at most `events.capacity() - events.len()` Events; never grows
 //!   the vector. A full buffer retains work for the next turn, without losing an
-//!   edge. At most one native wait/discovery call is allowed. Queued completions
-//!   prohibit blocking waits; one zero-time discovery poll is allowed only with
-//!   native operations pending and native output reserve. Queued pure-core work
-//!   with no native operations makes no OS call. `None` means an unbounded wait.
-//!   Durations must retain sub-millisecond precision.
+//!   edge. At most one OS wait is allowed (DESIGN §10 rule 3). Queued work
+//!   prohibits blocking waits: the driver passes a zero timeout, and calls poll
+//!   for that one discovery poll only with native operations pending and native
+//!   output reserve. With no native operation pending, the driver skips poll for
+//!   queued work, whatever `has_work` reports (web, whose poll never
+//!   enters the OS, keeps draining cached host work). `None` means an unbounded
+//!   wait. Durations must retain sub-millisecond precision.
 //! * Readiness backends execute I/O in poll, cache readiness until EAGAIN, and
 //!   requeue partially processed work fairly. Completion backends drain native
 //!   completions. WASI 0.2 polls pollables; 0.3 drives a waitable set; web drains

@@ -31,6 +31,64 @@ fn queued_terminals_idle_io() {
 fn sustained_posts_idle_io() {
     contract::sustained_posts_idle_io::<Platform>();
 }
+/// DESIGN §10.3: a natively accepted WASI 0.2 lookup is a pending native
+/// operation, so queued posts cannot starve its discovery.
+#[cfg(target_env = "p2")]
+#[test]
+fn queued_posts_preserve_native_dns_discovery() {
+    use std::time::Duration;
+    use turnloop::*;
+    let mut l = Loop::new(Config::default()).expect("loop");
+    let lookup = l
+        .resolve(
+            DnsRequest {
+                host: "localhost".into(),
+                port: 8080,
+            },
+            Token(1),
+        )
+        .expect("native lookup");
+    let poster = l.poster();
+    let mut out = Completions::with_capacity(1);
+    let until = l.now() + Duration::from_secs(2);
+    let (mut turns, mut posts, mut resolved, mut discovery_polls) = (0, 0, 0, 0);
+    while turns < 64 || resolved == 0 {
+        assert!(
+            l.now() < until,
+            "queued posts starved DNS: turns={turns}, posts={posts}, discovery_polls={discovery_polls}"
+        );
+        poster.post(Token(2), Payload::U64(7)).expect("replenish");
+        let info = l.turn(Timeout::Now, &mut out).expect("turn");
+        assert_eq!(info.os_waits, 0, "queued posts forbid blocking waits");
+        assert!(info.discovery_polls <= 1);
+        if resolved != 0 {
+            assert_eq!(info.discovery_polls, 0, "no native operation remains");
+        }
+        discovery_polls += info.discovery_polls;
+        turns += 1;
+        assert_eq!(out.len(), 1);
+        for c in out.drain() {
+            match c.result {
+                OpResult::Posted(Payload::U64(7)) => posts += 1,
+                OpResult::Resolved(addresses) => {
+                    assert_eq!(c.op, Some(lookup));
+                    assert!(!addresses.is_empty());
+                    assert!(
+                        addresses
+                            .iter()
+                            .all(|a| a.ip().is_loopback() && a.port() == 8080)
+                    );
+                    resolved += 1;
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+    eprintln!(
+        "queued posts with WASI DNS: turns={turns}, posts={posts}, discovery_polls={discovery_polls}"
+    );
+    assert_eq!((resolved, posts), (1, turns - 1));
+}
 #[test]
 fn tcp_one() {
     contract::tcp_echo::<Platform>(1);

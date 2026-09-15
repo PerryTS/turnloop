@@ -184,12 +184,12 @@ pub enum Timeout { Now, After(Duration), Until(Instant), Forever }
 
 `turn(timeout, &mut completions)`:
 
-1. Computes the effective wait: `min(timeout, next_deadline)`, or zero if completions are already queued (from posts, synchronous successes, or cached readiness).
-2. Does **at most one** native wait/discovery call (`epoll_pwait2` / `kevent` / `GetQueuedCompletionStatusEx`). Queued completions prohibit blocking waits (positive or infinite timeout). One nonblocking discovery poll (zero timeout) is permitted only when native operations are pending and native output reserve is available. Queued work with no native operations makes no OS call: pure post/timer/terminal churn costs zero syscalls (§10 rule 3).
+1. Computes the effective wait: `min(timeout, next_deadline)`, or zero if work is already queued (posts, blocking-pool results, synchronous or terminal completions). With queued work the native step is at most one nonblocking discovery poll, made only while native operations are pending and native output reserve is available; with no native operation pending it is skipped, so pure post/timer/terminal churn costs zero syscalls (§10 rule 3). Cached readiness runs inside the native step without an OS call.
+2. Does **at most one** OS wait (`epoll_pwait2` / `kevent` / `GetQueuedCompletionStatusEx`): a blocking wait (positive or infinite timeout) only when no work is queued, otherwise at most the zero-timeout discovery poll of step 1.
 3. On Unix, performs the ready I/O; on Windows, collects IOCP entries.
 4. Expires timers.
 5. Drains cross-thread posts.
-6. Returns `TurnInfo { completions, waited, alive }`.
+6. Returns `TurnInfo { completions, waited, alive, os_waits, discovery_polls, zero_event_waits }`: blocking waits, zero-timeout discovery polls, and native calls of either kind that returned no native event.
 
 There are two ways a host drives a loop:
 
@@ -484,20 +484,19 @@ No other Perry change is needed for P0.
 
 1. **Allocations:** zero heap allocations per read, write, timer or accept after warm-up (checked with a counting allocator in tests).
 2. **Wake:** zero syscalls on `notify()` while the loop is running (checked with a syscall-counting harness: `strace -c` / `ktrace` / ETW in CI smoke tests).
-3. **OS waits and discovery:** a `turn` makes at most one OS wait. When completions are already queued, it performs **no blocking wait** (positive or infinite timeout). It may perform **at most one nonblocking native discovery poll** (zero timeout), **only if native operations are pending and native output reserve is available**. With queued work and **no native operations pending**, the turn makes **no OS call at all**: pure post/timer/terminal churn costs zero syscalls. Blocking waits and nonblocking discovery polls share the single-call budget and have separate counters.
+3. **OS waits and discovery** (amended by tl-i01b, see the rationale below):
+   1. A `turn` makes at most one OS wait.
+   2. When completions are already queued, the turn performs **no blocking wait** (positive or infinite timeout).
+   3. It may perform **at most one nonblocking native discovery poll** (zero timeout), and **only if native operations are pending** and native output reserve is available.
+   4. With queued work and **no** native operations pending, the turn makes **no OS call at all**: pure post/timer/terminal churn costs zero syscalls.
+   5. The no-spin rule (4a) is unchanged.
+
+   *Queued work* means completions already queued before the native step: posts, blocking-pool and external-wait results, synchronous and terminal completions, including a timer's `Cancelled`/`Closed`; timer start, reset, cancel and close are therefore pure churn. A timer expiry that is due when the turn starts is not queued work: the effective wait is zero, so the turn may spend its one call on a zero-timeout poll. *Native operations* are operations submitted on native handles (sockets, pipes, files, processes, signals, web fetch/WebSocket), plus requests a backend accepts natively (WASI 0.2 DNS). `TurnInfo::os_waits` counts blocking waits and `TurnInfo::discovery_polls` counts zero-timeout discovery polls; their sum is at most one per turn. Web callback draining and Windows Event-helper queue draining make neither kind of call. **Contract tests:** a queued post beside an idle UDP receive delivers with `os_waits == 0`, `discovery_polls == 1`, then byte-verified I/O; queued posts and timer `Cancelled`/`Closed` with no native operation record zero of both; a sustained producer keeps fresh I/O progressing within two seconds.
 4. **Ticks:** no fixed-interval ticks and no minimum wait floor.
 4a. **No spin.** A turn with nothing ready and a future deadline blocks until that deadline, at the precision in §7.6. It never returns immediately and never degrades into a zero-timeout poll loop. Hosts must pass exact deadlines (`Instant`, not truncated milliseconds). The Linux A/B measured what happens otherwise: 37,607 turns for 50 timers, ~70× user instructions. **Contract test:** with an idle registered socket and a 0.5 ms / 2 ms / 10 ms timer, turns per expiry ≤ 2 and zero-event OS waits ≤ 1 per expiry, on every backend.
 5. **Instruction budgets per operation** (Linux, cgu=1, `perf stat -e instructions:u,instructions:k`): TCP read / write / accept, timer start + cancel, notify + turn round trip, blocking job round trip, idle turn. **Values to be set from the attribution run of today's tokio bridge**, with a target below the tokio-bridge cost and within X % of a hand-written epoll loop. The CI gate compares against a committed baseline, with a control probe that must not move.
 
-**Rule 3 rationale (tl-i01b, spec-owner decision, 2026-09-15):** revision 2 has no
-separate no-wait discovery primitive. [libuv's `uv_run` and backend timeout](https://github.com/libuv/libuv/blob/v1.51.0/src/unix/core.c#L374-L449)
-also retain zero-time `uv__io_poll` while work is pending. The
-[tl-i01 fairness probes](docs/lanes/tl-i01.md#evidence--specification-decision)
-showed that skipping discovery, including a cached-only guard, starves fresh I/O
-through sustained queued work and fails the unchanged two-second fairness contract.
-A separate collection API across six backends is not justified before measurement.
-Rule 4a and its raw zero-event accounting are unchanged: empty discovery polls
-still count toward the same no-spin bound.
+**Rule 3 rationale (tl-i01b, spec-owner decision, 2026-09-15).** The original rule 3 ("none when completions are already queued") forbade even a zero-timeout poll. Backend revision 2 has no separate no-wait discovery primitive: `poll(Duration::ZERO)` is the only way to learn about fresh readiness or completions, and on Unix, after cached readiness reaches `EAGAIN`, only the poller marks a resource ready again. libuv and Node make the same trade: `uv_run` computes `uv_backend_timeout()`, which is zero while pending, idle or closing work exists, and still calls `uv__io_poll` with that zero timeout (see the libuv [loop API](https://docs.libuv.org/en/v1.x/loop.html) and [`src/unix/core.c`](https://github.com/libuv/libuv/blob/v1.x/src/unix/core.c)). The [tl-i01 probes](docs/lanes/tl-i01.md#evidence--specification-decision) showed that skipping discovery breaks the unchanged fairness contract: skipping the native step whenever work was queued failed the timer/I/O/post fairness test after two seconds, and a guard that only drained cached work delivered 64 posts with zero reads and failed the same fairness test. A separate no-wait collection API on all six backends is not justified before measurement. Rule 4a and its raw zero-event accounting are unchanged: an empty discovery poll still counts toward the same no-spin bound.
 
 **Methodology** (lessons already paid for):
 - Instruction A/Bs at `codegen-units=16` swing 0.5–8 % on untouched code, so gates build at cgu=1.
