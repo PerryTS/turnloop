@@ -285,6 +285,12 @@ pub enum SocketOption {
     /// `TCP_NODELAY`: send small writes immediately instead of coalescing them.
     NoDelay(bool),
     /// `SO_KEEPALIVE` and its probe schedule; `None` disables probing.
+    ///
+    /// The switch and each schedule value are separate kernel settings, and every
+    /// value is validated before any of them is written. If the OS still rejects
+    /// one after the switch was set, the error is reported and the socket keeps
+    /// whatever the OS left: read it back rather than assuming a rollback.
+    /// Disabling clears the switch and leaves the schedule alone, as the OS does.
     KeepAlive(Option<KeepAlive>),
     /// `SO_LINGER`: `Some(d)` blocks the close until queued data is delivered or
     /// `d` elapses, and `Some(Duration::ZERO)` discards it and resets the

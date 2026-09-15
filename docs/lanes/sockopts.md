@@ -73,6 +73,11 @@ drift:
 - **Granularity.** Native keep-alive and linger schedules are whole seconds, so a
   `Duration` is rounded **up** and a zero keep-alive interval is `InvalidInput`
   rather than silently becoming "immediately". WASI takes the duration unrounded.
+- **Partial failure is reported, not hidden.** Keep-alive is a switch plus up to
+  three separate kernel settings. Every value is validated before any is written,
+  but if the OS still rejects one after the switch was set, the error is returned
+  and the socket keeps whatever the OS left — documented on the variant, because a
+  silent rollback that itself failed would be worse.
 - **Handle rules.** A timer handle is `InvalidInput`; a closing handle is
   `InvalidInput`; a released handle is `NotFound`; stdio/file/TTY, process, signal
   and fs-watch handles are `Unsupported`.
