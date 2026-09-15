@@ -692,6 +692,31 @@ impl<B: Backend> Driver<B> {
         }
         self.backend.get_option(h, kind)
     }
+    /// Report the native identity of a live transport handle, for the host's own
+    /// bookkeeping. This is Node's `socket._handle.fd`.
+    ///
+    /// The loop keeps ownership. The value is **borrowed and reporting-only**,
+    /// valid until this handle is closed, detached or its loop is dropped, after
+    /// which the OS may reuse the number for something else. A host may print it,
+    /// expose it to script, compare it, or pass it to a read-only query such as
+    /// `getsockname`. A host must not do I/O on it, close or shut it down, change
+    /// its blocking mode, register it with another poller or completion port, or
+    /// give it to anything that takes ownership: every one of those breaks the
+    /// exactly-once completion and buffer-ownership contracts, and turnloop cannot
+    /// detect it. To take ownership, [`detach`](Self::detach) it and convert the
+    /// resulting transport (`into_fd` on Unix, `into_socket`/`into_handle` on
+    /// Windows), which is the only supported way for a descriptor to leave a loop.
+    ///
+    /// Timers, and any resource whose platform has no descriptor for it (WASI 0.2
+    /// and 0.3 sockets are component-model resource handles; web resources are
+    /// host objects), report `Unsupported`.
+    pub fn raw_transport(&self, h: Handle) -> Result<crate::RawTransport> {
+        let r = self.resource(h)?;
+        if !matches!(r.kind, Kind::Socket) {
+            return Err(Error::new(ErrorKind::Unsupported));
+        }
+        self.backend.raw_transport(h)
+    }
     fn submit(&mut self, h: Handle, operation: Operation, token: Token) -> Result<OpId> {
         let r = self.resource(h)?;
         if r.closing.is_some() || !matches!(r.kind, Kind::Socket) {
@@ -860,6 +885,26 @@ impl<B: Backend> Driver<B> {
         Ok(())
     }
     /// Cancel pending operations and detach once acknowledgements are delivered; WouldBlock means turn and retry.
+    ///
+    /// Detaching is how a transport leaves a loop, whether it is going to another
+    /// loop ([`attach`](Self::attach)) or to the host for good. It never cancels
+    /// silently: operations still outstanding are cancelled, `WouldBlock` is
+    /// returned while their terminal completions drain, and the host turns this
+    /// loop and retries. On success this loop owns nothing of that transport —
+    /// the handle is gone (a later call reports `NotFound`), it is unregistered
+    /// from the poller or worker, no buffer is retained, and no completion for it
+    /// will ever be produced again.
+    ///
+    /// To hand the descriptor itself to the host — Node's mid-stream
+    /// `socket.upgradeToTLS`, which gives a live connected socket to a TLS layer
+    /// — convert the returned transport: `into_fd` on Unix,
+    /// `into_socket`/`into_handle` on Windows (where the completion-port rules in
+    /// those methods' documentation apply). WASI 0.2, WASI 0.3 and web report
+    /// `Unsupported`: their sockets are component-model resource handles or host
+    /// objects, not descriptors, and neither platform can pass one out.
+    ///
+    /// [`raw_transport`](Self::raw_transport) is the borrowed, reporting-only
+    /// counterpart for a socket the loop keeps.
     pub fn detach(&mut self, h: Handle) -> Result<B::Detached> {
         let r = self.resource(h)?;
         if r.closing.is_some() || !matches!(r.kind, Kind::Socket) {

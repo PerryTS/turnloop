@@ -366,6 +366,12 @@ fn wasi_random_fills_both_getrandom_generations_and_bson() {
 fn revision_two_unsupported_native_capabilities() {
     contract::single_agent::unsupported_native::<Platform>();
 }
+/// A WASI socket is a component-model resource handle, not a descriptor: there
+/// is nothing to hand to a host, and nothing to report as `_handle.fd` (#35).
+#[test]
+fn transports_have_no_descriptor_to_hand_out() {
+    contract::handoff::handoff_is_unsupported::<Platform>();
+}
 #[test]
 fn external_wait_routing_cancellation_and_capacity() {
     contract::single_agent::waits::<Platform>();
