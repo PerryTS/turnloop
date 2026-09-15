@@ -18,6 +18,31 @@ import urllib.request
 from common import PIN, ROOT, cargo, entrypoint, fail, get_json, metadata, publish_order, run
 
 
+def semver_key(number):
+    """SemVer 2.0.0 precedence; build metadata is ignored."""
+    core, _, pre = number.split('+', 1)[0].partition('-')
+    major, minor, patch = (int(part) for part in core.split('.'))
+    if not pre:
+        return (major, minor, patch, 1, ())
+    ids = tuple((0, int(i), '') if i.isdigit() else (1, 0, i) for i in pre.split('.'))
+    return (major, minor, patch, 0, ids)
+
+
+def semver_baseline(record, version):
+    """Highest non-yanked published version below `version`.
+
+    Stable releases are preferred, as before. A crate that has only
+    pre-releases (the 0.1.0-alpha series) is checked against its newest earlier
+    pre-release instead of failing for lack of a stable baseline.
+    """
+    target = semver_key(version)
+    earlier = [v['num'] for v in record['versions']
+               if not v.get('yanked') and semver_key(v['num']) < target]
+    stable = [n for n in earlier if '-' not in n.split('+', 1)[0]]
+    candidates = stable or earlier
+    return max(candidates, key=semver_key) if candidates else None
+
+
 def registry(name):
     try:
         return get_json(f'https://crates.io/api/v1/crates/{name}')
@@ -81,9 +106,9 @@ def main():
                 recovery.append(package['name'])
             else:
                 pending.append(package['name'])
-            baseline = record['crate']['max_stable_version']
+            baseline = semver_baseline(record, package['version'])
             if not baseline:
-                fail(f'{package["name"]}: no stable registry baseline for semver-checks')
+                fail(f'{package["name"]}: no earlier published version for semver-checks')
             run(cargo(PIN) + ['semver-checks', '--manifest-path', package['manifest_path'],
                 '--baseline-version', baseline, '--all-features'], cwd=data['workspace_root'])
         # One invocation checks EACH crate and stages unpublished siblings in a
