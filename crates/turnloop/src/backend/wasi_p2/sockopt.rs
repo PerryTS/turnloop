@@ -150,6 +150,11 @@ pub(super) fn get(socket: &Socket, kind: SocketOptionKind) -> Result<SocketOptio
 /// Apply a listener's accepted-socket defaults to one accepted socket, before
 /// the `Accepted` outcome exists.
 pub(super) fn apply_accept_defaults(socket: &TcpSocket, defaults: AcceptDefaults) -> Result<()> {
+    // `open` already refused this, but an accept must never quietly hand up a
+    // connection whose requested default was not applied.
+    if defaults.nodelay {
+        return unsupported();
+    }
     if let Some(schedule) = defaults.keep_alive {
         set_keep_alive(socket, Some(schedule))?;
     }

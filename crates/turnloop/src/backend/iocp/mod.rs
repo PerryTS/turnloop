@@ -1234,6 +1234,7 @@ unsafe impl Backend for Iocp {
                 if opts.reuse_port {
                     return Err(unsupported());
                 }
+                sockopt::validate_accept_defaults(opts.accept_defaults, Kind::Listener)?;
                 let socket = socket::create(addr.is_ipv6(), false)?;
                 let raw = socket.as_raw_socket() as usize;
                 socket::option(raw, SO_EXCLUSIVEADDRUSE, 1)?;
