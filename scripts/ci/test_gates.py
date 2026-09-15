@@ -47,6 +47,25 @@ class Gates(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             publish_order(data)
 
+    def test_release_notes_falls_back_for_a_version_only_bump(self):
+        release = module('release')
+        with tempfile.TemporaryDirectory() as d:
+            manifest = Path(d) / 'Cargo.toml'
+            manifest.write_text('')
+            package = {'name': 'turnloop-io', 'version': '0.1.0-alpha.4', 'manifest_path': str(manifest)}
+            # No changelog file at all is still a hard failure.
+            with self.assertRaises(RuntimeError):
+                release.release_notes(package)
+            (Path(d) / 'CHANGELOG.md').write_text(
+                '# Changelog\n\n## [Unreleased]\n\n## [0.1.0-alpha.3] - 2026-09-15\n\n- something\n')
+            # A crate with no section for this version gets a stated body, not a failure.
+            notes = release.release_notes(package)
+            self.assertIn('released with the workspace', notes)
+            self.assertIn('0.1.0-alpha.4', notes)
+            # A crate whose own section exists gets exactly that section.
+            package['version'] = '0.1.0-alpha.3'
+            self.assertEqual(release.release_notes(package).strip().splitlines()[-1], '- something')
+
     def test_semver_baseline_prefers_stable_then_earlier_prerelease(self):
         release = module('release')
         record = lambda *nums, yanked=(): {'versions': [{'num': n, 'yanked': n in yanked} for n in nums]}
