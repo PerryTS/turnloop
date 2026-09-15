@@ -34,6 +34,7 @@ contract!(
     ipv6_only_is_readable_and_bind_time,
     nodelay_round_trip_and_accept_default,
     nodelay_small_write_round_trip,
+    accept_defaults_survive_transfer,
 );
 #[test]
 fn multicast_membership_is_tracked() {

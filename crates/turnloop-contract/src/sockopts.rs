@@ -541,6 +541,53 @@ pub fn nodelay_small_write_round_trip<B: Backend>() {
     assert_eq!((received, echoed), (8, 8), "every round must complete");
     close_all(&mut l, &[client, conn, server]);
 }
+/// A listener's accept defaults belong to the listener, not to the loop that
+/// created it: they travel with the transport through `detach`/`attach`, so a
+/// listener handed to another agent keeps configuring its connections there.
+pub fn accept_defaults_survive_transfer<B: Backend>() {
+    let listen = ListenOpts {
+        accept_defaults: AcceptDefaults {
+            nodelay: true,
+            ..AcceptDefaults::EMPTY
+        },
+        ..ListenOpts::default()
+    };
+    let mut source = Driver::<B>::new(Config::default()).expect("source loop");
+    let server = source.tcp_listen(localhost(), &listen).expect("listen");
+    let address = source.local_addr(server).expect("address");
+    let transport = source.detach(server).expect("quiescent detach");
+    assert!(!source.alive(), "the source loop keeps nothing");
+
+    let mut l = Driver::<B>::new(Config::default()).expect("destination loop");
+    let server = l.attach(transport, Token(1)).expect("attach");
+    l.accept(server, Token(2)).expect("accept");
+    let client = l
+        .tcp_connect(address, &TcpOpts::default(), Token(3))
+        .expect("connect");
+    let mut out = Completions::default();
+    let until = l.now() + Duration::from_secs(5);
+    let (mut conn, mut connected) = (None, false);
+    while conn.is_none() || !connected {
+        assert!(l.now() < until, "transferred listener never accepted");
+        l.turn(Timeout::Until(until), &mut out).expect("turn");
+        for c in out.drain() {
+            match c.result {
+                OpResult::Accepted { conn: h, .. } => conn = Some(h),
+                OpResult::Connected => connected = true,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+    let conn = conn.expect("accepted");
+    assert!(
+        matches!(
+            read_option(&l, conn, SocketOptionKind::NoDelay),
+            SocketOption::NoDelay(true)
+        ),
+        "the default did not travel with the listener"
+    );
+    close_all(&mut l, &[client, conn, server]);
+}
 /// Options the platform cannot express are reported, never accepted and ignored.
 /// `expected` names what this backend genuinely lacks.
 pub fn unsupported_options_are_reported<B: Backend>(
