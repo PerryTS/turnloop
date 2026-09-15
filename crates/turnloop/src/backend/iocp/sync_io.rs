@@ -96,6 +96,30 @@ fn cancel_thread(state: &State, direction: usize) -> bool {
     }
     false
 }
+fn readable_and_writable(handle: HANDLE) -> bool {
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FILE_ACCESS_INFORMATION, FileAccessInformation, NtQueryInformationFile,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{FILE_READ_DATA, FILE_WRITE_DATA};
+    // SAFETY: valid zeroed C output storage.
+    let mut status: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+    let mut info = FILE_ACCESS_INFORMATION { AccessFlags: 0 };
+    // SAFETY: live quiescent handle and correctly sized writable output; the query
+    // retains no pointer. libuv's uv_pipe_open makes the same query at adoption.
+    let result = unsafe {
+        NtQueryInformationFile(
+            handle,
+            &mut status,
+            ptr::from_mut(&mut info).cast(),
+            std::mem::size_of_val(&info) as u32,
+            FileAccessInformation,
+        )
+    };
+    let both = FILE_READ_DATA | FILE_WRITE_DATA;
+    // An unknown answer keeps preemption: it is only a cost when a write actually
+    // arrives beside an idle read.
+    result != 0 || info.AccessFlags & both == both
+}
 fn aborted(result: &Result<u32>) -> bool {
     matches!(result, Err(error) if error.os == Some(ERROR_OPERATION_ABORTED as i32))
 }
@@ -167,9 +191,13 @@ impl Worker {
         let canceller = canceller()?;
         // Classified while quiescent. Console input and screen output are distinct
         // objects and disk reads do not wait for data, so only pipes need preemption.
-        // Other character devices keep their driver's serialization semantics.
+        // Other character devices keep their driver's serialization semantics. A
+        // one-way pipe end (every anonymous pipe) fails the other direction's access
+        // check before any I/O serialization, so it needs no preemption either.
         // SAFETY: live adopted handle; GetFileType has no lifetime side effects.
-        let preemptible = !console && unsafe { GetFileType(handle) } == FILE_TYPE_PIPE;
+        let preemptible = !console
+            && unsafe { GetFileType(handle) } == FILE_TYPE_PIPE
+            && readable_and_writable(handle);
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 directions: [Direction::default(), Direction::default()],

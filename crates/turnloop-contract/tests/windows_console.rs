@@ -304,6 +304,7 @@ fn windows_hide_and_detached_match_console_inheritance() {
                     "Node-compatible defaults"
                 );
                 spec.args.push("console-probe".into());
+                spec.args.push(std::process::id().to_string().into());
                 spec.windows_hide = hide;
                 spec.detached = detached;
                 spec.stdio = [
@@ -380,8 +381,11 @@ fn windows_hide_and_detached_match_console_inheritance() {
                 }
                 assert_eq!((exit, eof), (1, 1));
                 let show = if hide { 0 } else { 10 }; // SW_HIDE / SW_SHOWDEFAULT
+                // CREATE_NO_WINDOW (hidden, nothing inherited) runs the child in its own
+                // windowless console; DETACHED_PROCESS leaves it without any console.
+                let own = !detached;
                 let expected = format!(
-                    "console:{attached},show:{show}\n{}",
+                    "console:{attached},own:{own},show:{show}\n{}",
                     if attached { "ctrl-c-received\n" } else { "" }
                 );
                 assert_eq!(

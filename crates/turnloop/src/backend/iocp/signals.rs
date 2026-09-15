@@ -12,7 +12,14 @@ use windows_sys::Win32::System::Threading::{INFINITE, Sleep};
 
 static SLOTS: [AtomicPtr<Ticket>; 1024] = [const { AtomicPtr::new(ptr::null_mut()) }; 1024];
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
-static REGISTRATION: Mutex<usize> = Mutex::new(0);
+// Whether `handler` is installed. Installation is permanent, as in libuv's
+// uv__signals_init: SetConsoleCtrlHandler (add or remove) blocks while any control
+// handler is running (windows-2025 run 34934409445), and a subscribed Hup holds its
+// handler forever. Removing it on the last subscription's Drop therefore deadlocked the
+// cleanup a close handler exists to allow. With no subscription the installed handler
+// returns FALSE, exactly as if it were absent, so older and newer host handlers and
+// the default handler still run.
+static REGISTRATION: Mutex<bool> = Mutex::new(false);
 struct Ticket {
     signal: Signal,
     pending: AtomicBool,
@@ -81,14 +88,15 @@ impl Subscription {
         ) {
             return Err(unsupported());
         }
-        let mut count = REGISTRATION.lock().unwrap_or_else(|e| e.into_inner());
+        let mut installed = REGISTRATION.lock().unwrap_or_else(|e| e.into_inner());
         let index = SLOTS
             .iter()
             .position(|s| s.load(Ordering::SeqCst).is_null())
             .ok_or(Error::new(ErrorKind::ResourceLimit))?;
-        if *count == 0 {
+        if !*installed {
             // SAFETY: process-lifetime function pointer; handler has no locks or allocations.
             bool_result(unsafe { SetConsoleCtrlHandler(Some(handler), 1) })?;
+            *installed = true;
         }
         let ticket = Box::into_raw(Box::new(Ticket {
             signal,
@@ -96,7 +104,6 @@ impl Subscription {
             notifier,
         }));
         SLOTS[index].store(ticket, Ordering::SeqCst);
-        *count += 1;
         Ok(Self { ticket, index })
     }
     pub(super) fn ready(&self) -> bool {
@@ -113,15 +120,10 @@ impl Subscription {
 }
 impl Drop for Subscription {
     fn drop(&mut self) {
-        let mut count = REGISTRATION.lock().unwrap_or_else(|e| e.into_inner());
+        // The installed handler stays registered (see REGISTRATION); unpublishing
+        // the ticket is enough for it to stop claiming this signal.
+        let _slots = REGISTRATION.lock().unwrap_or_else(|e| e.into_inner());
         SLOTS[self.index].store(ptr::null_mut(), Ordering::SeqCst);
-        *count -= 1;
-        if *count == 0 {
-            // SAFETY: remove only our handler, preserving every host handler.
-            unsafe {
-                SetConsoleCtrlHandler(Some(handler), 0);
-            }
-        }
         while ACTIVE.load(Ordering::SeqCst) != 0 {
             std::thread::yield_now();
         }

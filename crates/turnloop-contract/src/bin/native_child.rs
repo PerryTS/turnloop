@@ -65,7 +65,7 @@ fn main() {
             let _ = child.wait();
         }
         #[cfg(windows)]
-        "console-probe" => console_probe(),
+        "console-probe" => console_probe(&args),
         #[cfg(windows)]
         "lifetime-parent" => lifetime_parent(&args),
         #[cfg(windows)]
@@ -101,12 +101,21 @@ fn main() {
 }
 
 #[cfg(windows)]
-fn console_probe() {
+fn console_probe(args: &[std::ffi::OsString]) {
     use turnloop::*;
     use windows_sys::Win32::System::{Console::*, Threading::*};
-    let mut pids = [0u32; 16];
+    let host: u32 = args
+        .get(2)
+        .and_then(|pid| pid.to_str())
+        .and_then(|pid| pid.parse().ok())
+        .expect("host process id");
+    let mut pids = [0u32; 64];
     // SAFETY: initialized writable array and its actual element count.
-    let attached = unsafe { GetConsoleProcessList(pids.as_mut_ptr(), pids.len() as u32) } > 0;
+    let count = unsafe { GetConsoleProcessList(pids.as_mut_ptr(), pids.len() as u32) } as usize;
+    // Membership in the host's console, not merely having a console: CREATE_NO_WINDOW
+    // gives the child its own windowless console, which host Ctrl-C does not reach.
+    let own = count > 0;
+    let attached = pids[..count.min(pids.len())].contains(&host);
     // SAFETY: writable C startup structure for this process.
     let mut startup: STARTUPINFOW = unsafe { std::mem::zeroed() };
     // SAFETY: valid writable output structure, no retained pointers are dereferenced.
@@ -114,7 +123,7 @@ fn console_probe() {
         GetStartupInfoW(&mut startup);
     }
     if !attached {
-        println!("console:false,show:{}", startup.wShowWindow);
+        println!("console:false,own:{own},show:{}", startup.wShowWindow);
         return;
     }
     let mut driver = Loop::new(Config::default()).expect("console child loop");
@@ -123,7 +132,7 @@ fn console_probe() {
         .expect("console child signal");
     // SAFETY: enable Ctrl-C only in this fixture process, after subscription.
     assert_ne!(unsafe { SetConsoleCtrlHandler(None, 0) }, 0);
-    println!("console:true,show:{}", startup.wShowWindow);
+    println!("console:true,own:{own},show:{}", startup.wShowWindow);
     std::io::stdout().flush().expect("ready for broadcast");
     let mut out = Completions::default();
     let deadline = driver.now() + Duration::from_secs(10);
