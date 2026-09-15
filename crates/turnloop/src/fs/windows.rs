@@ -19,6 +19,7 @@ use windows_sys::Win32::{
     Storage::FileSystem::*,
     System::IO::{OVERLAPPED, OVERLAPPED_0, OVERLAPPED_0_0},
 };
+use windows_sys::core::BOOL;
 
 pub(in crate::fs) struct File {
     handle: OwnedHandle,

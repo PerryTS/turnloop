@@ -27,6 +27,7 @@ impl Ring {
         }
     }
     /// Storage-free placeholder for watches whose records live elsewhere.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn empty() -> Self {
         Self {
             bytes: Box::default(),
@@ -38,6 +39,24 @@ impl Ring {
         if !put_record(&mut self.bytes, &mut self.len, kind as u8, name) {
             self.overflow = true;
         }
+    }
+    /// Append a record whose UTF-16 name is encoded as WTF-8 in place.
+    #[cfg(windows)]
+    pub fn push_wide(&mut self, kind: WatchKind, name: &[u16]) {
+        let start = self.len;
+        let mut end = start + RECORD_HEADER;
+        if end > self.bytes.len()
+            || !crate::fs::wtf8(name, &mut self.bytes, &mut end)
+            || end - start - RECORD_HEADER > usize::from(u16::MAX)
+        {
+            self.overflow = true;
+            return;
+        }
+        let length = (end - start - RECORD_HEADER) as u16;
+        self.bytes[start] = kind as u8;
+        self.bytes[start + 1] = 0;
+        self.bytes[start + 2..start + 4].copy_from_slice(&length.to_le_bytes());
+        self.len = end;
     }
     pub fn lost(&mut self) {
         self.overflow = true;

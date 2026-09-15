@@ -365,6 +365,8 @@ fn time(seconds: i64, nanoseconds: i64) -> Option<FileTime> {
         nanoseconds: nanoseconds as u32,
     })
 }
+// mode_t is u16 on Apple platforms and u32 elsewhere.
+#[allow(clippy::unnecessary_cast)]
 fn kind(mode: u32) -> FileType {
     match mode & libc::S_IFMT as u32 {
         m if m == libc::S_IFREG as u32 => FileType::File,

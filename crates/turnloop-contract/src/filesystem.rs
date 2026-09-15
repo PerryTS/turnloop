@@ -329,6 +329,15 @@ pub fn bytes_metadata_namespace<B: Backend>(root: &Path) {
             panic!("realpath: {r:?}")
         };
         let expected = std::fs::canonicalize(&file).expect("std canonical path");
+        // std keeps the Windows verbatim prefix; RealPath reports the DOS form.
+        #[cfg(windows)]
+        let expected = PathBuf::from(
+            expected
+                .to_str()
+                .expect("UTF-8 path")
+                .strip_prefix(r"\\?\")
+                .expect("verbatim canonical path"),
+        );
         assert_eq!(
             Path::new(std::str::from_utf8(&canonical[..n]).expect("UTF-8 path")),
             expected

@@ -1724,3 +1724,287 @@ fn windows_console_control_delivery_allocates_nothing_on_any_thread() {
     assert_eq!((delivered, stops, closes), (200, 2, 2));
     println!("console allocation subject: 200 deliveries, 2 stops, 2 closes");
 }
+
+/// Directory for filesystem allocation subjects: the temporary directory natively,
+/// the `/turnloop-fs` preopen on WASI (see scripts/ci/wasmtime-runner.sh).
+#[cfg(not(target_os = "wasi"))]
+fn fs_root(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("tl-alloc-fs-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("allocation fixture directory");
+    dir
+}
+#[cfg(target_os = "wasi")]
+fn fs_root(name: &str) -> std::path::PathBuf {
+    let dir = std::path::Path::new("/turnloop-fs").join(format!("alloc-{name}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("preopened allocation fixture directory");
+    dir
+}
+fn count_all_threads(enabled: bool) {
+    #[cfg(windows)]
+    {
+        use std::sync::atomic::Ordering;
+        ALL_THREADS_ACTIVE.store(enabled, Ordering::SeqCst);
+        if enabled {
+            ALL_THREADS_ALLOCS.store(0, Ordering::SeqCst);
+        }
+    }
+    let _ = enabled;
+}
+fn all_thread_allocations() -> usize {
+    #[cfg(windows)]
+    {
+        ALL_THREADS_ALLOCS.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    #[cfg(not(windows))]
+    {
+        0
+    }
+}
+fn fs_wait(l: &mut Loop, out: &mut Completions, op: OpId) -> FsResult {
+    let until = l.now() + Duration::from_secs(10);
+    loop {
+        assert!(l.now() < until, "filesystem allocation subject stalled");
+        l.turn(Timeout::Until(until), out).expect("turn");
+        if out.is_empty() {
+            continue;
+        }
+        assert_eq!(out.len(), 1);
+        let c = out.drain().next().expect("completion");
+        assert_eq!(c.op, Some(op));
+        match c.result {
+            OpResult::Fs(result) => return result,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+}
+
+#[cfg(any(
+    unix,
+    windows,
+    all(
+        target_os = "wasi",
+        any(
+            target_env = "p2",
+            all(target_env = "p3", feature = "wasi-p3-experimental")
+        )
+    )
+))]
+#[test]
+fn steady_typed_file_requests_allocate_nothing() {
+    let dir = fs_root("requests");
+    let file = dir.join("subject");
+    std::fs::write(&file, [3u8; 64]).expect("fixture");
+    let mut l = Loop::new(Config::default()).expect("loop");
+    let mut out = Completions::with_capacity(1);
+    let path = FsPath::new(&file).expect("prepared path");
+    let op = l
+        .fs(
+            FsRequest::Open {
+                path: path.clone(),
+                options: FileOptions {
+                    read: true,
+                    write: true,
+                    ..FileOptions::default()
+                },
+            },
+            Token(1),
+        )
+        .expect("open");
+    let FsResult::Opened(h) = fs_wait(&mut l, &mut out, op) else {
+        panic!("open")
+    };
+    static INPUT: [u8; 64] = [9; 64];
+    let mut output = [0u8; 64];
+    let mut counts = [0usize; 6];
+    for round in 0..201 {
+        if round == 1 {
+            let calibration = std::hint::black_box(Box::new([0u8; 32]));
+            ALLOCS.with(|n| n.set(0));
+            ACTIVE.with(|v| v.set(true));
+            drop(std::hint::black_box(calibration));
+            let probe = std::hint::black_box(vec![1u8; 8]);
+            assert_eq!(ALLOCS.with(Cell::get), 1, "allocation counter is live");
+            drop(probe);
+            ALLOCS.with(|n| n.set(0));
+            count_all_threads(true);
+        }
+        // SAFETY: static immutable input outlives the request.
+        let buffer = WriteBuf::Provided(unsafe { IoBuf::from_raw_parts(INPUT.as_ptr(), 64) });
+        let op = l
+            .fs(
+                FsRequest::Write {
+                    file: h,
+                    buffer,
+                    offset: Some(0),
+                },
+                Token(2),
+            )
+            .expect("write");
+        assert!(matches!(fs_wait(&mut l, &mut out, op), FsResult::Wrote(64)));
+        // SAFETY: `output` stays in place and is inspected only after completion.
+        let buffer =
+            ReadBuf::Provided(unsafe { IoBufMut::from_raw_parts(output.as_mut_ptr(), 64) });
+        let op = l
+            .fs(
+                FsRequest::Read {
+                    file: h,
+                    buffer,
+                    offset: Some(0),
+                },
+                Token(3),
+            )
+            .expect("read");
+        assert!(matches!(
+            fs_wait(&mut l, &mut out, op),
+            FsResult::Read { n: 64, lease: None }
+        ));
+        assert_eq!(output, INPUT);
+        let op = l
+            .fs(
+                FsRequest::Read {
+                    file: h,
+                    buffer: ReadBuf::Pooled,
+                    offset: Some(32),
+                },
+                Token(4),
+            )
+            .expect("pooled read");
+        let FsResult::Read {
+            n: 32,
+            lease: Some(lease),
+        } = fs_wait(&mut l, &mut out, op)
+        else {
+            panic!("pooled read")
+        };
+        assert_eq!(lease.as_slice(), &INPUT[..32]);
+        drop(lease);
+        let op = l.fs(FsRequest::Fstat { file: h }, Token(5)).expect("fstat");
+        assert!(matches!(
+            fs_wait(&mut l, &mut out, op),
+            FsResult::Metadata(FileMetadata { size: 64, .. })
+        ));
+        let op = l
+            .fs(
+                FsRequest::Stat {
+                    path: path.clone(),
+                    follow_symlinks: true,
+                },
+                Token(6),
+            )
+            .expect("stat");
+        assert!(matches!(
+            fs_wait(&mut l, &mut out, op),
+            FsResult::Metadata(FileMetadata { size: 64, .. })
+        ));
+        let op = l
+            .fs(FsRequest::Truncate { file: h, size: 64 }, Token(7))
+            .expect("truncate");
+        assert!(matches!(fs_wait(&mut l, &mut out, op), FsResult::Done));
+        for (i, count) in counts.iter_mut().enumerate() {
+            *count += usize::from(round != 0 && i < 6);
+        }
+    }
+    ACTIVE.with(|v| v.set(false));
+    count_all_threads(false);
+    assert_eq!(
+        ALLOCS.with(Cell::get),
+        0,
+        "typed write/read/pooled read/fstat/stat/truncate allocations"
+    );
+    assert_eq!(
+        all_thread_allocations(),
+        0,
+        "pool-thread allocations for the same requests"
+    );
+    assert_eq!(counts, [200; 6], "every subject executed");
+    l.close(h, Token(8)).expect("close");
+    l.turn(Timeout::Now, &mut out).expect("closed");
+    assert!(matches!(out[0].result, OpResult::Closed));
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn steady_watch_batches_allocate_nothing() {
+    use std::io::Write;
+    let dir = fs_root("watch");
+    let subject_path = dir.join("subject");
+    #[cfg_attr(unix, allow(unused_mut))]
+    let mut subject = std::fs::File::create(&subject_path).expect("fixture");
+    let mut l = Loop::new(Config::default()).expect("loop");
+    let watch = l
+        .fs_watch(
+            &FsPath::new(&dir).expect("path"),
+            WatchOptions::default(),
+            Token(1),
+        )
+        .expect("watch");
+    let mut out = Completions::with_capacity(4);
+    let mut batches = 0;
+    let mut records = 0;
+    for round in 0..101 {
+        if round == 1 {
+            ALLOCS.with(|n| n.set(0));
+            ACTIVE.with(|v| v.set(true));
+            count_all_threads(true);
+        }
+        // macOS reports content changes when the writer closes (std opens short
+        // paths without allocating); Windows reports the size change directly.
+        #[cfg(unix)]
+        {
+            let mut writer = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&subject_path)
+                .expect("reopen");
+            writer.write_all(b"x").expect("event");
+        }
+        #[cfg(windows)]
+        subject.write_all(b"x").expect("event");
+        let until = l.now() + Duration::from_secs(10);
+        loop {
+            assert!(
+                l.now() < until,
+                "watch allocation subject stalled in round {round}"
+            );
+            l.turn(Timeout::Until(until), &mut out).expect("turn");
+            let mut got = false;
+            for c in out.drain() {
+                let OpResult::Watch { events, .. } = c.result else {
+                    panic!("unexpected {:?}", c.result)
+                };
+                let n = WatchEvents::new(events.as_slice()).count();
+                assert!(n > 0);
+                if round != 0 {
+                    records += n;
+                    batches += 1;
+                }
+                got = true;
+            }
+            if got {
+                break;
+            }
+        }
+    }
+    ACTIVE.with(|v| v.set(false));
+    count_all_threads(false);
+    assert_eq!(ALLOCS.with(Cell::get), 0, "watch delivery allocations");
+    assert_eq!(
+        all_thread_allocations(),
+        0,
+        "watch allocations on any thread"
+    );
+    assert!(
+        batches >= 100 && records >= 100,
+        "{batches} batches, {records} records"
+    );
+    l.close(watch, Token(2)).expect("close watch");
+    let until = l.now() + Duration::from_secs(10);
+    while l.alive() {
+        assert!(l.now() < until);
+        l.turn(Timeout::Until(until), &mut out).expect("close turn");
+    }
+    drop(subject);
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+}
