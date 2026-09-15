@@ -1,9 +1,9 @@
 # sockopts — socket options on live handles (issue #34)
 
-Base: `09d205f`. Branch `lane/sockopts`, clone
+Base: `09d205f`. Branch `lane/sockopts` (PR #36), clone
 `/Users/amlug/projects/perry/windlass-lanes/sockopts`. Linux coverage ran in
 `/root/claude-sockopts` on the shared build box. Implementation and verification
-complete except the browser web arm and the real Windows/WASI CI arms (below).
+complete: CI run 34991952873 is green on every platform arm.
 
 Perry's `node:net` migration could not implement `socket.setNoDelay()`,
 `setKeepAlive()` or `dgram.setTTL()`: turnloop took `nodelay` only in `ConnectOpts`
@@ -253,8 +253,21 @@ with an `OWNER` file naming this lane.
 | `cargo +nightly-2026-08-20 deny --locked check` | PASS — advisories, bans, licenses, sources |
 | `python3 scripts/ci/lint-workflows.py` (actionlint + zizmor + shellcheck) | PASS — no workflow files were changed |
 | `python3 -m unittest discover -s scripts/ci -p 'test_*.py'` | PASS — 98 tests |
-| `python3 scripts/ci/run-tests.py web` (headless Chromium/Firefox) | **UNRUN** — browsers not installed on this machine. The Node arm above executes the identical `tests/web/web_contract.rs` assertions, and the web backend's `Unsupported` comes from the Rust `Backend` trait defaults, not from JS. |
-| Windows `cargo test` | **UNRUN** — no Windows host in this lane. Windows is compile- and clippy-clean cross-target; the IOCP implementation and the `adopted_socket_options_reach_the_shared_socket` probe need a real `windows-2025` CI arm. |
+| `python3 scripts/ci/run-tests.py web` (headless Chromium/Firefox) | PASS **in CI** (run 34991952873); UNRUN locally, no browsers on this machine |
+| Windows `cargo test` | PASS **in CI** on all three `windows-2025` modes (run 34991952873) |
+
+### CI
+
+| Run | SHA | Result |
+| --- | --- | --- |
+| [34990033482](https://github.com/PerryTS/turnloop/actions/runs/34990033482) | `7d97b2a` | FAIL — every job green except the three `windows-2025` arms, each failing only `adopted_socket_options_reach_the_shared_socket` (15/16), all with `the OS reports 131072 bytes for a 49152-byte request` |
+| [34991952873](https://github.com/PerryTS/turnloop/actions/runs/34991952873) | `b87bae6` | **PASS — every job, `ci-gate` green.** Zero `test result: FAILED` lines in the whole log; the previously failing probe now passes six times on `windows-2025` (three modes × workspace and per-member runs) |
+
+That first run is the evidence for the buffer-size decision above: it is also the
+first execution of `backend/iocp/sockopt.rs` anywhere, and everything else in it
+passed on Windows first time — the `LINGER` layout, the Win10-1709 keep-alive
+schedule, the accept default applied after `SO_UPDATE_ACCEPT_CONTEXT`, and the
+`linger 0` → `ConnectionReset` behavioural test.
 
 ### Pre-existing failures seen on the build box (not this lane)
 
@@ -267,14 +280,8 @@ with an `OWNER` file naming this lane.
 
 ## What still needs CI
 
-1. **Windows (`windows-2025`)** — the whole `backend/iocp/sockopt.rs` path: the
-   option round trips, the accept default applied after `SO_UPDATE_ACCEPT_CONTEXT`,
-   the `LINGER` `u16` layout, the Win10-1709 keep-alive schedule, and the
-   duplicated-socket probe. Cross-compilation and strict clippy are green; nothing
-   has executed.
-2. **WASI in CI** — ran locally against the pinned Wasmtime 46.0.0 for both p2 and
-   p3, so this is a confirmation rather than an unknown.
-3. **Browser web arm** — Chromium and Firefox, same assertions the Node arm passed.
+Nothing. Every platform arm has executed: Linux x86_64 and arm64 (six modes each),
+macOS, Windows (three modes), WASI 0.2 and 0.3, and the headless-browser web arm.
 
 ## Follow-ups this lane deliberately did not take
 
