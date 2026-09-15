@@ -126,13 +126,24 @@ fn console_input_resize_and_modes_restore() {
             assert_ne!(mode(&output) & ENABLE_VIRTUAL_TERMINAL_PROCESSING, 0);
             let size = driver.tty_window_size(h).expect("input window query");
             assert!(size.columns > 0 && size.rows > 0);
+            // conhost may queue its own buffer-size/focus records for a new console;
+            // the assertions below must observe only the records this test writes.
+            assert_ne!(
+                // SAFETY: the test's isolated, owned console input handle.
+                unsafe { FlushConsoleInputBuffer(input.as_raw_handle()) },
+                0
+            );
             let resize = driver.tty_resize_start(h, Token(3)).expect("resize");
             driver
                 .read(h, ReadBuf::Pooled, Token(4))
                 .expect("console read");
             let mut out = Completions::default();
             driver.turn(Timeout::Now, &mut out).expect("start reader");
-            assert!(out.is_empty());
+            assert!(
+                out.is_empty(),
+                "completion before any input was written: {:?}",
+                out.drain().map(|c| c.result).collect::<Vec<_>>()
+            );
             // SAFETY: initialized native input records; fill the selected union arms.
             let mut records: [INPUT_RECORD; 2] = unsafe { std::mem::zeroed() };
             records[0].EventType = WINDOW_BUFFER_SIZE_EVENT as u16;
