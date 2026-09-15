@@ -432,6 +432,151 @@ pub fn ref_unref<B: Backend>() {
     assert!(matches!(out[1].result, OpResult::Closed));
     assert!(!l.alive());
 }
+/// Timer-precision gate for [`timer_precision`], measured against this host.
+///
+/// Wake precision is as much a property of the host as of the backend. The M1
+/// Windows spike measured p50/p95/max lateness of 275.2/285.8/380.9 us for a
+/// 250 us deadline on real hardware (`spikes/iocp/WINDOWS_RESULTS.md`), so a fixed
+/// 500 us bound left the Windows backend under a factor of two of clear air and a
+/// loaded CI VM crossed it with no backend regression at all: 756.2 us and 594.2 us
+/// on windows-2025 within one hour, and 2.31 ms against the 2 ms Wasmtime bound on
+/// WASI 0.3, whose samples that run spanned 1.07-6.44 ms (issue #30).
+///
+/// Two independent requirements replace the single fixed median, and every attempt
+/// reports the whole distribution of both measurements:
+///
+/// 1. **Capability.** The backend's second-best expiry of twenty must still meet the
+///    platform floor. Load only ever makes a sample later, never earlier, so this is
+///    immune to a loaded or mismeasured host -- while a wait floor or a deadline
+///    rounded up to milliseconds raises *every* sample and fails it. This is the
+///    clause the mutation proof in `docs/lanes/flakes.md` exercises.
+/// 2. **Typical case.** The median must stay within the larger of that same floor
+///    and twice what this host achieves with its own sleep, measured interleaved
+///    with the expiries so a load spike moves the bound as well as its subject.
+///
+/// The calibration never touches the `Driver`: `std::thread::sleep` waits on the OS
+/// primitive directly -- a `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` timer on Windows
+/// (the same object the backend arms), `nanosleep` on Unix and a `wasi:clocks`
+/// monotonic pollable on WASI -- so a backend that loses precision cannot move it.
+/// It is a bound, not a verdict: a host whose own sleep is coarser than its timers
+/// (macos-15 runners coalesce `nanosleep` to ~2 ms while the loop resolves 234 us)
+/// can only relax the median clause, never the capability clause.
+#[cfg(any(not(target_os = "wasi"), not(debug_assertions)))]
+mod precision {
+    use super::*;
+    /// Short enough that any millisecond rounding or wait floor dominates.
+    const DELAY: Duration = Duration::from_micros(250);
+    /// Samples of each kind per attempt.
+    const SAMPLES: usize = 20;
+    /// A demonstrably loaded host may retry; a wait floor is systematic and fails
+    /// every attempt.
+    const ATTEMPTS: usize = 3;
+    /// The lateness a quiet host must meet whatever the calibration says. A host
+    /// that beats it cannot buy itself a looser bound.
+    #[cfg(not(target_os = "wasi"))]
+    const FLOOR: Duration = Duration::from_micros(500);
+    #[cfg(target_os = "wasi")]
+    const FLOOR: Duration = Duration::from_millis(2);
+
+    /// Sorted lateness samples, with the statistics every attempt reports.
+    struct Samples(Vec<Duration>);
+    impl Samples {
+        fn new(mut values: Vec<Duration>) -> Self {
+            assert_eq!(values.len(), SAMPLES, "every sample must be recorded");
+            values.sort_unstable();
+            Self(values)
+        }
+        /// The capability statistic: the second-best sample, so one lucky expiry
+        /// cannot certify a backend, and one stalled one cannot condemn it.
+        fn best(&self) -> Duration {
+            self.0[1]
+        }
+        /// The typical-case statistic: a few stalled wakes cannot move it.
+        fn median(&self) -> Duration {
+            self.0[SAMPLES / 2]
+        }
+        fn report(&self) -> String {
+            format!(
+                "min={:?} 2nd={:?} p50={:?} p90={:?} max={:?}",
+                self.0[0],
+                self.best(),
+                self.median(),
+                self.0[SAMPLES * 9 / 10],
+                self.0[SAMPLES - 1]
+            )
+        }
+    }
+
+    /// One loop expiry: arm a `DELAY` timer, turn until it fires, then release it.
+    /// The 100 ms ceiling still rejects a wake that never arrives.
+    fn expiry<B: Backend>(l: &mut Driver<B>, out: &mut Completions) -> Duration {
+        let at = l.now() + DELAY;
+        let h = l.timer(at, None, Token(77)).expect("precision sample");
+        let until = at + Duration::from_millis(100);
+        let late = loop {
+            assert!(l.now() < until, "precision sample missed maximum bound");
+            l.turn(Timeout::Until(until), out).expect("sample turn");
+            if out
+                .iter()
+                .any(|c| c.token == Token(77) && matches!(c.result, OpResult::Timer))
+            {
+                break l.now().duration_since(at);
+            }
+        };
+        l.close(h, Token(78)).expect("close sample");
+        l.turn(Timeout::Now, out).expect("release sample");
+        late
+    }
+
+    /// The same measurement with no loop in it: what this host resolves on its own.
+    fn calibration<B: Backend>(l: &Driver<B>) -> Duration {
+        let at = l.now() + DELAY;
+        thread::sleep(DELAY);
+        l.now().duration_since(at)
+    }
+
+    /// Require the loop to still reach the platform floor, and to be typical of
+    /// what this host can do at all.
+    pub(super) fn check<B: Backend>(l: &mut Driver<B>, out: &mut Completions) {
+        let mut attempts = Vec::with_capacity(ATTEMPTS);
+        for _ in 0..ATTEMPTS {
+            let mut expiries = Vec::with_capacity(SAMPLES);
+            let mut sleeps = Vec::with_capacity(SAMPLES);
+            // Interleaved, so a load spike moves the bound as well as its subject.
+            for _ in 0..SAMPLES {
+                expiries.push(expiry(l, out));
+                sleeps.push(calibration(l));
+            }
+            let (expiries, sleeps) = (Samples::new(expiries), Samples::new(sleeps));
+            let allowance = FLOOR.max(sleeps.median() * 2);
+            let capable = expiries.best() <= FLOOR;
+            let typical = expiries.median() <= allowance;
+            let attempt = format!(
+                "loop {} | host sleep {} | floor {FLOOR:?} {} | allowance {allowance:?} {}",
+                expiries.report(),
+                sleeps.report(),
+                if capable { "met" } else { "MISSED" },
+                if typical { "met" } else { "MISSED" }
+            );
+            println!("turnloop timer precision: {attempt}");
+            attempts.push(attempt);
+            if capable && typical {
+                return;
+            }
+            // A host whose own sleep stays inside half the quiet-host floor is not
+            // loaded, so the loop is the only explanation: retrying such an attempt
+            // could only hide a real regression.
+            if sleeps.median() * 2 <= FLOOR {
+                break;
+            }
+        }
+        panic!(
+            "timer precision missed its bound in {} attempt(s): {}",
+            attempts.len(),
+            attempts.join(" ;; ")
+        );
+    }
+}
 pub fn timer_precision<B: Backend>() {
     let mut l = Driver::<B>::new(Config::default()).expect("loop");
     let mut out = Completions::default();
@@ -487,56 +632,11 @@ pub fn timer_precision<B: Backend>() {
     assert!(l.stop(op));
     l.turn(Timeout::Now, &mut out).expect("stop");
     assert!(matches!(out[0].result, OpResult::Stopped));
-    // WASI wake precision is host-dependent (DESIGN §7.4); compare release
-    // builds against the measured Wasmtime bound. Debug still exercises all
-    // timer semantics above and the independent mandatory no-spin contract.
+    // WASI wake precision is host-dependent (DESIGN §7.4); debug builds exercise
+    // every timer semantic above and the independent mandatory no-spin contract,
+    // and leave the measured precision gate to release.
     #[cfg(any(not(target_os = "wasi"), not(debug_assertions)))]
-    {
-        // A 100 ms ceiling admits occasional scheduler stalls, but it must not hide
-        // a systematic 1 ms wait floor. Twenty sub-millisecond samples check that
-        // typical lateness remains below half a millisecond.
-        let mut lateness = Vec::with_capacity(20);
-        for _ in 0..20 {
-            let at = l.now() + Duration::from_micros(250);
-            let h = l.timer(at, None, Token(77)).expect("precision sample");
-            let until = at + Duration::from_millis(100);
-            loop {
-                assert!(l.now() < until, "precision sample missed maximum bound");
-                l.turn(Timeout::Until(until), &mut out)
-                    .expect("sample turn");
-                if out
-                    .iter()
-                    .any(|c| c.token == Token(77) && matches!(c.result, OpResult::Timer))
-                {
-                    lateness.push(l.now().duration_since(at));
-                    break;
-                }
-            }
-            l.close(h, Token(78)).expect("close sample");
-            l.turn(Timeout::Now, &mut out).expect("release sample");
-        }
-        #[cfg(target_os = "wasi")]
-        println!(
-            "turnloop WASI lateness_ns={:?}",
-            lateness.iter().map(Duration::as_nanos).collect::<Vec<_>>()
-        );
-        lateness.sort_unstable();
-        assert_eq!(lateness.len(), 20);
-        #[cfg(target_os = "wasi")]
-        let within_bound = lateness[10] <= Duration::from_millis(2);
-        #[cfg(not(target_os = "wasi"))]
-        let within_bound = lateness[10] < Duration::from_micros(500);
-        #[cfg(target_os = "wasi")]
-        println!(
-            "turnloop WASI expiries=20 median_ns={}",
-            lateness[10].as_nanos()
-        );
-        assert!(
-            within_bound,
-            "timer precision exceeded platform bound: median lateness {:?}",
-            lateness[10]
-        );
-    }
+    precision::check(&mut l, &mut out);
 }
 pub fn udp_round_trip<B: Backend>() {
     let mut l = Driver::<B>::new(Config::default()).expect("loop");
