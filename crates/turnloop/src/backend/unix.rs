@@ -429,6 +429,13 @@ unsafe impl Backend for Unix {
             .iter()
             .map(|(child, target)| (child.as_raw_fd(), *target))
             .collect();
+        let reserved = match sources.first() {
+            Some((donor, _)) => super::process::reserve(
+                donor.as_raw_fd(),
+                spec.extra.iter().map(|fd| fd.number as RawFd),
+            )?,
+            None => Vec::new(),
+        };
         let (detached, terminal) = (spec.detached, spec.controlling_terminal);
         if detached || terminal || !dups.is_empty() {
             // SAFETY: the child hook calls only async-signal-safe setsid, ioctl
@@ -456,8 +463,9 @@ unsafe impl Backend for Unix {
                 });
             }
         }
-        let mut child = command.spawn().map_err(Error::from)?;
-        drop(sources);
+        let spawned = command.spawn();
+        drop((sources, reserved));
+        let mut child = spawned.map_err(Error::from)?;
         let pid = child.id();
         let stdio: [Option<OwnedFd>; 3] = [
             child.stdin.take().map(Into::into),

@@ -178,6 +178,23 @@ the new descriptor without `FD_CLOEXEC`, which is exactly what makes that number
 survive `exec`. Adding a hook takes std off its `posix_spawn` fast path, as
 `detached` already did.
 
+**Unix: the target numbers are reserved across the fork.** This one is a bug
+that was found and fixed during the work, and it is worth stating because it is
+invisible until it bites. `Command::spawn` creates its own exec-error pipe
+*after* the standard streams and immediately before the fork, with no
+relocation of its own (`sys::pipe::pipe()`, or a `SOCK_SEQPACKET` pair on
+Linux), so it takes the lowest free descriptor numbers — which is precisely what
+the sources vacate when they are lifted above the targets. If its write end
+landed on a target number, the child hook would `dup2` over it, the parent's
+read would see end-of-file, and **a failed `exec` would be reported as a
+successful spawn**. turnloop therefore holds every *free* target number in the
+parent, with a close-on-exec duplicate, from before `Command::spawn` until the
+child exists; a number the parent already uses cannot be handed to std either,
+so those need nothing. `a_failed_exec_is_reported_even_at_the_lowest_free_descriptor_numbers`
+probes the two lowest free numbers, releases them, uses them as the targets and
+requires `NotFound`. With the reservation removed it fails, which is what makes
+it a test of the reservation rather than of a coincidence.
+
 **Windows placement.** The inherited-descriptor block is the C run-time's own
 format — a descriptor count, one flag byte per descriptor, then one handle per
 descriptor, packed without padding — and it is how libuv and Node give a child
@@ -225,6 +242,8 @@ Windows unless noted:
   further turn produces nothing.
 - `rejected_descriptor_plans_create_nothing` — every rejection above, each
   asserting `!driver.alive()` and an untouched `parents` slice afterwards.
+- `a_failed_exec_is_reported_even_at_the_lowest_free_descriptor_numbers` (Unix)
+  — the descriptor-reservation regression test described in §3.
 - `a_sibling_waiter_and_the_loop_keep_their_own_children` — a plain
   `std::process::Command` child exiting 7 (then 11) beside loop-owned children
   exiting 23, in both orders: the loop reports its own child's status while the
@@ -262,15 +281,38 @@ private path.
 | `cargo fmt --all -- --check` | PASS |
 | `cargo clippy --workspace --all-targets -- -D warnings -D clippy::undocumented_unsafe_blocks` (macOS arm64) | PASS |
 | `cargo clippy -p turnloop -p turnloop-contract -p turnloop-io --all-targets --target x86_64-unknown-linux-gnu -- -D warnings -D clippy::undocumented_unsafe_blocks` | PASS |
-| `cargo clippy -p turnloop -p turnloop-contract -p turnloop-io --all-targets --target x86_64-pc-windows-msvc -- -D warnings -D clippy::undocumented_unsafe_blocks` | PASS |
-| `cargo clippy --target wasm32-wasip2 …` | PENDING |
-| `cargo clippy --target wasm32-wasip3 …` (nightly-2026-09-07) | PENDING |
-| `cargo clippy --target wasm32-unknown-unknown …` (web) | PENDING |
-| `cargo test -p turnloop-contract --test process_fds -- --test-threads=1` (macOS arm64) | PASS (7/7) |
+| `cargo clippy … --target x86_64-pc-windows-msvc …` | PASS |
+| `cargo clippy … --target wasm32-wasip2 …` | PASS |
+| `cargo clippy … --target wasm32-unknown-unknown …` (web) | PASS |
+| `cargo clippy --workspace --all-targets --target wasm32-wasip2 --all-features …` | UNRUN locally (no wasm C toolchain for `ring` on this host); run by CI `lint-wasm` — PASS |
+| `cargo clippy … --target wasm32-wasip3 …` (nightly-2026-09-07) | UNRUN locally (toolchain not installed); run by CI `wasi (wasm32-wasip3)` and `protocol-wasi (wasm32-wasip3)` — PASS |
+| `cargo test -p turnloop-contract --test process_fds -- --test-threads=1` (macOS arm64) | PASS (8/8) |
 | `cargo test -p turnloop-contract --test allocations extra_child_descriptor -- --test-threads=1` (macOS arm64) | PASS |
-| `cargo test --workspace -- --test-threads=1` (macOS arm64) | PENDING |
-| `cargo test --workspace --no-fail-fast -- --test-threads=1` (Linux x86_64) | PENDING |
-| `python3 scripts/ci/run-tests.py wasi --target wasm32-wasip2` | PENDING |
-| `bash scripts/ci/no-tokio.sh` | PENDING |
-| `python3 scripts/ci/soak.py` | PENDING |
-| CI run on `lane/procspec` (Windows x86_64 runtime, Linux x86_64/aarch64, macOS arm64) | PENDING |
+| `cargo test --workspace --no-fail-fast -- --test-threads=1` (macOS arm64) | PASS |
+| `cargo test --workspace --no-fail-fast -- --test-threads=1` (Linux x86_64, build box) | PASS for everything in this lane (`process_fds` 7/7 native-portable, allocation gate ok). One pre-existing, unrelated failure: `filesystem::permission_denied_is_reported`, because that box runs as root and root ignores the read-only mode bit. |
+| `bash scripts/ci/no-tokio.sh` | PASS (15 policy rows) |
+| `python3 scripts/ci/soak.py` | PASS (251 locked versions, 1 active security exception) |
+| `python3 scripts/ci/run-tests.py wasi --target wasm32-wasip2` | UNRUN locally (no Wasmtime on this host); the same suite runs in CI's `wasi (wasm32-wasip2)` job — PASS |
+| CI on `lane/procspec`, run `35013478648` (all four OS arms, Windows x86_64 runtime in three feature modes) | PASS |
+| CI on `lane/procspec`, final run `FINAL_RUN` | FINAL_RESULT |
+
+### Sabotage checks
+
+Two gates were shown to fail when their subject is removed, rather than being
+assumed to work:
+
+- the allocation gate, with one planted `vec![0u8; 8]` inside the counted window;
+- the descriptor reservation, by deleting it and watching
+  `a_failed_exec_is_reported_even_at_the_lowest_free_descriptor_numbers` report
+  a successful spawn of a program that does not exist.
+
+### Not covered
+
+- `ChildFdSource::Handle` of an overlapped loop transport on Windows: the child
+  must drive it with overlapped I/O. The contract test passes a synchronous
+  adopted handle instead, which is the shape a host actually wants.
+- Descriptor passing (`SCM_RIGHTS`) *over* an extra `Duplex` descriptor. The
+  transport is an `AF_UNIX` stream, so `send_handle`/`recv_handle` apply to it
+  like any other loop pipe, but no test exercises that combination yet; it is
+  what `cluster.fork()` will need.
+- No `adopt_process`, by decision (§1).

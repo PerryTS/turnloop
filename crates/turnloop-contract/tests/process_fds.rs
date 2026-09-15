@@ -398,6 +398,49 @@ fn rejected_descriptor_plans_create_nothing() {
     assert!(!driver.alive(), "no handle survived a rejected spawn");
 }
 
+/// A failed exec must be reported as a failed spawn, even when the descriptor
+/// numbers under test are exactly the ones the standard library would otherwise
+/// hand to its own exec-error pipe.
+///
+/// `Command::spawn` creates that pipe after the standard streams and before the
+/// fork, and it takes the lowest free numbers — the very ones the extra
+/// descriptors' sources vacate when they are lifted above their targets. The
+/// two lowest free numbers are probed and released here so that the collision
+/// is the expected outcome rather than a coincidence: inherited standard streams
+/// and null-device sources allocate nothing else in between.
+#[cfg(unix)]
+#[test]
+fn a_failed_exec_is_reported_even_at_the_lowest_free_descriptor_numbers() {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let mut driver = Loop::new(Config::default()).expect("loop");
+    let lowest = |from: i32| {
+        // SAFETY: duplicates descriptor 0 at or above `from`, nothing else.
+        let raw = unsafe { libc::fcntl(0, libc::F_DUPFD_CLOEXEC, from) };
+        assert!(raw >= from, "{}", std::io::Error::last_os_error());
+        // SAFETY: fcntl transferred ownership of a fresh descriptor.
+        unsafe { OwnedFd::from_raw_fd(raw) }
+    };
+    let (first, second) = (lowest(3), lowest(4));
+    let numbers = [first.as_raw_fd() as u32, second.as_raw_fd() as u32];
+    drop((first, second));
+    let mut spec = ProcessSpec::new("/nonexistent/turnloop-procspec-fixture");
+    spec.stdio = [ProcessStdio::Inherit; 3];
+    spec.extra = numbers
+        .iter()
+        .map(|number| ChildFd {
+            number: *number,
+            source: ChildFdSource::Null,
+        })
+        .collect();
+    let mut parents = [None; 2];
+    let error = driver
+        .spawn_extra(&spec, Token(13), &mut parents)
+        .expect_err("a missing program cannot be executed");
+    assert_eq!(error.kind, ErrorKind::NotFound, "exec failure reached us");
+    assert!(parents.iter().all(Option::is_none));
+    assert!(!driver.alive(), "no handle survived the failed spawn");
+}
+
 /// turnloop reaps only the children it owns, by their own identity. A host that
 /// waits for its own child in the same process keeps that child's status, and
 /// loses nothing to the loop.

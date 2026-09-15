@@ -75,6 +75,40 @@ pub(super) fn lift(fd: OwnedFd, floor: RawFd) -> Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(raw) })
 }
 
+/// Hold every free target number in the parent until the child has forked.
+///
+/// `Command::spawn` creates its exec-error pipe after the standard streams and
+/// before the fork, and the kernel gives it the lowest free numbers — which is
+/// exactly what the sources vacate when they are lifted above the targets. If
+/// that pipe landed on a target number, the child hook would `dup2` over it, and
+/// a failed `exec` would be reported to the parent as a successful spawn. A
+/// number the parent is already using cannot be handed out either, so only the
+/// free ones need holding, and each is released as soon as the child exists.
+pub(super) fn reserve(donor: RawFd, numbers: impl Iterator<Item = RawFd>) -> Result<Vec<OwnedFd>> {
+    let mut held = Vec::new();
+    for number in numbers {
+        // SAFETY: integer-only query of one descriptor's flags.
+        if unsafe { libc::fcntl(number, libc::F_GETFD) } >= 0 {
+            continue;
+        }
+        if last_error().os != Some(libc::EBADF) {
+            return Err(last_error());
+        }
+        // SAFETY: live donor descriptor, lifted above every target, and a
+        // number this process is not using.
+        if unsafe { libc::dup2(donor, number) } < 0 {
+            return Err(last_error());
+        }
+        // SAFETY: dup2 created this descriptor and nothing else owns it.
+        held.push(unsafe { OwnedFd::from_raw_fd(number) });
+        // SAFETY: live owned descriptor and integer-only fcntl arguments.
+        if unsafe { libc::fcntl(number, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+            return Err(last_error());
+        }
+    }
+    Ok(held)
+}
+
 /// Reject a spec whose extra descriptors this platform cannot place.
 pub(super) fn checked_floor(numbers: impl Iterator<Item = u32>) -> Result<RawFd> {
     let mut floor = 0;
