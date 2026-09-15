@@ -2057,14 +2057,52 @@ fn steady_typed_file_requests_allocate_nothing() {
     std::fs::remove_dir_all(&dir).expect("cleanup");
 }
 
+/// Append one byte through a new handle, flush and close it, without allocating.
+#[cfg(windows)]
+fn append_and_close(path: &[u16]) {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
+        Storage::FileSystem::{
+            CreateFileW, FILE_APPEND_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            FlushFileBuffers, OPEN_EXISTING, WriteFile,
+        },
+    };
+    // SAFETY: NUL-terminated wide path; default security, no template.
+    let handle = unsafe {
+        CreateFileW(
+            path.as_ptr(),
+            FILE_APPEND_DATA,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        )
+    };
+    assert_ne!(handle, INVALID_HANDLE_VALUE, "open subject");
+    let mut written = 0;
+    // SAFETY: live handle and one initialized byte; synchronous write.
+    let ok = unsafe { WriteFile(handle, b"x".as_ptr(), 1, &mut written, std::ptr::null_mut()) };
+    assert!(ok != 0 && written == 1, "append subject");
+    // SAFETY: live handle owned by this function.
+    assert_ne!(unsafe { FlushFileBuffers(handle) }, 0, "flush subject");
+    // SAFETY: closes the handle opened above exactly once.
+    assert_ne!(unsafe { CloseHandle(handle) }, 0, "close subject");
+}
+
 #[cfg(any(unix, windows))]
 #[test]
 fn steady_watch_batches_allocate_nothing() {
+    #[cfg(unix)]
     use std::io::Write;
     let dir = fs_root("watch");
     let subject_path = dir.join("subject");
-    #[cfg_attr(unix, allow(unused_mut))]
-    let mut subject = std::fs::File::create(&subject_path).expect("fixture");
+    let subject = std::fs::File::create(&subject_path).expect("fixture");
+    #[cfg(windows)]
+    let subject_wide: Vec<u16> = {
+        use std::os::windows::ffi::OsStrExt;
+        subject_path.as_os_str().encode_wide().chain([0]).collect()
+    };
     let mut l = Loop::new(Config::default()).expect("loop");
     let watch = l
         .fs_watch(
@@ -2082,8 +2120,12 @@ fn steady_watch_batches_allocate_nothing() {
             ACTIVE.with(|v| v.set(true));
             count_all_threads(true);
         }
-        // macOS reports content changes when the writer closes (std opens short
-        // paths without allocating); Windows reports the size change directly.
+        // Append through a fresh descriptor and close it. macOS FSEvents reports
+        // the content change on close, and NTFS updates the directory entry that
+        // ReadDirectoryChangesW observes only when a handle is flushed or closed:
+        // writes through a long-lived handle produce no notification there.
+        // std opens short Unix paths from a stack buffer; on Windows std converts
+        // every path to UTF-16 on the heap, so the handle is opened directly.
         #[cfg(unix)]
         {
             let mut writer = std::fs::OpenOptions::new()
@@ -2093,7 +2135,7 @@ fn steady_watch_batches_allocate_nothing() {
             writer.write_all(b"x").expect("event");
         }
         #[cfg(windows)]
-        subject.write_all(b"x").expect("event");
+        append_and_close(&subject_wide);
         let until = l.now() + Duration::from_secs(10);
         loop {
             assert!(

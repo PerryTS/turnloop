@@ -121,6 +121,9 @@ mod native {
         reserved: AtomicUsize,
         ready: Condvar,
         stopping: AtomicBool,
+        /// Workers that finished thread startup; `start` returns only once all have.
+        started: Mutex<usize>,
+        started_changed: Condvar,
     }
     struct Pool {
         state: Arc<State>,
@@ -133,6 +136,8 @@ mod native {
             reserved: AtomicUsize::new(0),
             ready: Condvar::new(),
             stopping: AtomicBool::new(false),
+            started: Mutex::new(0),
+            started_changed: Condvar::new(),
         });
         let mut handles = Vec::with_capacity(config.threads);
         for i in 0..config.threads {
@@ -140,6 +145,12 @@ mod native {
             let worker = thread::Builder::new()
                 .name(format!("turnloop-blocking-{i}"))
                 .spawn(move || {
+                    // The runtime's per-thread setup (thread name, current-thread
+                    // handle, TLS destructor lists; allocating on Windows) has run.
+                    *s.started
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
+                    s.started_changed.notify_all();
                     loop {
                         let job = {
                             let mut jobs = s
@@ -185,6 +196,20 @@ mod native {
                 }
             }
         }
+        // Return only after every worker finished starting. Thread startup runs
+        // asynchronously and allocates on some platforms; it must not overlap the
+        // first steady-state jobs of any loop.
+        let mut started = state
+            .started
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *started < config.threads {
+            started = state
+                .started_changed
+                .wait(started)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        drop(started);
         // Workers live for the process lifetime, shared by every submitting loop.
         Ok(Pool { state, config })
     }
