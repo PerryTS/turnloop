@@ -1,0 +1,20 @@
+label	command	result	exit	log_sha256
+fmt	cargo fmt --check	PASS	0	e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+clippy	cargo clippy --locked --workspace --all-targets -- -D warnings -D clippy::undocumented_unsafe_blocks	PASS	0	4df148c04eb3aa42c8c8d1b1dc64151d16f040e6fbb386945c8789203aeea341
+clippy-all	cargo clippy --locked --workspace --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks	PASS	0	d2fc977fc97f359ff5fd7a20763d30318b5d8f85bb5a88aeeb32bfb776656100
+stable	cargo +stable check --locked --workspace --all-targets --all-features	PASS	0	dd473cfd2cf4bc7c10883e1d83233adf95c7095efe30727077a047dcbe2fb21f
+test-workspace	cargo test --workspace	PASS	0	21551846d0fbd6e0d1d253cd5a9c80b191f03abae7e687522f4985ed1697fe9d
+no-tokio	bash scripts/ci/no-tokio.sh	PASS	0	f9fecebecf12ee820da5dceec45b1572cf59df676c8bd2692b9fd428601181d2
+soak	python3 scripts/ci/soak.py	PASS	0	89179fe205150c440b738a9417ce5c18e09a025fd65ae25321733959e6cc25d9
+feature-modes	python3 scripts/ci/feature_modes.py	PASS	0	6012a425909adcd1689e2b35cc45754907392333573e2310077cfaa23e245c59
+x86_64-unknown-freebsd	cargo clippy --locked -p turnloop -p turnloop-contract --all-targets --all-features --target x86_64-unknown-freebsd -- -D warnings -D clippy::undocumented_unsafe_blocks	PASS	0	f86b218c342bc088c7c0c4a2a209357fbb8b351f29caf7eb4e94161b4da8b09f
+aarch64-linux-android	cargo clippy --locked -p turnloop -p turnloop-contract --all-targets --all-features --target aarch64-linux-android -- -D warnings -D clippy::undocumented_unsafe_blocks	FAIL	101	1102840922d72bc017d19ef1c3eafc6cb34754d50db4ecd54e5304abb3e5b16f
+aarch64-apple-ios	cargo clippy --locked -p turnloop -p turnloop-contract --all-targets --all-features --target aarch64-apple-ios -- -D warnings -D clippy::undocumented_unsafe_blocks	PASS	0	517af297e21c9fc355fbf7108c3fdc69e9c7f448d1454cf19bb523c24f692f98
+aarch64-apple-ios-sim	cargo clippy --locked -p turnloop -p turnloop-contract --all-targets --all-features --target aarch64-apple-ios-sim -- -D warnings -D clippy::undocumented_unsafe_blocks	PASS	0	ce55ec3517f931d412528620a5fddd588c177f3e0df52ec7d15d5a298071de4e
+aarch64-apple-tvos	cargo clippy --locked -p turnloop -p turnloop-contract --all-targets --all-features --target aarch64-apple-tvos -- -D warnings -D clippy::undocumented_unsafe_blocks	PASS	0	517af297e21c9fc355fbf7108c3fdc69e9c7f448d1454cf19bb523c24f692f98
+aarch64-apple-visionos	cargo clippy --locked -p turnloop -p turnloop-contract --all-targets --all-features --target aarch64-apple-visionos -- -D warnings -D clippy::undocumented_unsafe_blocks	PASS	0	3881914b3c012f2c915b5fbd782c9baa5d777b7747cc6c9fd4b3d25a05b2aa3e
+aarch64-apple-watchos	cargo clippy --locked -p turnloop -p turnloop-contract --all-targets --all-features --target aarch64-apple-watchos -- -D warnings -D clippy::undocumented_unsafe_blocks	PASS	0	a9c25dc7a627d9ea048dd7fd48d7465a99ca21f29fdfe4063b6dcd5ced325f85
+x86_64-unknown-linux-musl	cargo clippy --locked -p turnloop -p turnloop-contract --all-targets --all-features --target x86_64-unknown-linux-musl -- -D warnings -D clippy::undocumented_unsafe_blocks	FAIL	101	f3e3b215b24f39ede21f4befb391e1846080bc5f5923465ced5a43c338f1cfae
+mongodb-wasip2-allocations	"cargo test --locked -p turnloop-mongodb --release --target wasm32-wasip2 --test allocations --config 'target.wasm32-wasip2.runner=""wasmtime run""'"	FAIL	134	428c9fcb0f2a47e169f8566cdc5f57aa06e113fccdcbd3370739f3f3a058d73e
+mongodb-wasip2-allocations-nocapture	"cargo test --locked -p turnloop-mongodb --release --target wasm32-wasip2 --test allocations --config 'target.wasm32-wasip2.runner=""wasmtime run""' -- --nocapture"	FAIL	134	eeb68456904efbf0e5d4167b076dcb7a542e9f32dc12e9b33d6ac9cee79cbda4
+queued-post-probe	cargo run --offline --manifest-path /tmp/gap-audit-probe/Cargo.toml	FAIL	101	5ea2ee8b293b381296270e4b74648a871e81fbe8d29295a9dc12954ca6994b28
