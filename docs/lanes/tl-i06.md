@@ -289,7 +289,11 @@ p3 target (`nightly-2026-09-07`).
 | `58e6bda` | this report |
 | `75011b4` | merge of GitHub `main` f6fc128 (#20 I01, #16 Windows semantics) |
 | `d0d35b3` | DESIGN §10 rule 3 applied to filesystem requests; regressions |
-| (last) | report update for the merge |
+| `e796489` | report update for the merge |
+| `0424920` | allocation gates record thread, size and alignment of counted allocations on Windows |
+| `cc9fc43` | blocking pool starts fully before first use; Windows watch gate appends through fresh handles |
+| `18445f5` | `fifo_cancel_close` accepts a started, cancelled write |
+| (last) | report update for PR #22 Windows CI |
 
 ## 8. Needs CI (runtime not available here)
 
@@ -358,3 +362,44 @@ Rule 3 applied (`d0d35b3`):
 - Counters: `filesystem::wait` asserts `os_waits + discovery_polls <= 1`;
   `watch_backpressure` counts a spin only for a turn with neither a blocking wait
   nor a discovery poll and no output, and bounds all turns per 20 ms window.
+
+## 11. PR #22 Windows CI: allocation gates
+
+CI run 34939104575 failed only two Windows allocation gates. Probes ran on a
+throwaway `diag/tl-i06-windows-alloc` branch (runs 34940257417 and 34940923718,
+deleted afterwards) on the unfixed code.
+
+- **`steady_watch_batches_allocate_nothing` stalled in round 0 (all modes).** The
+  gate appended through one long-lived handle. NTFS does not report that to
+  `ReadDirectoryChangesW`: the probe showed no event for a write on an open handle,
+  and `Change:subject` after `FlushFileBuffers`, after reopen+write+close and after
+  reopen+write+flush+close (identical in all three Windows modes). The watch
+  backend was correct; the workload never produced a notification. The gate now
+  appends, flushes and closes a fresh handle each round through `CreateFileW` with
+  a UTF-16 path prepared before measurement (std converts every Windows path on
+  the heap, which the gate would otherwise count).
+- **`steady_typed_file_requests_allocate_nothing`: 2 allocations on other threads
+  (default mode only, intermittent).** The first submission started the process
+  pool, whose threads start asynchronously; on Windows std allocates inside the new
+  thread before user code (the thread name as UTF-16). The probes measured that a
+  named `turnloop-blocking-0` thread allocates exactly once on itself, `size 40
+  align 2`, before its closure runs. With CPU hogs delaying worker startup, the gate
+  failed in all three modes, and every counted allocation was `size 40 align 2` on
+  a pool worker thread (e.g. `[thread 6584, 7004, 7012]` with workers
+  `[3060, 7004, 7012, 6584]`). Fix: each worker reports the end of thread startup
+  and the first pool submission returns only after every worker has started. The
+  gate is unchanged.
+- **Found by the same probes:** `fifo_cancel_close` failed once on Windows (executor
+  mode): the head write was already running on a pool thread when close cancelled
+  it, so it wrote and reported `Cancelled` — correct per D8. The contract now
+  accepts complete or absent content for a cancelled write, never partial content.
+- The Windows allocation gates now report the thread id, size and alignment of the
+  first counted allocations on any thread when they fail.
+
+Verification before pushing: `cargo fmt --all --check`; strict clippy native and
+`--target x86_64-pc-windows-msvc` / `x86_64-unknown-linux-gnu` for `-p turnloop
+-p turnloop-contract -p turnloop-io --all-targets`; `cargo test -p turnloop -p
+turnloop-contract -- --test-threads=1` on macOS: PASS. CI run 34940860132 on
+`18445f5`: success, every job, including all three Windows modes where both gates,
+`fifo_cancel_close` and every watch contract passed (run 34940742526 on
+`cc9fc43` was superseded by that push and cancelled by the PR concurrency group).
