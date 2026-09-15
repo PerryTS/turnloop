@@ -146,6 +146,9 @@ impl ServerConfig {
     }
 }
 
+mod channel_binding;
+pub use channel_binding::tls_server_end_point;
+
 macro_rules! endpoint {
     ($name:ident, $connection:ty, $data:ty) => {
         pub struct $name {
@@ -172,6 +175,13 @@ macro_rules! endpoint {
             }
             pub fn alpn_protocol(&self) -> Option<&[u8]> {
                 self.inner.alpn_protocol()
+            }
+            /// Peer chain, leaf first. Verification follows the configured verifier;
+            /// consume it only after a successful handshake.
+            pub fn peer_certificates(
+                &self,
+            ) -> Option<&[rustls::pki_types::CertificateDer<'static>]> {
+                self.inner.peer_certificates()
             }
             pub fn is_handshaking(&self) -> bool {
                 self.inner.is_handshaking()

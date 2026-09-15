@@ -424,6 +424,14 @@ impl Operation {
         self.state = State::Failed;
         self.deadline = None;
     }
+    /// Number of retries actually scheduled for the current operation.
+    pub fn retry_count(&self) -> u8 {
+        self.policy.attempts
+    }
+    /// The failure which triggered the current retry, or the terminal failure.
+    pub fn last_error(&self) -> Option<&Error> {
+        self.error.as_ref().or(self.first_error.as_ref())
+    }
     pub fn next_timeout(&self) -> Option<Instant> {
         self.deadline
     }

@@ -301,44 +301,9 @@ fn invalid_input_is_bounded_and_commands_are_atomic() {
     assert!(c.next_event().is_err());
 }
 
-fn sha256(b: &[u8]) -> [u8; 32] {
-    use sha2::Digest;
-    sha2::Sha256::digest(b).into()
-}
-
-fn hmac(key: &[u8], message: &[u8]) -> [u8; 32] {
-    let mut inner = vec![0x36; 64];
-    let mut outer = vec![0x5c; 64];
-    for (i, b) in key.iter().enumerate() {
-        inner[i] ^= *b;
-        outer[i] ^= *b;
-    }
-    inner.extend_from_slice(message);
-    outer.extend_from_slice(&sha256(&inner));
-    sha256(&outer)
-}
-fn base64(bytes: &[u8]) -> String {
-    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut s = String::new();
-    for chunk in bytes.chunks(3) {
-        let a = chunk[0] as usize;
-        let b = chunk.get(1).copied().unwrap_or(0) as usize;
-        let c = chunk.get(2).copied().unwrap_or(0) as usize;
-        s.push(alphabet[a >> 2] as char);
-        s.push(alphabet[((a & 3) << 4) | (b >> 4)] as char);
-        s.push(if chunk.len() > 1 {
-            alphabet[((b & 15) << 2) | (c >> 6)] as char
-        } else {
-            '='
-        });
-        s.push(if chunk.len() > 2 {
-            alphabet[c & 63] as char
-        } else {
-            '='
-        });
-    }
-    s
-}
+#[path = "support/scram.rs"]
+mod scram;
+use scram::{base64, hex_salted_password, hmac};
 #[test]
 fn scram_and_plus_verify_server_signature_and_reject_bad_verifier() {
     // PBKDF2-HMAC-SHA256('secret','salt',4096), independently generated with Python hashlib.
@@ -361,7 +326,8 @@ fn scram_and_plus_verify_server_signature_and_reject_bad_verifier() {
                 c.next_event().expect("fixture operation must succeed"),
                 Some(Event::UpgradeTls)
             ));
-            c.tls_established().expect("fixture operation must succeed");
+            c.tls_established_with_channel_binding(true)
+                .expect("fixture operation must succeed");
             flush(&mut c);
         }
         let mut mechanisms = 10u32.to_be_bytes().to_vec();
@@ -435,12 +401,6 @@ fn scram_and_plus_verify_server_signature_and_reject_bad_verifier() {
         }
     }
 }
-fn hex_salted_password() -> [u8; 32] {
-    [
-        96, 154, 98, 181, 182, 135, 186, 101, 146, 177, 42, 85, 44, 121, 254, 59, 241, 158, 78, 20,
-        90, 22, 123, 121, 91, 122, 202, 181, 232, 159, 160, 246,
-    ]
-}
 
 #[test]
 fn extended_copy_resynchronizes_after_copy_done() {
@@ -492,6 +452,256 @@ fn extended_copy_resynchronizes_after_copy_done() {
         c.next_event().expect("fixture operation must succeed"),
         Some(Event::Completed {
             token: 1,
+            outcome: Outcome::Success,
+            ..
+        })
+    ));
+}
+
+fn tls_authentication(required: bool, available: bool) -> Result<Connection> {
+    let mut c = Connection::new(Config {
+        ssl: SslMode::Require,
+        channel_binding_required: required,
+        ..Default::default()
+    })?;
+    flush(&mut c);
+    c.receive(b"S")?;
+    assert!(matches!(c.next_event()?, Some(Event::UpgradeTls)));
+    c.tls_established_with_channel_binding(available)?;
+    flush(&mut c);
+    Ok(c)
+}
+
+#[test]
+fn scram_preference_is_decided_by_tls_binding_availability_and_server_offer() {
+    let mut ran = 0;
+    for available in [false, true] {
+        for offer in [
+            b"SCRAM-SHA-256-PLUS\0SCRAM-SHA-256\0\0".as_slice(),
+            b"SCRAM-SHA-256\0\0",
+            b"SCRAM-SHA-256-PLUS\0\0",
+        ] {
+            let mut c = tls_authentication(false, available).expect("TLS");
+            c.receive(&frame(
+                b'R',
+                &[10u32.to_be_bytes().as_slice(), offer].concat(),
+            ))
+            .expect("mechanisms");
+            let offers_plus = offer.starts_with(b"SCRAM-SHA-256-PLUS\0");
+            let only_plus = offer == b"SCRAM-SHA-256-PLUS\0\0";
+            if only_plus && !available {
+                assert_eq!(
+                    c.next_event().expect_err("no usable mechanism"),
+                    Error::Protocol("unsupported SASL mechanisms")
+                );
+            } else {
+                let plus = available && offers_plus;
+                assert!(
+                    matches!(c.next_event().expect("selection"), Some(Event::ScramNeeded { plus: selected }) if selected == plus)
+                );
+                let binding = if plus {
+                    ChannelBinding::tls_server_end_point(vec![1; 32])
+                } else {
+                    ChannelBinding::unsupported()
+                };
+                c.start_scram(ScramSha256::new(b"secret", binding))
+                    .expect("SCRAM start");
+                let packet = flush(&mut c);
+                let name = if plus {
+                    b"SCRAM-SHA-256-PLUS\0".as_slice()
+                } else {
+                    b"SCRAM-SHA-256\0"
+                };
+                assert_eq!(&packet[5..5 + name.len()], name);
+                let initial = &packet[5 + name.len() + 4..];
+                assert!(initial.starts_with(if plus {
+                    b"p=tls-server-end-point,,".as_slice()
+                } else {
+                    b"n,,"
+                }));
+            }
+            ran += 1;
+        }
+    }
+    assert_eq!(ran, 6);
+}
+
+#[test]
+fn required_binding_rejects_missing_data_missing_plus_and_authentication_bypass() {
+    assert!(matches!(
+        tls_authentication(true, false),
+        Err(Error::State(
+            "channel binding required but certificate binding is unavailable"
+        ))
+    ));
+    let mut c = tls_authentication(true, true).expect("binding available");
+    c.receive(&frame(
+        b'R',
+        &[10u32.to_be_bytes().as_slice(), b"SCRAM-SHA-256\0\0"].concat(),
+    ))
+    .expect("plain-only offer");
+    assert_eq!(
+        c.next_event().expect_err("PLUS required"),
+        Error::Protocol("channel binding required but server did not offer SCRAM-SHA-256-PLUS")
+    );
+    assert!(c.output().is_empty());
+    let mut c = tls_authentication(true, true).expect("binding available");
+    c.receive(&frame(b'R', &0u32.to_be_bytes()))
+        .expect("AuthenticationOk without SCRAM");
+    assert_eq!(
+        c.next_event()
+            .expect_err("trust cannot satisfy required binding"),
+        Error::Protocol("channel binding required but SCRAM-PLUS was not authenticated")
+    );
+    assert!(!c.is_ready());
+}
+
+#[test]
+fn legacy_tls_acknowledgement_has_no_binding_and_uses_n_gs2_flag() {
+    let mut c = Connection::new(Config {
+        ssl: SslMode::Require,
+        ..Default::default()
+    })
+    .expect("core");
+    flush(&mut c);
+    c.receive(b"S").expect("TLS accepted");
+    assert!(matches!(
+        c.next_event().expect("event"),
+        Some(Event::UpgradeTls)
+    ));
+    c.tls_established().expect("no binding acknowledgement");
+    flush(&mut c);
+    c.receive(&frame(
+        b'R',
+        &[
+            10u32.to_be_bytes().as_slice(),
+            b"SCRAM-SHA-256-PLUS\0SCRAM-SHA-256\0\0",
+        ]
+        .concat(),
+    ))
+    .expect("mechanisms");
+    assert!(matches!(
+        c.next_event().expect("selection"),
+        Some(Event::ScramNeeded { plus: false })
+    ));
+    c.start_scram(ScramSha256::new(b"secret", ChannelBinding::unsupported()))
+        .expect("plain SCRAM");
+    let packet = flush(&mut c);
+    assert_eq!(&packet[5..19], b"SCRAM-SHA-256\0");
+    assert!(packet[23..].starts_with(b"n,,"));
+}
+
+#[test]
+fn fatal_errors_abort_every_pending_token_and_preserve_diagnostics_after_eof() {
+    let mut ran = 0;
+    for severity in [
+        b"SFATAL\0".as_slice(),
+        b"SPANIQUE\0VPANIC\0",
+        b"SERREUR\0VFATAL\0",
+    ] {
+        for pending in [0, 3] {
+            let mut c = ready();
+            for token in 1..=pending {
+                c.query(token, "SELECT 1", None).expect("queue query");
+            }
+            let response = frame(
+                b'E',
+                &[
+                    severity,
+                    b"C57P01\0Mterminated by administrator\0Dretained detail\0\0",
+                ]
+                .concat(),
+            );
+            // A fragmented terminal response must not need ReadyForQuery or EOF.
+            for byte in &response[..response.len() - 1] {
+                c.receive(&[*byte]).expect("fragment");
+                assert!(c.next_event().expect("incomplete frame").is_none());
+            }
+            c.receive(&response[response.len() - 1..])
+                .expect("last fragment");
+            let error = c.next_event().expect_err("connection failure");
+            let Error::ConnectionAborted(ref failure) = error else {
+                panic!("lost server failure: {error:?}");
+            };
+            assert_eq!(failure.server_error().code(), "57P01");
+            assert_eq!(
+                failure.server_error().message(),
+                "terminated by administrator"
+            );
+            assert_eq!(failure.server_error().detail(), Some("retained detail"));
+            assert!(!c.is_ready());
+            assert!(c.output().is_empty(), "discard unsent pipeline output");
+            assert!(c.query(99, "SELECT 1", None).is_err());
+            c.abort(Error::Transport); // Scripted peer closes immediately after FATAL.
+            for token in 1..=pending {
+                match c.next_event().expect("terminal completion") {
+                    Some(Event::Completed {
+                        token: actual,
+                        outcome: Outcome::Aborted(reason),
+                        ..
+                    }) => {
+                        assert_eq!(actual, token);
+                        assert_eq!(reason, error);
+                    }
+                    event => panic!("missing aborted token: {event:?}"),
+                }
+            }
+            assert!(
+                matches!(c.next_event().expect("close"), Some(Event::Closed { reason }) if reason == error)
+            );
+            c.abort(Error::Cancelled);
+            assert!(c.next_event().expect("no duplicate").is_none());
+            assert_eq!(c.pending_count(), 0);
+            let io = std::io::Error::from(error);
+            assert_eq!(io.kind(), std::io::ErrorKind::ConnectionAborted);
+            assert!(
+                io.to_string()
+                    .contains("57P01: terminated by administrator")
+            );
+            ran += 1;
+        }
+    }
+    assert_eq!(ran, 6);
+}
+
+#[test]
+fn nonlocalized_severity_controls_statement_error_recovery() {
+    let mut c = ready();
+    c.query(1, "bad", None).expect("query");
+    flush(&mut c);
+    // V is authoritative even if S resembles a terminal severity.
+    c.receive(
+        &[
+            frame(b'E', b"SFATAL\0VERROR\0C42601\0Msyntax error\0\0"),
+            frame(b'Z', b"I"),
+        ]
+        .concat(),
+    )
+    .expect("response");
+    assert!(matches!(
+        c.next_event().expect("statement error"),
+        Some(Event::Error { token: Some(1), .. })
+    ));
+    assert!(matches!(
+        c.next_event().expect("ready"),
+        Some(Event::Completed {
+            outcome: Outcome::ServerError,
+            ..
+        })
+    ));
+    assert!(c.is_ready());
+    c.query(2, "SELECT 1", None).expect("reuse");
+    flush(&mut c);
+    c.receive(&[frame(b'C', b"SELECT 1\0"), frame(b'Z', b"I")].concat())
+        .expect("response");
+    assert!(matches!(
+        c.next_event().expect("tag"),
+        Some(Event::CommandComplete { token: 2, .. })
+    ));
+    assert!(matches!(
+        c.next_event().expect("success"),
+        Some(Event::Completed {
+            token: 2,
             outcome: Outcome::Success,
             ..
         })

@@ -12,6 +12,7 @@ documentation = "https://docs.rs/turnloop-mongodb"
 description = "Host-driven, sans-IO MongoDB protocol state machines"
 
 [dependencies]
+turnloop-tls = { workspace = true, optional = true, features = ["turnloop"] }
 turnloop-io = { workspace = true, optional = true }
 bson.workspace = true
 base64.workspace = true
@@ -37,11 +38,28 @@ workspace = true
 
 [package.metadata.turnloop-ci]
 role = "protocol"
-integration-tests = ["real_mongodb"]
+wasi-tests = ["asynchronous"]
+# Pinned p3 compiler: custom allocator traps before main in debug (wasm2 report).
+wasi-p3-release-tests = ["asynchronous"]
+wasi-integration-tests = ["async_server"]
+wasi-setup-tests = ["real_mongodb"]
+integration-tests = ["real_mongodb", "async_server"]
 
 [target.'cfg(all(target_os = "wasi", target_env = "p3"))'.dependencies]
 turnloop-io = { workspace = true, optional = true, features = ["wasi-p3-experimental"] }
 turnloop-wasi-random.workspace = true
 
 [features]
-turnloop = ["dep:turnloop-io"]
+turnloop = ["dep:turnloop-io", "dep:turnloop-tls"]
+
+[[test]]
+name = "asynchronous"
+required-features = ["turnloop"]
+
+[[test]]
+name = "async_server"
+required-features = ["turnloop"]
+
+[[example]]
+name = "turnloop"
+required-features = ["turnloop"]

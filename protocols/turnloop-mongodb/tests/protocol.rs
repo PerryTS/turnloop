@@ -722,3 +722,58 @@ fn incompatible_handshake_and_change_stream_empty_batch_resume_budget() {
     stream.finish_batch(None).unwrap();
     assert!(stream.should_resume(&e, 27));
 }
+
+#[test]
+fn discarded_lease_preserves_other_connections_and_generation() {
+    let now = clock::now();
+    let mut pool = Pool::new(PoolOptions {
+        min_size: 2,
+        max_size: 2,
+        ..Default::default()
+    })
+    .unwrap();
+    pool.ready(now);
+    let first = match pool.poll_event().unwrap() {
+        PoolEvent::Connect(l) => l,
+        e => panic!("{e:?}"),
+    };
+    let second = match pool.poll_event().unwrap() {
+        PoolEvent::Connect(l) => l,
+        e => panic!("{e:?}"),
+    };
+    pool.connected(first, now).unwrap();
+    pool.connected(second, now).unwrap();
+    pool.checkout(1, now).unwrap();
+    let discarded = match pool.poll_event().unwrap() {
+        PoolEvent::CheckedOut {
+            token: 1,
+            connection,
+        } => connection,
+        e => panic!("{e:?}"),
+    };
+    pool.checkout(2, now).unwrap();
+    let retained = match pool.poll_event().unwrap() {
+        PoolEvent::CheckedOut {
+            token: 2,
+            connection,
+        } => connection,
+        e => panic!("{e:?}"),
+    };
+    pool.discard(discarded, now).unwrap();
+    assert_eq!(pool.generation(), 0);
+    assert_eq!(pool.checked_out(), 1);
+    assert!(matches!(pool.poll_event(), Some(PoolEvent::Close(l)) if l == discarded));
+    assert!(
+        matches!(pool.poll_event(), Some(PoolEvent::Connect(l)) if l != retained && l != discarded)
+    );
+    assert!(pool.poll_event().is_none(), "no pool-wide clear");
+    pool.checkin(retained, now).unwrap();
+    pool.checkout(3, now).unwrap();
+    assert!(
+        matches!(pool.poll_event(), Some(PoolEvent::CheckedOut { token: 3, connection }) if connection == retained)
+    );
+    assert!(
+        pool.discard(discarded, now).is_err(),
+        "stale lease rejected"
+    );
+}

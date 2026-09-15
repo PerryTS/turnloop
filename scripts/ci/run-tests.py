@@ -130,6 +130,8 @@ def main():
     parser.add_argument('suite', choices=['native', 'wasi', 'web', 'node', 'loom', 'miri', 'protocol', 'protocol-wasi', 'interop'])
     parser.add_argument('--manifest-path', default='Cargo.toml')
     parser.add_argument('--target')
+    parser.add_argument('--real-servers', action='store_true', help='Require WASI real-server adapter suites using the unified fixture environment')
+    parser.add_argument('--package', action='append', dest='packages', help='Select protocol members for a local fixture run; CI omits this filter')
     parser.add_argument('--mode', help='One applicable native CI matrix mode; omitted runs all applicable modes')
     parser.add_argument('--browser', choices=['chrome', 'firefox'])
     args = parser.parse_args()
@@ -138,6 +140,12 @@ def main():
     root = Path(data['workspace_root'])
     base = cargo(pin) + ['test', '--locked', '--manifest-path', str(Path(args.manifest_path).resolve())]
     env = os.environ.copy()
+    if args.packages:
+        known = {p['name'] for p in members(data)}
+        if set(args.packages) - known:
+            fail('Unknown selected protocol package')
+    if args.real_servers and (args.suite != 'protocol-wasi' or args.target != 'wasm32-wasip2'):
+        fail('--real-servers applies to protocol-wasi on WASI 0.2')
     if args.target:
         base += ['--target', args.target]
     if args.mode and args.suite not in ('native', 'interop'):
@@ -156,10 +164,17 @@ def main():
         env['CARGO_TARGET_' + args.target.upper().replace('-', '_') + '_RUNNER'] = str(ROOT / 'scripts/ci/wasmtime-runner.sh')
         if args.suite == 'protocol-wasi':
             selected = [(p, settings(p).get('wasi-tests', [])) for p in members(data)
-                        if role(p) in ('protocol', 'codec', 'adapter') and settings(p).get('wasi-tests')]
+                        if role(p) in ('protocol', 'codec', 'adapter') and settings(p).get('wasi-tests')
+                        and (not args.packages or p['name'] in args.packages)]
             if not selected:
                 fail('No wasi-tests metadata: protocol runtime coverage is required')
             for package, targets in selected:
+                if args.real_servers:
+                    env['TURNLOOP_TEST_REQUIRED'] = '1'
+                    for setup in settings(package).get('wasi-setup-tests', []):
+                        checked_tests(cargo(PIN) + ['test', '--locked', '-p', package['name'], '--features', 'turnloop', '--test', setup,
+                            '--', '--include-ignored', '--test-threads=1', '--nocapture'], cwd=root, env=env)
+                    targets = targets + settings(package).get('wasi-integration-tests', [])
                 available = {t['name'] for t in package['targets'] if 'test' in t['kind']}
                 for target in targets:
                     if target not in available:
@@ -169,8 +184,13 @@ def main():
                     target_features = ['--features', ','.join(required)] if required else []
                     if args.target == 'wasm32-wasip3' and (required or role(package) == 'adapter'):
                         target_features = ['--all-features']
-                    checked_tests(base + ['-p', package['name'], '--test', target] + target_features +
-                        ['--', '--test-threads=1'], cwd=root, env=env)
+                    # The pinned p3 compiler can trap before main when lowering
+                    # arguments through a debug custom allocator. Keep the actual
+                    # allocation/semantic assertions in release, as the core gate
+                    # does (docs/lanes/wasm2-wasm3.md); never accept zero tests.
+                    profile = ['--release'] if args.target == 'wasm32-wasip3' and target in settings(package).get('wasi-p3-release-tests', []) else []
+                    checked_tests(base + ['-p', package['name'], '--test', target] + target_features + profile +
+                        ['--', '--test-threads=1'] + (['--include-ignored', '--nocapture'] if target in settings(package).get('wasi-integration-tests', []) else []), cwd=root, env=env)
         else:
             for package in select(data, 'core'):
                 if settings(package).get('wasi-lib-tests'):
@@ -253,7 +273,7 @@ def main():
             fail('Core must mark pure-Rust tests with package.metadata.turnloop-ci.miri-filters')
     else:
         env['TURNLOOP_TEST_REQUIRED'] = '1'
-        packages = select(data, 'protocol')
+        packages = [p for p in select(data, 'protocol') if not args.packages or p['name'] in args.packages]
         if args.suite == 'interop':
             packages = [p for p in packages if settings(p).get('service-group') == 'http']
             if not packages:

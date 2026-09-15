@@ -62,3 +62,11 @@ mod tests {
         );
     }
 }
+
+#[path = "client.rs"]
+mod client;
+pub use client::*;
+
+#[path = "async_pool.rs"]
+mod pool;
+pub use pool::{Pool, PooledConnection};

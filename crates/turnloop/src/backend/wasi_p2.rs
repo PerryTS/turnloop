@@ -19,8 +19,10 @@ use wasip2::{
     },
     sockets::{
         instance_network::instance_network,
+        ip_name_lookup::{ResolveAddressStream, resolve_addresses},
         network::{
-            ErrorCode, IpAddressFamily, IpSocketAddress, Ipv4SocketAddress, Ipv6SocketAddress,
+            ErrorCode, IpAddress, IpAddressFamily, IpSocketAddress, Ipv4SocketAddress,
+            Ipv6SocketAddress,
         },
         tcp::TcpSocket,
         tcp_create_socket::create_tcp_socket,
@@ -94,6 +96,20 @@ impl Wake for WasiWake {
         0
     }
 }
+// Children precede parents, including when cancellation drops a lookup.
+struct Lookup {
+    poll: Pollable,
+    stream: ResolveAddressStream,
+    op: OpId,
+    port: u16,
+    addresses: Vec<SocketAddr>,
+    ready: bool,
+}
+#[derive(Clone, Copy)]
+enum PollOwner {
+    Socket(Handle, usize),
+    Dns(usize),
+}
 /// WASI 0.2 pollable driver with retained canonical buffers.
 pub struct WasiP2 {
     resources: Vec<Option<Resource>>,
@@ -101,7 +117,8 @@ pub struct WasiP2 {
     ready: VecDeque<Handle>,
     cancelled: VecDeque<OpId>,
     handles: Vec<u32>,
-    owners: Vec<(Handle, usize)>,
+    owners: Vec<PollOwner>,
+    lookups: Vec<Option<Lookup>>,
     indices: Vec<usize>,
     poll_storage: Vec<u32>,
     scratch: Vec<u32>,
@@ -300,6 +317,61 @@ impl WasiP2 {
     }
 }
 
+impl WasiP2 {
+    fn run_dns(&mut self, events: &mut Vec<Event<Detached>>) {
+        for slot in &mut self.lookups {
+            if events.len() == events.capacity() {
+                break;
+            }
+            let Some(l) = slot.as_mut().filter(|l| l.ready) else {
+                continue;
+            };
+            // Bound address collection per turn; ready stays true only while
+            // actual buffered resolver output may still be consumed.
+            for _ in 0..64 {
+                match l.stream.resolve_next_address() {
+                    Ok(Some(ip)) => {
+                        let ip = match ip {
+                            IpAddress::Ipv4(a) => Ipv4Addr::new(a.0, a.1, a.2, a.3).into(),
+                            IpAddress::Ipv6(a) => {
+                                Ipv6Addr::new(a.0, a.1, a.2, a.3, a.4, a.5, a.6, a.7).into()
+                            }
+                        };
+                        l.addresses.push(SocketAddr::new(ip, l.port));
+                    }
+                    Ok(None) => {
+                        let result = if l.addresses.is_empty() {
+                            Err(Error::new(ErrorKind::NotFound))
+                        } else {
+                            Ok(Outcome::Resolved(std::mem::take(&mut l.addresses)))
+                        };
+                        events.push(Event {
+                            op: l.op,
+                            terminal: true,
+                            result,
+                        });
+                        *slot = None;
+                        break;
+                    }
+                    Err(ErrorCode::WouldBlock) => {
+                        l.ready = false;
+                        break;
+                    }
+                    Err(e) => {
+                        events.push(Event {
+                            op: l.op,
+                            terminal: true,
+                            result: Err(error(e)),
+                        });
+                        *slot = None;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
 // SAFETY: I/O imports synchronously copy buffers and never retain pointers.
 // Terminal events retire requests. Resource drop order releases subscriptions
 // before streams and sockets; accepted transports transfer ownership into core.
@@ -310,6 +382,7 @@ unsafe impl Backend for WasiP2 {
         let polls = config
             .max_handles
             .checked_mul(2)
+            .and_then(|n| n.checked_add(config.max_operations))
             .and_then(|n| n.checked_add(1))
             .ok_or(Error::new(ErrorKind::ResourceLimit))?;
         Ok(Self {
@@ -319,6 +392,7 @@ unsafe impl Backend for WasiP2 {
             cancelled: VecDeque::with_capacity(config.max_operations),
             handles: Vec::with_capacity(polls),
             owners: Vec::with_capacity(polls),
+            lookups: (0..config.max_operations).map(|_| None).collect(),
             indices: Vec::with_capacity(polls),
             poll_storage: vec![0; polls],
             scratch: vec![0; 16400],
@@ -478,7 +552,36 @@ unsafe impl Backend for WasiP2 {
         self.schedule(h);
         Ok(())
     }
+    fn resolve(&mut self, op: OpId, request: &DnsRequest) -> Result<()> {
+        let slot = self
+            .lookups
+            .get_mut(op.index())
+            .ok_or(Error::new(ErrorKind::ResourceLimit))?;
+        if slot.is_some() || self.ops[op.index()].is_some() {
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
+        let stream = resolve_addresses(&instance_network(), &request.host).map_err(error)?;
+        *slot = Some(Lookup {
+            poll: stream.subscribe(),
+            stream,
+            op,
+            port: request.port,
+            addresses: Vec::new(),
+            ready: true,
+        });
+        Ok(())
+    }
     fn cancel(&mut self, op: OpId) -> Result<()> {
+        if self
+            .lookups
+            .get(op.index())
+            .and_then(Option::as_ref)
+            .is_some_and(|l| l.op == op)
+        {
+            self.lookups[op.index()] = None;
+            self.cancelled.push_back(op);
+            return Ok(());
+        }
         let p = self
             .ops
             .get(op.index())
@@ -493,7 +596,9 @@ unsafe impl Backend for WasiP2 {
         Ok(())
     }
     fn has_work(&self) -> bool {
-        !self.ready.is_empty() || !self.cancelled.is_empty()
+        !self.ready.is_empty()
+            || !self.cancelled.is_empty()
+            || self.lookups.iter().flatten().any(|l| l.ready)
     }
 
     fn poll(
@@ -513,6 +618,7 @@ unsafe impl Backend for WasiP2 {
             });
         }
         self.run_ready(events);
+        self.run_dns(events);
         if self.has_work() || !events.is_empty() || events.len() == events.capacity() {
             return Ok(PollInfo::default());
         }
@@ -537,7 +643,13 @@ unsafe impl Backend for WasiP2 {
                     t.poll.as_ref().expect("socket pollable")
                 };
                 self.handles.push(poll.handle());
-                self.owners.push((r.handle, d));
+                self.owners.push(PollOwner::Socket(r.handle, d));
+            }
+        }
+        for (i, l) in self.lookups.iter().enumerate() {
+            if let Some(l) = l {
+                self.handles.push(l.poll.handle());
+                self.owners.push(PollOwner::Dns(i));
             }
         }
         let deadline = timeout
@@ -551,15 +663,22 @@ unsafe impl Backend for WasiP2 {
         }
         abi::poll(&self.handles, &mut self.poll_storage, &mut self.indices);
         for i in 0..self.indices.len() {
-            if let Some(&(h, d)) = self.owners.get(self.indices[i]) {
-                self.resources[h.index()]
-                    .as_mut()
-                    .expect("live poll owner")
-                    .ready[d] = true;
-                self.schedule(h);
+            match self.owners.get(self.indices[i]).copied() {
+                Some(PollOwner::Socket(h, d)) => {
+                    self.resources[h.index()]
+                        .as_mut()
+                        .expect("live poll owner")
+                        .ready[d] = true;
+                    self.schedule(h);
+                }
+                Some(PollOwner::Dns(i)) => {
+                    self.lookups[i].as_mut().expect("live lookup").ready = true
+                }
+                None => {}
             }
         }
         self.run_ready(events);
+        self.run_dns(events);
         Ok(PollInfo {
             waits: 1,
             zero_event_waits: u32::from(self.indices.is_empty()),

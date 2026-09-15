@@ -28,3 +28,17 @@ one absolute backend-clock deadline for a whole exchange.
 Native TCP/pipes and WASI sockets use the identical generic stream code. Browser
 raw sockets/listeners return Unsupported; browser HTTP uses host fetch. Windows
 uses the production Backend implementation when integrated.
+
+## Pools and DNS
+
+`pool::Pool` schedules the existing protocol pool policies with one manager task,
+retained waiters and real executor deadlines. A lease owns the connection across
+awaits. Cancelling a waiter removes its request; returning an incomplete exchange
+retires the transport. Pool replacement/end observes the backend's physical close
+acknowledgement through `ExecutorHandle::close`.
+
+`resolve` uses native blocking DNS or WASI 0.2 `ip-name-lookup`. `dns::query` returns
+native SRV/TXT records through `ExecutorHandle::blocking`, keeping system resolver
+calls off the loop thread. Native worker count/queue bounds remain those of the
+host's turnloop configuration. WASI exposes no SRV/TXT capability; use resolved
+seeds when the protocol needs those records.

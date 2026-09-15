@@ -9,6 +9,10 @@
 ))]
 use turnloop::*;
 
+// A fan-out fixture must consume only its own SIGUSR1. Another fixture's send
+// can release its workers before its own send, after they restore SIG_DFL.
+static SIGNAL_FANOUT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn local_echo_and_descriptor_ownership() {
     let path = std::env::temp_dir().join(format!("tl-ipc-{}.sock", std::process::id()));
@@ -31,6 +35,7 @@ fn spawned_child_stdio_uses_the_driver() {
 }
 #[test]
 fn signals_reach_four_loops_on_four_threads() {
+    let _guard = SIGNAL_FANOUT.lock().expect("serialize SIGUSR1 fixtures");
     turnloop_contract::native_surface::signal_fanout::<backend::Platform>(Signal::Usr1, || {
         // SAFETY: SIGUSR1 is subscribed by all four loops before the barrier opens.
         assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGUSR1) }, 0);
@@ -57,6 +62,7 @@ fn pending_signal_cannot_outlive_kqueue_unsubscribe() {
 
 #[test]
 fn signal_subscribe_raise_unsubscribe_stress() {
+    let _guard = SIGNAL_FANOUT.lock().expect("serialize SIGUSR1 fixtures");
     // Each round proves delivery and Stopped/Closed on all four owning threads;
     // the next round exercises restoration followed by fresh subscriptions.
     for _ in 0..256 {
@@ -78,9 +84,22 @@ fn kills_live_child_and_grandchild_as_a_group() {
 }
 #[test]
 fn registered_processes_and_signals_do_not_spin() {
-    turnloop_contract::native_surface::services_no_spin::<backend::Platform>(
-        std::ffi::OsStr::new(env!("CARGO_BIN_EXE_native_child")),
-        Signal::Usr2,
+    // Every owned child subscribes to process-wide SIGCHLD. Parallel tests
+    // exiting unrelated children notify this loop too, invalidating the quiet
+    // premise. A fresh process gives the unchanged contract its own dispatcher.
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_native_child"))
+        .arg("services-no-spin")
+        .output()
+        .expect("no-spin fixture");
+    assert!(
+        output.status.success(),
+        "no-spin fixture: {:?}; {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.stdout,
+        b"60 service timer expiries; no-spin bounds passed\n"
     );
 }
 #[test]

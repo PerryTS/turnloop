@@ -28,6 +28,40 @@ write twice if its first reply was lost. Set `auto_resend_unfulfilled=false` whe
 that policy is inappropriate. Connection failures during AUTH are terminal;
 transport failures use retry policy. The host reports transport/DNS/TLS errors.
 
+## Getting started on turnloop
+
+Enable `turnloop-redis = { version = "0.1.0-alpha.1", features = ["turnloop"] }`
+and use the `asynchronous` module: `Client::command/pipeline, Subscriber::next, ClusterClient and sentinel`. The default feature set remains sans-I/O.
+The adapter reuses `turnloop-io`; the host owns `LocalExecutor` and calls `turn`.
+Spawn local futures through its handle and keep their `JoinHandle`s until completion.
+
+```sh
+cargo run -p turnloop-redis --features turnloop --example turnloop
+```
+
+[The complete example](examples/turnloop.rs) connects to `127.0.0.1:6379` by default;
+`TURNLOOP_DB_ADDR` overrides that development endpoint. All operations take an
+absolute `turnloop_io::Instant` deadline, shared across authentication, I/O and retries.
+Callbacks borrow row/reply storage; copy values only when retaining them.
+Dropping a pending operation closes its transport before a pool can reuse it.
+
+For TLS, set the protocol's TLS mode and provide
+`turnloop_tls::asynchronous::ClientTls` with the trust configuration, verified
+server name and current Unix seconds. Certificates are verified; a requested TLS
+upgrade without a configuration fails. Native TCP and WASI 0.2 sockets share the
+same driver. Browser raw TCP is unavailable; Windows accepts a host-provided
+`Backend` until the repository's production IOCP provider is integrated.
+
+Pipelines encode the entire batch before awaiting ordered replies. Per-command
+Redis errors are returned to the pipeline callback while later replies continue.
+`subscribe` lends an exclusive subscriber with async `next(deadline)`; dropping
+it closes the subscribed session. Reconnects use real turnloop timers, restore
+subscriptions, and follow the core's `auto_resend_unfulfilled` policy. An ambiguous
+write can execute twice if that policy permits replay. `ClusterClient` follows
+MOVED/ASK and reuses per-node sessions; `sentinel` verifies the discovered primary's
+ROLE, with separate Sentinel/data-node authentication settings.
+
+
 ## Reply conversion boundary
 
 | Wire/core result | ioredis/Perry conversion in the host |

@@ -12,6 +12,7 @@ documentation = "https://docs.rs/turnloop-smtp"
 description = "Pull-driven SMTP client and MIME message builder"
 
 [dependencies]
+turnloop-tls = { workspace = true, optional = true, features = ["turnloop"] }
 turnloop-io = { workspace = true, optional = true }
 base64.workspace = true
 lettre.workspace = true
@@ -26,10 +27,26 @@ workspace = true
 
 [package.metadata.turnloop-ci]
 role = "protocol"
-integration-tests = ["smtp"]
+wasi-tests = ["asynchronous"]
+# Pinned p3 compiler: custom allocator traps before main in debug (wasm2 report).
+wasi-p3-release-tests = ["asynchronous"]
+wasi-integration-tests = ["async_server"]
+integration-tests = ["smtp", "async_server"]
 
 [features]
-turnloop = ["dep:turnloop-io"]
+turnloop = ["dep:turnloop-io", "dep:turnloop-tls"]
 
 [target.'cfg(all(target_os = "wasi", target_env = "p3"))'.dependencies]
 turnloop-io = { workspace = true, optional = true, features = ["wasi-p3-experimental"] }
+
+[[test]]
+name = "asynchronous"
+required-features = ["turnloop"]
+
+[[test]]
+name = "async_server"
+required-features = ["turnloop"]
+
+[[example]]
+name = "turnloop"
+required-features = ["turnloop"]

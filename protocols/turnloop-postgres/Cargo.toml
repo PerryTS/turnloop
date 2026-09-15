@@ -12,6 +12,7 @@ documentation = "https://docs.rs/turnloop-postgres"
 description = "Pull-driven sans-I/O PostgreSQL client protocol"
 
 [dependencies]
+turnloop-tls = { workspace = true, optional = true, features = ["turnloop"] }
 turnloop-io = { workspace = true, optional = true }
 bytes.workspace = true
 postgres-protocol.workspace = true
@@ -28,14 +29,33 @@ workspace = true
 
 [package.metadata.turnloop-ci]
 role = "protocol"
-integration-tests = ["server"]
+wasi-tests = ["asynchronous", "protocol", "allocations"]
+# Pinned p3 compiler: custom allocator traps before main in debug (wasm2 report).
+wasi-p3-release-tests = ["asynchronous", "allocations"]
+wasi-integration-tests = ["async_server"]
+integration-tests = ["server", "async_server"]
 
 [dev-dependencies]
 sha2.workspace = true
+rcgen.workspace = true
+base64.workspace = true
+turnloop-tls.workspace = true
 
 [target.'cfg(all(target_os = "wasi", target_env = "p3"))'.dependencies]
 turnloop-io = { workspace = true, optional = true, features = ["wasi-p3-experimental"] }
 turnloop-wasi-random.workspace = true
 
 [features]
-turnloop = ["dep:turnloop-io"]
+turnloop = ["dep:turnloop-io", "dep:turnloop-tls"]
+
+[[test]]
+name = "asynchronous"
+required-features = ["turnloop"]
+
+[[test]]
+name = "async_server"
+required-features = ["turnloop"]
+
+[[example]]
+name = "turnloop"
+required-features = ["turnloop"]

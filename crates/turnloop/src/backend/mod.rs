@@ -150,6 +150,8 @@ pub struct Event<D> {
 #[derive(Debug)]
 /// Successful backend outcomes; accepted transports remain owned until attached.
 pub enum Outcome<D> {
+    /// Addresses from an asynchronous host resolver.
+    Resolved(Vec<SocketAddr>),
     /// Reaped child termination.
     Exited(crate::ExitStatus),
     /// Coalesced signal delivery.
@@ -275,6 +277,12 @@ pub unsafe trait Backend: Sized + 'static {
     fn local_addr(&self, handle: Handle) -> Result<SocketAddr>;
     /// Accept one operation or reject it before retaining native buffer access.
     fn submit(&mut self, request: Request) -> Result<()>;
+    /// Start a handle-free host name lookup. The default uses no resources and
+    /// lets the core fall back to its native blocking pool. Accepted requests
+    /// obey the same terminal/cancellation and no-spin rules as socket I/O.
+    fn resolve(&mut self, _op: OpId, _request: &crate::DnsRequest) -> Result<()> {
+        Err(Error::new(crate::ErrorKind::Unsupported))
+    }
     /// Request cancellation; terminal acknowledgement must precede memory reuse.
     fn cancel(&mut self, op: OpId) -> Result<()>;
     /// Whether completions or immediately runnable cached operations are available.

@@ -28,7 +28,7 @@ pub mod pool;
 pub mod types;
 mod wire;
 use wire::Cursor;
-pub use wire::{Field, Fields, Row, ServerError};
+pub use wire::{ConnectionFailure, Field, Fields, Row, ServerError};
 
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 mod host_time;
@@ -39,13 +39,15 @@ pub use std::time::Instant;
 
 pub type Token = u64;
 pub type Result<T> = std::result::Result<T, Error>;
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
     Protocol(&'static str),
     State(&'static str),
     Limit,
     Timeout,
     Transport,
+    /// The server terminated the session; preserves SQLSTATE and every field.
+    ConnectionAborted(ConnectionFailure),
     Cancelled,
 }
 impl fmt::Display for Error {
@@ -55,11 +57,22 @@ impl fmt::Display for Error {
             Self::Limit => f.write_str("protocol buffer limit exceeded"),
             Self::Timeout => f.write_str("Connection terminated due to timeout"),
             Self::Transport => f.write_str("Connection terminated unexpectedly"),
+            Self::ConnectionAborted(error) => write!(f, "Connection aborted: {error}"),
             Self::Cancelled => f.write_str("Connection terminated"),
         }
     }
 }
 impl std::error::Error for Error {}
+impl From<Error> for std::io::Error {
+    fn from(error: Error) -> Self {
+        let kind = match error {
+            Error::ConnectionAborted(_) | Error::Transport => std::io::ErrorKind::ConnectionAborted,
+            Error::Timeout => std::io::ErrorKind::TimedOut,
+            _ => std::io::ErrorKind::Other,
+        };
+        Self::new(kind, error)
+    }
+}
 impl From<std::io::Error> for Error {
     fn from(_: std::io::Error) -> Self {
         Self::Protocol("invalid PostgreSQL message")
@@ -108,9 +121,10 @@ pub enum TransactionStatus {
     InTransaction,
     Failed,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     Success,
+    /// A statement failed and ReadyForQuery confirmed the session can continue.
     ServerError,
     Aborted(Error),
 }
@@ -228,6 +242,8 @@ pub struct Connection {
     scram: Option<ScramSha256>,
     auth_ok: bool,
     tls: bool,
+    binding_available: bool,
+    scram_plus: bool,
     copy_in: bool,
     transaction: TransactionStatus,
     key: Option<(i32, i32)>,
@@ -262,6 +278,8 @@ impl Connection {
             scram: None,
             auth_ok: false,
             tls: false,
+            binding_available: false,
+            scram_plus: false,
             copy_in: false,
             transaction: TransactionStatus::Idle,
             key: None,
@@ -320,11 +338,23 @@ impl Connection {
         self.input.extend_from_slice(bytes);
         Ok(())
     }
+    /// Acknowledge TLS without channel-binding data (plain SCRAM fallback).
     pub fn tls_established(&mut self) -> Result<()> {
+        self.tls_established_with_channel_binding(false)
+    }
+    /// Acknowledge verified TLS and whether the host can supply tls-server-end-point
+    /// data to `start_scram`. The core prefers PLUS only when data is available.
+    pub fn tls_established_with_channel_binding(&mut self, available: bool) -> Result<()> {
         if self.state != State::Tls || !self.output().is_empty() {
             return Err(Error::State("TLS transition not ready"));
         }
+        if self.config.channel_binding_required && !available {
+            return Err(Error::State(
+                "channel binding required but certificate binding is unavailable",
+            ));
+        }
         self.tls = true;
+        self.binding_available = available;
         self.startup()
     }
     pub fn start_scram(&mut self, scram: ScramSha256) -> Result<()> {
@@ -592,12 +622,16 @@ impl Connection {
             .map(|p| p.token)
             .ok_or(Error::Protocol("unsolicited query response"))
     }
+    /// Pull the next borrowed event. A terminal server ErrorResponse returns
+    /// `Error::ConnectionAborted` immediately and makes the session unusable.
+    /// Continue pulling to drain one Aborted completion per pending token, then
+    /// Closed; a later transport abort cannot replace the server diagnostic.
     pub fn next_event(&mut self) -> Result<Option<Event<'_>>> {
         if self.state == State::Closing {
             if let Some(p) = self.pending.pop_front() {
                 return Ok(Some(Event::Completed {
                     token: p.token,
-                    outcome: Outcome::Aborted(self.reason),
+                    outcome: Outcome::Aborted(self.reason.clone()),
                     transaction: self.transaction,
                 }));
             }
@@ -606,7 +640,7 @@ impl Connection {
             }
             self.state = State::Closed;
             return Ok(Some(Event::Closed {
-                reason: self.reason,
+                reason: self.reason.clone(),
             }));
         }
         if matches!(self.state, State::Closed | State::Tls | State::Scram(_)) {
@@ -662,6 +696,11 @@ impl Connection {
                         if self.scram.is_some() {
                             return Err(Error::Protocol("SCRAM final verification missing"));
                         }
+                        if self.config.channel_binding_required && !self.scram_plus {
+                            return Err(Error::Protocol(
+                                "channel binding required but SCRAM-PLUS was not authenticated",
+                            ));
+                        }
                         self.auth_ok = true;
                     }
                     3 => {
@@ -693,10 +732,16 @@ impl Connection {
                             }
                         }
                         c.end()?;
-                        let plus = self.tls && plus;
-                        if (!plus && !plain) || (self.config.channel_binding_required && !plus) {
+                        let plus = self.tls && self.binding_available && plus;
+                        if self.config.channel_binding_required && !plus {
+                            return Err(Error::Protocol(
+                                "channel binding required but server did not offer SCRAM-SHA-256-PLUS",
+                            ));
+                        }
+                        if !plus && !plain {
                             return Err(Error::Protocol("unsupported SASL mechanisms"));
                         }
+                        self.scram_plus = plus;
                         self.state = State::Scram(plus);
                         return Ok(Some(Event::ScramNeeded { plus }));
                     }
@@ -814,9 +859,13 @@ impl Connection {
                         )
                     {
                         self.state = State::Closing;
-                        self.reason = Error::Transport;
+                        self.reason = Error::ConnectionAborted(ConnectionFailure::new(error));
                         self.output.clear();
                         self.output_at = 0;
+                        self.copy_in = false;
+                        // FATAL/PANIC needs no ReadyForQuery or EOF confirmation.
+                        // Subsequent pulls still complete every queued token once.
+                        return Err(self.reason.clone());
                     }
                     return Ok(Some(Event::Error { token, error }));
                 }

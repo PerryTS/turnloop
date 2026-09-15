@@ -1,0 +1,298 @@
+#![cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#[path = "../../../crates/turnloop-io/tests/support/count.rs"]
+mod count;
+use std::{
+    future::Future,
+    pin::Pin,
+    task::{Context, Poll, Waker},
+    time::Duration,
+};
+use turnloop_io::{
+    turnloop::{Config as LoopConfig, LocalExecutor, Timeout, backend::Platform},
+    *,
+};
+fn finish<T>(task: &mut turnloop::JoinHandle<T>) -> T {
+    match Pin::new(task).poll(&mut Context::from_waker(Waker::noop())) {
+        Poll::Ready(Ok(v)) => v,
+        _ => panic!("task must finish"),
+    }
+}
+fn drive<T>(executor: &mut LocalExecutor<Platform>, task: &mut turnloop::JoinHandle<T>) -> T {
+    let at = executor.handle().now() + Duration::from_secs(90);
+    while !task.is_finished() {
+        assert!(executor.handle().now() < at, "test deadline");
+        executor.turn(Timeout::Until(at)).expect("turn");
+    }
+    finish(task)
+}
+async fn exact<S: Stream>(s: &mut S, mut bytes: &mut [u8]) {
+    while !bytes.is_empty() {
+        let n = read(s, bytes).await.expect("read");
+        assert!(n > 0, "unexpected EOF");
+        bytes = &mut bytes[n..];
+    }
+}
+use turnloop_smtp::{
+    Auth, Envelope, Tls,
+    asynchronous::{ConnectOptions, Transport},
+};
+use turnloop_tls::asynchronous::ClientTls;
+use turnloop_tls::{
+    ClientConfig, ClientOptions, ServerConfig, TlsStream,
+    rustls::pki_types::{CertificateDer, PrivateKeyDer},
+};
+async fn line<S: Stream>(s: &mut S) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    loop {
+        let mut b = [0];
+        exact(s, &mut b).await;
+        bytes.push(b[0]);
+        assert!(bytes.len() < 8192);
+        if bytes.ends_with(b"\r\n") {
+            return bytes;
+        }
+    }
+}
+#[test]
+fn starttls_auth_pipeline_and_recipient_results() {
+    for implicit in [false, true] {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("wall time")
+            .as_secs();
+        let server = ServerConfig::new(
+            vec![CertificateDer::from(
+                include_bytes!("fixtures/server.der").to_vec(),
+            )],
+            PrivateKeyDer::try_from(include_bytes!("fixtures/server-key.der").to_vec())
+                .expect("key"),
+            vec![],
+            now,
+        )
+        .expect("TLS config");
+        let tls = ClientTls {
+            config: ClientConfig::new(
+                ClientOptions {
+                    ca: Some(vec![CertificateDer::from(
+                        include_bytes!("fixtures/ca.der").to_vec(),
+                    )]),
+                    alpn: vec![],
+                    ..Default::default()
+                },
+                now,
+            )
+            .expect("client TLS"),
+            server_name: "localhost".try_into().expect("name"),
+            unix_seconds: now,
+        };
+        let mut ex = LocalExecutor::<Platform>::new(LoopConfig::default()).expect("executor");
+        let h = ex.handle();
+        let sh = h.clone();
+        let listener = Listener::bind(&h, "127.0.0.1:0".parse().expect("address")).expect("listen");
+        let address = listener.local_addr().expect("address");
+        let mut server = ex
+            .spawn_local(async move {
+                let mut s = listener.accept().await.expect("accept");
+                let at = sh.now() + Duration::from_secs(5);
+                if !implicit {
+                    write_all(&mut s, b"220 test\r\n").await.expect("greeting");
+                    assert!(line(&mut s).await.starts_with(b"EHLO"));
+                    write_all(&mut s, b"250-test\r\n250 STARTTLS\r\n")
+                        .await
+                        .expect("EHLO");
+                    assert_eq!(line(&mut s).await, b"STARTTLS\r\n");
+                    write_all(&mut s, b"220 ready\r\n").await.expect("STARTTLS");
+                }
+                let mut s = TlsStream::accept(s, &server, &sh, at, now)
+                    .await
+                    .expect("TLS handshake");
+                if implicit {
+                    write_all(&mut s, b"220 test\r\n").await.expect("greeting");
+                }
+                assert!(line(&mut s).await.starts_with(b"EHLO"));
+                write_all(&mut s, b"250-test\r\n250-PIPELINING\r\n250 AUTH PLAIN\r\n")
+                    .await
+                    .expect("EHLO");
+                assert!(line(&mut s).await.starts_with(b"AUTH PLAIN "));
+                write_all(&mut s, b"235 authenticated\r\n")
+                    .await
+                    .expect("auth");
+                assert!(line(&mut s).await.starts_with(b"MAIL FROM:"));
+                assert_eq!(line(&mut s).await, b"RCPT TO:<ok@example.test>\r\n");
+                assert_eq!(line(&mut s).await, b"RCPT TO:<bad@example.test>\r\n");
+                write_all(&mut s, b"250 sender\r\n250 recipient\r\n550 rejected\r\n")
+                    .await
+                    .expect("envelope");
+                assert_eq!(line(&mut s).await, b"DATA\r\n");
+                write_all(&mut s, b"354 go\r\n").await.expect("DATA");
+                assert_eq!(line(&mut s).await, b"..payload\r\n");
+                assert_eq!(line(&mut s).await, b".\r\n");
+                write_all(&mut s, b"250 queued\r\n").await.expect("sent");
+            })
+            .expect("spawn");
+        let mut client = ex
+            .spawn_local(async move {
+                let at = h.now() + Duration::from_secs(5);
+                let mut t = Transport::connect(
+                    &h,
+                    &ConnectOptions {
+                        address,
+                        protocol: turnloop_smtp::Config {
+                            tls: if implicit {
+                                Tls::Implicit
+                            } else {
+                                Tls::Required
+                            },
+                            auth: Some(Auth::Plain {
+                                user: "lane".into(),
+                                password: "test".into(),
+                            }),
+                            ..Default::default()
+                        },
+                        tls: Some(tls),
+                    },
+                    at,
+                )
+                .await
+                .expect("connect");
+                assert!(t.capabilities().pipelining);
+                let info = t
+                    .send(
+                        Envelope {
+                            from: "a@example.test".into(),
+                            to: vec!["ok@example.test".into(), "bad@example.test".into()],
+                        },
+                        "message-id".into(),
+                        b".payload\n",
+                        at,
+                    )
+                    .await
+                    .expect("send");
+                assert_eq!(info.accepted, ["ok@example.test"]);
+                assert_eq!(info.rejected.len(), 1);
+                assert_eq!(info.rejected[0].error.response_code, Some(550));
+                assert_eq!(info.response_code, 250);
+            })
+            .expect("spawn");
+        drive(&mut ex, &mut client);
+        drive(&mut ex, &mut server);
+    }
+}
+#[test]
+fn warmed_async_send_allocates_only_owned_result() {
+    let mut ex = LocalExecutor::<Platform>::new(LoopConfig::default()).expect("executor");
+    let h = ex.handle();
+    let listener = Listener::bind(&h, "127.0.0.1:0".parse().expect("address")).expect("listen");
+    let address = listener.local_addr().expect("address");
+    let mut server = ex
+        .spawn_local(async move {
+            let mut s = listener.accept().await.expect("accept");
+            write_all(&mut s, b"220 test\r\n").await.expect("hello");
+            assert!(line(&mut s).await.starts_with(b"EHLO"));
+            write_all(&mut s, b"250-test\r\n250 PIPELINING\r\n")
+                .await
+                .expect("hello");
+            for _ in 0..101 {
+                assert!(line(&mut s).await.starts_with(b"MAIL FROM:"));
+                assert_eq!(line(&mut s).await, b"RCPT TO:<ok@example.test>\r\n");
+                write_all(&mut s, b"250 sender\r\n250 recipient\r\n")
+                    .await
+                    .expect("envelope");
+                assert_eq!(line(&mut s).await, b"DATA\r\n");
+                write_all(&mut s, b"354 go\r\n").await.expect("DATA");
+                assert_eq!(line(&mut s).await, b"payload\r\n");
+                assert_eq!(line(&mut s).await, b".\r\n");
+                write_all(&mut s, b"250 queued\r\n").await.expect("sent");
+            }
+            101
+        })
+        .expect("server");
+    let mut client=ex.spawn_local(async move {count::prove_counter().await;let at=h.now()+Duration::from_secs(30);let mut c=Transport::connect(&h,&ConnectOptions{address,protocol:turnloop_smtp::Config{tls:Tls::None,..Default::default()},tls:None},at).await.expect("connect");for i in 0..101 {let envelope=Envelope{from:"a@example.test".into(),to:vec!["ok@example.test".into()]};let id="id@example.test".into();let (result,n)=count::measure(c.send(envelope,id,b"payload\r\n",at)).await;let info=result.expect("send");assert_eq!(info.accepted,["ok@example.test"]);assert_eq!(info.response_code,250);if i>0 {assert_eq!(n,3,"only owned accepted vector, recipient and response; zero adapter allocations");}}}).expect("client");
+    drive(&mut ex, &mut client);
+    assert_eq!(drive(&mut ex, &mut server), 101);
+}
+
+#[test]
+fn idle_transport_parks_and_cancelled_send_closes_socket() {
+    let mut ex = LocalExecutor::<Platform>::new(LoopConfig::default()).expect("executor");
+    let h = ex.handle();
+    let listener = Listener::bind(&h, "127.0.0.1:0".parse().expect("address")).expect("listen");
+    let address = listener.local_addr().expect("address");
+    let mut server = ex
+        .spawn_local(async move {
+            let mut s = listener.accept().await.expect("accept");
+            write_all(&mut s, b"220 test\r\n").await.expect("hello");
+            assert!(line(&mut s).await.starts_with(b"EHLO"));
+            write_all(&mut s, b"250-test\r\n250 PIPELINING\r\n")
+                .await
+                .expect("hello");
+            assert_eq!(line(&mut s).await, b"MAIL FROM:<a@example.test>\r\n");
+            assert_eq!(line(&mut s).await, b"RCPT TO:<ok@example.test>\r\n");
+            let mut byte = [0];
+            assert_eq!(read(&mut s, &mut byte).await.expect("cancel EOF"), 0);
+            2
+        })
+        .expect("server");
+    let idle = std::rc::Rc::new(std::cell::Cell::new(false));
+    let client_idle = idle.clone();
+    let mut client = ex
+        .spawn_local(async move {
+            let at = h.now() + Duration::from_secs(5);
+            let mut c = Transport::connect(
+                &h,
+                &ConnectOptions {
+                    address,
+                    protocol: turnloop_smtp::Config {
+                        tls: Tls::None,
+                        ..Default::default()
+                    },
+                    tls: None,
+                },
+                at,
+            )
+            .await
+            .expect("connect");
+            client_idle.set(true);
+            h.sleep(Duration::from_millis(60))
+                .await
+                .expect("idle timer");
+            let result = deadline(
+                &h,
+                h.now() + Duration::from_millis(20),
+                c.send(
+                    Envelope {
+                        from: "a@example.test".into(),
+                        to: vec!["ok@example.test".into()],
+                    },
+                    "message-id".into(),
+                    b"payload",
+                    at,
+                ),
+            )
+            .await;
+            assert_eq!(
+                result.expect_err("drop pending send").kind(),
+                std::io::ErrorKind::TimedOut
+            );
+            assert!(!c.is_reusable());
+        })
+        .expect("client");
+    let end = ex.handle().now() + Duration::from_secs(5);
+    while !idle.get() {
+        assert!(ex.handle().now() < end);
+        ex.turn(Timeout::Until(end)).expect("turn");
+    }
+    let mut waited = false;
+    for _ in 0..8 {
+        let before = ex.handle().now();
+        let info = ex.turn(Timeout::Until(end)).expect("idle turn");
+        if ex.handle().now().duration_since(before) >= Duration::from_millis(10) {
+            assert_eq!(info.os_waits, 1);
+            waited = true;
+            break;
+        }
+    }
+    assert!(waited, "idle SMTP transport spun instead of parking");
+    drive(&mut ex, &mut client);
+    assert_eq!(drive(&mut ex, &mut server), 2);
+}

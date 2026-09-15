@@ -2,7 +2,47 @@
 
 A pull-driven PostgreSQL v3 client core, built on `postgres-protocol` frontend
 messages, framing and SCRAM. It never opens a socket, starts a thread, reads a
-clock, schedules a timer or generates entropy. Production code forbids unsafe.
+clock, schedules a timer or generates entropy. The sans-I/O code forbids unsafe.
+
+## Getting started on turnloop
+
+Enable `turnloop-postgres = { version = "0.1.0-alpha.1", features = ["turnloop"] }`
+and use the `asynchronous` module: `Client::connect, query, execute, copy_in/copy_out and notification`. The default feature set remains sans-I/O.
+The adapter reuses `turnloop-io`; the host owns `LocalExecutor` and calls `turn`.
+Spawn local futures through its handle and keep their `JoinHandle`s until completion.
+
+```sh
+cargo run -p turnloop-postgres --features turnloop --example turnloop
+```
+
+[The complete example](examples/turnloop.rs) connects to `127.0.0.1:5432` by default;
+`TURNLOOP_DB_ADDR` overrides that development endpoint. All operations take an
+absolute `turnloop_io::Instant` deadline, shared across authentication, I/O and retries.
+Callbacks borrow row/reply storage; copy values only when retaining them.
+Dropping a pending operation closes its transport before a pool can reuse it.
+
+For TLS, set the protocol's TLS mode and provide
+`turnloop_tls::asynchronous::ClientTls` with the trust configuration, verified
+server name and current Unix seconds. Certificates are verified; a requested TLS
+upgrade without a configuration fails. Native TCP and WASI 0.2 sockets share the
+same driver. Browser raw TCP is unavailable; Windows accepts a host-provided
+`Backend` until the repository's production IOCP provider is integrated.
+
+`Pool::new` accepts the existing `pool::Config` (max, max_idle, idle/acquire
+limits, max_uses); `acquire(deadline)` returns an exclusive lease. A transaction
+still open at release destroys the connection. Named `ExtendedQuery` values use
+the core prepared-statement cache. `notification(deadline)` is the async next
+operation after `LISTEN`; query callbacks also receive interleaved notifications.
+`copy_in` lends a chunk writer with `finish`; dropping it closes the session.
+`copy_out` lends each chunk to a callback without buffering the complete transfer.
+`cancel_token().cancel(...)` sends CancelRequest over a separate connection.
+TLS authentication prefers SCRAM-SHA-256-PLUS. The client derives RFC 5929
+`tls-server-end-point` data from the verified peer leaf; an explicit
+`ConnectOptions::channel_binding` overrides that digest. RSA/ECDSA SHA-256/384/512
+and RSA-PSS are supported; MD5/SHA-1 signatures use SHA-256. Unsupported algorithms
+(such as Ed25519) or absent peer certificates fall back to SCRAM-SHA-256 with the
+`n,,` GS2 header. `Config::channel_binding_required` rejects that fallback.
+
 
 ## Driving a connection
 
@@ -14,12 +54,16 @@ clock, schedules a timer or generates entropy. Production code forbids unsafe.
 3. Feed plaintext with `receive(bytes)`, then repeatedly pull `next_event()` until
    it returns `None`. Flush any newly generated output before reading again.
 4. `UpgradeTls` is a hard boundary. Finish the existing plaintext write, perform
-   and verify TLS in the host, then call `tls_established`. TLS records never go
-   into `receive`. Prefer mode can fall back after `N`; Require cannot.
+   and verify TLS in the host. Derive binding with
+   `turnloop_tls::tls_server_end_point` from the verified peer leaf, then call
+   `tls_established_with_channel_binding(binding.is_some())`. The original
+   `tls_established()` acknowledges TLS without binding data. TLS records never
+   go into `receive`. Prefer mode can fall back after `N`; Require cannot.
 5. For `ScramNeeded`, construct the reexported upstream `ScramSha256` **in the
    host** (its constructor reads entropy), then call `start_scram`. PLUS needs
    `ChannelBinding::tls_server_end_point` containing the certificate digest
-   defined in RFC 5929. The core checks the mechanism/binding selection and
+   defined in RFC 5929. For plain SCRAM use `ChannelBinding::unsupported()`.
+   The core checks the mechanism/binding selection and
    verifies the server signature. Iterations are capped by configuration.
 6. Schedule `next_timeout()` in the host. Call `handle_timeout(now)` with supplied
    monotonic time. No method obtains time implicitly.
@@ -139,3 +183,21 @@ the core. For an upgrade, `into_parts` preserves the stream, core and unread byt
 Apply `turnloop_io::deadline` using the core's next deadline. Dropping a pending
 drive future closes the stream and aborts the core; terminal core events remain
 available for draining. See `turnloop-io` for the shared adapter ownership pattern.
+
+### Terminal server failures
+
+`ErrorResponse` with nonlocalized severity `FATAL`/`PANIC` (or `S` when `V` is
+absent) terminates the session immediately. `Connection::next_event()` returns
+`Error::ConnectionAborted(ConnectionFailure)`; its `server_error()` view retains
+SQLSTATE, message and all other fields. Close the transport and drain the core's
+one `Outcome::Aborted` per pending token, followed by `Closed`. EOF/abort does not
+replace the original diagnostic. Startup rejection is terminal too.
+
+The async client closes its stream and returns `io::ErrorKind::ConnectionAborted`
+with the typed `turnloop_postgres::Error` as its inner error. Such a client is not
+reusable. Ordinary statement `ERROR` stays borrowed and becomes
+`Outcome::ServerError` only after `ReadyForQuery`; the session can then continue.
+
+`Error` and `Outcome` are `Clone`, no longer `Copy`. Terminal diagnostics share one
+owned copy of the wire fields; cloning pipeline aborts allocates nothing.
+Successful queries and reusable statement errors retain zero steady allocations.

@@ -18,6 +18,7 @@ turnloop = ["dep:turnloop-io"]
 turnloop-io = { workspace = true, optional = true }
 
 rustls.workspace = true
+ring.workspace = true
 webpki-roots.workspace = true
 
 [dev-dependencies]
@@ -34,7 +35,7 @@ workspace = true
 role = "protocol"
 service-group = "http"
 integration-tests = ["tls", "asynchronous", "async_allocations"]
-wasi-tests = ["asynchronous", "async_allocations", "portable"]
+wasi-tests = ["asynchronous", "async_allocations", "portable", "channel_binding"]
 
 [[test]]
 name = "portable"

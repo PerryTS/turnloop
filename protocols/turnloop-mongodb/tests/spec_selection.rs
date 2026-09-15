@@ -4,7 +4,7 @@ use serde_json::Value;
 use std::{collections::BTreeMap, fs, path::Path, time::Duration};
 use turnloop_mongodb::{
     bson::doc,
-    topology::{ServerType, Topology, TopologyType},
+    topology::{SelectionBuffer, ServerType, Topology, TopologyType},
     uri::{Options, ReadPreference},
 };
 fn kind(s: &str) -> ServerType {
@@ -103,22 +103,47 @@ fn run(path: &Path) {
             })
             .collect()
     };
+    let max_staleness = p["maxStalenessSeconds"]
+        .as_i64()
+        .filter(|v| *v >= 0)
+        .map(|v| Duration::from_secs(v as u64));
+    let excluded: Vec<_> = v["deprioritized_servers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|s| s["address"].as_str().unwrap())
+        .collect();
     let mut actual = Vec::new();
-    let result = t.candidates_deprioritized(
-        pref,
-        &tags,
-        p["maxStalenessSeconds"]
-            .as_i64()
-            .filter(|v| *v >= 0)
-            .map(|v| Duration::from_secs(v as u64)),
-        &v["deprioritized_servers"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|s| s["address"].as_str().unwrap())
-            .collect::<Vec<_>>(),
-        &mut actual,
-    );
+    let result = t.candidates_deprioritized(pref, &tags, max_staleness, &excluded, &mut actual);
+    let mut scratch = SelectionBuffer::default();
+    // Every official fixture also executes the retained async selection path.
+    // Sweep both choices and reuse the same scratch through every filter pass.
+    for first in [0, u64::MAX / 2, u64::MAX] {
+        for second in [0, u64::MAX / 2, u64::MAX] {
+            let selected = t.select_reusing(
+                pref,
+                &tags,
+                max_staleness,
+                &excluded,
+                [first, second],
+                &mut scratch,
+            );
+            if v["error"] == true {
+                assert!(
+                    selected.is_err(),
+                    "retained selection must reject {}",
+                    path.display()
+                );
+            } else {
+                assert_eq!(
+                    selected.unwrap(),
+                    t.choose(&actual, [first, second]),
+                    "retained selection differs for {}",
+                    path.display()
+                );
+            }
+        }
+    }
     if v["error"] == true {
         assert!(result.is_err());
         return;

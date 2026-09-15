@@ -19,7 +19,7 @@ impl SansIo for crate::Connection {
         &mut self,
         mut receive: impl FnMut(Self::Event<'_>) -> io::Result<()>,
     ) -> io::Result<bool> {
-        if let Some(event) = self.next_event().map_err(io::Error::other)? {
+        if let Some(event) = self.next_event().map_err(io::Error::from)? {
             receive(event)?;
             Ok(true)
         } else {
@@ -62,3 +62,11 @@ mod tests {
         );
     }
 }
+
+#[path = "client.rs"]
+mod client;
+pub use client::*;
+
+#[path = "async_pool.rs"]
+mod pool;
+pub use pool::{Pool, PooledConnection};

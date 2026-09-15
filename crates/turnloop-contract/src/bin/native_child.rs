@@ -7,6 +7,19 @@ fn main() {
     let args: Vec<_> = std::env::args_os().collect();
     let mode = args.get(1).and_then(|s| s.to_str()).expect("fixture mode");
     match mode {
+        #[cfg(any(
+            target_vendor = "apple",
+            target_os = "linux",
+            target_os = "android",
+            target_os = "freebsd"
+        ))]
+        "services-no-spin" => {
+            turnloop_contract::native_surface::services_no_spin::<turnloop::backend::Platform>(
+                &args[0],
+                turnloop::Signal::Usr2,
+            );
+            println!("60 service timer expiries; no-spin bounds passed");
+        }
         "exit" => std::process::exit(23),
         "sleep" => std::thread::sleep(Duration::from_secs(60)),
         "environment" => {

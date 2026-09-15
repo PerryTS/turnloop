@@ -189,6 +189,21 @@ impl Pool {
         self.schedule(now);
         Ok(())
     }
+    /// Remove a pending async checkout without retaining its waiter or connection.
+    pub fn cancel_checkout(&mut self, token: u64, now: Instant) {
+        if let Some(i) = self.waiting.iter().position(|r| r.token == token) {
+            self.waiting.remove(i);
+        }
+        for i in 0..self.slots.len() {
+            if matches!(self.slots[i].state, State::Connecting(r) if r.token == token) {
+                self.close(ConnectionId {
+                    slot: i,
+                    generation: self.slots[i].generation,
+                });
+            }
+        }
+        self.schedule(now);
+    }
     fn schedule(&mut self, now: Instant) {
         if self.ending {
             return;

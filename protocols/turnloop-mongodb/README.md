@@ -1,6 +1,6 @@
 # turnloop-mongodb
 
-Host-driven MongoDB protocol components. The library opens no sockets, reads no clock,
+Host-driven MongoDB protocol components. The default sans-I/O library opens no sockets, reads no clock,
 starts no threads and uses no async runtime. It forbids unsafe code. BSON values stay
 BSON values; converting them to Perry's JSON strings or JS result shapes is the host's job.
 
@@ -8,6 +8,41 @@ The crate currently provides connection/command/operation state machines, topolo
 pool components, and explicit session/transaction/change-stream helpers. It is not a
 drop-in implementation of every Node MongoClient feature. See the root LANE_REPORT.md
 for the precise coverage and remaining conformance work.
+
+## Getting started on turnloop
+
+Enable `turnloop-mongodb = { version = "0.1.0-alpha.1", features = ["turnloop"] }`
+and use the `asynchronous` module: `Client::connect/command/cursor and Cursor::next/close`. The default feature set remains sans-I/O.
+The adapter reuses `turnloop-io`; the host owns `LocalExecutor` and calls `turn`.
+Spawn local futures through its handle and keep their `JoinHandle`s until completion.
+
+```sh
+cargo run -p turnloop-mongodb --features turnloop --example turnloop
+```
+
+[The complete example](examples/turnloop.rs) connects to `127.0.0.1:27017` by default;
+`TURNLOOP_DB_ADDR` overrides that development endpoint. All operations take an
+absolute `turnloop_io::Instant` deadline, shared across authentication, I/O and retries.
+Callbacks borrow row/reply storage; copy values only when retaining them.
+Dropping a pending operation closes its transport before a pool can reuse it.
+
+For TLS, set the protocol's TLS mode and provide
+`turnloop_tls::asynchronous::ClientTls` with the trust configuration, verified
+server name and current Unix seconds. Certificates are verified; a requested TLS
+upgrade without a configuration fails. Native TCP and WASI 0.2 sockets share the
+same driver. Browser raw TCP is unavailable; Windows accepts a host-provided
+`Backend` until the repository's production IOCP provider is integrated.
+
+The client schedules SDAM heartbeats with absolute turnloop timers, owns CMAP
+pools, and uses the existing Operation coordinator for retryable reads/writes.
+`last_retry_count` reports actual retries of the last command. `cursor` returns
+an async `next(deadline)` stream with server affinity and backpressure. `close`
+awaits killCursors; drop queues bounded-deadline cleanup while the client remains
+alive. Call `close` when acknowledgement is required. Native `mongodb+srv` looks
+up SRV/TXT through turnloop's blocking pool and validates domains/TXT options in
+the core. WASI 0.2 supports A/AAAA through ip-name-lookup; its standard interface
+has no SRV/TXT capability, so use explicit resolved seed URIs there.
+
 
 ## Driving a connection
 

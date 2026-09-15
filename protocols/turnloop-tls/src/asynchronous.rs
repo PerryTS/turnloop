@@ -10,6 +10,105 @@ use std::{
 };
 use turnloop_io::{AsyncRead, AsyncWrite, Backend, ExecutorHandle, Instant, Stream};
 
+/// Certificate verification and wall time supplied by the embedding host.
+#[derive(Clone)]
+pub struct ClientTls {
+    pub config: ClientConfig,
+    pub server_name: rustls::pki_types::ServerName<'static>,
+    pub unix_seconds: u64,
+}
+/// A stream that can cross a protocol's explicit STARTTLS boundary once.
+/// TLS state is allocated at connection setup, never per operation.
+pub enum Transport<S> {
+    Plain(S),
+    Tls(Box<TlsStream<S>>),
+    Closed,
+}
+impl<S: Stream> Transport<S> {
+    pub async fn upgrade<B: Backend>(
+        &mut self,
+        tls: &ClientTls,
+        executor: &ExecutorHandle<B>,
+        at: Instant,
+    ) -> io::Result<()> {
+        let Self::Plain(stream) = std::mem::replace(self, Self::Closed) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "TLS already negotiated",
+            ));
+        };
+        *self = Self::Tls(Box::new(
+            TlsStream::connect(
+                stream,
+                &tls.config,
+                tls.server_name.clone(),
+                executor,
+                at,
+                tls.unix_seconds,
+            )
+            .await?,
+        ));
+        Ok(())
+    }
+    pub fn is_tls(&self) -> bool {
+        matches!(self, Self::Tls(_))
+    }
+    /// Handshaken peer chain, leaf first; absent on plaintext/closed transports.
+    pub fn peer_certificates(&self) -> Option<&[rustls::pki_types::CertificateDer<'static>]> {
+        match self {
+            Self::Tls(s) => s.peer_certificates(),
+            Self::Plain(_) | Self::Closed => None,
+        }
+    }
+    pub fn get_ref(&self) -> Option<&S> {
+        match self {
+            Self::Plain(s) => Some(s),
+            Self::Tls(s) => Some(s.get_ref()),
+            Self::Closed => None,
+        }
+    }
+}
+impl<S: Stream> AsyncRead for Transport<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_read(cx, bytes),
+            Self::Tls(s) => Pin::new(&mut **s).poll_read(cx, bytes),
+            Self::Closed => Poll::Ready(Err(io::ErrorKind::NotConnected.into())),
+        }
+    }
+}
+impl<S: Stream> AsyncWrite for Transport<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_write(cx, bytes),
+            Self::Tls(s) => Pin::new(&mut **s).poll_write(cx, bytes),
+            Self::Closed => Poll::Ready(Err(io::ErrorKind::NotConnected.into())),
+        }
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_flush(cx),
+            Self::Tls(s) => Pin::new(&mut **s).poll_flush(cx),
+            Self::Closed => Poll::Ready(Err(io::ErrorKind::NotConnected.into())),
+        }
+    }
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_close(cx),
+            Self::Tls(s) => Pin::new(&mut **s).poll_close(cx),
+            Self::Closed => Poll::Ready(Ok(())),
+        }
+    }
+}
+
 trait Endpoint {
     type Data;
     fn process<'c, 'i>(
@@ -229,6 +328,14 @@ impl<S: Stream> TlsStream<S> {
         match &self.session {
             Session::Client(c) => c.alpn_protocol(),
             Session::Server(s) => s.alpn_protocol(),
+        }
+    }
+    /// Peer chain from the completed handshake, leaf first. Verification follows
+    /// the configured verifier, including any explicitly insecure host options.
+    pub fn peer_certificates(&self) -> Option<&[rustls::pki_types::CertificateDer<'static>]> {
+        match &self.session {
+            Session::Client(c) => c.peer_certificates(),
+            Session::Server(s) => s.peer_certificates(),
         }
     }
     /// Refresh wall time supplied by the embedding host.

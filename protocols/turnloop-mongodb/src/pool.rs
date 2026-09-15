@@ -182,6 +182,19 @@ impl Pool {
         self.drive(now);
         Ok(())
     }
+    /// Discard one checked-out transport after local cancellation or corruption.
+    /// Unlike a topology clear, this preserves other leases and the pool generation.
+    pub fn discard(&mut self, lease: Lease, now: Instant) -> Result<()> {
+        let at = self
+            .entries
+            .iter()
+            .position(|e| e.lease == lease && e.status == Status::Out)
+            .ok_or_else(|| Error::protocol("Unknown checked-out connection"))?;
+        self.entries.swap_remove(at);
+        self.events.push_back(PoolEvent::Close(lease));
+        self.drive(now);
+        Ok(())
+    }
     pub fn clear(&mut self) {
         if self.closed {
             return;

@@ -709,6 +709,10 @@ impl<B: Backend> Driver<B> {
         }
         true
     }
+    /// Whether close has begun and physical release is still pending.
+    pub fn is_closing(&self, h: Handle) -> bool {
+        self.resource(h).is_ok_and(|r| r.closing.is_some())
+    }
     /// Cancel pending operations, then deliver Closed. The resource is released
     /// only after Closed is appended to the host's output buffer.
     pub fn close(&mut self, h: Handle, token: Token) -> Result<()> {
@@ -793,9 +797,21 @@ impl<B: Backend> Driver<B> {
     ) -> Result<OpId> {
         self.submit_work(crate::blocking::blocking(f), token)
     }
-    /// Resolve an owned hostname on the shared native blocking pool.
+    /// Resolve through a host resolver, or the shared native blocking pool.
     pub fn resolve(&mut self, request: crate::DnsRequest, token: Token) -> Result<OpId> {
-        self.submit_work(crate::blocking::resolve(request), token)
+        let op = self.new_op(None, token)?;
+        match self.backend.resolve(op, &request) {
+            Ok(()) => Ok(op),
+            Err(e) => {
+                self.retire(op);
+                self.outstanding -= 1;
+                if e.kind == ErrorKind::Unsupported {
+                    self.submit_work(crate::blocking::resolve(request), token)
+                } else {
+                    Err(e)
+                }
+            }
+        }
     }
     fn submit_work(
         &mut self,
@@ -889,6 +905,7 @@ impl<B: Backend> Driver<B> {
             }
         } else {
             match e.result {
+                Ok(Outcome::Resolved(addresses)) => OpResult::Resolved(addresses),
                 Ok(Outcome::Exited(status)) => OpResult::Exited(status),
                 Ok(Outcome::Signal(signal)) => OpResult::Signal(signal),
                 Ok(Outcome::PipeAccepted(d)) => match self.attach(d, op.token) {
