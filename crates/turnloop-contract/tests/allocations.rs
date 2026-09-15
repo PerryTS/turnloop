@@ -522,6 +522,13 @@ fn steady_socket_options_allocate_nothing() {
 /// Handing a transport to the host and taking it back allocates nothing: the
 /// identity is read out of the backend's own table, `detach` only unregisters,
 /// and the conversion to an owned descriptor moves the resource it already held.
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    windows
+))]
 #[test]
 fn steady_handoff_allocates_nothing() {
     let mut l = Loop::new(Config::default()).expect("loop");
