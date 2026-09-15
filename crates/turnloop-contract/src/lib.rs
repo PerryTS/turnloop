@@ -71,7 +71,7 @@ pub fn pair<B: Backend>(l: &mut Driver<B>) -> (Handle, Handle, Handle) {
     let client = l
         .tcp_connect(
             l.local_addr(server).expect("addr"),
-            &TcpOpts { nodelay: true },
+            &TcpOpts::default(),
             Token(2),
         )
         .expect("connect");

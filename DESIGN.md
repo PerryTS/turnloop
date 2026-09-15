@@ -437,6 +437,7 @@ Two backends, because both versions matter now:
 | Wake | eventfd | EVFILT_USER | PostQueuedCompletionStatus | same-thread flag | same-thread flag | `schedule_turn` import / Atomics.notify |
 | Timer wait precision | ns (epoll_pwait2 / timerfd) | ns (kevent timespec) | sub-ms via high-res waitable timer | host-dependent (Wasmtime ≈1 ms) | host-dependent (Wasmtime ≈1 ms) | host `setTimeout` (clamped by browser) |
 | TCP / UDP | non-blocking + readiness | non-blocking + readiness | overlapped Winsock | `wasi:sockets` | `wasi:sockets` | unsupported |
+| Socket options (§7.7) | full setsockopt set | full setsockopt set, no IPv4 membership by interface index | full Winsock set, no IPv4 membership by interface index | keep-alive, buffer sizes, hop limit | keep-alive, buffer sizes, hop limit | unsupported |
 | Outbound HTTP | protocol crate | protocol crate | protocol crate | protocol crate or `wasi:http` | protocol crate or `wasi:http` | host `fetch` |
 | WebSocket | protocol crate | protocol crate | protocol crate | protocol crate | protocol crate | host `WebSocket` |
 | Local IPC | AF_UNIX | AF_UNIX | named pipes (overlapped) | unsupported | unsupported | `postMessage` |
@@ -449,6 +450,39 @@ Two backends, because both versions matter now:
 | DNS | pool (getaddrinfo) | pool (getaddrinfo) | pool (GetAddrInfoW) | `wasi:sockets/ip-name-lookup` | same | host (via fetch) |
 | Host integration | epoll fd | kqueue fd | event HANDLE + helper thread | runtime-owned | runtime-owned | `HostCallback` |
 | Cost measurement | perf instructions:u/k | rusage ri_instructions | QueryProcessCycleTime | Wasmtime fuel / instruction counts | Wasmtime fuel | browser profiler (relative) |
+
+### 7.7 Socket options
+
+Node exposes `socket.setNoDelay()`, `setKeepAlive()`, `setTTL()` and friends as
+methods on a *connected* socket, and a server commonly configures every
+connection it accepts, so a creation-time option struct cannot express what the
+host needs. `Loop::set_option(handle, SocketOption)` and
+`Loop::get_option(handle, SocketOptionKind)` are therefore part of the core API
+and work on any live socket handle, including one produced by `accept`.
+
+- **Synchronous, not an operation.** Both run entirely inside the call: no
+  Request is accepted, no completion is produced, nothing is queued and nothing
+  is allocated. They are the same shape as `tty_set_mode` and `local_addr`.
+- **No cache, ever.** `get_option` always asks the OS, because the OS is entitled
+  to round, clamp or double what it was given (`SO_RCVBUF` on Linux is the usual
+  example). Reporting the request back would be a lie the host acts on.
+- **`Unsupported`, never silently ignored.** A backend that has no equivalent for
+  an option says so. "The option is on" is a latency and connection-lifetime
+  claim; a host that cannot distinguish an applied option from an ignored one has
+  no way to find the bug later. WASI 0.2/0.3 therefore refuse Nagle, linger,
+  IPv6-only, broadcast and multicast, because `wasi:sockets` has no interface for
+  them, and the web backend refuses all of them.
+- **Bind-time options stay in the opts structs.** `SO_REUSEADDR`/`SO_REUSEPORT`
+  cannot be changed on a bound socket, so they belong to `ListenOpts`/`UdpOpts`,
+  not to `SocketOption`. `IPV6_V6ONLY` is readable on a live socket and kept in
+  the enum for that, but setting it after bind is refused by every OS.
+- **`ListenOpts::accept_defaults`** carries the per-connection defaults a server
+  would otherwise apply by hand: `nodelay` and a keep-alive schedule, each at most
+  one `setsockopt` on the new socket. The accepting backend applies them after the
+  OS accept and **before** the `Accepted` completion is produced, so the host never
+  observes an unconfigured connection. A backend that cannot apply a requested
+  default rejects the *listener* when it is created, and an OS failure while
+  applying one fails that accept rather than handing up a half-configured socket.
 
 ## 8. Loop liveness and ref/unref
 

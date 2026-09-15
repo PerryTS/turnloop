@@ -413,6 +413,31 @@ pub fn ipv6_only_is_readable_and_bind_time<B: Backend>() {
 /// accepts. This is `socket.setNoDelay()` and the per-connection server default.
 pub fn nodelay_round_trip_and_accept_default<B: Backend>() {
     let mut l = Driver::<B>::new(Config::default()).expect("loop");
+    // The creation-time hint still works, and is visible through the OS.
+    let eager = l
+        .tcp_connect(
+            (std::net::Ipv4Addr::LOCALHOST, 9).into(),
+            &TcpOpts { nodelay: true },
+            Token(30),
+        )
+        .expect("connecting socket");
+    assert!(
+        matches!(
+            read_option(&l, eager, SocketOptionKind::NoDelay),
+            SocketOption::NoDelay(true)
+        ),
+        "TcpOpts::nodelay must reach the socket it created"
+    );
+    // An IP-level option on a socket that has neither connected nor bound: the
+    // backend still has to learn its address family to pick IP_TTL over
+    // IPV6_UNICAST_HOPS.
+    assert!(
+        matches!(read_option(&l, eager, SocketOptionKind::Ttl), SocketOption::Ttl(hops) if hops > 0),
+        "an unconnected socket still knows its address family"
+    );
+    close_all(&mut l, &[eager]);
+
+    let mut l = Driver::<B>::new(Config::default()).expect("loop");
     let (server, client, conn) = plain_pair(&mut l, &ListenOpts::default());
     for (name, h) in [("client", client), ("accepted", conn)] {
         assert!(
@@ -550,6 +575,22 @@ impl UnwrapErrOrPanic for turnloop::Result<()> {
         self.err()
             .unwrap_or_else(|| panic!("{option:?} was accepted by a backend that cannot apply it"))
     }
+}
+/// A backend without Nagle control refuses the creation-time hint as well, so a
+/// host cannot tell itself the connection is configured when it is not.
+pub fn unsupported_connect_nodelay_is_rejected<B: Backend>() {
+    let mut l = Driver::<B>::new(Config::default()).expect("loop");
+    assert_eq!(
+        l.tcp_connect(
+            (std::net::Ipv4Addr::LOCALHOST, 9).into(),
+            &TcpOpts { nodelay: true },
+            Token(1),
+        )
+        .expect_err("no Nagle control here")
+        .kind,
+        ErrorKind::Unsupported
+    );
+    assert!(!l.alive(), "a rejected socket retains nothing");
 }
 /// A listener default this backend cannot apply is refused when the listener is
 /// created, not ignored once per accepted connection.

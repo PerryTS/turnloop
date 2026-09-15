@@ -197,6 +197,10 @@ fn socket_options_without_a_wasi_interface_are_unsupported() {
 /// `wasi:sockets` has no Nagle control, so a listener asking for it as a
 /// per-connection default is refused when it is created.
 #[test]
+fn nodelay_connect_hint_is_rejected() {
+    contract::sockopts::unsupported_connect_nodelay_is_rejected::<Platform>();
+}
+#[test]
 fn nodelay_accept_default_rejects_the_listener() {
     contract::sockopts::unsupported_accept_default_rejects_the_listener::<Platform>(
         turnloop::AcceptDefaults {

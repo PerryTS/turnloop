@@ -418,7 +418,15 @@ unsafe impl Backend for WasiP3 {
                     None,
                 );
             }
-            Open::Tcp { addr, .. } => (addr, Kind::Tcp, false, 0, AcceptDefaults::EMPTY),
+            Open::Tcp { addr, opts } => {
+                // wasi:sockets has no Nagle control. Reporting it is the only
+                // honest answer; a dropped hint is indistinguishable from an
+                // applied one (see Backend::set_option).
+                if opts.nodelay {
+                    return Err(Error::new(ErrorKind::Unsupported));
+                }
+                (addr, Kind::Tcp, false, 0, AcceptDefaults::EMPTY)
+            }
             Open::Listener { addr, opts } => (
                 addr,
                 Kind::Listener,
