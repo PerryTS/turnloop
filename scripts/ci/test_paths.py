@@ -16,10 +16,19 @@ class Paths(unittest.TestCase):
             for name, contents in files.items():
                 path = root / name
                 path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(contents)
+                path.write_text(contents, encoding='utf-8')
             check = checker.Check(root, tracked if tracked is not None else files)
             errors = check.run()
             return errors, check.references
+
+    def test_sources_and_manifests_are_utf8_on_windows(self):
+        errors, count = self.check({
+            'Cargo.toml': '[package]\nname="p"\ndescription="あ"\nreadme="README.md"',
+            'README.md': '',
+            'src/lib.rs': '// あ\nconst DOC: &str = include_str!("../README.md");',
+        })
+        self.assertEqual(errors, [])
+        self.assertEqual(count, 2)
 
     def test_real_git_index_case_mismatch_cli(self):
         with tempfile.TemporaryDirectory() as directory:

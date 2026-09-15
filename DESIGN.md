@@ -387,7 +387,7 @@ pub struct Error { pub kind: ErrorKind, pub os: Option<i32> }   // host maps to 
 - **Processes:** `CreateProcessW` with overlapped pipe handles, a Job Object for kill-tree semantics, and `RegisterWaitForSingleObject` on the process handle to post the exit completion.
 - **Signals:** `SetConsoleCtrlHandler` for CTRL_C, CTRL_BREAK and CTRL_CLOSE, mapped to `SIGINT`/`SIGBREAK`/`SIGHUP`. SIGTERM has no console equivalent; documented as such, matching Perry today (`os/signal.rs:441–531`).
 - **Wake:** `PostQueuedCompletionStatus` with a reserved completion key.
-- **Timer precision:** the default system tick is about 15.6 ms and `GetQueuedCompletionStatusEx` timeouts round to it. The plan is a **high-resolution waitable timer** (`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`, Windows 10 1803+) armed to the next deadline, waking the wait through an alertable `GetQueuedCompletionStatusEx` (APC) or by associating the timer with the port. M1 prototypes both. `timeBeginPeriod` is not an acceptable default because it changes the tick system-wide.
+- **Timer precision:** the default system tick is about 15.6 ms and `GetQueuedCompletionStatusEx` timeouts round to it. Use a **high-resolution waitable timer** (`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`, Windows 10 1803+) armed to the next deadline and associated with the port through dynamically resolved `NtAssociateWaitCompletionPacket`. `GetQueuedCompletionStatusEx` is nonalertable. Cancellation returning `STATUS_PENDING` requires dequeuing the generation-tagged timer packet before reuse. M1 prototyped both APC and NT packet routes; §15 question 3 records the NT packet decision and measured lateness. `timeBeginPeriod` is not an acceptable default because it changes the tick system-wide.
 - **Host integration:** `Integration::Event(HANDLE)` via the helper thread (D7).
 - **Measuring cost:** there is no `perf`; use `QueryThreadCycleTime`/`QueryProcessCycleTime` (CPU cycles) for A/B comparisons.
 
@@ -566,7 +566,7 @@ P5–P7 are independent of each other once P1 and P4 have landed, and can run as
 
 1. **Name.** Settled: `turnloop`.
 2. **`sys` layer.** Own thin backends vs building on compio-driver (IOCP and io_uring already done) vs `polling`/mio for Unix. Decided in M1 with instruction numbers.
-3. **Windows timer mechanism.** Alertable GQCSEx + waitable timer APC, or timer-to-port association.
+3. **Windows timer mechanism.** Use a high-resolution waitable timer with dynamically resolved `NtAssociateWaitCompletionPacket` and nonalertable GQCSEx. Windows 11 build 26200 rejected high-resolution APC callbacks with error 87; 100 NT-packet samples at 250 us measured p50/p95/max lateness of 275.2/285.8/380.9 us. See [the Windows results](spikes/iocp/WINDOWS_RESULTS.md); minimum-version and VM precision validation remain separate work.
 4. **Pooled buffer sizing and lease lifetime.** Until the next `turn`, or explicit release only?
 5. **io_uring timing.** When, and whether as the default where available.
 6. **Mobile CI.** iOS (kqueue) and Android (epoll) come almost free from the Unix backends. Which simulators/emulators run in CI.

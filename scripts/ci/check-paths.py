@@ -126,7 +126,7 @@ class Check:
         self.roots = set()
         for path in sorted(self.tracked):
             if PurePosixPath(path).name == 'Cargo.toml':
-                data = tomllib.loads((self.root / path).read_text())
+                data = tomllib.loads((self.root / path).read_text(encoding='utf-8'))
                 base = posixpath.dirname(path)
                 self.manifests[base] = data
                 for kind in ('lib', 'bin', 'test', 'bench', 'example'):
@@ -191,7 +191,7 @@ class Check:
         raise ValueError('cannot statically resolve file reference; use a literal or literal concat!')
 
     def rust(self, path, module_dir=None):
-        source = (self.root / path).read_text()
+        source = (self.root / path).read_text(encoding='utf-8')
         ts = tokens(source)
         parent = posixpath.dirname(path)
         if module_dir is None:

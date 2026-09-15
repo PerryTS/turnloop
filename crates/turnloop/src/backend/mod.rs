@@ -308,6 +308,11 @@ pub mod unix;
 #[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
 pub use unix::Unix as Platform;
 
+#[cfg(turnloop_backend = "iocp")]
+pub mod iocp;
+#[cfg(turnloop_backend = "iocp")]
+pub use iocp::Iocp as Platform;
+
 #[cfg(turnloop_backend = "wasi_p2")]
 pub mod wasi_p2;
 #[cfg(turnloop_backend = "wasi_p2")]

@@ -9,6 +9,7 @@ import platform
 import tarfile
 import tempfile
 import urllib.request
+import zipfile
 from common import ROOT, entrypoint, fail
 
 
@@ -28,19 +29,34 @@ def install(name, destination):
     with tempfile.TemporaryFile() as handle:
         handle.write(archive)
         handle.seek(0)
-        with tarfile.open(fileobj=handle, mode='r:*') as bundle:
-            for executable in pin['executables']:
-                matches = [m for m in bundle.getmembers()
-                           if m.isfile() and Path(m.name).name == executable]
-                if len(matches) != 1:
-                    fail(f'{name}: expected exactly one {executable} in archive')
-                contents = bundle.extractfile(matches[0])
-                if contents is None:
-                    fail(f'{name}: cannot read {executable}')
-                target = destination / executable
-                target.write_bytes(contents.read())
-                target.chmod(0o755)
+        if pin['url'].endswith('.zip'):
+            with zipfile.ZipFile(handle) as bundle:
+                for executable in pin['executables']:
+                    matches = [m for m in bundle.infolist()
+                               if not m.is_dir() and (m.external_attr >> 16) & 0o170000 in (0, 0o100000)
+                               and Path(m.filename).name == executable]
+                    if len(matches) != 1:
+                        fail(f'{name}: expected exactly one {executable} in archive')
+                    target = destination / executable
+                    target.write_bytes(bundle.read(matches[0]))
+        else:
+            install_tar(handle, pin, name, destination)
     print(f'PASS install {name} {pin["version"]}: sha256:{digest}')
+
+
+def install_tar(handle, pin, name, destination):
+    with tarfile.open(fileobj=handle, mode='r:*') as bundle:
+        for executable in pin['executables']:
+            matches = [m for m in bundle.getmembers()
+                       if m.isfile() and Path(m.name).name == executable]
+            if len(matches) != 1:
+                fail(f'{name}: expected exactly one {executable} in archive')
+            contents = bundle.extractfile(matches[0])
+            if contents is None:
+                fail(f'{name}: cannot read {executable}')
+            target = destination / executable
+            target.write_bytes(contents.read())
+            target.chmod(0o755)
 
 
 def main():
