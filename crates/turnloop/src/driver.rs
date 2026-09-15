@@ -39,6 +39,7 @@ struct Op {
     handle: Option<Handle>,
     token: Token,
     cancel: bool,
+    timed_out: bool,
     stop: bool,
     external_wait: bool,
     job_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -71,6 +72,7 @@ pub struct Driver<B: Backend> {
     handles: Table<Resource>,
     ops: Table<Op>,
     timers: TimerQueue,
+    connect_deadlines: TimerQueue,
     queued: VecDeque<Queued>,
     buffered: [usize; 3],
     events: Vec<Event<B::Detached>>,
@@ -130,6 +132,7 @@ impl<B: Backend> Driver<B> {
             handles: Table::new(config.max_handles),
             ops: Table::new(config.max_operations),
             timers: TimerQueue::new(config.max_handles),
+            connect_deadlines: TimerQueue::new(config.max_operations),
             // Terminal operation and Closed credits live until delivery. Native
             // multishot events, repeating timers and posts each have their own
             // bounded reserve, so no source can consume cancellation capacity or
@@ -191,6 +194,7 @@ impl<B: Backend> Driver<B> {
                 handle: h,
                 token,
                 cancel: false,
+                timed_out: false,
                 stop: false,
                 job_cancel: None,
                 external_wait: false,
@@ -229,6 +233,7 @@ impl<B: Backend> Driver<B> {
     }
     fn retire(&mut self, id: OpId) -> Option<Op> {
         let op = self.ops.remove(id.key)?;
+        self.connect_deadlines.cancel(id.key);
         if let Some(previous) = op.previous {
             self.ops.get_mut(previous.key).expect("previous").next = op.next;
         }
@@ -330,9 +335,15 @@ impl<B: Backend> Driver<B> {
     pub fn now(&self) -> Instant {
         self.backend.now()
     }
-    /// Return the earliest pending timer deadline in the backend clock domain.
+    /// Return the earliest pending timer or connection deadline in the backend clock domain.
     pub fn next_deadline(&self) -> Option<Instant> {
-        let deadline = self.timers.next_deadline();
+        let deadline = match (
+            self.timers.next_deadline(),
+            self.connect_deadlines.next_deadline(),
+        ) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
         #[cfg(target_arch = "wasm32")]
         let deadline = match (deadline, crate::external_wait::deadline(self.owner)) {
             (Some(a), Some(b)) => Some(a.min(b)),
@@ -431,16 +442,62 @@ impl<B: Backend> Driver<B> {
             opts: *opts,
         })
     }
-    /// Connect a local stream, completing with Connected or an error.
+    /// Connect a local stream, completing with Connected or an error. Busy named
+    /// pipes wait asynchronously until available or cancelled by closing the handle.
     pub fn pipe_connect(&mut self, name: &PipeName, token: Token) -> Result<Handle> {
+        self.pipe_connect_inner(name, None, token)
+    }
+    /// Connect a local stream by an absolute loop-clock deadline. Expiry cancels
+    /// native I/O and reports TimedOut only after its cancellation acknowledgement.
+    /// The deadline covers connection completion, not subsequent stream I/O.
+    pub fn pipe_connect_until(
+        &mut self,
+        name: &PipeName,
+        deadline: Instant,
+        token: Token,
+    ) -> Result<Handle> {
+        self.pipe_connect_inner(name, Some(deadline), token)
+    }
+    fn pipe_connect_inner(
+        &mut self,
+        name: &PipeName,
+        deadline: Option<Instant>,
+        token: Token,
+    ) -> Result<Handle> {
         let h = self.open(Open::Pipe(name.clone()))?;
-        if let Err(e) = self.submit(h, Operation::Connect, token) {
-            self.backend.release(h);
-            self.handles.remove(h.key);
-            self.refs -= 1;
-            return Err(e);
+        match self.submit(h, Operation::Connect, token) {
+            Ok(op) => {
+                if let Some(at) = deadline {
+                    self.connect_deadlines.insert(op.key, at);
+                    self.backend.deadline_changed(self.next_deadline());
+                }
+                Ok(h)
+            }
+            Err(e) => {
+                self.backend.release(h);
+                self.handles.remove(h.key);
+                self.refs -= 1;
+                Err(e)
+            }
         }
-        Ok(h)
+    }
+    fn expire_connects(&mut self, now: Instant) -> Result<()> {
+        while let Some((key, at)) = self.connect_deadlines.pop_expired(now) {
+            let op = OpId {
+                owner: self.owner,
+                key,
+            };
+            if let Err(error) = self.backend.cancel(op) {
+                // Preserve both the deadline and original cancellation error;
+                // no premature timeout may release in-flight kernel storage.
+                self.connect_deadlines.insert(key, at);
+                return Err(error);
+            }
+            let op = self.ops.get_mut(key).expect("cancelled connect");
+            op.cancel = true;
+            op.timed_out = true;
+        }
+        Ok(())
     }
     /// Duplicate standard input, output or error, classifying pipe/file/terminal.
     pub fn open_stdio(&mut self, which: Stdio) -> Result<Handle> {
@@ -707,6 +764,9 @@ impl<B: Backend> Driver<B> {
             op.cancel = true;
             op.stop = stop;
         }
+        if self.connect_deadlines.cancel(id.key) {
+            self.backend.deadline_changed(self.next_deadline());
+        }
         true
     }
     /// Whether close has begun and physical release is still pending.
@@ -898,7 +958,9 @@ impl<B: Backend> Driver<B> {
             if !e.terminal {
                 return;
             }
-            if op.stop {
+            if op.timed_out {
+                OpResult::Err(Error::new(ErrorKind::TimedOut))
+            } else if op.stop {
                 OpResult::Stopped
             } else {
                 OpResult::Cancelled
@@ -941,6 +1003,7 @@ impl<B: Backend> Driver<B> {
         out.clear();
         let notified = self.notifier.begin();
         let start = self.backend.now();
+        self.expire_connects(start)?;
         #[cfg(target_arch = "wasm32")]
         crate::external_wait::poll(self.owner, start);
         let deadline = match (timeout.deadline(start), self.next_deadline()) {
@@ -972,6 +1035,7 @@ impl<B: Backend> Driver<B> {
             self.events = events;
         }
         let now = self.backend.now();
+        self.expire_connects(now)?;
         #[cfg(target_arch = "wasm32")]
         crate::external_wait::poll(self.owner, now);
         for _ in 0..self.config.events_per_turn {
@@ -1096,8 +1160,15 @@ mod clock_contract {
         deadline: Option<Instant>,
         changes: usize,
         polls: usize,
+        accept_connect: bool,
+        pending: Option<Request>,
+        cancellation: Option<OpId>,
+        cancel_error: Option<Error>,
+        cancel_calls: usize,
+        acknowledge: bool,
     }
-    // SAFETY: this test backend accepts no native I/O and owns no user buffers.
+    // SAFETY: this test backend accepts only buffer-free synthetic connects;
+    // it performs no native I/O and owns no user buffers.
     unsafe impl Backend for Host {
         type Wake = NoWake;
         type Detached = ();
@@ -1107,6 +1178,12 @@ mod clock_contract {
                 deadline: None,
                 changes: 0,
                 polls: 0,
+                accept_connect: false,
+                pending: None,
+                cancellation: None,
+                cancel_error: None,
+                cancel_calls: 0,
+                acknowledge: false,
             })
         }
         fn now(&self) -> Instant {
@@ -1126,24 +1203,60 @@ mod clock_contract {
             self.deadline = deadline;
             self.changes += 1;
         }
-        fn open(&mut self, _: Handle, _: Open) -> Result<()> {
-            Err(Error::new(ErrorKind::Unsupported))
+        fn open(&mut self, _: Handle, spec: Open) -> Result<()> {
+            if self.accept_connect && matches!(spec, Open::Pipe(_)) {
+                Ok(())
+            } else {
+                Err(Error::new(ErrorKind::Unsupported))
+            }
         }
         fn local_addr(&self, _: Handle) -> Result<SocketAddr> {
             Err(Error::new(ErrorKind::Unsupported))
         }
-        fn submit(&mut self, _: Request) -> Result<()> {
-            Err(Error::new(ErrorKind::Unsupported))
+        fn submit(&mut self, request: Request) -> Result<()> {
+            if self.accept_connect && matches!(request.operation, Operation::Connect) {
+                assert!(self.pending.replace(request).is_none());
+                Ok(())
+            } else {
+                Err(Error::new(ErrorKind::Unsupported))
+            }
         }
-        fn cancel(&mut self, _: OpId) -> Result<()> {
-            Err(Error::new(ErrorKind::NotFound))
+        fn cancel(&mut self, op: OpId) -> Result<()> {
+            self.cancel_calls += 1;
+            if let Some(error) = self.cancel_error {
+                return Err(error);
+            }
+            if self
+                .pending
+                .as_ref()
+                .is_some_and(|request| request.op == op)
+            {
+                self.cancellation = Some(op);
+                Ok(())
+            } else {
+                Err(Error::new(ErrorKind::NotFound))
+            }
         }
         fn has_work(&self) -> bool {
             false
         }
-        fn poll(&mut self, timeout: Option<Duration>, _: &mut Vec<Event<()>>) -> Result<PollInfo> {
+        fn poll(
+            &mut self,
+            timeout: Option<Duration>,
+            events: &mut Vec<Event<()>>,
+        ) -> Result<PollInfo> {
             assert_eq!(timeout, Some(Duration::ZERO));
             self.polls += 1;
+            if self.acknowledge
+                && let Some(op) = self.cancellation.take()
+            {
+                assert_eq!(self.pending.take().expect("pending connect").op, op);
+                events.push(Event {
+                    op,
+                    terminal: true,
+                    result: Ok(Outcome::Cancelled),
+                });
+            }
             Ok(PollInfo::default())
         }
         fn release(&mut self, _: Handle) {}
@@ -1156,6 +1269,79 @@ mod clock_contract {
         fn integration(&mut self) -> Result<Integration> {
             Ok(Integration::HostCallback)
         }
+    }
+    #[test]
+    fn connection_deadline_waits_for_acknowledgement_and_retains_cancellation_errors() {
+        let mut driver = Driver::<Host>::new(Config::default()).expect("host loop");
+        driver.backend.accept_connect = true;
+        let at = driver.now() + Duration::from_millis(10);
+        let h = driver
+            .pipe_connect_until(&PipeName("synthetic".into()), at, Token(1))
+            .expect("connect");
+        let op = driver
+            .backend
+            .pending
+            .as_ref()
+            .expect("submitted connect")
+            .op;
+        let mut out = Completions::with_capacity(1);
+        driver
+            .turn(Timeout::Now, &mut out)
+            .expect("before deadline");
+        assert!(out.is_empty());
+        assert_eq!(driver.backend.cancel_calls, 0);
+        assert_eq!(driver.next_deadline(), Some(at));
+        let failure = Error {
+            kind: ErrorKind::Other,
+            os: Some(12345),
+        };
+        driver.backend.cancel_error = Some(failure);
+        driver.backend.now = at;
+        assert_eq!(
+            driver
+                .turn(Timeout::Now, &mut out)
+                .expect_err("injected cancellation error"),
+            failure
+        );
+        assert_eq!(driver.backend.cancel_calls, 1);
+        assert_eq!(driver.next_deadline(), Some(at));
+        assert!(out.is_empty() && driver.backend.pending.is_some());
+        driver.backend.cancel_error = None;
+        driver
+            .turn(Timeout::Now, &mut out)
+            .expect("retry cancellation");
+        assert_eq!(driver.backend.cancel_calls, 2);
+        assert_eq!(driver.next_deadline(), None);
+        assert!(
+            out.is_empty() && driver.backend.pending.is_some(),
+            "timeout cannot retire before native acknowledgement"
+        );
+        driver.backend.acknowledge = true;
+        driver
+            .turn(Timeout::Now, &mut out)
+            .expect("acknowledge timeout");
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            (out[0].handle, out[0].op, out[0].token, out[0].terminal),
+            (Some(h), Some(op), Token(1), true)
+        );
+        assert!(matches!(
+            out[0].result,
+            OpResult::Err(Error {
+                kind: ErrorKind::TimedOut,
+                ..
+            })
+        ));
+        assert!(driver.backend.pending.is_none());
+        assert_eq!(driver.backend.cancel_calls, 2);
+        driver.close(h, Token(2)).expect("close timed-out stream");
+        driver.turn(Timeout::Now, &mut out).expect("closed");
+        assert_eq!(out.len(), 1);
+        assert!(matches!(out[0].result, OpResult::Closed));
+        driver
+            .turn(Timeout::Now, &mut out)
+            .expect("no duplicate timeout");
+        assert!(out.is_empty() && !driver.alive());
     }
     #[test]
     fn optional_native_capabilities_reject_without_leaking_core_reservations() {

@@ -526,3 +526,13 @@ fn sigchld_subscription_cooperates_with_owned_child_reaping() {
     }
     assert_eq!(reaped, 1);
 }
+
+#[test]
+fn local_connect_deadlines_complete_and_cancel() {
+    let path =
+        std::env::temp_dir().join(format!("tl-connect-deadline-{}.sock", std::process::id()));
+    turnloop_contract::native_surface::pipe_connect_deadlines::<backend::Platform>(&PipeName(
+        path.clone(),
+    ));
+    std::fs::remove_file(path).expect("remove deadline listener");
+}

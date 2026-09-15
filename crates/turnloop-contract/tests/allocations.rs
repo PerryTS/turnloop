@@ -27,7 +27,16 @@ use turnloop::*;
 struct Counting;
 use std::cell::Cell;
 thread_local! { static ACTIVE: Cell<bool> = const { Cell::new(false) }; static ALLOCS: Cell<usize> = const { Cell::new(0) }; }
+#[cfg(windows)]
+static ALL_THREADS_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(windows)]
+static ALL_THREADS_ALLOCS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 fn record() {
+    #[cfg(windows)]
+    if ALL_THREADS_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+        ALL_THREADS_ALLOCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     if ACTIVE.try_with(Cell::get).unwrap_or(false) {
         let _ = ALLOCS.try_with(|n| n.set(n.get() + 1));
     }
@@ -1411,4 +1420,307 @@ fn windows_child_watch_cancel_exit_and_close_allocate_nothing_after_setup() {
         "Windows service completion allocations"
     );
     assert_eq!((cancellations, exits, closes), (8, 8, 16));
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_backlog_accept_rearm_and_busy_deadlines_allocate_nothing() {
+    const N: usize = 8;
+    let name = PipeName(format!(r"\\.\pipe\tl-backlog-alloc-{}", std::process::id()).into());
+    let mut server = Loop::new(Config::default()).expect("server");
+    let listener = server
+        .pipe_listen(
+            &name,
+            &ListenOpts {
+                backlog: N as u32,
+                ..ListenOpts::default()
+            },
+        )
+        .expect("backlog");
+    let mut out = Completions::with_capacity(1);
+    let mut accepts = 0;
+    for _ in 0..16 {
+        let _clients: [std::fs::File; N] = std::array::from_fn(|_| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&name.0)
+                .expect("fill backlog before accepts")
+        });
+        ALLOCS.with(|n| n.set(0));
+        ACTIVE.with(|v| v.set(true));
+        for _ in 0..N {
+            let op = server.accept(listener, Token(1)).expect("accept");
+            let until = server.now() + Duration::from_secs(5);
+            let conn = loop {
+                assert!(server.now() < until);
+                server
+                    .turn(Timeout::Until(until), &mut out)
+                    .expect("accept/rearm");
+                if out.is_empty() {
+                    continue;
+                }
+                assert_eq!(out.len(), 1);
+                assert_eq!(out[0].op, Some(op));
+                let OpResult::PipeAccepted { conn } = out[0].result else {
+                    panic!("accept missing")
+                };
+                break conn;
+            };
+            server.close(conn, Token(2)).expect("close accepted pipe");
+            server
+                .turn(Timeout::Now, &mut out)
+                .expect("close completion");
+            assert_eq!(out.len(), 1);
+            assert!(matches!(out[0].result, OpResult::Closed));
+            accepts += 1;
+        }
+        ACTIVE.with(|v| v.set(false));
+        assert_eq!(ALLOCS.with(Cell::get), 0, "backlog accept/rearm storage");
+    }
+    assert_eq!(accepts, 128);
+    let _occupied: [std::fs::File; N] = std::array::from_fn(|_| {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&name.0)
+            .expect("occupy backlog")
+    });
+    let mut client = Loop::new(Config::default()).expect("client");
+    let mut expiries = 0;
+    for _ in 0..16 {
+        let at = client.now() + Duration::from_millis(20);
+        let h = client
+            .pipe_connect_until(&name, at, Token(3))
+            .expect("busy open setup");
+        ALLOCS.with(|n| n.set(0));
+        ACTIVE.with(|v| v.set(true));
+        let mut waits = 0;
+        loop {
+            assert!(client.now() < at + Duration::from_secs(3));
+            waits += client
+                .turn(Timeout::Until(at + Duration::from_secs(3)), &mut out)
+                .expect("busy wait expiry")
+                .os_waits;
+            if out.is_empty() {
+                continue;
+            }
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].handle, Some(h));
+            assert!(matches!(
+                out[0].result,
+                OpResult::Err(Error {
+                    kind: ErrorKind::TimedOut,
+                    ..
+                })
+            ));
+            break;
+        }
+        client.close(h, Token(4)).expect("close timed-out pipe");
+        client
+            .turn(Timeout::Now, &mut out)
+            .expect("release wait state");
+        assert_eq!(out.len(), 1);
+        assert!(matches!(out[0].result, OpResult::Closed));
+        ACTIVE.with(|v| v.set(false));
+        assert!(waits > 0, "availability/deadline wait subject ran");
+        assert_eq!(
+            ALLOCS.with(Cell::get),
+            0,
+            "busy wait/cancel/deadline storage"
+        );
+        expiries += 1;
+    }
+    assert_eq!(expiries, 16);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_worker_file_fifo_allocate_nothing_after_setup() {
+    use std::io::{Read, Seek};
+    let path = std::env::temp_dir().join(format!("tl-file-fifo-alloc-{}", std::process::id()));
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .expect("file");
+    let payload: [[u8; 32]; 64] = std::array::from_fn(|i| [i as u8; 32]);
+    let mut driver = Loop::new(Config::default()).expect("loop");
+    let h = driver
+        .attach(
+            Detached::from_handle(file.try_clone().expect("duplicate").into())
+                .expect("synchronous file"),
+            Token(0),
+        )
+        .expect("worker setup");
+    let mut out = Completions::with_capacity(1);
+    let mut writes = 0;
+    for round in 0..5 {
+        file.rewind().expect("rewind completed file");
+        ALLOCS.with(|n| n.set(0));
+        ACTIVE.with(|v| v.set(round != 0));
+        let ops: [_; 64] = std::array::from_fn(|i| {
+            // SAFETY: immutable fixed payload outlives the driver on success/unwind.
+            let bytes = unsafe { IoBuf::from_raw_parts(payload[i].as_ptr(), 32) };
+            driver
+                .write(h, WriteBuf::Provided(bytes), Token(i as u64))
+                .expect("FIFO write")
+        });
+        let mut count = 0;
+        let deadline = driver.now() + Duration::from_secs(5);
+        while count < 64 {
+            assert!(driver.now() < deadline);
+            driver
+                .turn(Timeout::Until(deadline), &mut out)
+                .expect("FIFO delivery");
+            for c in out.drain() {
+                assert_eq!(
+                    (c.op, c.token, c.handle, c.terminal),
+                    (Some(ops[count]), Token(count as u64), Some(h), true)
+                );
+                assert!(matches!(c.result, OpResult::Wrote(32)));
+                count += 1;
+            }
+        }
+        ACTIVE.with(|v| v.set(false));
+        assert_eq!(ALLOCS.with(Cell::get), 0, "worker FIFO allocation gate");
+        file.rewind().expect("rewind for independent content check");
+        let mut bytes = [[0u8; 32]; 64];
+        for chunk in &mut bytes {
+            file.read_exact(chunk).expect("file bytes");
+        }
+        assert_eq!(bytes, payload);
+        writes += if round == 0 { 0 } else { count };
+    }
+    assert_eq!(writes, 256);
+    drop(driver);
+    drop(file);
+    std::fs::remove_file(path).expect("remove file");
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_console_control_delivery_allocates_nothing_on_any_thread() {
+    use std::{
+        os::windows::{io::AsRawHandle, process::CommandExt},
+        sync::atomic::Ordering,
+    };
+    use windows_sys::Win32::{
+        Foundation::WAIT_OBJECT_0,
+        System::{
+            Console::*,
+            Threading::{CREATE_NEW_CONSOLE, WaitForSingleObject},
+        },
+    };
+    const NAME: &str = "windows_console_control_delivery_allocates_nothing_on_any_thread";
+    if std::env::var("TURNLOOP_CONSOLE_ALLOCATION_TEST").as_deref() != Ok(NAME) {
+        let mut child =
+            std::process::Command::new(std::env::current_exe().expect("test executable"))
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env("TURNLOOP_CONSOLE_ALLOCATION_TEST", NAME)
+                .creation_flags(CREATE_NEW_CONSOLE)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("isolated console allocator child");
+        // SAFETY: owned child handle, bounded wait; this child owns its console.
+        let waited = unsafe { WaitForSingleObject(child.as_raw_handle(), 30_000) };
+        if waited != WAIT_OBJECT_0 {
+            child.kill().expect("watchdog kill");
+        }
+        let output = child.wait_with_output().expect("child output");
+        assert_eq!(waited, WAIT_OBJECT_0, "console fixture timeout");
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).expect("fixture stdout");
+        assert!(stdout.contains("1 passed"));
+        assert!(stdout.contains("console allocation subject: 200 deliveries, 2 stops, 2 closes"));
+        return;
+    }
+    let mut driver = Loop::new(Config::default()).expect("loop");
+    // SAFETY: this test's isolated console; enable real Ctrl-C delivery.
+    assert_ne!(unsafe { SetConsoleCtrlHandler(None, 0) }, 0);
+    let signals = [
+        driver.signal_start(Signal::Int, Token(1)).expect("Ctrl-C"),
+        driver
+            .signal_start(Signal::Break, Token(2))
+            .expect("Ctrl-Break"),
+    ];
+    let mut out = Completions::with_capacity(1);
+    let mut delivered = 0;
+    for round in 0..101 {
+        if round == 1 {
+            ALL_THREADS_ACTIVE.store(true, Ordering::SeqCst);
+            let calibration = std::hint::black_box(Box::new([0u8; 32]));
+            drop(std::hint::black_box(calibration));
+            assert!(
+                ALL_THREADS_ALLOCS.load(Ordering::SeqCst) > 0,
+                "global allocator calibration ran"
+            );
+            ALL_THREADS_ALLOCS.store(0, Ordering::SeqCst);
+        }
+        for (i, (control, signal)) in [
+            (CTRL_C_EVENT, Signal::Int),
+            (CTRL_BREAK_EVENT, Signal::Break),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            // SAFETY: private console and live subscription; OS invokes the real
+            // handler on its own thread, covered by the process-wide counter.
+            assert_ne!(unsafe { GenerateConsoleCtrlEvent(control, 0) }, 0);
+            let until = driver.now() + Duration::from_secs(5);
+            loop {
+                assert!(driver.now() < until);
+                driver
+                    .turn(Timeout::Until(until), &mut out)
+                    .expect("console delivery");
+                if out.is_empty() {
+                    continue;
+                }
+                assert_eq!(out.len(), 1);
+                let c = &out[0];
+                assert_eq!(
+                    (c.handle, c.token, c.terminal),
+                    (Some(signals[i]), Token(i as u64 + 1), false)
+                );
+                assert!(matches!(c.result, OpResult::Signal(actual) if actual == signal));
+                delivered += usize::from(round != 0);
+                break;
+            }
+        }
+    }
+    for signal in signals {
+        driver
+            .signal_stop(signal, Token(3))
+            .expect("stop subscription");
+    }
+    let (mut stops, mut closes) = (0, 0);
+    let until = driver.now() + Duration::from_secs(5);
+    while driver.alive() {
+        assert!(driver.now() < until);
+        driver
+            .turn(Timeout::Until(until), &mut out)
+            .expect("join handlers on stop");
+        for c in out.drain() {
+            match c.result {
+                OpResult::Stopped => stops += 1,
+                OpResult::Closed => closes += 1,
+                other => panic!("duplicate/unexpected {other:?}"),
+            }
+        }
+    }
+    ALL_THREADS_ACTIVE.store(false, Ordering::SeqCst);
+    assert_eq!(
+        ALL_THREADS_ALLOCS.load(Ordering::SeqCst),
+        0,
+        "console handler/delivery/stop Rust allocations on any thread"
+    );
+    assert_eq!((delivered, stops, closes), (200, 2, 2));
+    println!("console allocation subject: 200 deliveries, 2 stops, 2 closes");
 }

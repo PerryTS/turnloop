@@ -502,3 +502,658 @@ fn cancelled_child_watch_completes_while_child_is_alive() {
         .expect("no duplicate cancellation");
     assert!(out.is_empty());
 }
+
+#[test]
+fn pipe_backlog_connects_before_accept_is_serviced_and_rearms() {
+    let _guard = HANDLES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    use std::io::Read;
+    const BACKLOG: usize = 8;
+    let mut driver = Loop::new(Config::default()).expect("loop");
+    let name = PipeName(format!(r"\\.\pipe\tl-backlog-{}", std::process::id()).into());
+    let listener = driver
+        .pipe_listen(
+            &name,
+            &ListenOpts {
+                backlog: BACKLOG as u32,
+                ..ListenOpts::default()
+            },
+        )
+        .expect("backlog listener");
+    let mut accepted = 0;
+    let mut out = Completions::with_capacity(1);
+    for round in 0..3 {
+        // The host has not submitted or serviced an accept in this round. Every
+        // client opens synchronously, proving all eight native instances exist.
+        let mut clients: [std::fs::File; BACKLOG] = std::array::from_fn(|i| {
+            let mut client = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&name.0)
+                .expect("client before accept");
+            client
+                .write_all(&[i as u8])
+                .expect("unique client identity");
+            client
+        });
+        let op = driver
+            .accept_start(listener, Token(1))
+            .expect("multishot accept");
+        let deadline = driver.now() + Duration::from_secs(5);
+        let mut servers = Vec::new();
+        while servers.len() != BACKLOG {
+            assert!(driver.now() < deadline);
+            driver
+                .turn(Timeout::Until(deadline), &mut out)
+                .expect("accept backlog");
+            for c in out.drain() {
+                assert_eq!(
+                    (c.op, c.handle, c.token, c.terminal),
+                    (Some(op), Some(listener), Token(1), false)
+                );
+                let OpResult::PipeAccepted { conn } = c.result else {
+                    panic!("unexpected {c:?}")
+                };
+                assert!(!servers.contains(&conn), "duplicate accepted handle");
+                servers.push(conn);
+            }
+        }
+        assert!(driver.cancel(op));
+        driver.turn(Timeout::Now, &mut out).expect("stop accept");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].op, Some(op));
+        assert!(matches!(out[0].result, OpResult::Cancelled));
+        let mut seen = [false; BACKLOG];
+        for server in servers {
+            let read = driver
+                .read(server, ReadBuf::Pooled, Token(2))
+                .expect("identify accepted peer");
+            let peer = loop {
+                assert!(driver.now() < deadline);
+                driver
+                    .turn(Timeout::Until(deadline), &mut out)
+                    .expect("identity read");
+                if out.is_empty() {
+                    continue;
+                }
+                assert_eq!(out.len(), 1);
+                assert_eq!(out[0].op, Some(read));
+                let OpResult::Read {
+                    n: 1,
+                    lease: Some(bytes),
+                } = &out[0].result
+                else {
+                    panic!("missing identity")
+                };
+                let i = bytes.as_slice()[0] as usize;
+                assert!(i < BACKLOG && !std::mem::replace(&mut seen[i], true));
+                driver
+                    .write(server, WriteBuf::Owned(vec![round, i as u8]), Token(3))
+                    .expect("reply to same client");
+                break i;
+            };
+            loop {
+                assert!(driver.now() < deadline);
+                driver
+                    .turn(Timeout::Until(deadline), &mut out)
+                    .expect("reply");
+                if out.is_empty() {
+                    continue;
+                }
+                assert_eq!(out.len(), 1);
+                assert!(matches!(out[0].result, OpResult::Wrote(2)));
+                break;
+            }
+            let mut reply = [0; 2];
+            clients[peer]
+                .read_exact(&mut reply)
+                .expect("exact peer reply before server close");
+            assert_eq!(reply, [round, peer as u8]);
+            driver.close(server, Token(4)).expect("close server");
+            driver.turn(Timeout::Now, &mut out).expect("closed");
+            assert_eq!(out.len(), 1);
+            assert!(matches!(out[0].result, OpResult::Closed));
+            accepted += 1;
+        }
+        assert!(seen.into_iter().all(|v| v));
+        driver
+            .turn(Timeout::Now, &mut out)
+            .expect("no duplicate accepts");
+        assert!(out.is_empty());
+    }
+    assert_eq!(accepted, 24);
+}
+
+#[test]
+fn busy_pipe_connect_parks_expires_cancels_and_retries() {
+    let _guard = HANDLES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let name = PipeName(format!(r"\\.\pipe\tl-busy-{}", std::process::id()).into());
+    let mut server = Loop::new(Config::default()).expect("server loop");
+    let listener = server
+        .pipe_listen(
+            &name,
+            &ListenOpts {
+                backlog: 1,
+                ..ListenOpts::default()
+            },
+        )
+        .expect("one instance");
+    let occupied = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&name.0)
+        .expect("occupy sole instance");
+    let mut client = Loop::new(Config::default()).expect("client loop");
+    let mut out = Completions::with_capacity(1);
+    let mut timeouts = 0;
+    for delay in [
+        Duration::from_micros(500),
+        Duration::from_millis(2),
+        Duration::from_millis(10),
+    ] {
+        let at = client.now() + delay;
+        let h = client
+            .pipe_connect_until(&name, at, Token(1))
+            .expect("busy connection accepted");
+        let mut turns = 0;
+        let mut empty_waits = 0;
+        loop {
+            assert!(client.now() < at + Duration::from_secs(3));
+            let info = client
+                .turn(Timeout::Until(at + Duration::from_secs(3)), &mut out)
+                .expect("park busy connect");
+            turns += 1;
+            empty_waits += info.zero_event_waits;
+            if out.is_empty() {
+                continue;
+            }
+            assert_eq!(out.len(), 1);
+            assert_eq!(
+                (out[0].handle, out[0].token, out[0].terminal),
+                (Some(h), Token(1), true)
+            );
+            assert!(matches!(
+                out[0].result,
+                OpResult::Err(Error {
+                    kind: ErrorKind::TimedOut,
+                    ..
+                })
+            ));
+            assert!(client.now() >= at);
+            assert!(
+                turns <= 2 && empty_waits <= 1,
+                "busy retry spun: {turns} turns, {empty_waits} empty waits"
+            );
+            timeouts += 1;
+            break;
+        }
+        assert_eq!(client.next_deadline(), None);
+        assert_eq!(
+            client
+                .detach(h)
+                .expect_err("pending-open state is not a connected transport")
+                .kind,
+            ErrorKind::Unsupported
+        );
+        client.close(h, Token(2)).expect("close expired client");
+        client.turn(Timeout::Now, &mut out).expect("closed client");
+        assert_eq!(out.len(), 1);
+        assert!(matches!(out[0].result, OpResult::Closed));
+    }
+    assert_eq!(timeouts, 3);
+    // A host turn deadline bounds only that turn; it must leave the unbounded
+    // connection pending. Replenishing the server backlog then wakes that request.
+    let h = client
+        .pipe_connect(&name, Token(3))
+        .expect("busy unbounded connect");
+    let at = client.now() + Duration::from_millis(10);
+    let info = client
+        .turn(Timeout::Until(at), &mut out)
+        .expect("pending availability wait");
+    assert_eq!((info.os_waits, info.zero_event_waits), (1, 1));
+    assert!(client.now() >= at && out.is_empty());
+    server
+        .accept(listener, Token(4))
+        .expect("consume occupied instance");
+    let deadline = server.now() + Duration::from_secs(5);
+    let mut accepts = 0;
+    while accepts == 0 {
+        assert!(server.now() < deadline);
+        server
+            .turn(Timeout::Until(deadline), &mut out)
+            .expect("rearm listener");
+        for c in out.drain() {
+            assert!(matches!(c.result, OpResult::PipeAccepted { .. }));
+            accepts += 1;
+        }
+    }
+    let mut connected = 0;
+    while connected == 0 {
+        assert!(client.now() < deadline);
+        client
+            .turn(Timeout::Until(deadline), &mut out)
+            .expect("availability wake");
+        for c in out.drain() {
+            assert_eq!((c.handle, c.token), (Some(h), Token(3)));
+            assert!(matches!(c.result, OpResult::Connected));
+            connected += 1;
+        }
+    }
+    assert_eq!((accepts, connected), (1, 1));
+    let cancelled = client.pipe_connect(&name, Token(5)).expect("busy again");
+    client
+        .turn(Timeout::Now, &mut out)
+        .expect("arm cancellable wait");
+    assert!(out.is_empty());
+    client.close(cancelled, Token(6)).expect("cancel busy open");
+    let mut count = 0;
+    while count != 2 {
+        assert!(client.now() < deadline);
+        client
+            .turn(Timeout::Until(deadline), &mut out)
+            .expect("cancel/close availability");
+        for c in out.drain() {
+            assert_eq!(c.handle, Some(cancelled));
+            assert!(match count {
+                0 => matches!(c.result, OpResult::Cancelled),
+                1 => matches!(c.result, OpResult::Closed),
+                _ => false,
+            });
+            count += 1;
+        }
+    }
+    drop(occupied);
+}
+
+#[test]
+fn close_live_child_with_exit_watch_reaps_before_closed() {
+    let _guard = HANDLES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut completed = 0;
+    for group in [false, true] {
+        let mut driver = Loop::new(Config::default()).expect("loop");
+        let mut spec = ProcessSpec::new(env!("CARGO_BIN_EXE_native_child"));
+        spec.args.push("sleep".into());
+        spec.stdio = [ProcessStdio::Null; 3];
+        spec.new_process_group = group;
+        let child = driver.spawn(&spec, Token(1)).expect("live child");
+        let wait = child_wait_handle(child.pid);
+        assert_eq!(
+            // SAFETY: owned identity, nonblocking query establishes a live close subject.
+            unsafe { WaitForSingleObject(wait.as_raw_handle(), 0) },
+            WAIT_TIMEOUT
+        );
+        driver
+            .close(child.handle, Token(2))
+            .expect("close without prior kill");
+        assert_cancelled_then_closed(&mut driver, child.handle, &wait);
+        completed += 1;
+    }
+    assert_eq!(completed, 2);
+}
+
+#[test]
+fn loop_drop_terminates_live_children_and_releases_their_handles() {
+    let _guard = HANDLES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let cycle = || {
+        let mut driver = Loop::new(Config::default()).expect("loop");
+        let mut spec = ProcessSpec::new(env!("CARGO_BIN_EXE_native_child"));
+        spec.args.push("sleep".into());
+        spec.stdio = [ProcessStdio::Null; 3];
+        let waits: [OwnedHandle; 8] = std::array::from_fn(|i| {
+            spec.new_process_group = i % 2 == 0;
+            let child = driver
+                .spawn(&spec, Token(i as u64))
+                .expect("owned live child");
+            let wait = child_wait_handle(child.pid);
+            assert_eq!(
+                // SAFETY: independent owned wait handle proves the child is live before drop.
+                unsafe { WaitForSingleObject(wait.as_raw_handle(), 0) },
+                WAIT_TIMEOUT
+            );
+            wait
+        });
+        drop(driver);
+        for wait in waits {
+            assert_eq!(
+                // SAFETY: duplicate survives loop destruction; no blocking wait can conceal a leak.
+                unsafe { WaitForSingleObject(wait.as_raw_handle(), 0) },
+                WAIT_OBJECT_0
+            );
+        }
+        8
+    };
+    assert_eq!(cycle(), 8); // initialize Windows thread-pool wait infrastructure
+    let baseline = handles();
+    let mut reaped = 0;
+    for _ in 0..16 {
+        reaped += cycle();
+        assert_eq!(
+            handles(),
+            baseline,
+            "live-child drop leaked a native handle"
+        );
+    }
+    assert_eq!(reaped, 128);
+}
+
+#[test]
+fn child_argv_environment_and_directory_roundtrip_exactly() {
+    let _guard = HANDLES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let directory =
+        std::env::temp_dir().join(format!("tl-argv-{}-日本語 space", std::process::id()));
+    std::fs::create_dir(&directory).expect("private unicode cwd");
+    let cwd = directory.canonicalize().expect("canonical cwd");
+    let arguments = [
+        "",
+        "two words",
+        "plain",
+        "\"",
+        "trailing\\",
+        "two trailing \\\\",
+        "slash\\\"quote",
+        "x\"\"y",
+        "日本語 🦀",
+        "\\\\server\\dir with spaces\\",
+        "tab\tline\nend",
+    ];
+    let value = "value with spaces, \"quotes\", 日本語 🦀 and trailing\\";
+    let mut driver = Loop::new(Config::default()).expect("loop");
+    let mut spec = ProcessSpec::new(env!("CARGO_BIN_EXE_native_child"));
+    spec.args.push("roundtrip".into());
+    spec.args.extend(arguments.iter().map(Into::into));
+    spec.env_clear = true;
+    spec.env = vec![
+        ("TURNLOOP_CHILD_VALUE".into(), "overwritten".into()),
+        ("turnloop_child_value".into(), value.into()),
+        ("TURNLOOP_CHILD_OTHER".into(), "".into()),
+    ];
+    spec.cwd = Some(cwd.clone());
+    spec.stdio = [ProcessStdio::Null, ProcessStdio::Pipe, ProcessStdio::Null];
+    let child = driver.spawn(&spec, Token(1)).expect("configured child");
+    let stdout = child.stdout.expect("stdout");
+    let read = driver
+        .read_start(stdout, Token(2))
+        .expect("read exact fixture output");
+    let mut out = Completions::with_capacity(1);
+    let mut bytes = Vec::new();
+    let (mut reads, mut eof, mut exits) = (0, 0, 0);
+    let deadline = driver.now() + Duration::from_secs(10);
+    while eof == 0 || exits == 0 {
+        assert!(driver.now() < deadline);
+        driver
+            .turn(Timeout::Until(deadline), &mut out)
+            .expect("child output");
+        for c in out.drain() {
+            match c.result {
+                OpResult::Read {
+                    n,
+                    lease: Some(data),
+                } => {
+                    assert_eq!(
+                        (c.op, c.handle, c.token),
+                        (Some(read), Some(stdout), Token(2))
+                    );
+                    assert!(n > 0 && !c.terminal);
+                    bytes.extend_from_slice(data.as_slice());
+                    reads += 1;
+                }
+                OpResult::Eof => {
+                    assert_eq!(c.op, Some(read));
+                    assert!(c.terminal);
+                    eof += 1;
+                }
+                OpResult::Exited(status) => {
+                    assert_eq!((c.handle, c.token), (Some(child.handle), Token(1)));
+                    assert_eq!(status.code, Some(0));
+                    assert!(c.terminal);
+                    exits += 1;
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+    assert!(reads > 0);
+    assert_eq!((eof, exits), (1, 1));
+    let mut expected = Vec::new();
+    for field in
+        arguments
+            .into_iter()
+            .chain([value, "", cwd.to_str().expect("UTF-8 cwd"), "<absent>"])
+    {
+        writeln!(&mut expected, "{}", field.len()).expect("expected length");
+        expected.extend_from_slice(field.as_bytes());
+    }
+    assert_eq!(
+        bytes, expected,
+        "all 15 length-delimited argv/env/cwd fields"
+    );
+    driver.close(stdout, Token(3)).expect("close stdout");
+    driver
+        .close(child.handle, Token(4))
+        .expect("close reaped child");
+    let mut closed = 0;
+    while driver.alive() {
+        assert!(driver.now() < deadline);
+        driver
+            .turn(Timeout::Until(deadline), &mut out)
+            .expect("close");
+        for c in out.drain() {
+            assert!(matches!(c.result, OpResult::Closed));
+            closed += 1;
+        }
+    }
+    assert_eq!(closed, 2);
+    std::fs::remove_dir(directory).expect("remove private cwd");
+}
+
+#[test]
+fn worker_file_fifo_and_loop_drop_quiesce_queued_buffers() {
+    let _guard = HANDLES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    use std::io::{Read, Seek, SeekFrom};
+    let path = std::env::temp_dir().join(format!("tl-windows-file-fifo-{}", std::process::id()));
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .expect("file");
+    let mut provided = [[0xa5; 32]; 64]; // outlive driver on every unwind path
+    let mut driver = Loop::new(Config::default()).expect("loop");
+    let h = driver
+        .attach(
+            Detached::from_handle(file.try_clone().expect("duplicate").into())
+                .expect("file transport"),
+            Token(0),
+        )
+        .expect("attach worker file");
+    let ops: [_; 64] = std::array::from_fn(|i| {
+        driver
+            .write(h, WriteBuf::Owned(vec![i as u8; 32]), Token(i as u64))
+            .expect("FIFO write")
+    });
+    let mut out = Completions::with_capacity(1);
+    let deadline = driver.now() + Duration::from_secs(10);
+    let mut writes = 0;
+    while writes < 64 {
+        assert!(driver.now() < deadline);
+        driver
+            .turn(Timeout::Until(deadline), &mut out)
+            .expect("file writes");
+        for c in out.drain() {
+            assert_eq!(
+                (c.op, c.handle, c.token, c.terminal),
+                (Some(ops[writes]), Some(h), Token(writes as u64), true)
+            );
+            assert!(matches!(c.result, OpResult::Wrote(32)));
+            writes += 1;
+        }
+    }
+    file.rewind().expect("rewind after writes");
+    let mut bytes = [0; 2048];
+    file.read_exact(&mut bytes).expect("FIFO file data");
+    for (i, chunk) in bytes.as_chunks::<32>().0.iter().enumerate() {
+        assert_eq!(*chunk, [i as u8; 32]);
+    }
+    file.rewind().expect("rewind before queued reads");
+    for (i, memory) in provided.iter_mut().enumerate() {
+        // SAFETY: each distinct fixed output stays exclusive until the corresponding
+        // terminal completion or full driver destruction, including panic unwinding.
+        let buffer = unsafe { IoBufMut::from_raw_parts(memory.as_mut_ptr(), memory.len()) };
+        driver
+            .read(h, ReadBuf::Provided(buffer), Token(100 + i as u64))
+            .expect("queued read on drop");
+    }
+    driver
+        .turn(Timeout::Now, &mut out)
+        .expect("start first worker read");
+    assert!(
+        out.len() <= 1,
+        "FIFO permits at most one started read per turn"
+    );
+    let mut reads = 0;
+    for c in out.drain() {
+        assert_eq!(c.token, Token(100));
+        assert!(matches!(c.result, OpResult::Read { n: 32, lease: None }));
+        reads += 1;
+    }
+    assert!(
+        64 - reads > 0,
+        "drop must have queued caller buffers to quiesce"
+    );
+    drop(driver);
+    provided.fill([37; 32]);
+    // Reuse the shared file offset with fresh ownership after drop. Old queued
+    // reads must not consume these bytes or write to the released caller buffers.
+    file.seek(SeekFrom::Start(0)).expect("rewind after drop");
+    let mut fresh = Loop::new(Config::default()).expect("fresh loop");
+    let h = fresh
+        .attach(
+            Detached::from_handle(file.try_clone().expect("fresh duplicate").into()).expect("file"),
+            Token(1),
+        )
+        .expect("fresh worker");
+    fresh
+        .read(h, ReadBuf::Pooled, Token(2))
+        .expect("fresh read");
+    let deadline = fresh.now() + Duration::from_secs(5);
+    loop {
+        assert!(fresh.now() < deadline);
+        fresh
+            .turn(Timeout::Until(deadline), &mut out)
+            .expect("fresh worker completion");
+        if out.is_empty() {
+            continue;
+        }
+        let OpResult::Read {
+            n: 2048,
+            lease: Some(data),
+        } = &out[0].result
+        else {
+            panic!("fresh read missing")
+        };
+        assert_eq!(data.as_slice(), bytes);
+        break;
+    }
+    drop(fresh);
+    assert_eq!(provided, [[37; 32]; 64]);
+    assert_eq!(writes, 64);
+    drop(file);
+    std::fs::remove_file(path).expect("remove FIFO file");
+}
+
+#[test]
+fn local_connect_deadlines_complete_and_cancel() {
+    let _guard = HANDLES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let name = PipeName(format!(r"\\.\pipe\tl-connect-deadline-{}", std::process::id()).into());
+    turnloop_contract::native_surface::pipe_connect_deadlines::<backend::Platform>(&name);
+}
+
+#[test]
+fn listener_reuse_and_busy_connect_drop_release_native_handles() {
+    let _guard = HANDLES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let name = PipeName(format!(r"\\.\pipe\tl-pipe-drop-{}", std::process::id()).into());
+    let cycle = || {
+        let mut server = Loop::new(Config::default()).expect("server");
+        let mut out = Completions::with_capacity(1);
+        for _ in 0..4 {
+            let listener = server
+                .pipe_listen(
+                    &name,
+                    &ListenOpts {
+                        backlog: 4,
+                        ..ListenOpts::default()
+                    },
+                )
+                .expect("fresh listener generation");
+            let accept = server.accept(listener, Token(1)).expect("pending accept");
+            server.turn(Timeout::Now, &mut out).expect("arm accept");
+            assert!(out.is_empty());
+            let _occupied: [std::fs::File; 4] = std::array::from_fn(|_| {
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&name.0)
+                    .expect("occupy backlog")
+            });
+            let mut client = Loop::new(Config::default()).expect("busy client");
+            client
+                .pipe_connect(&name, Token(2))
+                .expect("pending busy connect");
+            let at = client.now() + Duration::from_millis(2);
+            let info = client
+                .turn(Timeout::Until(at), &mut out)
+                .expect("park availability before drop");
+            assert_eq!((info.os_waits, info.zero_event_waits), (1, 1));
+            assert!(client.now() >= at && out.is_empty());
+            drop(client); // must cancel/drain the pending FSCTL before freeing its input
+            server
+                .close(listener, Token(3))
+                .expect("close with queued native packets");
+            let until = server.now() + Duration::from_secs(5);
+            let mut count = 0;
+            while count < 2 {
+                assert!(server.now() < until);
+                server
+                    .turn(Timeout::Until(until), &mut out)
+                    .expect("retire listener generation");
+                for c in out.drain() {
+                    assert_eq!(c.handle, Some(listener));
+                    if count == 0 {
+                        assert_eq!(c.op, Some(accept));
+                        assert!(matches!(c.result, OpResult::Cancelled));
+                    } else {
+                        assert!(matches!(c.result, OpResult::Closed));
+                    }
+                    count += 1;
+                }
+            }
+            // The next listener is opened before the old private IOCP packets
+            // are necessarily dequeued; stale addresses must not target it.
+            assert!(!server.alive());
+        }
+        4
+    };
+    assert_eq!(cycle(), 4);
+    let baseline = handles();
+    let mut drops = 0;
+    for _ in 0..8 {
+        drops += cycle();
+        assert_eq!(handles(), baseline, "listener or availability handle leak");
+    }
+    assert_eq!(drops, 32);
+}

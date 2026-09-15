@@ -15,15 +15,27 @@ I/O before releasing caller memory.
   and has no competing coarse timeout when an exact timer is armed. No global
   timer-period change is made. See the measured decision in
   [WINDOWS_RESULTS.md](../../../../../spikes/iocp/WINDOWS_RESULTS.md).
-- Named pipes use overlapped, byte-mode, local-only instances. Socket passing is
+- Named pipes reserve `max(backlog, 1)` overlapped, byte-mode, local-only server
+  instances at listen, and replenish their fixed slots on accept. Kernel storage
+  stays separate from mutable metadata. Listener teardown cancels and joins private
+  connects; never-reused port keys discard any packets arriving after release.
+  Busy client opens submit NPFS `FSCTL_PIPE_WAIT` through `NtFsControlFile`, the overlapped
+  availability operation underlying `WaitNamedPipeW`; no worker or retry tick is
+  used. `pipe_connect_until` sets an absolute connection deadline. Expiry closes
+  out the pending wait through normal cancellation acknowledgement before TimedOut;
+  ordinary `pipe_connect` remains unbounded and cancellable.
+- Socket passing is
   a private cooperative control protocol: WSADuplicateSocket targets the actual
   peer PID queried from the OS, and send acceptance retains independent socket
   ownership. Do not mix payload reads with receive-handle operations on a control
   stream. This is not a general-purpose untrusted wire protocol.
-- IOCP association survives duplication. Quiescent transferred sockets and pipe
+- IOCP association survives duplication. Known same-port accepted/reattached pipes
+  use native IOCP directly; unassociated imports join the receiving port. Only a
+  foreign association needs the event bridge. Quiescent transferred sockets and pipe
   endpoints suppress their old port's notifications with the OVERLAPPED event's
   low bit; one-shot registered event waits forward completion to the new port.
-  Callbacks are joined before slot reuse. Named-pipe listeners cannot be detached;
+  Callbacks are joined before slot reuse. Named-pipe listeners and pending busy
+  connections cannot be detached;
   socket listeners and connected pipe endpoints can. Reuse-port is unsupported.
 - Child creation uses an explicit inherited handle list, correctly quoted argv,
   Unicode environment, suspended creation and optional Job Object assignment
@@ -37,7 +49,8 @@ I/O before releasing caller memory.
   files/pipes reserve one worker at adoption; operations on a handle are FIFO,
   with no worker allocation needed when the first read receives a buffer lease.
   Imported handles are classified by native file mode before submission;
-  overlapped pipes use routed I/O, and other overlapped files are unsupported.
+  overlapped pipes join this IOCP or route an existing foreign association, and
+  other overlapped files are unsupported.
   One process-wide cancellation helper handles the race before a worker enters
   ReadFile, without blocking turns or polling idle handles. Console input workers
   translate key records to UTF-8 and dispatch resize records to WinCh subscribers.

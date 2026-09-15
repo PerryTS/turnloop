@@ -85,7 +85,9 @@ impl Iocp {
                 ptr::write(ptr::addr_of_mut!((*k).overlapped), std::mem::zeroed());
                 (*k).overlapped.hEvent = event;
             }
-            if let Some(bridge) = &mut self.bridges[i] {
+            if self.get(p.request.handle)?.transport.routed
+                && let Some(bridge) = &mut self.bridges[i]
+            {
                 bridge.prepare(raw)?;
             }
             k
