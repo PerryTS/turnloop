@@ -259,6 +259,7 @@ impl Poller for Epoll {
                         & (libc::EPOLLIN | libc::EPOLLHUP | libc::EPOLLRDHUP | libc::EPOLLERR)
                         != 0,
                     write: flags & (libc::EPOLLOUT | libc::EPOLLHUP | libc::EPOLLERR) != 0,
+                    vnode: 0,
                 });
             }
         }

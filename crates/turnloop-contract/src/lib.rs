@@ -1344,6 +1344,8 @@ pub fn no_spin<B: Backend>() {
     );
 }
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub mod filesystem;
 pub mod native_surface;
 
 #[cfg(feature = "executor")]

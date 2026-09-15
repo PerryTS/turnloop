@@ -3,10 +3,11 @@
 //! Experimental: host-yield boundedness is unproven. Allocation gates require
 //! release on the pinned p3 compiler; see docs/upstream/wasi-p3-wait.md.
 mod abi;
+mod fs;
 mod return_storage;
 mod wait_set;
 use crate::{
-    backend::{Backend, Event, Operation, Outcome, PollInfo, Request, Wake},
+    backend::{Backend, Event, Filesystem, Operation, Outcome, PollInfo, Request, Wake},
     *,
 };
 use std::{
@@ -136,6 +137,7 @@ pub struct WasiP3 {
     wake: Arc<WasiWake>,
     wait_set: WaitSet,
     returns: Rc<return_storage::Arena>,
+    files: super::wasi_fs::Files<fs::P3>,
 }
 fn direction(op: &Operation) -> usize {
     usize::from(!matches!(
@@ -342,12 +344,17 @@ impl WasiP3 {
 unsafe impl Backend for WasiP3 {
     type Wake = WasiWake;
     type Detached = Detached;
+    const FILESYSTEM: Filesystem = Filesystem::Backend;
+    fn fs(&mut self, op: OpId, handle: Option<Handle>, request: FsRequest) -> Result<()> {
+        self.files.submit(op, handle, request)
+    }
     fn new(config: &Config, pool: BufferPool) -> Result<Self> {
         Ok(Self {
             resources: (0..config.max_handles).map(|_| None).collect(),
             ops: (0..config.max_operations).map(|_| None).collect(),
             ready: VecDeque::with_capacity(config.max_handles),
             cancelled: VecDeque::with_capacity(config.max_operations),
+            files: super::wasi_fs::Files::new(config, pool.clone()),
             pool,
             wake: Arc::new(WasiWake),
             wait_set: WaitSet::new(),
@@ -461,6 +468,7 @@ unsafe impl Backend for WasiP3 {
             request.operation,
             Operation::ProcessExit
                 | Operation::WatchSignal
+                | Operation::WatchFs
                 | Operation::SendHandle(_)
                 | Operation::RecvHandle
         ) {
@@ -510,6 +518,9 @@ unsafe impl Backend for WasiP3 {
         Ok(())
     }
     fn cancel(&mut self, op: OpId) -> Result<()> {
+        if self.files.cancel(op) {
+            return Ok(());
+        }
         let p = self
             .ops
             .get(op.index())
@@ -533,7 +544,7 @@ unsafe impl Backend for WasiP3 {
         Ok(())
     }
     fn has_work(&self) -> bool {
-        !self.ready.is_empty() || !self.cancelled.is_empty()
+        !self.ready.is_empty() || !self.cancelled.is_empty() || self.files.has_work()
     }
 
     fn poll(
@@ -552,6 +563,7 @@ unsafe impl Backend for WasiP3 {
                 result: Ok(Outcome::Cancelled),
             });
         }
+        self.files.run(events);
         self.run_ready(events);
         if self.has_work() || !events.is_empty() || events.len() == events.capacity() {
             return Ok(PollInfo::default());
@@ -620,6 +632,7 @@ unsafe impl Backend for WasiP3 {
         ))
     }
     fn release(&mut self, h: Handle) {
+        self.files.release(h);
         if self.get(h).is_ok() {
             self.ready.retain(|&at| at != h);
             self.resources[h.index()] = None;
@@ -835,6 +848,7 @@ fn execute(
     match &p.request.operation {
         Operation::ProcessExit
         | Operation::WatchSignal
+        | Operation::WatchFs
         | Operation::SendHandle(_)
         | Operation::RecvHandle => return Err(Error::new(ErrorKind::Unsupported)),
         Operation::Connect => {

@@ -1,5 +1,6 @@
 use crate::{
-    backend::{Backend, Event, Operation, Outcome, Request},
+    backend::{Backend, Event, Filesystem, Operation, Outcome, Request},
+    fs::FsOutput,
     table::Table,
     timer::DriverTimerQueue as TimerQueue,
     *,
@@ -20,6 +21,8 @@ const POST_EVENTS: usize = 2;
 #[derive(Clone, Copy)]
 enum Kind {
     Socket,
+    /// A typed file or directory handle served by the native pool service.
+    File,
     Timer {
         op: Option<OpId>,
         repeat: Option<Duration>,
@@ -27,6 +30,8 @@ enum Kind {
 }
 struct Resource {
     kind: Kind,
+    /// Reserved by an in-flight open; addressable only after `Opened`.
+    hidden: bool,
     referenced: bool,
     pending: usize,
     closing: Option<Token>,
@@ -42,6 +47,8 @@ struct Op {
     timed_out: bool,
     stop: bool,
     external_wait: bool,
+    /// A typed filesystem request (pool service or backend, per `B::FILESYSTEM`).
+    fs: bool,
     /// Counted in `native_pending`: a socket-handle operation or a request the
     /// backend accepted natively (such as WASI DNS). DESIGN §10 rule 3 keys
     /// queued-turn discovery on these operations.
@@ -71,6 +78,9 @@ pub struct Driver<B: Backend> {
     poster: Poster,
     external: bool,
     work_port: std::sync::Arc<crate::blocking::WorkPort>,
+    #[cfg(not(target_arch = "wasm32"))]
+    files: crate::fs::Service,
+    metadata: crate::fs::MetadataPool,
     owner: u64,
     thread: ThreadId,
     handles: Table<Resource>,
@@ -105,10 +115,8 @@ impl<B: Backend> Driver<B> {
             .and_then(|n| n.checked_add(config.max_operations))
             .and_then(|n| n.checked_add(config.max_handles))
             .ok_or(Error::new(ErrorKind::InvalidInput))?;
-        let mut backend = B::new(
-            &config,
-            BufferPool::new(config.pooled_buffers, config.pooled_buffer_size),
-        )?;
+        let buffers = BufferPool::new(config.pooled_buffers, config.pooled_buffer_size);
+        let mut backend = B::new(&config, buffers.clone())?;
         let notifier = Notifier::new(backend.waker());
         backend.set_notifier(notifier.clone());
         let poster = Poster::new(config.post_capacity, notifier.clone());
@@ -130,6 +138,9 @@ impl<B: Backend> Driver<B> {
             notifier,
             poster,
             external: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            files: crate::fs::Service::new(&config, work_port.clone(), buffers),
+            metadata: crate::fs::MetadataPool::new(config.max_operations),
             work_port,
             owner,
             thread: thread::current().id(),
@@ -164,6 +175,7 @@ impl<B: Backend> Driver<B> {
         }
         self.handles
             .get(h.key)
+            .filter(|r| !r.hidden)
             .ok_or(Error::new(ErrorKind::NotFound))
     }
     fn new_handle(&mut self, kind: Kind) -> Result<Handle> {
@@ -171,6 +183,7 @@ impl<B: Backend> Driver<B> {
             .handles
             .insert(Resource {
                 kind,
+                hidden: false,
                 referenced: true,
                 pending: 0,
                 closing: None,
@@ -179,7 +192,7 @@ impl<B: Backend> Driver<B> {
                 tail: None,
             })
             .ok_or(Error::new(ErrorKind::ResourceLimit))?;
-        if matches!(kind, Kind::Socket) {
+        if matches!(kind, Kind::Socket | Kind::File) {
             self.refs += 1;
         }
         Ok(Handle {
@@ -205,6 +218,7 @@ impl<B: Backend> Driver<B> {
                 stop: false,
                 job_cancel: None,
                 external_wait: false,
+                fs: false,
                 native,
                 previous,
                 next: None,
@@ -360,7 +374,8 @@ impl<B: Backend> Driver<B> {
     /// Include or exclude a handle and its pending/queued operations from loop liveness.
     pub fn set_ref(&mut self, h: Handle, referenced: bool) -> Result<()> {
         let r = self.resource(h)?;
-        let weight = r.pending + usize::from(matches!(r.kind, Kind::Socket) || r.closing.is_some());
+        let weight = r.pending
+            + usize::from(matches!(r.kind, Kind::Socket | Kind::File) || r.closing.is_some());
         if r.referenced != referenced {
             if referenced {
                 self.refs += weight;
@@ -761,6 +776,9 @@ impl<B: Backend> Driver<B> {
                 crate::external_wait::cancel(id);
                 #[cfg(target_arch = "wasm32")]
                 self.backend.deadline_changed(self.next_deadline());
+            } else if op.fs && B::FILESYSTEM == Filesystem::Pool {
+                #[cfg(not(target_arch = "wasm32"))]
+                self.files.cancel(id);
             } else if let Some(cancel) = op.job_cancel {
                 cancel.store(true, Ordering::Release);
             } else if self.backend.cancel(id).is_err() {
@@ -786,7 +804,9 @@ impl<B: Backend> Driver<B> {
         if r.closing.is_some() {
             return Err(Error::new(ErrorKind::InvalidInput));
         }
-        self.backend.prepare_close(h)?;
+        if !matches!(r.kind, Kind::File) {
+            self.backend.prepare_close(h)?;
+        }
         let r = self.handles.get_mut(h.key).expect("validated");
         r.closing = Some(token);
         // Socket handles already carry a reference. Inactive timer handles do
@@ -855,6 +875,148 @@ impl<B: Backend> Driver<B> {
         self.backend.deadline_changed(self.next_deadline());
         Ok(op)
     }
+    /// Submit a typed filesystem request; see [`FsRequest`] for ordering and
+    /// ownership. Native targets run it on the shared blocking pool, where queue
+    /// exhaustion rejects the request with ResourceLimit before acceptance. Requests
+    /// naming a handle need a visible, open file handle that is not closing.
+    pub fn fs(&mut self, request: FsRequest, token: Token) -> Result<OpId> {
+        if B::FILESYSTEM == Filesystem::Unsupported {
+            return Err(Error::new(ErrorKind::Unsupported));
+        }
+        let kind = if B::FILESYSTEM == Filesystem::Pool {
+            Kind::File
+        } else {
+            Kind::Socket
+        };
+        let target = request.handle();
+        if let Some(h) = target {
+            let r = self.resource(h)?;
+            if r.closing.is_some()
+                || std::mem::discriminant(&r.kind) != std::mem::discriminant(&kind)
+            {
+                return Err(Error::new(ErrorKind::InvalidInput));
+            }
+        }
+        let opened = if request.opens() {
+            let h = self.new_handle(kind)?;
+            self.handles.get_mut(h.key).expect("new handle").hidden = true;
+            Some(h)
+        } else {
+            None
+        };
+        let handle = opened.or(target);
+        let op = match self.new_op(handle, token) {
+            Ok(op) => op,
+            Err(e) => {
+                if let Some(h) = opened {
+                    self.discard_hidden(h, false);
+                }
+                return Err(e);
+            }
+        };
+        self.ops.get_mut(op.key).expect("new request").fs = true;
+        let accepted = match B::FILESYSTEM {
+            #[cfg(not(target_arch = "wasm32"))]
+            Filesystem::Pool => self.files.submit(op, handle, request),
+            _ => self.backend.fs(op, handle, request),
+        };
+        if let Err(e) = accepted {
+            self.retire(op);
+            self.outstanding -= 1;
+            if let Some(h) = opened {
+                self.discard_hidden(h, false);
+            }
+            return Err(e);
+        }
+        // DESIGN §10 rule 3: a request the backend executes needs its native step
+        // even while posts are queued, like a natively accepted lookup. Requests on
+        // backend handles are already counted; path requests are counted here. Pool
+        // requests are not native: their results arrive as queued work.
+        if B::FILESYSTEM == Filesystem::Backend {
+            let op = self.ops.get_mut(op.key).expect("accepted request");
+            if !op.native {
+                op.native = true;
+                self.native_pending += 1;
+            }
+        }
+        Ok(op)
+    }
+    /// Whether a request waiting for a pooled lease can start now.
+    fn files_waiting(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.files.has_work()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            false
+        }
+    }
+    /// Remove a handle that never became visible, releasing any native object.
+    fn discard_hidden(&mut self, h: Handle, native: bool) {
+        let r = self.handles.remove(h.key).expect("hidden handle");
+        debug_assert!(r.hidden);
+        if r.referenced {
+            self.refs -= 1;
+        }
+        if native {
+            match r.kind {
+                #[cfg(not(target_arch = "wasm32"))]
+                Kind::File => self.files.release(h),
+                _ => self.backend.release(h),
+            }
+        }
+    }
+    /// Deliver a typed filesystem terminal result, publishing or discarding an
+    /// opened handle. A failed or cancelled open never exposes its handle.
+    fn finish_fs(&mut self, id: OpId, result: OpResult) {
+        let Some(h) = self.ops.get(id.key).and_then(|op| op.handle) else {
+            self.finish(id, result, true);
+            return;
+        };
+        if !self.handles.get(h.key).is_some_and(|r| r.hidden) {
+            self.finish(id, result, true);
+            return;
+        }
+        if matches!(result, OpResult::Fs(FsResult::Opened(_))) {
+            self.handles.get_mut(h.key).expect("hidden handle").hidden = false;
+            self.finish(id, result, true);
+            return;
+        }
+        self.finish(id, result, true);
+        let q = self.queued.back_mut().expect("queued open result");
+        debug_assert_eq!(q.completion.op, Some(id));
+        q.completion.handle = None;
+        self.discard_hidden(h, true);
+    }
+    /// Watch a file or directory with the platform's native API: inotify (Linux),
+    /// FSEvents for directories and kqueue for files (macOS), kqueue (BSD/iOS),
+    /// ReadDirectoryChangesW (Windows). Nonterminal `OpResult::Watch` batches follow
+    /// until `fs_watch_stop` (Stopped, then Closed) or `close` (Cancelled, then Closed).
+    /// WASI and the web return Unsupported. Node `watchFile` is a host timer plus `Stat`.
+    pub fn fs_watch(
+        &mut self,
+        path: &FsPath,
+        options: WatchOptions,
+        token: Token,
+    ) -> Result<Handle> {
+        let h = self.new_handle(Kind::Socket)?;
+        if let Err(e) = self
+            .backend
+            .fs_watch(h, path, options)
+            .and_then(|()| self.submit(h, Operation::WatchFs, token).map(|_| ()))
+        {
+            self.backend.release(h);
+            self.handles.remove(h.key);
+            self.refs -= 1;
+            return Err(e);
+        }
+        Ok(h)
+    }
+    /// Stop a filesystem watch, delivering Stopped before the final Closed.
+    pub fn fs_watch_stop(&mut self, h: Handle, token: Token) -> Result<()> {
+        self.signal_stop(h, token)
+    }
     /// Submit an owned Send closure to the bounded shared blocking pool.
     pub fn blocking<F: FnOnce() -> BlockingResult + Send + 'static>(
         &mut self,
@@ -921,6 +1083,7 @@ impl<B: Backend> Driver<B> {
             !self.queued.is_empty()
                 || !self.poster.is_empty()
                 || !self.work_port.is_empty()
+                || self.files_waiting()
                 || self.backend.has_work(),
         )?;
         Ok(integration)
@@ -949,8 +1112,11 @@ impl<B: Backend> Driver<B> {
             if let Some(h) = closed
                 && let Some(r) = self.handles.remove(h.key)
             {
-                if matches!(r.kind, Kind::Socket) {
-                    self.backend.release(h);
+                match r.kind {
+                    Kind::Socket => self.backend.release(h),
+                    #[cfg(not(target_arch = "wasm32"))]
+                    Kind::File => self.files.release(h),
+                    _ => {}
                 }
                 if r.referenced {
                     self.refs -= 1;
@@ -965,6 +1131,21 @@ impl<B: Backend> Driver<B> {
         let Some(op) = self.ops.get(e.op.key).cloned() else {
             return;
         };
+        if op.fs && e.terminal {
+            let result = if op.cancel {
+                OpResult::Cancelled
+            } else {
+                match e.result {
+                    Ok(Outcome::Fs { output, lease }) => {
+                        fs_result(&self.metadata, op.handle, output, lease)
+                    }
+                    Err(e) => OpResult::Err(e),
+                    Ok(_) => OpResult::Err(Error::new(ErrorKind::Other)),
+                }
+            };
+            self.finish_fs(e.op, result);
+            return;
+        }
         let result = if op.cancel {
             if !e.terminal {
                 return;
@@ -1002,6 +1183,10 @@ impl<B: Backend> Driver<B> {
                 Ok(Outcome::Wrote(n)) => OpResult::Wrote(n),
                 Ok(Outcome::RecvFrom { n, from, lease }) => OpResult::RecvFrom { n, from, lease },
                 Ok(Outcome::Shutdown) => OpResult::Shutdown,
+                Ok(Outcome::Watch { events, overflow }) => OpResult::Watch { events, overflow },
+                Ok(Outcome::Fs { output, lease }) => {
+                    fs_result(&self.metadata, op.handle, output, lease)
+                }
                 Ok(Outcome::Cancelled) => OpResult::Cancelled,
             }
         };
@@ -1012,6 +1197,9 @@ impl<B: Backend> Driver<B> {
         self.assert_owner();
         self.backend.validate_timeout(timeout)?;
         out.clear();
+        // Leases released by the host since the last turn can start waiting requests.
+        #[cfg(not(target_arch = "wasm32"))]
+        self.files.retry();
         let notified = self.notifier.begin();
         let start = self.backend.now();
         self.expire_connects(start)?;
@@ -1101,6 +1289,21 @@ impl<B: Backend> Driver<B> {
             let Some(op) = self.ops.get(work.op.key) else {
                 continue;
             };
+            #[cfg(not(target_arch = "wasm32"))]
+            if op.fs {
+                let (cancel, handle) = (op.cancel, op.handle);
+                let (lease, metadata) = self.files.complete(work.op);
+                let result = match work.result {
+                    _ if cancel => OpResult::Cancelled,
+                    Ok(crate::blocking::WorkOutput::Fs(reply)) => {
+                        fs_result(&self.metadata, handle, reply.output(metadata), lease)
+                    }
+                    Ok(_) => OpResult::Err(Error::new(ErrorKind::Other)),
+                    Err(e) => OpResult::Err(e),
+                };
+                self.finish_fs(work.op, result);
+                continue;
+            }
             let result = if op.cancel {
                 if op.stop {
                     OpResult::Stopped
@@ -1109,6 +1312,10 @@ impl<B: Backend> Driver<B> {
                 }
             } else {
                 match work.result {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    Ok(crate::blocking::WorkOutput::Fs(_)) => {
+                        OpResult::Err(Error::new(ErrorKind::Other))
+                    }
                     Ok(crate::blocking::WorkOutput::ExternalWait(r)) => OpResult::ExternalWait(r),
                     Ok(crate::blocking::WorkOutput::Blocking(p)) => OpResult::Blocking(p),
                     Ok(crate::blocking::WorkOutput::Resolved(a)) => OpResult::Resolved(a),
@@ -1137,12 +1344,16 @@ impl<B: Backend> Driver<B> {
                 false,
             );
         }
+        // Cancelled or failed reads may have returned leases during this turn.
+        #[cfg(not(target_arch = "wasm32"))]
+        self.files.retry();
         self.drain(out);
         if self.external {
             self.notifier.external_park(
                 !self.queued.is_empty()
                     || !self.poster.is_empty()
                     || !self.work_port.is_empty()
+                    || self.files_waiting()
                     || self.backend.has_work(),
             )?;
         }
@@ -1155,6 +1366,38 @@ impl<B: Backend> Driver<B> {
             zero_event_waits,
         })
     }
+}
+
+/// Attach the lease and convert a worker or backend filesystem result.
+fn fs_result(
+    metadata: &crate::fs::MetadataPool,
+    handle: Option<Handle>,
+    output: FsOutput,
+    mut lease: Option<BufLease>,
+) -> OpResult {
+    let mut fill = |n: usize| {
+        if let Some(lease) = &mut lease {
+            lease.set_len(n);
+        }
+    };
+    OpResult::Fs(match output {
+        FsOutput::Opened => FsResult::Opened(handle.expect("open request handle")),
+        FsOutput::Read(n) => {
+            fill(n);
+            FsResult::Read { n, lease }
+        }
+        FsOutput::Wrote(n) => FsResult::Wrote(n),
+        FsOutput::Metadata(m) => FsResult::Metadata(metadata.lease(m)),
+        FsOutput::Directory { n, eof } => {
+            fill(n);
+            FsResult::Directory { n, lease, eof }
+        }
+        FsOutput::Bytes(n) => {
+            fill(n);
+            FsResult::Bytes { n, lease }
+        }
+        FsOutput::Done => FsResult::Done,
+    })
 }
 
 impl<B: Backend> Drop for Driver<B> {
@@ -1285,6 +1528,7 @@ mod clock_contract {
         cached_work: bool,
         lookup: Option<OpId>,
         lookup_ready: bool,
+        file_request: Option<OpId>,
         accept_connect: bool,
         pending: Option<Request>,
         cancellation: Option<OpId>,
@@ -1297,6 +1541,14 @@ mod clock_contract {
     unsafe impl Backend for Host {
         type Wake = NoWake;
         type Detached = ();
+        const FILESYSTEM: Filesystem = Filesystem::Backend;
+        fn fs(&mut self, op: OpId, handle: Option<Handle>, request: FsRequest) -> Result<()> {
+            if handle.is_some() || !matches!(request, FsRequest::Stat { .. }) {
+                return Err(Error::new(ErrorKind::Unsupported));
+            }
+            assert!(self.file_request.replace(op).is_none());
+            Ok(())
+        }
         fn new(_: &Config, _: BufferPool) -> Result<Self> {
             Ok(Self {
                 now: Instant::now(),
@@ -1306,6 +1558,7 @@ mod clock_contract {
                 cached_work: false,
                 lookup: None,
                 lookup_ready: false,
+                file_request: None,
                 accept_connect: false,
                 pending: None,
                 cancellation: None,
@@ -1379,6 +1632,18 @@ mod clock_contract {
         ) -> Result<PollInfo> {
             assert_eq!(timeout, Some(Duration::ZERO));
             self.polls += 1;
+            // Like the WASI backends: accepted filesystem requests run in poll.
+            if let Some(op) = self.file_request.take() {
+                events.push(Event {
+                    op,
+                    terminal: true,
+                    result: Ok(Outcome::Fs {
+                        output: FsOutput::Done,
+                        lease: None,
+                    }),
+                });
+                return Ok(PollInfo::default());
+            }
             if self.lookup_ready
                 && let Some(op) = self.lookup.take()
             {
@@ -1476,6 +1741,61 @@ mod clock_contract {
         }
         assert_eq!((resolved, posts), (1, 7));
         assert!(driver.backend.lookup.is_none());
+    }
+
+    #[test]
+    fn backend_path_request_is_a_pending_native_operation() {
+        let mut driver = Driver::<Host>::new(Config::default()).expect("host loop");
+        let path = FsPath::new("/synthetic").expect("path");
+        let mut out = Completions::with_capacity(1);
+        // Sustained posts: without the native flag, every turn has queued work and
+        // no native operation, so the backend (where the request runs) is skipped.
+        driver
+            .poster()
+            .post(Token(2), Payload::U64(0))
+            .expect("post");
+        let op = driver
+            .fs(
+                FsRequest::Stat {
+                    path,
+                    follow_symlinks: true,
+                },
+                Token(1),
+            )
+            .expect("backend accepts the path request");
+        assert_eq!(driver.native_pending, 1, "path request counted as native");
+        let (mut done, mut posts) = (0, 0);
+        for turn in 0..4 {
+            let polls = driver.backend.polls;
+            let info = driver.turn(Timeout::Now, &mut out).expect("turn");
+            assert_eq!(info.os_waits, 0, "queued turns never block");
+            assert!(info.os_waits + info.discovery_polls <= 1);
+            assert_eq!(
+                driver.backend.polls - polls,
+                usize::from(turn == 0),
+                "one native step while the request is pending, none after"
+            );
+            for c in out.drain() {
+                match c.result {
+                    OpResult::Fs(FsResult::Done) => {
+                        assert_eq!(c.op, Some(op));
+                        done += 1;
+                    }
+                    OpResult::Posted(_) => posts += 1,
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+            driver
+                .poster()
+                .post(Token(2), Payload::U64(turn))
+                .expect("replenish");
+        }
+        assert_eq!(done, 1, "the request completed despite queued posts");
+        assert_eq!(
+            driver.native_pending, 0,
+            "terminal completion retires the flag"
+        );
+        assert!(posts >= 3);
     }
 
     #[test]

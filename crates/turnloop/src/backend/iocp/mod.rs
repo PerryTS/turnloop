@@ -11,6 +11,7 @@ mod signals;
 mod socket;
 mod sync_io;
 mod timer;
+mod watch;
 
 use crate::{
     backend::{Backend, Event, Operation, Outcome, PollInfo, Request},
@@ -193,6 +194,7 @@ pub struct Iocp {
     deadline: Option<Instant>,
     failure: Option<Error>,
     next_listener_key: usize,
+    watches: watch::Watches,
 }
 impl Iocp {
     #[cfg(test)]
@@ -921,6 +923,9 @@ impl Iocp {
             && entry.key < port::STOP
             && !(base..end).contains(&entry.overlapped)
         {
+            if self.watches.completed(entry)? {
+                return Ok(());
+            }
             // Listener keys are never reused in this loop. Cancellation packets
             // can arrive after release; ignore those without dereferencing them.
             for resource in self.resources.iter_mut().flatten() {
@@ -994,6 +999,7 @@ unsafe impl Backend for Iocp {
             .iter()
             .map(|slot| bridge::Bridge::new(Arc::clone(&port), slot.get().cast()).map(Some))
             .collect::<Result<Vec<_>>>()?;
+        let watches = watch::Watches::new(config, pool.clone(), Arc::clone(&port));
         Ok(Self {
             resources: (0..config.max_handles).map(|_| None).collect(),
             ops: (0..config.max_operations).map(|_| None).collect(),
@@ -1016,10 +1022,27 @@ unsafe impl Backend for Iocp {
             deadline: None,
             failure: None,
             next_listener_key: pipes::FIRST_KEY,
+            watches,
         })
     }
     fn set_notifier(&mut self, notifier: Notifier) {
         self.notifier = Some(notifier);
+    }
+    fn fs_watch(&mut self, handle: Handle, path: &FsPath, options: WatchOptions) -> Result<()> {
+        if self
+            .resources
+            .get(handle.index())
+            .is_none_or(Option::is_some)
+            || self.services.contains(handle)
+        {
+            return Err(invalid());
+        }
+        let key = self.next_listener_key;
+        self.next_listener_key = key
+            .checked_add(1)
+            .filter(|key| *key < port::STOP)
+            .ok_or(Error::new(ErrorKind::ResourceLimit))?;
+        self.watches.start(handle, path, options.recursive, key)
     }
     fn spawn(
         &mut self,
@@ -1266,6 +1289,9 @@ unsafe impl Backend for Iocp {
         if self.services.contains(request.handle) {
             return self.services.submit(request);
         }
+        if self.watches.contains(request.handle) {
+            return self.watches.submit(&request);
+        }
         let r = self.get(request.handle)?;
         let kind = r.transport.kind;
         let valid = match &request.operation {
@@ -1328,7 +1354,7 @@ unsafe impl Backend for Iocp {
         Ok(())
     }
     fn cancel(&mut self, op: OpId) -> Result<()> {
-        if self.services.cancel(op) {
+        if self.services.cancel(op) || self.watches.cancel(op)? {
             return Ok(());
         }
         let Some(p) = self
@@ -1365,6 +1391,7 @@ unsafe impl Backend for Iocp {
         self.failure.is_some()
             || !self.ready.is_empty()
             || self.services.has_work()
+            || self.watches.has_work()
             || (self.pool.available() && !self.pool_waiting.is_empty())
     }
     fn poll(
@@ -1380,6 +1407,7 @@ unsafe impl Backend for Iocp {
         }
         let before = events.len();
         self.services.collect(events)?;
+        self.watches.collect(events);
         self.run_ready(events);
         if events.len() != before || events.len() == events.capacity() || !self.ready.is_empty() {
             return Ok(PollInfo::default());
@@ -1420,11 +1448,13 @@ unsafe impl Backend for Iocp {
         cancel_result?;
         entries_result?;
         self.services.collect(events)?;
+        self.watches.collect(events);
         self.run_ready(events);
         Ok(info)
     }
     fn release(&mut self, h: Handle) {
         self.services.release(h);
+        self.watches.release(h);
         if self.get(h).is_ok() {
             self.workers[h.index()] = None;
             self.resources[h.index()] = None;
@@ -1516,8 +1546,9 @@ impl Drop for Iocp {
                 }
             }
         }
+        self.watches.shutdown();
         let mut events = Vec::with_capacity(64);
-        while self.ops.iter().any(Option::is_some) {
+        while self.ops.iter().any(Option::is_some) || self.watches.pending() {
             if self.poll(None, &mut events).is_err() {
                 std::process::abort();
             }

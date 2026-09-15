@@ -240,6 +240,7 @@ unsafe impl Backend for Web {
             request.operation,
             Operation::ProcessExit
                 | Operation::WatchSignal
+                | Operation::WatchFs
                 | Operation::SendHandle(_)
                 | Operation::RecvHandle
         ) {

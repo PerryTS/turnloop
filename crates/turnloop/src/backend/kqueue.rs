@@ -220,6 +220,11 @@ impl Poller for Kqueue {
                 key: e.udata as usize as u64,
                 read: e.filter == libc::EVFILT_READ,
                 write: e.filter == libc::EVFILT_WRITE,
+                vnode: if e.filter == libc::EVFILT_VNODE {
+                    e.fflags
+                } else {
+                    0
+                },
             });
         }
         Ok(PollInfo::native(timeout, n == 0))

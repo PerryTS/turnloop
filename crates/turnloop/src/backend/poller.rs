@@ -8,6 +8,9 @@ pub(crate) struct Ready {
     pub key: u64,
     pub read: bool,
     pub write: bool,
+    /// kqueue EVFILT_VNODE flags for a filesystem watch; zero otherwise.
+    #[cfg_attr(turnloop_backend = "epoll", allow(dead_code))]
+    pub vnode: u32,
 }
 pub(crate) trait Poller: Sized {
     type W: Wake;

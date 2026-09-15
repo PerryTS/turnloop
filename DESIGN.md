@@ -205,7 +205,10 @@ There are two ways a host drives a loop:
 - A bounded pool: default 4 threads, configurable, lazily started, shared per process or per loop (config).
 - It runs file operations, DNS resolution and host-submitted `FnOnce() -> BlockingResult + Send` jobs, and completes through the notifier.
 - Cancellation is best-effort: a job that has started runs to the end and completes as `Cancelled` if its cancel won the race.
-- File I/O goes through the pool on every platform in 0.x. io_uring and IOCP file I/O are later optimisations behind the same API.
+- File I/O goes through the pool on every native platform in 0.x. io_uring and IOCP file I/O are later optimisations behind the same API.
+  - **Typed requests** (`Loop::fs`: open, read, write, metadata, directories, namespace changes) use this one shared pool on Linux, macOS/BSD **and Windows**. Requests on one handle run FIFO; only the head is ever queued on the pool, and each accepted request reserves its queue slot, so a full queue rejects before acceptance and a queued successor always starts.
+  - **Adopted descriptors** (stdio, `Detached::from_fd`/`from_handle`) keep their stream paths: reusable pool jobs on Unix, and one synchronous worker per handle on Windows. Such a handle may be a pipe or console whose read blocks indefinitely and cannot be cancelled from a shared thread; it must not occupy the pool. This is the only per-handle file worker.
+  - **WASI** has no threads: requests run inside `turn`, bounded by its event budget, against `wasi:filesystem` preopens.
 
 ### D9. Optional layers
 
@@ -251,7 +254,7 @@ There are two ways a host drives a loop:
    - one `Atomics.waitAsync` waiter service: a single helper thread, not one per call, posting to the waiting loop
    
    Each completes on the loop that submitted.
-4. **The ad-hoc threads become loop handles or pool jobs.** Child stdio, dgram, stdin, pty, fs-watch, IPC, signal wake, waitAsync, N-API async work and message acks all move off dedicated threads. The only exceptions are where the OS requires a thread: Windows non-overlapped stdio and console input (§7.3).
+4. **The ad-hoc threads become loop handles or pool jobs.** Child stdio, dgram, stdin, pty, fs-watch, IPC, signal wake, waitAsync, N-API async work and message acks all move off dedicated threads. The only exceptions are where the OS requires a thread: Windows non-overlapped stdio and console input (§7.3), and macOS FSEvents, which delivers on its own dispatch queue. Filesystem watches are loop handles: inotify on epoll, EVFILT_VNODE on kqueue, ReadDirectoryChangesW on the loop's IOCP.
 5. **Handle transfer:**
    - **Between loops:** `Loop::detach(h) -> Detached` (`Send`) and `Loop::attach(Detached, token) -> Handle`. For sockets, pipes and servers across threads or workers, it cancels in-flight ops with the usual exactly-once completions before detaching.
    - **Between processes:** fd passing via `SCM_RIGHTS` on Unix and `WSADuplicateSocketW` / `DuplicateHandle` on Windows, exposed on pipe handles so `child.send(msg, handle)` and cluster round-robin can move sockets (today `emitter.rs:430` drops the handle).
@@ -344,7 +347,8 @@ impl Loop {
     pub fn signal_start(&mut self, sig: Signal, tok: Token) -> io::Result<Handle>;
 
     // pool
-    pub fn fs(&mut self, req: FsRequest, tok: Token) -> OpId;
+    pub fn fs(&mut self, req: FsRequest, tok: Token) -> io::Result<OpId>;          // pool (native) or wasi:filesystem
+    pub fn fs_watch(&mut self, path: &FsPath, o: WatchOptions, tok: Token) -> io::Result<Handle>; // multishot Watch
     pub fn resolve(&mut self, req: DnsRequest, tok: Token) -> OpId;
     pub fn blocking<F: FnOnce() -> BlockingResult + Send + 'static>(&mut self, f: F, tok: Token) -> OpId;
 }
@@ -355,7 +359,8 @@ pub enum OpResult {
     Read { n: usize, lease: Option<BufLease> }, Eof,
     Wrote(usize), RecvFrom { n: usize, from: SocketAddr, lease: Option<BufLease> },
     Timer, Signal(Signal), Exited(ExitStatus),
-    Fs(FsResult), Resolved(DnsResult), Blocking(BlockingResult),
+    Fs(FsResult), Watch { events: BufLease, overflow: bool },
+    Resolved(DnsResult), Blocking(BlockingResult),
     Cancelled, Closed, Stopped, Err(Error),
 }
 pub struct Error { pub kind: ErrorKind, pub os: Option<i32> }   // host maps to ECONNRESET etc.
@@ -439,7 +444,8 @@ Two backends, because both versions matter now:
 | TTY | termios + readiness | termios + readiness | console API reader thread, VT modes | size only | size only | unsupported |
 | Child processes | pidfd / SIGCHLD | EVFILT_PROC | RegisterWaitForSingleObject + Job Object | unsupported | unsupported | unsupported |
 | Signals | sigaction + self-pipe | EVFILT_SIGNAL | SetConsoleCtrlHandler | unsupported | unsupported | unsupported |
-| Files | blocking pool | blocking pool | blocking pool | `wasi:filesystem` | `wasi:filesystem` async | OPFS if host-mapped |
+| Files | blocking pool | blocking pool | blocking pool | `wasi:filesystem` preopens, run in `turn` | `wasi:filesystem` async preopens, run in `turn` | unsupported (no OPFS host mapping defined) |
+| File watch | inotify (recursion by the host) | FSEvents for directories (recursive), kqueue for files | ReadDirectoryChangesW (recursive) | unsupported | unsupported | unsupported |
 | DNS | pool (getaddrinfo) | pool (getaddrinfo) | pool (GetAddrInfoW) | `wasi:sockets/ip-name-lookup` | same | host (via fetch) |
 | Host integration | epoll fd | kqueue fd | event HANDLE + helper thread | runtime-owned | runtime-owned | `HostCallback` |
 | Cost measurement | perf instructions:u/k | rusage ri_instructions | QueryProcessCycleTime | Wasmtime fuel / instruction counts | Wasmtime fuel | browser profiler (relative) |
@@ -491,7 +497,7 @@ No other Perry change is needed for P0.
    4. With queued work and **no** native operations pending, the turn makes **no OS call at all**: pure post/timer/terminal churn costs zero syscalls.
    5. The no-spin rule (4a) is unchanged.
 
-   *Queued work* means completions already queued before the native step: posts, blocking-pool and external-wait results, synchronous and terminal completions, including a timer's `Cancelled`/`Closed`; timer start, reset, cancel and close are therefore pure churn. A timer expiry that is due when the turn starts is not queued work: the effective wait is zero, so the turn may spend its one call on a zero-timeout poll. *Native operations* are operations submitted on native handles (sockets, pipes, files, processes, signals, web fetch/WebSocket), plus requests a backend accepts natively (WASI 0.2 DNS). `TurnInfo::os_waits` counts blocking waits and `TurnInfo::discovery_polls` counts zero-timeout discovery polls; their sum is at most one per turn. Web callback draining and Windows Event-helper queue draining make neither kind of call. **Contract tests:** a queued post beside an idle UDP receive delivers with `os_waits == 0`, `discovery_polls == 1`, then byte-verified I/O; queued posts and timer `Cancelled`/`Closed` with no native operation record zero of both; a sustained producer keeps fresh I/O progressing within two seconds.
+   *Queued work* means completions already queued before the native step: posts, blocking-pool and external-wait results, synchronous and terminal completions, including a timer's `Cancelled`/`Closed`; timer start, reset, cancel and close are therefore pure churn. A timer expiry that is due when the turn starts is not queued work: the effective wait is zero, so the turn may spend its one call on a zero-timeout poll. *Native operations* are operations submitted on native handles (sockets, pipes, files, processes, signals, web fetch/WebSocket), plus requests a backend accepts natively (WASI 0.2 DNS, and WASI filesystem requests, including path requests). Typed file requests on the native blocking pool are not native operations: their results arrive as queued work, like host blocking jobs. `TurnInfo::os_waits` counts blocking waits and `TurnInfo::discovery_polls` counts zero-timeout discovery polls; their sum is at most one per turn. Web callback draining and Windows Event-helper queue draining make neither kind of call. **Contract tests:** a queued post beside an idle UDP receive delivers with `os_waits == 0`, `discovery_polls == 1`, then byte-verified I/O; queued posts and timer `Cancelled`/`Closed` with no native operation record zero of both; a sustained producer keeps fresh I/O progressing within two seconds.
 4. **Ticks:** no fixed-interval ticks and no minimum wait floor.
 4a. **No spin.** A turn with nothing ready and a future deadline blocks until that deadline, at the precision in §7.6. It never returns immediately and never degrades into a zero-timeout poll loop. Hosts must pass exact deadlines (`Instant`, not truncated milliseconds). The Linux A/B measured what happens otherwise: 37,607 turns for 50 timers, ~70× user instructions. **Contract test:** with an idle registered socket and a 0.5 ms / 2 ms / 10 ms timer, turns per expiry ≤ 2 and zero-event OS waits ≤ 1 per expiry, on every backend.
 5. **Instruction budgets per operation** (Linux, cgu=1, `perf stat -e instructions:u,instructions:k`): TCP read / write / accept, timer start + cancel, notify + turn round trip, blocking job round trip, idle turn. **Values to be set from the attribution run of today's tokio bridge**, with a target below the tokio-bridge cost and within X % of a hand-written epoll loop. The CI gate compares against a committed baseline, with a control probe that must not move.

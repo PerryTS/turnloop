@@ -57,6 +57,16 @@ pub enum ErrorKind {
     BrokenPipe,
     /// A configured capacity or native resource limit was reached.
     ResourceLimit,
+    /// Permissions or a capability boundary denied a filesystem operation.
+    PermissionDenied,
+    /// The target already exists (for example an exclusive create).
+    AlreadyExists,
+    /// A path component that must be a directory is not one.
+    NotADirectory,
+    /// A file operation targeted a directory.
+    IsADirectory,
+    /// A directory to be removed or replaced is not empty.
+    DirectoryNotEmpty,
     /// An error without a more specific portable category.
     Other,
 }
@@ -88,6 +98,11 @@ impl From<std::io::Error> for Error {
             I::ConnectionReset | I::ConnectionAborted => ErrorKind::ConnectionReset,
             I::BrokenPipe => ErrorKind::BrokenPipe,
             I::OutOfMemory => ErrorKind::ResourceLimit,
+            I::PermissionDenied => ErrorKind::PermissionDenied,
+            I::AlreadyExists => ErrorKind::AlreadyExists,
+            I::NotADirectory => ErrorKind::NotADirectory,
+            I::IsADirectory => ErrorKind::IsADirectory,
+            I::DirectoryNotEmpty => ErrorKind::DirectoryNotEmpty,
             _ => ErrorKind::Other,
         };
         Self {

@@ -1,8 +1,9 @@
 //! WASI 0.2 completion backend. One poll import per turn, reusable canonical
 //! lists, and synchronous nonblocking I/O with generational cancellation.
 mod abi;
+mod fs;
 use crate::{
-    backend::{Backend, Event, Operation, Outcome, PollInfo, Request, Wake},
+    backend::{Backend, Event, Filesystem, Operation, Outcome, PollInfo, Request, Wake},
     *,
 };
 use std::{
@@ -122,6 +123,7 @@ pub struct WasiP2 {
     indices: Vec<usize>,
     poll_storage: Vec<u32>,
     scratch: Vec<u32>,
+    files: super::wasi_fs::Files<fs::P2>,
     pool: BufferPool,
     wake: Arc<WasiWake>,
 }
@@ -378,6 +380,10 @@ impl WasiP2 {
 unsafe impl Backend for WasiP2 {
     type Wake = WasiWake;
     type Detached = Detached;
+    const FILESYSTEM: Filesystem = Filesystem::Backend;
+    fn fs(&mut self, op: OpId, handle: Option<Handle>, request: FsRequest) -> Result<()> {
+        self.files.submit(op, handle, request)
+    }
     fn new(config: &Config, pool: BufferPool) -> Result<Self> {
         let polls = config
             .max_handles
@@ -396,6 +402,7 @@ unsafe impl Backend for WasiP2 {
             indices: Vec::with_capacity(polls),
             poll_storage: vec![0; polls],
             scratch: vec![0; 16400],
+            files: super::wasi_fs::Files::new(config, pool.clone()),
             pool,
             wake: Arc::new(WasiWake),
         })
@@ -507,6 +514,7 @@ unsafe impl Backend for WasiP2 {
             request.operation,
             Operation::ProcessExit
                 | Operation::WatchSignal
+                | Operation::WatchFs
                 | Operation::SendHandle(_)
                 | Operation::RecvHandle
         ) {
@@ -572,6 +580,9 @@ unsafe impl Backend for WasiP2 {
         Ok(())
     }
     fn cancel(&mut self, op: OpId) -> Result<()> {
+        if self.files.cancel(op) {
+            return Ok(());
+        }
         if self
             .lookups
             .get(op.index())
@@ -598,6 +609,7 @@ unsafe impl Backend for WasiP2 {
     fn has_work(&self) -> bool {
         !self.ready.is_empty()
             || !self.cancelled.is_empty()
+            || self.files.has_work()
             || self.lookups.iter().flatten().any(|l| l.ready)
     }
 
@@ -617,6 +629,7 @@ unsafe impl Backend for WasiP2 {
                 result: Ok(Outcome::Cancelled),
             });
         }
+        self.files.run(events);
         self.run_ready(events);
         self.run_dns(events);
         if self.has_work() || !events.is_empty() || events.len() == events.capacity() {
@@ -682,6 +695,7 @@ unsafe impl Backend for WasiP2 {
         Ok(PollInfo::native(timeout, self.indices.is_empty()))
     }
     fn release(&mut self, h: Handle) {
+        self.files.release(h);
         if self.get(h).is_ok() {
             self.ready.retain(|&at| at != h);
             self.resources[h.index()] = None;
@@ -707,6 +721,7 @@ fn execute(
     match &mut p.request.operation {
         Operation::ProcessExit
         | Operation::WatchSignal
+        | Operation::WatchFs
         | Operation::SendHandle(_)
         | Operation::RecvHandle => Err(Error::new(ErrorKind::Unsupported)),
         Operation::Connect => {

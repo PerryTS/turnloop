@@ -109,6 +109,7 @@ pub struct Unix {
     pool: BufferPool,
     services: super::services::Services,
     files: super::files::Files,
+    watches: super::watch::Watches,
 }
 fn direction(op: &Operation) -> usize {
     usize::from(!matches!(
@@ -257,16 +258,24 @@ unsafe impl Backend for Unix {
             cancelled: VecDeque::with_capacity(config.max_operations),
             polled: Vec::with_capacity(config.events_per_turn),
             files: super::files::Files::new(config, pool.clone()),
+            watches: super::watch::Watches::new(config, pool.clone()),
             pool,
             services: super::services::Services::new(config),
         })
     }
     fn set_notifier(&mut self, notifier: Notifier) {
+        self.watches.set_notifier(notifier.clone());
         self.files.set_notifier(notifier.clone());
         self.services.set_notifier(notifier);
     }
     fn signal(&mut self, h: Handle, signal: Signal) -> Result<()> {
         self.services.signal(h, signal)
+    }
+    fn fs_watch(&mut self, h: Handle, path: &FsPath, options: WatchOptions) -> Result<()> {
+        if self.resources.get(h.index()).is_none_or(Option::is_some) || self.services.contains(h) {
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
+        self.watches.start(h, path, options, &mut self.poller)
     }
     fn prepare_close(&mut self, h: Handle) -> Result<()> {
         self.services.prepare_close(h)
@@ -488,6 +497,9 @@ unsafe impl Backend for Unix {
         if self.services.contains(h) {
             return self.services.submit(&request);
         }
+        if self.watches.contains(h) {
+            return self.watches.submit(&request);
+        }
         let r = self.get(h)?;
         if r.transport.kind == Kind::File {
             let fd = r.transport.fd.try_clone().map_err(Error::from)?;
@@ -554,6 +566,9 @@ unsafe impl Backend for Unix {
         if self.services.cancel(op) {
             return Ok(());
         }
+        if self.watches.cancel(op) {
+            return Ok(());
+        }
         let p = self
             .ops
             .get(op.index())
@@ -572,6 +587,7 @@ unsafe impl Backend for Unix {
             || !self.cancelled.is_empty()
             || self.services.has_work()
             || self.files.has_work()
+            || self.watches.has_work()
     }
     fn poll(
         &mut self,
@@ -591,6 +607,7 @@ unsafe impl Backend for Unix {
         }
         self.files.poll(events);
         self.services.poll(events);
+        self.watches.poll(events);
         self.run_ready(events);
         // Cached readiness can end in EAGAIN without producing a completion.
         // In that case use this turn's single OS wait with its exact timeout;
@@ -602,7 +619,7 @@ unsafe impl Backend for Unix {
         let info = self.poller.wait(timeout, &mut self.polled)?;
         for i in 0..self.polled.len() {
             let e = self.polled[i];
-            if self.services.ready(e.key) {
+            if self.services.ready(e.key) || self.watches.ready(e) {
                 continue;
             }
             let Some(r) = self
@@ -622,11 +639,13 @@ unsafe impl Backend for Unix {
         }
         self.files.poll(events);
         self.services.poll(events);
+        self.watches.poll(events);
         self.run_ready(events);
         Ok(info)
     }
     fn release(&mut self, h: Handle) {
         self.services.release(h, &mut self.poller);
+        self.watches.release(h, &mut self.poller);
         if let Ok(r) = self.get(h) {
             if r.transport.kind != Kind::File {
                 let fd = r.transport.fd.as_raw_fd();
@@ -667,7 +686,9 @@ fn execute(
 ) -> Result<Option<(Outcome<Detached>, bool)>> {
     let fd = r.transport.fd.as_raw_fd();
     match &mut p.request.operation {
-        Operation::ProcessExit | Operation::WatchSignal => Err(Error::new(ErrorKind::InvalidInput)),
+        Operation::ProcessExit | Operation::WatchSignal | Operation::WatchFs => {
+            Err(Error::new(ErrorKind::InvalidInput))
+        }
         Operation::Connect => {
             if !r.connecting {
                 let a = r
