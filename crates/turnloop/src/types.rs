@@ -37,6 +37,14 @@ id!(OpId);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Portable error categories independent of native numeric error codes.
 pub enum ErrorKind {
+    /// Filesystem access was denied by permissions or capabilities.
+    PermissionDenied,
+    /// A create-exclusive target already exists.
+    AlreadyExists,
+    /// A path component was expected to be a directory.
+    NotADirectory,
+    /// A byte operation targeted a directory.
+    IsADirectory,
     /// The operation was cancelled and its native buffer access has ended.
     Cancelled,
     /// This platform or resource does not support the requested capability.
@@ -79,6 +87,10 @@ impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
         use std::io::ErrorKind as I;
         let kind = match e.kind() {
+            I::PermissionDenied => ErrorKind::PermissionDenied,
+            I::AlreadyExists => ErrorKind::AlreadyExists,
+            I::NotADirectory => ErrorKind::NotADirectory,
+            I::IsADirectory => ErrorKind::IsADirectory,
             I::Unsupported => ErrorKind::Unsupported,
             I::InvalidInput => ErrorKind::InvalidInput,
             I::NotFound => ErrorKind::NotFound,

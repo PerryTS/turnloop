@@ -20,6 +20,8 @@ const POST_EVENTS: usize = 2;
 #[derive(Clone, Copy)]
 enum Kind {
     Socket,
+    File,
+    Watch,
     Timer {
         op: Option<OpId>,
         repeat: Option<Duration>,
@@ -67,6 +69,10 @@ pub struct Driver<B: Backend> {
     poster: Poster,
     external: bool,
     work_port: std::sync::Arc<crate::blocking::WorkPort>,
+    #[cfg(not(target_arch = "wasm32"))]
+    files: crate::fs::Service,
+    #[cfg(not(target_arch = "wasm32"))]
+    watches: crate::fs::Watches,
     owner: u64,
     thread: ThreadId,
     handles: Table<Resource>,
@@ -123,9 +129,13 @@ impl<B: Backend> Driver<B> {
         };
         Ok(Self {
             backend,
+            #[cfg(not(target_arch = "wasm32"))]
+            watches: crate::fs::Watches::new(&config, notifier.clone()),
             notifier,
             poster,
             external: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            files: crate::fs::Service::new(&config, work_port.clone()),
             work_port,
             owner,
             thread: thread::current().id(),
@@ -175,7 +185,7 @@ impl<B: Backend> Driver<B> {
                 tail: None,
             })
             .ok_or(Error::new(ErrorKind::ResourceLimit))?;
-        if matches!(kind, Kind::Socket) {
+        if matches!(kind, Kind::Socket | Kind::File | Kind::Watch) {
             self.refs += 1;
         }
         Ok(Handle {
@@ -354,7 +364,10 @@ impl<B: Backend> Driver<B> {
     /// Include or exclude a handle and its pending/queued operations from loop liveness.
     pub fn set_ref(&mut self, h: Handle, referenced: bool) -> Result<()> {
         let r = self.resource(h)?;
-        let weight = r.pending + usize::from(matches!(r.kind, Kind::Socket) || r.closing.is_some());
+        let weight = r.pending
+            + usize::from(
+                matches!(r.kind, Kind::Socket | Kind::File | Kind::Watch) || r.closing.is_some(),
+            );
         if r.referenced != referenced {
             if referenced {
                 self.refs += weight;
@@ -751,10 +764,25 @@ impl<B: Backend> Driver<B> {
                 true,
             );
         } else {
-            if op.external_wait {
+            if op.handle.is_some_and(|h| {
+                self.handles
+                    .get(h.key)
+                    .is_some_and(|r| matches!(r.kind, Kind::Watch))
+            }) {
+                if self.cancel_watch(op.handle.expect("watch handle")).is_err() {
+                    return false;
+                }
+            } else if op.external_wait {
                 crate::external_wait::cancel(id);
                 #[cfg(target_arch = "wasm32")]
                 self.backend.deadline_changed(self.next_deadline());
+            } else if op.handle.is_some_and(|h| {
+                self.handles
+                    .get(h.key)
+                    .is_some_and(|r| matches!(r.kind, Kind::File))
+            }) || self.is_fs_op(id)
+            {
+                self.cancel_fs(id);
             } else if let Some(cancel) = op.job_cancel {
                 cancel.store(true, Ordering::Release);
             } else if self.backend.cancel(id).is_err() {
@@ -780,7 +808,9 @@ impl<B: Backend> Driver<B> {
         if r.closing.is_some() {
             return Err(Error::new(ErrorKind::InvalidInput));
         }
-        self.backend.prepare_close(h)?;
+        if !matches!(r.kind, Kind::File | Kind::Watch) {
+            self.backend.prepare_close(h)?;
+        }
         let r = self.handles.get_mut(h.key).expect("validated");
         r.closing = Some(token);
         // Socket handles already carry a reference. Inactive timer handles do
@@ -849,6 +879,170 @@ impl<B: Backend> Driver<B> {
         self.backend.deadline_changed(self.next_deadline());
         Ok(op)
     }
+    /// Watch native root invalidations. macOS/FSEvents and Windows support recursive
+    /// scope; Linux/inotify and BSD/kqueue reject recursive=true. WASI/web are Unsupported.
+    /// Watch events are coalesced; use Stat plus host timers for Node watchFile policy.
+    pub fn fs_watch(
+        &mut self,
+        path: &FsPath,
+        recursive: bool,
+        token: Token,
+    ) -> Result<(Handle, OpId)> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (path, recursive, token);
+            Err(Error::new(ErrorKind::Unsupported))
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let h = self.new_handle(Kind::Watch)?;
+            let op = match self.new_op(Some(h), token) {
+                Ok(op) => op,
+                Err(e) => {
+                    self.handles.remove(h.key);
+                    self.refs -= 1;
+                    return Err(e);
+                }
+            };
+            if let Err(e) = self.watches.start(h, op, path, recursive) {
+                self.retire(op);
+                self.outstanding -= 1;
+                self.handles.remove(h.key);
+                self.refs -= 1;
+                return Err(e);
+            }
+            Ok((h, op))
+        }
+    }
+    fn cancel_watch(&mut self, h: Handle) -> Result<()> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.watches.cancel(h)
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = h;
+            Err(Error::new(ErrorKind::Unsupported))
+        }
+    }
+    fn watch_work(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.watches.has_work()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            false
+        }
+    }
+    fn poll_watches(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        for _ in 0..self.config.events_per_turn {
+            if self.buffered[NATIVE_EVENTS] == self.config.events_per_turn {
+                break;
+            }
+            let Some((id, event)) = self.watches.poll() else {
+                break;
+            };
+            let Some(op) = self.ops.get(id.key) else {
+                continue;
+            };
+            match event {
+                Some(event) if !op.cancel => self.finish(id, OpResult::Watch(event), false),
+                None => {
+                    let result = if op.stop {
+                        OpResult::Stopped
+                    } else if op.cancel {
+                        OpResult::Cancelled
+                    } else {
+                        OpResult::Err(Error::new(ErrorKind::NotFound))
+                    };
+                    self.finish(id, result, true);
+                }
+                _ => {}
+            }
+        }
+    }
+    /// Open a regular file asynchronously. The returned handle is reserved immediately;
+    /// close it even if the Opened completion reports an error or cancellation.
+    /// Reads/writes submitted before Opened are serialized behind the open.
+    pub fn file_open(
+        &mut self,
+        path: FsPath,
+        options: FileOptions,
+        token: Token,
+    ) -> Result<(Handle, OpId)> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (path, options, token);
+            Err(Error::new(ErrorKind::Unsupported))
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let h = self.new_handle(Kind::File)?;
+            let op = match self.new_op(Some(h), token) {
+                Ok(op) => op,
+                Err(e) => {
+                    self.handles.remove(h.key);
+                    self.refs -= 1;
+                    return Err(e);
+                }
+            };
+            self.files.open(op, h, path, options);
+            Ok((h, op))
+        }
+    }
+    /// Submit a typed filesystem operation. Per-file operations are FIFO; independent
+    /// path requests can run concurrently. Close uses the ordinary close(handle) API.
+    pub fn fs(&mut self, request: FsRequest, token: Token) -> Result<OpId> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (request, token);
+            Err(Error::new(ErrorKind::Unsupported))
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let h = request.handle();
+            if let Some(h) = h {
+                let r = self.resource(h)?;
+                if !matches!(r.kind, Kind::File) || r.closing.is_some() {
+                    return Err(Error::new(ErrorKind::InvalidInput));
+                }
+            }
+            let op = self.new_op(h, token)?;
+            self.files.submit(op, request);
+            Ok(op)
+        }
+    }
+    fn is_fs_op(&self, op: OpId) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.files.contains(op)
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = op;
+            false
+        }
+    }
+    fn cancel_fs(&mut self, op: OpId) {
+        #[cfg(not(target_arch = "wasm32"))]
+        self.files.cancel(op);
+        #[cfg(target_arch = "wasm32")]
+        let _ = op;
+    }
+    fn complete_fs(&mut self, op: OpId) {
+        #[cfg(not(target_arch = "wasm32"))]
+        self.files.complete(op);
+        #[cfg(target_arch = "wasm32")]
+        let _ = op;
+    }
+    fn release_file(&mut self, h: Handle) {
+        #[cfg(not(target_arch = "wasm32"))]
+        self.files.release(h);
+        #[cfg(target_arch = "wasm32")]
+        let _ = h;
+    }
     /// Submit an owned Send closure to the bounded shared blocking pool.
     pub fn blocking<F: FnOnce() -> BlockingResult + Send + 'static>(
         &mut self,
@@ -910,6 +1104,7 @@ impl<B: Backend> Driver<B> {
             !self.queued.is_empty()
                 || !self.poster.is_empty()
                 || !self.work_port.is_empty()
+                || self.watch_work()
                 || self.backend.has_work(),
         )?;
         Ok(integration)
@@ -940,6 +1135,13 @@ impl<B: Backend> Driver<B> {
             {
                 if matches!(r.kind, Kind::Socket) {
                     self.backend.release(h);
+                }
+                if matches!(r.kind, Kind::File) {
+                    self.release_file(h);
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                if matches!(r.kind, Kind::Watch) {
+                    self.watches.release(h);
                 }
                 if r.referenced {
                     self.refs -= 1;
@@ -1010,8 +1212,11 @@ impl<B: Backend> Driver<B> {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
-        let queued =
-            !self.queued.is_empty() || !self.poster.is_empty() || !self.work_port.is_empty();
+        self.poll_watches();
+        let queued = !self.queued.is_empty()
+            || !self.poster.is_empty()
+            || !self.work_port.is_empty()
+            || self.watch_work();
         let mut waits = 0;
         let mut zero_event_waits = 0;
         if self.buffered[NATIVE_EVENTS] == 0
@@ -1074,6 +1279,9 @@ impl<B: Backend> Driver<B> {
             let Some(work) = self.work_port.pop() else {
                 break;
             };
+            if self.is_fs_op(work.op) {
+                self.complete_fs(work.op);
+            }
             let Some(op) = self.ops.get(work.op.key) else {
                 continue;
             };
@@ -1085,6 +1293,7 @@ impl<B: Backend> Driver<B> {
                 }
             } else {
                 match work.result {
+                    Ok(crate::blocking::WorkOutput::Fs(r)) => OpResult::Fs(r),
                     Ok(crate::blocking::WorkOutput::ExternalWait(r)) => OpResult::ExternalWait(r),
                     Ok(crate::blocking::WorkOutput::Blocking(p)) => OpResult::Blocking(p),
                     Ok(crate::blocking::WorkOutput::Resolved(a)) => OpResult::Resolved(a),
@@ -1113,12 +1322,14 @@ impl<B: Backend> Driver<B> {
                 false,
             );
         }
+        self.poll_watches();
         self.drain(out);
         if self.external {
             self.notifier.external_park(
                 !self.queued.is_empty()
                     || !self.poster.is_empty()
                     || !self.work_port.is_empty()
+                    || self.watch_work()
                     || self.backend.has_work(),
             )?;
         }

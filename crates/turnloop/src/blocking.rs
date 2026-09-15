@@ -34,6 +34,7 @@ pub struct DnsRequest {
 }
 pub(crate) enum WorkOutput {
     ExternalWait(crate::WaitResult),
+    Fs(crate::FsResult),
     Blocking(Payload),
     Resolved(Vec<SocketAddr>),
 }
@@ -87,7 +88,7 @@ impl WorkPort {
         let _ = self.notifier.notify();
     }
 }
-#[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) trait ReusableWork: Send + Sync {
     fn run(&self);
 }
@@ -108,7 +109,7 @@ mod native {
     }
     enum Task {
         Boxed(Job),
-        #[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
+        #[cfg(not(target_arch = "wasm32"))]
         Reusable(Arc<dyn ReusableWork>),
     }
     struct State {
@@ -150,12 +151,10 @@ mod native {
                             }
                             jobs.pop_front().expect("nonempty job queue")
                         };
-                        #[cfg(not(any(turnloop_backend = "kqueue", turnloop_backend = "epoll")))]
-                        let Task::Boxed(job) = job;
-                        #[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
+                        #[cfg(not(target_arch = "wasm32"))]
                         let job = match job {
                             Task::Boxed(job) => job,
-                            #[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
+                            #[cfg(not(target_arch = "wasm32"))]
                             Task::Reusable(work) => {
                                 work.run();
                                 continue;
@@ -220,7 +219,7 @@ mod native {
         pool.state.ready.notify_one();
         Ok(())
     }
-    #[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn reusable(config: PoolConfig, work: Arc<dyn ReusableWork>) -> Result<()> {
         if config.threads == 0 || config.queue_capacity == 0 {
             return Err(Error::new(ErrorKind::InvalidInput));
@@ -334,5 +333,5 @@ mod models {
     }
 }
 
-#[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) use native::reusable;

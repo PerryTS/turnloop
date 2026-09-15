@@ -90,3 +90,8 @@ pub use executor::{
 
 #[cfg(all(test, not(loom)))]
 mod portable_tests;
+
+mod fs;
+pub use fs::{
+    FileMetadata, FileOptions, FileTime, FileType, FsPath, FsRequest, FsResult, WatchEvent,
+};
