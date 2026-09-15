@@ -229,12 +229,15 @@ with an `OWNER` file naming this lane.
 | `cargo test --workspace --no-fail-fast -- --test-threads=1` (macOS) | PASS — 65 test binaries ok, 0 failed |
 | `cargo test -p turnloop-contract --test sockopts -- --test-threads=1` (macOS) | PASS — 17/17 |
 | `cargo test -p turnloop-contract --test sockopts -- --test-threads=1` (Linux, epoll) | PASS — 17/17 |
-| Linux six required modes: `default`, `epoll-timerfd`, `process-sigchld`, `fallbacks`, `executor`, `all-features`, each `cargo +nightly-2026-08-20 test --locked --workspace --no-fail-fast … -- --test-threads=1 --skip permission_denied_is_reported` | PASS — all six modes, 0 FAILED; the new `getsockopt`, multicast, transfer and allocation tests ran in every mode |
+| Linux six required modes: `default`, `epoll-timerfd`, `process-sigchld`, `fallbacks`, `executor`, `all-features`, each `cargo +nightly-2026-08-20 test --locked --workspace --no-fail-fast … -- --test-threads=1 --skip permission_denied_is_reported` | PASS — all six modes, 406 `test result: ok` lines, 0 FAILED; the `getsockopt`, multicast, transfer and allocation tests each ran once per mode |
 | `python3 scripts/ci/run-tests.py wasi --target wasm32-wasip2` (Wasmtime 46.0.0) | PASS — 42 contract + 13 allocation tests |
 | `python3 scripts/ci/run-tests.py wasi --target wasm32-wasip3` (nightly-2026-09-07) | PASS — 42 contract + 14 allocation tests |
 | `python3 scripts/ci/run-tests.py node` (web backend under Node 26.5.1) | PASS — 16/16, including `socket_options_are_unsupported_on_a_host_stream` |
 | `bash scripts/ci/no-tokio.sh` | PASS — 5 graphs, zero runtime crates |
 | `python3 scripts/ci/soak.py` | PASS — 251 locked versions, 1 pre-existing rustls exception |
+| `cargo +nightly-2026-08-20 deny --locked check` | PASS — advisories, bans, licenses, sources |
+| `python3 scripts/ci/lint-workflows.py` (actionlint + zizmor + shellcheck) | PASS — no workflow files were changed |
+| `python3 -m unittest discover -s scripts/ci -p 'test_*.py'` | PASS — 98 tests |
 | `python3 scripts/ci/run-tests.py web` (headless Chromium/Firefox) | **UNRUN** — browsers not installed on this machine. The Node arm above executes the identical `tests/web/web_contract.rs` assertions, and the web backend's `Unsupported` comes from the Rust `Backend` trait defaults, not from JS. |
 | Windows `cargo test` | **UNRUN** — no Windows host in this lane. Windows is compile- and clippy-clean cross-target; the IOCP implementation and the `adopted_socket_options_reach_the_shared_socket` probe need a real `windows-2025` CI arm. |
 
