@@ -75,10 +75,16 @@ fn buffer_of<B: Backend>(l: &Driver<B>, h: Handle, send: bool) -> u32 {
         other => panic!("buffer kind answered with {other:?}"),
     }
 }
-/// A kernel may keep the request exactly (macOS, Windows, WASI hosts on those) or
-/// double it (Linux). Anything outside that band means the request was not applied.
+/// The final buffer size is the kernel's, not ours: macOS keeps the request,
+/// Linux doubles it and clamps it to `net.core.{r,w}mem_max`, and Windows rounds
+/// up to its own granularity and may hold an auto-tuned window above it. The
+/// contract is therefore "at least what was asked", and an upper bound would be
+/// asserting one platform's policy rather than the API.
+///
+/// This predicate alone cannot prove the write landed — a large enough default
+/// satisfies it. The growth assertion at the call site is what does that.
 fn honoured(actual: u32, requested: u32) -> bool {
-    actual >= requested && actual <= requested.saturating_mul(2)
+    actual >= requested
 }
 
 /// Keep-alive is settable and readable on a connected client **and on an accepted
@@ -150,6 +156,9 @@ pub fn buffer_sizes_round_trip<B: Backend>() {
                     honoured(actual, requested),
                     "{name} send={send}: asked {requested}, OS reports {actual}"
                 );
+                // The subject proof: a second, larger request must move the
+                // kernel's own number. A `set_option` that did nothing reports
+                // the same size twice and fails here, whatever the rounding.
                 assert!(
                     actual > previous,
                     "{name} send={send}: {actual} did not grow past {previous}"

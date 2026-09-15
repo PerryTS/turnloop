@@ -297,10 +297,23 @@ pub enum SocketOption {
     /// connection. `None` restores the platform default (a graceful background
     /// close). The duration has one-second granularity, rounded up.
     Linger(Option<Duration>),
-    /// `SO_RCVBUF`: requested receive-buffer bytes. The OS may round, clamp or
-    /// double the request; read it back to see what it kept.
+    /// `SO_RCVBUF`: requested receive-buffer bytes.
+    ///
+    /// **The final size is the kernel's choice, not the request.** The contract
+    /// is only that the socket ends up with *at least* what was asked for, so
+    /// read it back rather than assuming an exact value:
+    ///
+    /// * **Linux** doubles the request and clamps it to `net.core.rmem_max`
+    ///   (asking 262144 on a stock kernel reports 524288).
+    /// * **macOS/BSD** normally keep the request exactly, but start much higher
+    ///   than Linux: an accepted loopback socket defaults to around 408300 bytes.
+    /// * **Windows** rounds up to its own granularity and may keep an auto-tuned
+    ///   receive window that is larger than the request.
+    /// * **WASI** forwards to the host socket, so it inherits that host's policy.
     RecvBufferSize(u32),
-    /// `SO_SNDBUF`: requested send-buffer bytes, with the same caveat.
+    /// `SO_SNDBUF`: requested send-buffer bytes. The final size is the kernel's
+    /// choice with the same per-platform rounding as
+    /// [`RecvBufferSize`](Self::RecvBufferSize); read it back.
     SendBufferSize(u32),
     /// `IP_TTL` / `IPV6_UNICAST_HOPS`: hop limit for outgoing unicast packets.
     Ttl(u32),

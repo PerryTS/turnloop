@@ -208,12 +208,31 @@ fn adopted_socket_options_reach_the_shared_socket() {
         nodelay_of(raw),
         "set_option did not reach the shared socket"
     );
-    l.set_option(h, SocketOption::RecvBufferSize(48 * 1024))
+    // A numeric option lands on the shared socket too. The hop limit carries that
+    // half of the proof because no kernel rounds it: the buffer sizes below are
+    // kernel-chosen (see `SocketOption::RecvBufferSize`), so they can only be
+    // checked for plausibility, never for the exact value asked.
+    let before = ttl_of(raw);
+    assert!(
+        before != 7 && before > 0,
+        "pick a hop limit the socket does not already have: {before}"
+    );
+    l.set_option(h, SocketOption::Ttl(7)).expect("hop limit");
+    assert_eq!(
+        ttl_of(raw),
+        7,
+        "set_option did not reach the shared socket's hop limit"
+    );
+    // Plausible honouring only: Linux doubles the request, macOS keeps it, and
+    // Windows may hold an auto-tuned receive window above it. Every platform
+    // gives at least what was asked for.
+    let requested = 48 * 1024;
+    l.set_option(h, SocketOption::RecvBufferSize(requested))
         .expect("receive buffer");
     let bytes = recv_buffer_of(raw);
     assert!(
-        (48 * 1024..=96 * 1024).contains(&bytes),
-        "the OS reports {bytes} bytes for a 49152-byte request"
+        bytes >= requested,
+        "the OS reports {bytes} bytes for a {requested}-byte request"
     );
     contract::close_all(&mut l, &[h]);
     drop(client);
@@ -226,6 +245,10 @@ fn nodelay_of(raw: std::os::fd::RawFd) -> bool {
 #[cfg(unix)]
 fn recv_buffer_of(raw: std::os::fd::RawFd) -> u32 {
     probe::int(raw, libc::SOL_SOCKET, libc::SO_RCVBUF).max(0) as u32
+}
+#[cfg(unix)]
+fn ttl_of(raw: std::os::fd::RawFd) -> u32 {
+    probe::int(raw, libc::IPPROTO_IP, libc::IP_TTL).max(0) as u32
 }
 #[cfg(unix)]
 fn close_raw(raw: std::os::fd::RawFd) {
@@ -275,6 +298,15 @@ fn recv_buffer_of(raw: std::os::windows::io::RawSocket) -> u32 {
         raw,
         windows_sys::Win32::Networking::WinSock::SOL_SOCKET,
         windows_sys::Win32::Networking::WinSock::SO_RCVBUF,
+    )
+    .max(0) as u32
+}
+#[cfg(windows)]
+fn ttl_of(raw: std::os::windows::io::RawSocket) -> u32 {
+    windows_probe::int(
+        raw,
+        windows_sys::Win32::Networking::WinSock::IPPROTO_IP,
+        windows_sys::Win32::Networking::WinSock::IP_TTL,
     )
     .max(0) as u32
 }

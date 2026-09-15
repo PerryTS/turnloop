@@ -73,6 +73,14 @@ drift:
 - **Granularity.** Native keep-alive and linger schedules are whole seconds, so a
   `Duration` is rounded **up** and a zero keep-alive interval is `InvalidInput`
   rather than silently becoming "immediately". WASI takes the duration unrounded.
+- **Buffer sizes are kernel-chosen; the contract is a floor, not an equality.**
+  Measured on an accepted loopback socket: macOS defaults to **408300** bytes and
+  keeps a request exactly; Linux defaults to **87380**, doubles the request and
+  clamps it to `net.core.rmem_max`; Windows rounds up to its own granularity and
+  refused to shrink an auto-tuned window from 131072 to a 49152 request. There is
+  therefore no portable exact expectation, and no portable *direction* either, so
+  the API documents "at least what you asked for, read it back" and the tests
+  assert that. Recorded on `SocketOption::RecvBufferSize`.
 - **Partial failure is reported, not hidden.** Keep-alive is a switch plus up to
   three separate kernel settings. Every value is validated before any is written,
   but if the OS still rejects one after the switch was set, the error is returned
@@ -168,8 +176,11 @@ own getter at all.
   visible there too.
 - `adopted_socket_options_reach_the_shared_socket` — `dup`s a socket the test owns,
   adopts one reference through `Detached::from_fd` / `from_socket`, and asserts
-  `TCP_NODELAY` and `SO_RCVBUF` through `getsockopt` on the reference turnloop
-  never saw. This is the portable probe and the one that runs on Windows.
+  through `getsockopt` on the reference turnloop never saw. This is the portable
+  probe and the one that runs on Windows. Its subject proof is carried by the two
+  options no kernel rounds — `TCP_NODELAY` (false → true) and `IP_TTL` (its
+  default → exactly 7) — because the buffer sizes cannot carry it: see the
+  kernel-chosen note above. `SO_RCVBUF` is still checked, as a floor.
 - `linger_zero_resets_the_connection` — the observable-behaviour test. Both arms
   run in one test: with `Linger(Some(ZERO))` the peer's pending read completes with
   `ConnectionReset`; without it the same close delivers `Eof`. The only difference
@@ -201,11 +212,15 @@ non-obvious), and non-socket handles.
 path on a connected socket, asserting `0` allocations *and* that the OS kept each
 value — a gate that cannot pass having done nothing. It runs on native and WASI.
 
-**Sabotage check (not committed).** With `apply_accept_defaults` neutered and
+**Sabotage checks (not committed).** With `apply_accept_defaults` neutered and
 `set_linger` turned into `Ok(())`, exactly the three tests that should fail did:
 `accepted_socket_options_are_visible_to_getsockopt`,
 `nodelay_round_trip_and_accept_default` and `linger_zero_resets_the_connection`.
-The other 13 stayed green, which is the right blast radius.
+The other tests stayed green, which is the right blast radius. After the buffer
+assertions were relaxed to a floor, both relaxed sites were re-sabotaged: stubbing
+`Ttl` fails the adopted probe, and stubbing the two buffer setters fails
+`buffer_sizes_round_trip` on its growth assertion. Neither relaxation made a test
+unable to fail.
 
 ## Verification
 
