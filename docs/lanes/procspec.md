@@ -299,7 +299,7 @@ private path.
 | `python3 scripts/ci/soak.py` | PASS (251 locked versions, 1 active security exception) |
 | `bash scripts/ci/install-wasmtime.sh` then `python3 scripts/ci/run-tests.py wasi --target wasm32-wasip2` | PASS (11 + 43 + 43 + 13 tests) |
 | CI on `lane/procspec`, run `35013478648` (all four OS arms, Windows x86_64 runtime in three feature modes) | PASS |
-| CI on `lane/procspec`, final run `FINAL_RUN` | FINAL_RESULT |
+| CI on `lane/procspec`, final run `35015001253` on `e135f79` — lint and tests on Linux x86_64 and aarch64, macOS arm64 and Windows x86_64 (each in the default, executor and all-features modes), both WASM lints, both WASI contracts, loom, Miri, the instruction gate and the protocol suites | PASS |
 
 ### Sabotage checks
 
