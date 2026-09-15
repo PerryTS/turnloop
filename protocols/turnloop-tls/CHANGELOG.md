@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0-alpha.4](https://github.com/PerryTS/turnloop/compare/turnloop-tls-v0.1.0-alpha.3...turnloop-tls-v0.1.0-alpha.4) - 2026-09-15
+
+### Other
+
+- Hand a quiescent transport's descriptor back to the host
+
 ## [0.1.0-alpha.3](https://github.com/PerryTS/turnloop/compare/turnloop-tls-v0.1.0-alpha.2...turnloop-tls-v0.1.0-alpha.3) - 2026-09-15
 
 ### Other
