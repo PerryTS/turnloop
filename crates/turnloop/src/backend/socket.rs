@@ -111,7 +111,7 @@ impl Addr {
 ///   requests are two different options here.
 /// * **macOS and the other Apple platforms, NetBSD, OpenBSD and DragonFly** have
 ///   only the original option. A [`ReusePort::Distribute`] request is refused
-///   rather than silently answered with `SO_REUSEPORT`: measured on macOS 15,
+///   rather than silently answered with `SO_REUSEPORT`: measured on macOS 26.5,
 ///   two loops binding one port with `SO_REUSEPORT` split 32 connections
 ///   `[0, 32]` — the first listener is not merely under-served, it is never
 ///   given anything at all.

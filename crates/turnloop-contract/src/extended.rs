@@ -237,7 +237,7 @@ pub fn reuse_port_share<B: Backend>() {
 /// This is the gate that makes the option honest. There is no third outcome: a
 /// backend may not accept the request and then leave a listener starved. The
 /// starved case is real and is what this exists to prevent — two loops sharing
-/// one port under plain `SO_REUSEPORT` on macOS 15 split 32 connections
+/// one port under plain `SO_REUSEPORT` on macOS 26.5 split 32 connections
 /// `[0, 32]`, so a host that developed against Linux would ship a server whose
 /// first loop never accepts anything.
 pub fn reuse_port_distribute<B: Backend>() {

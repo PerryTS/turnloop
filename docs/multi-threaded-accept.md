@@ -41,7 +41,7 @@ pub enum ReusePort { No, Share, Distribute }
 There is deliberately **no third outcome**. A platform either distributes or the
 listener is refused when it is created. The failure this prevents is not
 hypothetical, and it is silent: two loops sharing one port under plain
-`SO_REUSEPORT` on macOS 15 split 32 connections **`[0, 32]`** — the first
+`SO_REUSEPORT` on macOS 26.5 arm64 split 32 connections **`[0, 32]`** — the first
 listener is not merely under-served, it never accepts anything at all, for the
 life of the process, with no error anywhere. A host that developed the Linux path
 and shipped it would have a server that looks fine and uses one core.
@@ -58,7 +58,7 @@ Nothing asks how busy a loop is. A loop whose agent is inside a long turn keeps
 being handed its share, and those connections wait in its queue while another
 loop is idle.
 
-Measured (Linux 6.8, contract test `multi_threaded_accept_by_reuse_port`), 64
+Measured (Linux 6.17 x86-64, contract test `multi_threaded_accept_by_reuse_port`), 64
 connections over 4 loops:
 
 ```
@@ -134,9 +134,12 @@ cargo run --release -p turnloop-bench --locked -- --accept-scaling \
     --loops N --connections C --clients K --payload B [--portable]
 ```
 
-`--portable` reports elapsed nanoseconds; without it the harness uses the
-platform instruction counter (`perf` on Linux, `ri_instructions` on macOS,
-`QueryProcessCycleTime` on Windows). Output is one JSON line with
+`--portable` reports elapsed nanoseconds. Without it the harness uses the
+platform instruction counter where `turnloop-bench` has one — `perf` on Linux,
+`ri_instructions` on macOS — and falls back to elapsed nanoseconds everywhere
+else, Windows included. For a scaling sweep `--portable` is the right choice
+anyway: `connections_per_second` is the quantity of interest, and an instruction
+count attributes only the measuring thread's work. Output is one JSON line with
 `connections_per_second` and, beside it, `per_loop` — the service count for each
 loop, so the distribution is visible next to the total instead of inferred from
 it.
