@@ -22,6 +22,8 @@ contract!(
     udp_round_trip,
     detach_inflight,
     pool_and_dns,
+    occupancy_classes_do_not_starve_each_other,
+    long_jobs_settle_once_on_cancel_panic_and_shutdown,
     handoff_distribution,
     writev_and_shutdown,
     capacity_and_stale_ids,
