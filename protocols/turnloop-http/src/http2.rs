@@ -82,6 +82,18 @@ pub fn encode_frame(
     out.extend_from_slice(payload);
     Ok(())
 }
+/// Which of the three header blocks an [`Event::Headers`] carries. The
+/// connection already enforces the distinction, so a host does not have to
+/// track `received_head` itself to tell them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadersKind {
+    /// The request head, or a final (>= 200) response head.
+    Head,
+    /// A 1xx response head. It never ends the stream, and a final head follows.
+    Informational,
+    /// A trailer block. It always ends the stream.
+    Trailers,
+}
 #[derive(Debug)]
 pub enum Event<'a> {
     Settings,
@@ -89,12 +101,17 @@ pub enum Event<'a> {
         stream: u32,
         headers: Vec<Header>,
         end_stream: bool,
+        kind: HeadersKind,
     },
     Data {
         stream: u32,
         bytes: &'a [u8],
         end_stream: bool,
     },
+    /// The stream is over. It may name a stream the host never saw opened: the
+    /// connection refuses a stream it cannot accept — one arriving after a
+    /// GOAWAY, or past the concurrent-stream limit — before any
+    /// [`Event::Headers`] for it is produced.
     Reset {
         stream: u32,
         code: u32,
@@ -111,6 +128,43 @@ pub enum Event<'a> {
         stream: u32,
     },
 }
+/// One decode step: how much of `input` was consumed, and the event it
+/// produced, if any. See the [step contract](crate#the-step-contract).
+///
+/// **`consumed` and `event` are independent.** All three shapes are normal:
+///
+/// | `consumed` | `event` | meaning |
+/// |---|---|---|
+/// | `0` | `None` | **stop.** A partial preface or a partial frame; read more input before calling again. |
+/// | `> 0` | `None` | **keep going.** Progress with nothing for the host: the client preface, a SETTINGS acknowledgement, PRIORITY, or an unknown frame type. |
+/// | `> 0` | `Some` | an event. In HTTP/2 an event always consumes; `consumed == 0` is only ever the stop case. |
+///
+/// So the loop condition is `consumed > 0 || event.is_some()`:
+///
+/// ```
+/// # use turnloop_http::http2::{Connection, Limits, Role, PREFACE};
+/// # let mut connection = Connection::new(Role::Server, Limits::default())?;
+/// # let mut input = PREFACE.to_vec();
+/// loop {
+///     let step = connection.receive(&input)?;
+///     let consumed = step.consumed;
+///     let progressed = consumed > 0 || step.event.is_some();
+///     if let Some(event) = step.event {
+///         // DATA borrows `input`, so handle the event before draining.
+///         let _ = event;
+///     }
+///     input.drain(..consumed);
+///     if !progressed {
+///         break; // read more bytes from the transport, then continue
+///     }
+/// }
+/// # Ok::<(), turnloop_http::Error>(())
+/// ```
+///
+/// Looping while `event.is_some()` instead **stalls at the client preface** —
+/// the first step of every server connection, before a single frame is read.
+/// Looping while input remains spins forever on a partial frame.
+#[derive(Debug)]
 pub struct Step<'a> {
     pub consumed: usize,
     pub event: Option<Event<'a>>,
@@ -121,6 +175,9 @@ struct Stream {
     send_window: i64,
     recv_window: i64,
     unreleased: u32,
+    /// The peer reset this stream and its remaining connection credit was
+    /// returned in bulk, so a late `release_capacity` for it is a no-op.
+    credited: bool,
     local_end: bool,
     remote_end: bool,
     received_head: bool,
@@ -157,6 +214,10 @@ pub struct Connection {
     block: Vec<u8>,
     scratch: Vec<u8>,
     continuation: Option<(u32, bool, usize)>,
+    /// The error code a refused stream's header block is answered with once it
+    /// has been decoded and discarded. HPACK is connection state, so a refused
+    /// block still has to advance the decoder.
+    refusing: Option<u32>,
     output: Vec<u8>,
     output_pos: usize,
     draining: bool,
@@ -190,6 +251,7 @@ impl Connection {
             block: Vec::new(),
             scratch: Vec::new(),
             continuation: None,
+            refusing: None,
             output: Vec::new(),
             output_pos: 0,
             draining: false,
@@ -281,6 +343,55 @@ impl Connection {
     fn active(&self) -> usize {
         self.streams.iter().filter(|s| !s.closed()).count()
     }
+    /// A stream id this connection has already opened, refused or finished
+    /// with. Its record may be gone — dropped by `reset`, never created for a
+    /// refused stream, or recycled — while the peer, not yet having seen the
+    /// RST_STREAM or GOAWAY, still sends frames for it. RFC 9113 section 5.1
+    /// requires those to be tolerated; a frame for an id that was never used is
+    /// still a connection error.
+    fn seen(&self, id: u32) -> bool {
+        if id == 0 {
+            false
+        } else if (id % 2 == 1) == (self.role == Role::Client) {
+            id < self.next_id
+        } else {
+            id <= self.last_remote
+        }
+    }
+    /// `STREAM_CLOSED` for a stream this connection has finished with, and the
+    /// idle/unknown protocol error for one it has never used.
+    fn gone(&self, id: u32) -> Error {
+        if self.seen(id) {
+            error("STREAM_CLOSED", "stream already terminated")
+        } else {
+            protocol("unknown or idle stream")
+        }
+    }
+    /// Give back the connection-level credit a terminated stream still holds.
+    /// RFC 9113 section 5.1: DATA the peer sent before it saw our RST_STREAM
+    /// counts against the connection window either way, so the credit has to go
+    /// back or the window shrinks for the life of the connection. No
+    /// stream-level WINDOW_UPDATE: that stream is over.
+    fn return_credit(&mut self, i: usize) -> Result<()> {
+        let n = std::mem::take(&mut self.streams[i].unreleased);
+        if n == 0 {
+            return Ok(());
+        }
+        self.recv_window += n as i64;
+        self.frame(8, 0, 0, &n.to_be_bytes())
+    }
+    /// Account DATA for a stream that is gone against the connection window and
+    /// return the credit at once: the payload is discarded, so no host release
+    /// will ever arrive for it.
+    fn discard_data(&mut self, flow: i64) -> Result<()> {
+        if flow > self.recv_window {
+            return Err(error("FLOW_CONTROL_ERROR", "receive window exceeded"));
+        }
+        if flow == 0 {
+            return Ok(());
+        }
+        self.frame(8, 0, 0, &(flow as u32).to_be_bytes())
+    }
     fn add_stream(&mut self, id: u32) -> Result<usize> {
         if self.active() >= self.limits.streams {
             return Err(error("REFUSED_STREAM", "stream limit"));
@@ -290,6 +401,7 @@ impl Connection {
             send_window: self.initial_send,
             recv_window: 65535,
             unreleased: 0,
+            credited: false,
             local_end: false,
             remote_end: false,
             received_head: false,
@@ -342,7 +454,7 @@ impl Connection {
         if self.failed {
             return Err(protocol("failed connection"));
         }
-        let i = self.index(id)?;
+        let i = self.index(id).map_err(|_| self.gone(id))?;
         let s = &self.streams[i];
         if s.local_end {
             return Err(error("STREAM_CLOSED", "local stream closed"));
@@ -403,7 +515,7 @@ impl Connection {
     }
     /// Returns accepted bytes (zero on flow-control stall). Host retains remainder.
     pub fn send_data(&mut self, id: u32, bytes: &[u8], end_stream: bool) -> Result<usize> {
-        let i = self.index(id)?;
+        let i = self.index(id).map_err(|_| self.gone(id))?;
         let s = &self.streams[i];
         if self.failed || s.local_end || !s.sent_head {
             return Err(error("STREAM_CLOSED", "cannot send DATA"));
@@ -433,9 +545,23 @@ impl Connection {
         s.local_end = end;
         Ok(n)
     }
+    /// Return `n` bytes of a stream's receive window to the peer; `n` may not
+    /// exceed that stream's [`unreleased`](Self::unreleased) count.
+    ///
+    /// A terminated stream has already had its remaining credit returned in
+    /// bulk, so a late release for one is a **no-op, not an error** — a host
+    /// that buffers a body and releases when the application consumes it can
+    /// always call this, whatever happened to the stream meanwhile. An id this
+    /// connection has never used is still an error.
     pub fn release_capacity(&mut self, id: u32, n: u32) -> Result<()> {
-        let i = self.index(id)?;
-        if n == 0 {
+        let Ok(i) = self.index(id) else {
+            return if self.seen(id) {
+                Ok(())
+            } else {
+                Err(protocol("unknown or idle stream"))
+            };
+        };
+        if n == 0 || self.streams[i].credited {
             return Ok(());
         }
         let s = &mut self.streams[i];
@@ -451,20 +577,56 @@ impl Connection {
         }
         Ok(())
     }
+    /// Received DATA bytes for `id` whose flow-control credit the host has not
+    /// yet returned with [`release_capacity`](Self::release_capacity). `None`
+    /// once the stream is gone, its credit having been returned in bulk.
+    /// Padding never appears here: `receive` releases it as it is consumed.
+    pub fn unreleased(&self, id: u32) -> Option<u32> {
+        self.index(id).ok().map(|i| self.streams[i].unreleased)
+    }
+    /// Terminate a stream with RST_STREAM.
+    ///
+    /// The stream's outstanding connection-level credit is returned and its
+    /// table slot is freed at once, so resetting a stream that still holds
+    /// unreleased DATA — the ordinary "one stream errors while its siblings are
+    /// live" case — costs the connection nothing. Frames the peer already had
+    /// in flight for the stream are then ignored rather than failing the
+    /// connection (RFC 9113 section 5.1), and resetting it again is a no-op.
     pub fn reset(&mut self, id: u32, code: u32) -> Result<()> {
-        let i = self.index(id)?;
-        self.streams[i].local_end = true;
-        self.streams[i].remote_end = true;
+        let Ok(i) = self.index(id) else {
+            return if self.seen(id) {
+                Ok(())
+            } else {
+                Err(protocol("unknown or idle stream"))
+            };
+        };
+        self.return_credit(i)?;
+        self.streams.swap_remove(i);
         self.frame(3, 0, id, &code.to_be_bytes())
     }
     pub fn ping(&mut self, data: [u8; 8]) -> Result<()> {
         self.frame(6, 0, 0, &data)
     }
+    /// Graceful close: GOAWAY(NO_ERROR) naming the last stream this connection
+    /// has processed, then drain. Streams the peer opens before it sees the
+    /// frame are refused with RST_STREAM(REFUSED_STREAM); they do not fail the
+    /// connection.
     pub fn shutdown(&mut self) -> Result<()> {
+        self.goaway(0, self.last_remote, &[])
+    }
+    /// GOAWAY with an explicit error code, last stream id and opaque debug
+    /// data, the form [`shutdown`](Self::shutdown) cannot express. The
+    /// connection starts draining either way.
+    pub fn goaway(&mut self, code: u32, last_stream: u32, opaque: &[u8]) -> Result<()> {
+        if last_stream > 0x7fffffff {
+            return Err(protocol("invalid last stream"));
+        }
         self.draining = true;
-        let mut bytes = [0; 8];
-        bytes[..4].copy_from_slice(&self.last_remote.to_be_bytes());
-        self.frame(7, 0, 0, &bytes)
+        self.scratch.clear();
+        self.scratch.extend_from_slice(&last_stream.to_be_bytes());
+        self.scratch.extend_from_slice(&code.to_be_bytes());
+        self.scratch.extend_from_slice(opaque);
+        encode_frame(7, 0, 0, &self.scratch, &mut self.output)
     }
     pub fn is_drained(&self) -> bool {
         self.draining && self.active() == 0 && self.output().is_empty()
@@ -533,7 +695,16 @@ impl Connection {
                 if f.stream == 0 {
                     return Err(protocol("DATA on connection"));
                 }
-                let i = self.index(f.stream)?;
+                let Ok(i) = self.index(f.stream) else {
+                    // In flight when the stream was refused or reset. RFC 9113
+                    // section 5.1 tolerates it, and the bytes still count
+                    // against the connection window, so return the credit.
+                    if !self.seen(f.stream) {
+                        return Err(protocol("unknown or idle stream"));
+                    }
+                    self.discard_data(f.payload.len() as i64)?;
+                    return Ok(step);
+                };
                 let s = &mut self.streams[i];
                 if s.remote_end || !s.received_head {
                     return Err(protocol("DATA in invalid stream state"));
@@ -576,12 +747,27 @@ impl Connection {
                     if self.role != Role::Server
                         || f.stream % 2 == 0
                         || f.stream <= self.last_remote
-                        || self.draining
                     {
                         return Err(protocol("invalid new stream"));
                     }
                     self.last_remote = f.stream;
-                    self.add_stream(f.stream)?;
+                    // A stream this connection cannot accept is refused with
+                    // RST_STREAM(REFUSED_STREAM), never by failing the
+                    // connection: after a graceful GOAWAY the peer cannot yet
+                    // have seen it (RFC 9113 section 6.8), and exceeding the
+                    // concurrent-stream limit is a stream error (section
+                    // 5.1.2). The block is still decoded below - HPACK is
+                    // connection state, and skipping one desynchronises every
+                    // block that follows.
+                    self.refusing = if self.draining {
+                        Some(7)
+                    } else {
+                        match self.add_stream(f.stream) {
+                            Ok(_) => None,
+                            Err(e) if e.code == "REFUSED_STREAM" => Some(7),
+                            Err(e) => return Err(e),
+                        }
+                    };
                 }
                 let mut payload = unpadded(f)?;
                 if f.flags & 32 != 0 {
@@ -597,7 +783,7 @@ impl Connection {
                 self.append_block(payload)?;
                 let end = f.flags & 1 != 0;
                 if f.flags & 4 != 0 {
-                    step.event = Some(self.finish_headers(f.stream, end)?);
+                    step.event = Some(self.finish_block(f.stream, end)?);
                 } else {
                     self.continuation = Some((f.stream, end, 0));
                 }
@@ -610,7 +796,7 @@ impl Connection {
                 self.append_block(f.payload)?;
                 if f.flags & 4 != 0 {
                     self.continuation = None;
-                    step.event = Some(self.finish_headers(id, end)?);
+                    step.event = Some(self.finish_block(id, end)?);
                 } else {
                     self.continuation = Some((id, end, count + 1));
                 }
@@ -633,9 +819,18 @@ impl Connection {
                 if f.payload.len() != 4 {
                     return Err(frame_error());
                 }
-                let i = self.index(f.stream)?;
-                self.streams[i].remote_end = true;
-                self.streams[i].local_end = true;
+                let Ok(i) = self.index(f.stream) else {
+                    // Crossed resets, or a reset for a stream already refused.
+                    if !self.seen(f.stream) {
+                        return Err(protocol("unknown or idle stream"));
+                    }
+                    return Ok(step);
+                };
+                self.return_credit(i)?;
+                let s = &mut self.streams[i];
+                s.credited = true;
+                s.remote_end = true;
+                s.local_end = true;
                 step.event = Some(Event::Reset {
                     stream: f.stream,
                     code: u32be(f.payload),
@@ -730,6 +925,14 @@ impl Connection {
                 if f.payload.len() != 4 {
                     return Err(frame_error());
                 }
+                if f.stream != 0 && self.index(f.stream).is_err() {
+                    // Credit for a stream that is already gone. RFC 9113
+                    // section 6.9 requires this to be tolerated.
+                    if !self.seen(f.stream) {
+                        return Err(protocol("unknown or idle stream"));
+                    }
+                    return Ok(step);
+                }
                 let n = (u32be(f.payload) & 0x7fffffff) as i64;
                 if n == 0 {
                     if f.stream != 0 {
@@ -773,6 +976,21 @@ impl Connection {
         self.block.extend_from_slice(bytes);
         Ok(())
     }
+    /// Complete a header block: either the stream's own, or a refused one.
+    fn finish_block(&mut self, id: u32, end: bool) -> Result<Event<'static>> {
+        match self.refusing.take() {
+            Some(code) => self.refuse_headers(id, code),
+            None => self.finish_headers(id, end),
+        }
+    }
+    /// Answer a refused stream with RST_STREAM. The block is decoded and thrown
+    /// away first: HPACK state belongs to the connection, not the stream.
+    fn refuse_headers(&mut self, id: u32, code: u32) -> Result<Event<'static>> {
+        let mut headers = Vec::new();
+        self.decoder.decode(&self.block, &mut headers)?;
+        self.frame(3, 0, id, &code.to_be_bytes())?;
+        Ok(Event::Reset { stream: id, code })
+    }
     fn finish_headers(&mut self, id: u32, end: bool) -> Result<Event<'static>> {
         let mut headers = Vec::new();
         self.decoder.decode(&self.block, &mut headers)?;
@@ -792,6 +1010,13 @@ impl Connection {
         if s.received_head && !end {
             return Err(protocol("trailers without END_STREAM"));
         }
+        let kind = if informational {
+            HeadersKind::Informational
+        } else if s.received_head {
+            HeadersKind::Trailers
+        } else {
+            HeadersKind::Head
+        };
         if !s.received_head && !informational {
             s.recv_no_body = self.role == Role::Client
                 && (s.head_request
@@ -818,6 +1043,7 @@ impl Connection {
             stream: id,
             headers,
             end_stream: end,
+            kind,
         })
     }
 }

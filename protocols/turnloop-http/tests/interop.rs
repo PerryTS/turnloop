@@ -330,6 +330,7 @@ fn serve_h2(mut socket: TcpStream, total: usize) {
             stream,
             headers,
             end_stream,
+            ..
         }) = step.event
         {
             assert!(end_stream);
