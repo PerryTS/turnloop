@@ -6,6 +6,7 @@
 //! Only the head of a handle's FIFO is ever on the pool; a request needing a
 //! pooled lease waits (without spinning) until one is available.
 use super::{FileMetadata, FsOutput, FsRequest};
+use crate::slots::{Slots, page_reserve};
 use crate::{
     BufLease, BufferPool, Config, Error, ErrorKind, Handle, IoBufMut, OpId, PoolConfig, ReadBuf,
     Result,
@@ -145,15 +146,36 @@ struct Active {
 }
 
 pub(crate) struct Service {
-    slots: Vec<Arc<Slot>>,
-    objects: Vec<Arc<Mutex<Object>>>,
-    active: Vec<Option<Active>>,
-    heads: Vec<Option<usize>>,
-    tails: Vec<Option<usize>>,
+    /// Per-operation job slots, built when an operation index is first used.
+    slots: Slots<Arc<Slot>>,
+    /// Per-handle object cells, built when a handle index is first used.
+    objects: Slots<Arc<Mutex<Object>>>,
+    active: Slots<Active>,
+    heads: Slots<usize>,
+    tails: Slots<usize>,
     waiting: VecDeque<usize>,
     shared: Arc<Shared>,
     pool: BufferPool,
     config: PoolConfig,
+}
+/// Darwin's std mutex allocates its storage on first lock, so both locks are
+/// taken here: publishing a job later uses only storage reserved with the slot.
+fn build_slot(shared: &Arc<Shared>) -> Arc<Slot> {
+    let slot = Arc::new(Slot {
+        job: Mutex::new(None),
+        metadata: Mutex::new(None),
+        cancel: AtomicBool::new(false),
+        shared: shared.clone(),
+    });
+    drop(lock(&slot.job));
+    drop(lock(&slot.metadata));
+    slot
+}
+/// See [`build_slot`]: the cell's lock storage is reserved with the cell.
+fn build_object() -> Arc<Mutex<Object>> {
+    let object = Arc::new(Mutex::new(Object::Empty));
+    drop(lock(&object));
+    object
 }
 impl Service {
     pub fn new(config: &Config, work: Arc<WorkPort>, pool: BufferPool) -> Self {
@@ -164,37 +186,30 @@ impl Service {
         });
         // Darwin's std mutex allocates its storage on first lock: do it at setup.
         drop(lock(&shared.running));
-        let slots = (0..config.max_operations)
-            .map(|_| {
-                let slot = Arc::new(Slot {
-                    job: Mutex::new(None),
-                    metadata: Mutex::new(None),
-                    cancel: AtomicBool::new(false),
-                    shared: shared.clone(),
-                });
-                drop(lock(&slot.job));
-                drop(lock(&slot.metadata));
-                slot
-            })
-            .collect();
-        let objects = (0..config.max_handles)
-            .map(|_| {
-                let object = Arc::new(Mutex::new(Object::Empty));
-                drop(lock(&object));
-                object
-            })
-            .collect();
         Self {
-            slots,
-            objects,
-            active: (0..config.max_operations).map(|_| None).collect(),
-            heads: vec![None; config.max_handles],
-            tails: vec![None; config.max_handles],
-            waiting: VecDeque::with_capacity(config.max_operations),
+            slots: Slots::filled(config.max_operations, || build_slot(&shared)),
+            objects: Slots::filled(config.max_handles, build_object),
+            active: Slots::new(config.max_operations),
+            heads: Slots::new(config.max_handles),
+            tails: Slots::new(config.max_handles),
+            waiting: VecDeque::with_capacity(page_reserve(config.max_operations)),
             shared,
             pool,
             config: config.blocking_pool,
         }
+    }
+    /// This operation's job slot, built on first use.
+    ///
+    /// Darwin's std mutex allocates its storage on first lock, so both locks are
+    /// taken here: the slot's storage is reserved when the slot is built, never
+    /// on a later publication from the loop thread.
+    fn slot(&mut self, i: usize) -> &Arc<Slot> {
+        let shared = self.shared.clone();
+        self.slots.get_or_insert_with(i, || build_slot(&shared))
+    }
+    /// This handle's object cell, built on first use. See [`Service::slot`].
+    fn object(&mut self, i: usize) -> &Arc<Mutex<Object>> {
+        self.objects.get_or_insert_with(i, build_object)
     }
     /// Accept a request, or reject it without retaining or touching its buffers.
     pub fn submit(&mut self, op: OpId, handle: Option<Handle>, request: FsRequest) -> Result<()> {
@@ -246,12 +261,18 @@ impl Service {
             active.lease = Some(lease);
         }
         active.stage = Stage::Running;
-        let slot = &self.slots[i];
+        let (op, request, handle) = (
+            active.op,
+            active.request.take().expect("unstarted request"),
+            active.handle,
+        );
+        let object = handle.map(|h| self.object(h.index()).clone());
+        let slot = self.slot(i).clone();
         slot.cancel.store(false, Ordering::Release);
         *lock(&slot.job) = Some(Job {
-            op: active.op,
-            request: active.request.take().expect("unstarted request"),
-            object: active.handle.map(|h| self.objects[h.index()].clone()),
+            op,
+            request,
+            object,
         });
         *lock(&self.shared.running) += 1;
         crate::blocking::push_reserved(slot.clone());
@@ -292,7 +313,7 @@ impl Service {
             return;
         };
         match active.stage {
-            Stage::Running => self.slots[i].cancel.store(true, Ordering::Release),
+            Stage::Running => self.slot(i).cancel.store(true, Ordering::Release),
             Stage::Withdrawn => {}
             Stage::Queued | Stage::Waiting => {
                 let was_head = active.previous.is_none();
@@ -328,13 +349,13 @@ impl Service {
                 self.start(next);
             }
         }
-        let metadata = lock(&self.slots[i].metadata).take();
+        let metadata = lock(&self.slot(i).metadata).take();
         (self.active[i].take().and_then(|a| a.lease), metadata)
     }
     /// Reset a released handle's state; a still-open descriptor closes here.
     pub fn release(&mut self, h: Handle) {
         debug_assert!(self.heads[h.index()].is_none());
-        let object = std::mem::take(&mut *lock(&self.objects[h.index()]));
+        let object = std::mem::take(&mut *lock(self.object(h.index())));
         drop(object);
     }
 }
@@ -345,8 +366,11 @@ impl Drop for Service {
             let Some(active) = active else { continue };
             match active.stage {
                 Stage::Running => {
-                    self.slots[i].cancel.store(true, Ordering::Release);
-                    if lock(&self.slots[i].job).take().is_some() {
+                    let slot = self.slots[i]
+                        .as_ref()
+                        .expect("a running request built its slot");
+                    slot.cancel.store(true, Ordering::Release);
+                    if lock(&slot.job).take().is_some() {
                         withdrawn += 1;
                     }
                 }

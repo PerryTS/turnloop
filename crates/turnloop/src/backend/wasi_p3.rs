@@ -2,6 +2,7 @@
 //! and fixed request return areas avoid a fresh block_on or executor per turn.
 //! Experimental: host-yield boundedness is unproven. Allocation gates require
 //! release on the pinned p3 compiler; see docs/upstream/wasi-p3-wait.md.
+use crate::slots::{Slots, page_reserve};
 mod abi;
 mod fs;
 mod return_storage;
@@ -132,8 +133,8 @@ impl Wake for WasiWake {
 }
 /// Experimental WASI 0.3 driver with a persistent waitable set.
 pub struct WasiP3 {
-    resources: Vec<Option<Resource>>,
-    ops: Vec<Option<Pending>>,
+    resources: Slots<Resource>,
+    ops: Slots<Pending>,
     ready: VecDeque<Handle>,
     cancelled: VecDeque<OpId>,
     pool: BufferPool,
@@ -353,10 +354,10 @@ unsafe impl Backend for WasiP3 {
     }
     fn new(config: &Config, pool: BufferPool) -> Result<Self> {
         Ok(Self {
-            resources: (0..config.max_handles).map(|_| None).collect(),
-            ops: (0..config.max_operations).map(|_| None).collect(),
-            ready: VecDeque::with_capacity(config.max_handles),
-            cancelled: VecDeque::with_capacity(config.max_operations),
+            resources: Slots::new(config.max_handles),
+            ops: Slots::new(config.max_operations),
+            ready: VecDeque::with_capacity(page_reserve(config.max_handles)),
+            cancelled: VecDeque::with_capacity(page_reserve(config.max_operations)),
             files: super::wasi_fs::Files::new(config, pool.clone()),
             pool,
             wake: Arc::new(WasiWake),
@@ -648,7 +649,9 @@ unsafe impl Backend for WasiP3 {
             }
         }
         if kind != 0 && !deadline_event {
-            for i in 0..self.ops.len() {
+            // The materialised prefix, not the ceiling: an occupied slot is
+            // always below the high-water mark, and this runs per event.
+            for i in 0..self.ops.materialised() {
                 let Some(p) = &mut self.ops[i] else {
                     continue;
                 };

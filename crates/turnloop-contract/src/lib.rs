@@ -219,6 +219,18 @@ mod native {
         capacity_and_stale_ids::<B>();
     }
     #[test]
+    fn growth_preserves_handles() {
+        paged_growth_preserves_handles::<B>();
+    }
+    #[test]
+    fn accept_reserves_a_handle_slot() {
+        accept_reserves_its_handle_slot::<B>();
+    }
+    #[test]
+    fn an_armed_accept_keeps_its_reserved_slot() {
+        an_armed_accept_keeps_its_slot::<B>();
+    }
+    #[test]
     fn cancellation_close() {
         cancel_close_ordering::<B>();
     }
@@ -892,6 +904,273 @@ pub fn capacity_and_stale_ids<B: Backend>() {
     assert!(!a.cancel(op));
     assert!(a.cancel(a.timer_op(h3).expect("op")));
     assert_eq!(count, 3);
+}
+
+/// A key taken before the handle table grew still names its own resource after.
+///
+/// `max_handles` is a ceiling served by pages built on demand, so a loop crosses
+/// page boundaries as its high-water mark rises. Growth must leave every live
+/// handle addressing what it addressed: an index means the same slot before and
+/// after, and no live slot is ever handed out twice.
+pub fn paged_growth_preserves_handles<B: Backend>() {
+    // A ceiling many pages wide, so reaching the high-water mark below grows the
+    // table repeatedly while every handle taken from an earlier page is live.
+    let config = Config {
+        max_handles: 4096,
+        max_operations: 4096,
+        events_per_turn: 64,
+        ..Config::default()
+    };
+    let mut l = Driver::<B>::new(config).expect("loop");
+    let at = l.now() + Duration::from_secs(30);
+    const LIVE: u64 = 600;
+    let mut handles = Vec::new();
+    for i in 0..LIVE {
+        handles.push(l.timer(at, None, Token(i)).expect("within the ceiling"));
+    }
+    let mut keys: Vec<u64> = handles.iter().map(|h| h.key()).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    assert_eq!(
+        keys.len(),
+        handles.len(),
+        "growth handed out a slot that was still live"
+    );
+    let mut indices: Vec<usize> = handles.iter().map(|h| h.index()).collect();
+    indices.sort_unstable();
+    indices.dedup();
+    assert_eq!(
+        indices.len(),
+        handles.len(),
+        "two live handles share a slot"
+    );
+    // Slots are handed out lowest-free-first, so holding LIVE of them at once
+    // means the table really did grow through every page boundary below it —
+    // without this the rest of the assertions would pass on an ungrown table.
+    assert_eq!(
+        (indices[0], *indices.last().expect("handles")),
+        (0, LIVE as usize - 1),
+        "the high-water mark did not reach the slot count under test"
+    );
+    // Every handle still resolves, the first page's included, and each still
+    // names the timer it was created with rather than a neighbour's.
+    for (i, h) in handles.iter().enumerate() {
+        let op = l
+            .timer_op(*h)
+            .expect("a handle taken before growth still names its timer");
+        assert_eq!(op.owner(), h.owner());
+        l.set_ref(*h, true)
+            .expect("a live handle is still addressable");
+        assert_eq!(h.index(), indices[i], "a handle changed slot across growth");
+    }
+    // Closing every handle delivers exactly one Closed per handle, carrying the
+    // token that handle was closed with: growth aliased no slot onto another.
+    let mut out = Completions::with_capacity(64);
+    let mut closed = vec![false; LIVE as usize];
+    for h in &handles {
+        l.close(*h, Token(h.index() as u64)).expect("close");
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while closed.iter().any(|done| !done) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Closed never delivered"
+        );
+        l.turn(Timeout::After(Duration::from_millis(50)), &mut out)
+            .expect("drain");
+        for c in out.drain() {
+            if matches!(c.result, OpResult::Closed) {
+                let slot = c.token.0 as usize;
+                assert!(!closed[slot], "slot {slot} delivered Closed twice");
+                closed[slot] = true;
+            }
+        }
+    }
+    // A stale key never reaches the slot it used to name, even after reuse.
+    let reused = l.timer(at, None, Token(9999)).expect("freed slots return");
+    assert!(
+        handles.iter().all(|h| h.key() != reused.key()),
+        "a retired key was handed out again"
+    );
+    assert!(
+        l.set_ref(handles[0], true).is_err(),
+        "stale handle rejected"
+    );
+}
+
+/// A loop at its handle ceiling refuses to *ask* for a connection, rather than
+/// accepting one and destroying it.
+///
+/// An accept reserves its handle slot when it is submitted, so an accept the
+/// kernel has been asked to perform always has somewhere to put its connection.
+/// At the ceiling the submission is refused instead, and the connection stays in
+/// the listener's backlog: the accept queue is the queue that absorbs it.
+pub fn accept_reserves_its_handle_slot<B: Backend>() {
+    // Two handles: the listener, and room for exactly one accepted connection.
+    let mut l = Driver::<B>::new(Config {
+        max_handles: 2,
+        max_operations: 8,
+        ..Config::default()
+    })
+    .expect("loop");
+    let listener = l
+        .tcp_listen("127.0.0.1:0".parse().expect("addr"), &ListenOpts::default())
+        .expect("listen");
+    let addr = l.local_addr(listener).expect("addr");
+    // The reserve is taken at submission, so a second concurrent accept is
+    // refused before it reaches the kernel even though nothing has connected.
+    let first = l.accept(listener, Token(1)).expect("one slot is free");
+    assert!(
+        matches!(
+            l.accept(listener, Token(2)),
+            Err(Error {
+                kind: ErrorKind::ResourceLimit,
+                ..
+            })
+        ),
+        "a second accept has no slot to reserve and must not reach the kernel"
+    );
+    // The reserved slot is honoured: the accept that was armed delivers.
+    let _client = std::net::TcpStream::connect(addr).expect("client");
+    let mut out = Completions::with_capacity(8);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut conn = None;
+    while conn.is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "accept never delivered"
+        );
+        l.turn(Timeout::After(Duration::from_millis(50)), &mut out)
+            .expect("turn");
+        for c in out.drain() {
+            match c.result {
+                OpResult::Accepted { conn: h, .. } => conn = Some(h),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+    let conn = conn.expect("accepted");
+    assert_eq!(l.timer_op(conn), None, "an accepted socket is not a timer");
+    let _ = first;
+    // Now at the ceiling: no slot to reserve, so no accept is armed at all.
+    assert!(
+        matches!(
+            l.accept(listener, Token(3)),
+            Err(Error {
+                kind: ErrorKind::ResourceLimit,
+                ..
+            })
+        ),
+        "at the ceiling an accept is refused before the kernel is asked"
+    );
+    // Traffic on handles that already exist is not gated by the reservation: a
+    // loop at its ceiling still serves the connections it has.
+    static HELLO: [u8; 5] = *b"hello";
+    // SAFETY: HELLO is static immutable memory, valid through the completion.
+    let buf = unsafe { IoBuf::from_raw_parts(HELLO.as_ptr(), HELLO.len()) };
+    l.write(conn, WriteBuf::Provided(buf), Token(6))
+        .expect("a loop at its ceiling still serves its open connections");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut wrote = 0;
+    while wrote == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "write never completed"
+        );
+        l.turn(Timeout::After(Duration::from_millis(50)), &mut out)
+            .expect("turn");
+        for c in out.drain() {
+            if let OpResult::Wrote(n) = c.result {
+                wrote = n;
+            }
+        }
+    }
+    assert_eq!(wrote, HELLO.len());
+    // Releasing the connection returns its slot, and accepts arm again.
+    l.close(conn, Token(4)).expect("close");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut released = false;
+    while !released {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "close never delivered"
+        );
+        l.turn(Timeout::After(Duration::from_millis(50)), &mut out)
+            .expect("turn");
+        for c in out.drain() {
+            released |= matches!(c.result, OpResult::Closed);
+        }
+    }
+    l.accept(listener, Token(5))
+        .expect("a freed slot makes the loop acceptive again");
+}
+
+/// A slot promised to an armed accept cannot be spent by anything else.
+///
+/// The reservation is only worth something if the loop refuses to hand that slot
+/// to a handle the host creates directly. Without that, a host can fill its
+/// ceiling while an accept is in flight, and the accept arrives with nowhere to
+/// put its connection — which is the failure this whole mechanism exists to
+/// remove, because the connection is destroyed rather than deferred.
+pub fn an_armed_accept_keeps_its_slot<B: Backend>() {
+    // Three slots: the listener, one held for the armed accept, one to spend.
+    let mut l = Driver::<B>::new(Config {
+        max_handles: 3,
+        max_operations: 16,
+        ..Config::default()
+    })
+    .expect("loop");
+    let listener = l
+        .tcp_listen("127.0.0.1:0".parse().expect("addr"), &ListenOpts::default())
+        .expect("listen");
+    let addr = l.local_addr(listener).expect("addr");
+    l.accept(listener, Token(1)).expect("one slot to reserve");
+    let at = l.now() + Duration::from_secs(30);
+    let spare = l.timer(at, None, Token(2)).expect("the unreserved slot");
+    assert!(
+        matches!(
+            l.timer(at, None, Token(3)),
+            Err(Error {
+                kind: ErrorKind::ResourceLimit,
+                ..
+            })
+        ),
+        "the armed accept's slot must not be available to a new handle"
+    );
+    // And the accept therefore still has somewhere to put its connection.
+    let _client = std::net::TcpStream::connect(addr).expect("client");
+    let mut out = Completions::with_capacity(8);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut conn = None;
+    while conn.is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "accept never delivered"
+        );
+        l.turn(Timeout::After(Duration::from_millis(50)), &mut out)
+            .expect("turn");
+        for c in out.drain() {
+            match c.result {
+                OpResult::Accepted { conn: h, .. } => conn = Some(h),
+                OpResult::Err(e) => panic!("the reserved slot was spent elsewhere: {e:?}"),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+    let conn = conn.expect("accepted");
+    // Every slot is now live, and the reservation is gone with the accept.
+    assert!(
+        matches!(
+            l.timer(at, None, Token(4)),
+            Err(Error {
+                kind: ErrorKind::ResourceLimit,
+                ..
+            })
+        ),
+        "the loop is at its ceiling"
+    );
+    l.close(conn, Token(5)).expect("close");
+    l.close(spare, Token(6)).expect("close");
 }
 
 pub fn pooled_lease_backpressure<B: Backend>() {

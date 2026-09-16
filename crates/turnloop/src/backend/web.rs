@@ -6,6 +6,7 @@
 //! `TCP_NODELAY`, keep-alive schedule, linger, buffer size or group membership to
 //! set or read. `ListenOpts` never reaches this backend either, because listening
 //! sockets are themselves unsupported (DESIGN §7.5).
+use crate::slots::Slots;
 use crate::{
     backend::{Backend, Event, Operation, Outcome, PollInfo, Request, Wake},
     *,
@@ -94,8 +95,8 @@ struct Pending {
 pub struct Web {
     id: u32,
     wake: Arc<WebWake>,
-    resources: Vec<Option<Resource>>,
-    ops: Vec<Option<Pending>>,
+    resources: Slots<Resource>,
+    ops: Slots<Pending>,
     pool: BufferPool,
     failure: Option<Error>,
     #[cfg(feature = "web-worker")]
@@ -194,8 +195,8 @@ unsafe impl Backend for Web {
         Ok(Self {
             id,
             wake: Arc::new(WebWake { id }),
-            resources: (0..config.max_handles).map(|_| None).collect(),
-            ops: (0..config.max_operations).map(|_| None).collect(),
+            resources: Slots::new(config.max_handles),
+            ops: Slots::new(config.max_operations),
             pool,
             failure: None,
             #[cfg(feature = "web-worker")]

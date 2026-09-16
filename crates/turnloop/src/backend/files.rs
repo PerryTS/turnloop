@@ -1,5 +1,6 @@
 //! Reusable regular-file jobs on the shared blocking pool; never file I/O in poll.
 use super::{poller::last_error, unix::Detached};
+use crate::slots::{Slots, page_reserve};
 use crate::{
     backend::{Event, Operation, Outcome, Request},
     blocking::ReusableWork,
@@ -93,16 +94,32 @@ struct Active {
     awaiting_pool: bool,
 }
 pub(super) struct Files {
-    slots: Vec<Arc<Slot>>,
-    active: Vec<Option<Active>>,
-    heads: Vec<Option<usize>>,
-    tails: Vec<Option<usize>>,
+    /// Per-operation job slots, built when an operation index is first used.
+    slots: Slots<Arc<Slot>>,
+    active: Slots<Active>,
+    heads: Slots<usize>,
+    tails: Slots<usize>,
     port: Arc<Port>,
     config: PoolConfig,
     pool: BufferPool,
-    leases: Vec<Option<BufLease>>,
+    leases: Slots<BufLease>,
     ready: VecDeque<usize>,
     awaiting_pool: VecDeque<usize>,
+}
+/// Darwin's std mutex allocates its pthread storage on first lock, so the slot
+/// takes its own lock here: publishing a job later uses only reserved storage.
+fn build_slot(port: &Arc<Port>) -> Arc<Slot> {
+    let slot = Arc::new(Slot {
+        job: Mutex::new(None),
+        cancel: AtomicBool::new(false),
+        port: port.clone(),
+    });
+    drop(
+        slot.job
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    slot
 }
 impl Files {
     pub fn new(config: &Config, pool: BufferPool) -> Self {
@@ -113,33 +130,16 @@ impl Files {
             quiescent: Condvar::new(),
         });
         Self {
-            slots: (0..config.max_operations)
-                .map(|_| {
-                    let slot = Arc::new(Slot {
-                        job: Mutex::new(None),
-                        cancel: AtomicBool::new(false),
-                        port: port.clone(),
-                    });
-                    // Darwin's std mutex allocates its pthread storage on first
-                    // lock. Reserve it now for every op slot, including slots
-                    // first reached later through backpressure/cancellation.
-                    drop(
-                        slot.job
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner),
-                    );
-                    slot
-                })
-                .collect(),
-            active: (0..config.max_operations).map(|_| None).collect(),
-            heads: vec![None; config.max_handles],
-            tails: vec![None; config.max_handles],
+            slots: Slots::filled(config.max_operations, || build_slot(&port)),
+            active: Slots::new(config.max_operations),
+            heads: Slots::new(config.max_handles),
+            tails: Slots::new(config.max_handles),
             port,
             config: config.blocking_pool,
             pool,
-            leases: (0..config.max_operations).map(|_| None).collect(),
-            ready: VecDeque::with_capacity(config.max_handles),
-            awaiting_pool: VecDeque::with_capacity(config.max_handles),
+            leases: Slots::new(config.max_operations),
+            ready: VecDeque::with_capacity(page_reserve(config.max_handles)),
+            awaiting_pool: VecDeque::with_capacity(page_reserve(config.max_handles)),
         }
     }
     pub fn set_notifier(&mut self, notifier: Notifier) {
@@ -181,6 +181,16 @@ impl Files {
         });
         Ok(())
     }
+    /// This operation's job slot, built on first use.
+    ///
+    /// Darwin's std mutex allocates its pthread storage on first lock, so the
+    /// slot takes its own lock here: a job publication from the loop thread only
+    /// ever uses storage this reserved, including slots first reached later
+    /// through backpressure or cancellation.
+    fn slot(&mut self, i: usize) -> &Arc<Slot> {
+        let port = self.port.clone();
+        self.slots.get_or_insert_with(i, || build_slot(&port))
+    }
     pub fn cancel(&mut self, op: OpId) -> bool {
         let Some(active) = self
             .active
@@ -197,7 +207,11 @@ impl Files {
             self.ready.push_back(op.index());
         }
         if active.submitted {
-            self.slots[op.index()].cancel.store(true, Ordering::Release);
+            self.slots[op.index()]
+                .as_ref()
+                .expect("a submitted request built its slot")
+                .cancel
+                .store(true, Ordering::Release);
         }
         true
     }
@@ -216,6 +230,7 @@ impl Files {
             }
         }
         while let Some(i) = self.ready.pop_front() {
+            let slot = self.slot(i).clone();
             let active = self.active[i].as_mut().expect("file head");
             debug_assert!(!active.submitted);
             if active.cancelled {
@@ -255,7 +270,6 @@ impl Files {
                 self.leases[i] = Some(lease);
             }
             let result = active.fd.try_clone().map_err(Error::from).and_then(|fd| {
-                let slot = &self.slots[i];
                 slot.cancel.store(false, Ordering::Release);
                 *slot
                     .job
@@ -352,9 +366,10 @@ impl Files {
 impl Drop for Files {
     fn drop(&mut self) {
         for a in self.active.iter().flatten() {
-            self.slots[a.op.index()]
-                .cancel
-                .store(true, Ordering::Release);
+            // A request that never started has no slot, and nothing to cancel.
+            if let Some(slot) = self.slots[a.op.index()].as_ref() {
+                slot.cancel.store(true, Ordering::Release);
+            }
         }
         let mut running = self
             .port

@@ -255,10 +255,10 @@ pub(super) struct Streams {
     queue: Ref,
 }
 impl Streams {
-    pub fn new(capacity: usize) -> Self {
+    pub fn new() -> Self {
         let inbox = Arc::new(Inbox {
             pending: AtomicBool::new(false),
-            ready: Mutex::new(VecDeque::with_capacity(capacity * 2)),
+            ready: Mutex::new(VecDeque::with_capacity(crate::slots::PAGE)),
             notifier: Mutex::new(None),
         });
         drop(lock(&inbox.ready));

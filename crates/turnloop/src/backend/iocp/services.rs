@@ -1,4 +1,5 @@
 use super::{Detached, invalid, process::Child, signals::Subscription, unsupported};
+use crate::slots::Slots;
 use crate::{
     backend::{Event, Operation, Outcome, Request},
     *,
@@ -15,13 +16,13 @@ struct Entry {
     closing: bool,
 }
 pub(super) struct Services {
-    entries: Vec<Option<Entry>>,
+    entries: Slots<Entry>,
     pending: usize,
 }
 impl Services {
     pub(super) fn new(capacity: usize) -> Self {
         Self {
-            entries: (0..capacity).map(|_| None).collect(),
+            entries: Slots::new(capacity),
             pending: 0,
         }
     }

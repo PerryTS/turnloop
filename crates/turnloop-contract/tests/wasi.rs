@@ -126,6 +126,10 @@ fn capacity_stale_ids() {
     contract::capacity_and_stale_ids::<Platform>();
 }
 #[test]
+fn growth_preserves_handles() {
+    contract::paged_growth_preserves_handles::<Platform>();
+}
+#[test]
 fn pooled_backpressure() {
     contract::pooled_lease_backpressure::<Platform>();
 }

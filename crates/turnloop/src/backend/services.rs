@@ -4,6 +4,7 @@ use super::{
     signals::{self, Subscription},
     unix::Detached,
 };
+use crate::slots::{Slots, page_reserve};
 use crate::{
     backend::{Event, Operation, Outcome, Request},
     sync::{AtomicBool, Ordering},
@@ -76,15 +77,17 @@ mod readiness_models {
 }
 struct ReadyState {
     queue: VecDeque<Handle>,
-    queued: Vec<bool>,
+    /// Whether each handle is already in `queue`, so a repeat publication does
+    /// not enqueue it twice. Vacant reads as "not queued".
+    queued: Slots<()>,
 }
 impl ReadyQueue {
     fn new(capacity: usize) -> Self {
         let ready = Self {
             pending: AtomicBool::new(false),
             state: Mutex::new(ReadyState {
-                queue: VecDeque::with_capacity(capacity),
-                queued: vec![false; capacity],
+                queue: VecDeque::with_capacity(page_reserve(capacity)),
+                queued: Slots::new(capacity),
             }),
         };
         // Initialize Darwin's lazily allocated pthread mutex during loop setup,
@@ -102,8 +105,8 @@ impl ReadyQueue {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !s.queued[h.index()] {
-            s.queued[h.index()] = true;
+        if s.queued[h.index()].is_none() {
+            s.queued[h.index()] = Some(());
             s.queue.push_back(h);
             self.pending.store(true, Ordering::Release);
         }
@@ -117,7 +120,7 @@ impl ReadyQueue {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let h = s.queue.pop_front()?;
-        s.queued[h.index()] = false;
+        s.queued[h.index()] = None;
         self.pending.store(!s.queue.is_empty(), Ordering::Release);
         Some(h)
     }
@@ -127,7 +130,7 @@ impl ReadyQueue {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         s.queue.retain(|&queued| queued != h);
-        s.queued[h.index()] = false;
+        s.queued[h.index()] = None;
         self.pending.store(!s.queue.is_empty(), Ordering::Release);
     }
     fn has_work(&self) -> bool {
@@ -194,16 +197,16 @@ struct Entry {
     cancelled: bool,
 }
 pub(super) struct Services {
-    entries: Vec<Option<Entry>>,
-    operations: Vec<Option<Handle>>,
+    entries: Slots<Entry>,
+    operations: Slots<Handle>,
     ready: Arc<ReadyQueue>,
     notifier: Option<Notifier>,
 }
 impl Services {
     pub fn new(config: &Config) -> Self {
         Self {
-            entries: (0..config.max_handles).map(|_| None).collect(),
-            operations: vec![None; config.max_operations],
+            entries: Slots::new(config.max_handles),
+            operations: Slots::new(config.max_operations),
             ready: Arc::new(ReadyQueue::new(config.max_handles)),
             notifier: None,
         }

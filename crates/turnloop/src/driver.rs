@@ -49,6 +49,9 @@ struct Op {
     external_wait: bool,
     /// A typed filesystem request (pool service or backend, per `B::FILESYSTEM`).
     fs: bool,
+    /// Handle slots this operation holds against the ceiling, released when it
+    /// retires. Non-zero only for operations whose completion creates a handle.
+    reserved_handles: usize,
     /// Counted in `native_pending`: a socket-handle operation or a request the
     /// backend accepted natively (such as WASI DNS). DESIGN §10 rule 3 keys
     /// queued-turn discovery on these operations.
@@ -88,10 +91,16 @@ pub struct Driver<B: Backend> {
     timers: TimerQueue,
     connect_deadlines: TimerQueue,
     queued: VecDeque<Queued>,
+    /// Largest number of completions that may be queued at once. Was implicit in
+    /// `queued`'s reserved capacity, which is now a page that grows on demand.
+    completion_capacity: usize,
     buffered: [usize; 3],
     events: Vec<Event<B::Detached>>,
     refs: usize,
     outstanding: usize,
+    /// Handle slots promised to accepts and handle receives that have been asked
+    /// for but not yet delivered. See [`Driver::submit`].
+    reserved_handles: usize,
     native_pending: usize,
     config: Config,
     _local: PhantomData<Rc<()>>,
@@ -152,15 +161,34 @@ impl<B: Backend> Driver<B> {
             // multishot events, repeating timers and posts each have their own
             // bounded reserve, so no source can consume cancellation capacity or
             // prevent another source from making progress with small host output.
-            queued: VecDeque::with_capacity(completion_capacity),
+            // The bound is `completion_capacity`, checked on every push; the
+            // queue reserves a page of it and grows as a turn's backlog does.
+            queued: VecDeque::with_capacity(crate::slots::page_reserve(completion_capacity)),
+            completion_capacity,
             buffered: [0; 3],
             events: Vec::with_capacity(config.events_per_turn),
             refs: 0,
             outstanding: 0,
+            reserved_handles: 0,
             native_pending: 0,
             config,
             _local: PhantomData,
         })
+    }
+    /// Reserved slots are a subset of free ones.
+    ///
+    /// Every path that moves either side keeps this: a reserving submission
+    /// checks it before promising, `new_handle` refuses to spend a promised
+    /// slot, and a delivery releases its promise before taking the slot. Drift
+    /// here means an armed accept can arrive with nowhere to put its connection,
+    /// which is silent until a connection is destroyed for it.
+    fn assert_reservations(&self) {
+        debug_assert!(
+            self.reserved_handles <= self.handles.remaining(),
+            "{} handle slots promised but only {} free",
+            self.reserved_handles,
+            self.handles.remaining()
+        );
     }
     fn assert_owner(&self) {
         debug_assert_eq!(
@@ -178,7 +206,17 @@ impl<B: Backend> Driver<B> {
             .filter(|r| !r.hidden)
             .ok_or(Error::new(ErrorKind::NotFound))
     }
+    /// Take a handle slot for a resource the host is creating.
+    ///
+    /// Slots promised to armed accepts are not available here: an accept that the
+    /// kernel has been asked to perform must still have somewhere to put its
+    /// connection when it arrives, so a host creating handles cannot spend the
+    /// last one out from under it. The completion path consumes its own
+    /// reservation first, in [`Driver::attach_reserved`].
     fn new_handle(&mut self, kind: Kind) -> Result<Handle> {
+        if self.handles.remaining() <= self.reserved_handles {
+            return Err(Error::new(ErrorKind::ResourceLimit));
+        }
         let key = self
             .handles
             .insert(Resource {
@@ -195,6 +233,7 @@ impl<B: Backend> Driver<B> {
         if matches!(kind, Kind::Socket | Kind::File) {
             self.refs += 1;
         }
+        self.assert_reservations();
         Ok(Handle {
             owner: self.owner,
             key,
@@ -219,6 +258,7 @@ impl<B: Backend> Driver<B> {
                 job_cancel: None,
                 external_wait: false,
                 fs: false,
+                reserved_handles: 0,
                 native,
                 previous,
                 next: None,
@@ -254,6 +294,7 @@ impl<B: Backend> Driver<B> {
     fn retire(&mut self, id: OpId) -> Option<Op> {
         let op = self.ops.remove(id.key)?;
         self.connect_deadlines.cancel(id.key);
+        self.reserved_handles -= op.reserved_handles;
         if op.native {
             self.native_pending -= 1;
         }
@@ -314,7 +355,7 @@ impl<B: Backend> Driver<B> {
             debug_assert!(self.buffered[class] < self.config.events_per_turn);
             self.buffered[class] += 1;
         }
-        debug_assert!(self.queued.len() < self.queued.capacity());
+        debug_assert!(self.queued.len() < self.completion_capacity);
         self.refs += usize::from(referenced);
         self.queued.push_back(Queued {
             completion,
@@ -784,12 +825,33 @@ impl<B: Backend> Driver<B> {
         }
         self.backend.raw_transport(h)
     }
+    /// Submit one operation on a socket handle.
+    ///
+    /// An operation whose completion creates a handle (an accept, a handle
+    /// receive) reserves its handle slot here, before the backend is asked.
+    /// Refusing at the ceiling is therefore a refusal to *ask*: the connection
+    /// stays in the listener's backlog, which is the queue that is meant to
+    /// absorb it. The alternative, which this replaces, was to let the kernel
+    /// hand over a connection and then destroy it for want of a slot, so a host
+    /// at its ceiling refused connections instead of deferring them.
     fn submit(&mut self, h: Handle, operation: Operation, token: Token) -> Result<OpId> {
         let r = self.resource(h)?;
         if r.closing.is_some() || !matches!(r.kind, Kind::Socket) {
             return Err(Error::new(ErrorKind::InvalidInput));
         }
+        let reserve = usize::from(matches!(
+            operation,
+            Operation::Accept { .. } | Operation::RecvHandle
+        ));
+        // Only a reserving operation is gated: reads, writes and everything else
+        // on an existing handle must still work at the ceiling.
+        if reserve != 0 && self.handles.remaining() < self.reserved_handles + reserve {
+            return Err(Error::new(ErrorKind::ResourceLimit));
+        }
         let op = self.new_op(Some(h), token)?;
+        self.reserved_handles += reserve;
+        self.ops.get_mut(op.key).expect("new op").reserved_handles = reserve;
+        self.assert_reservations();
         if let Err(e) = self.backend.submit(Request {
             op,
             handle: h,
@@ -992,7 +1054,43 @@ impl<B: Backend> Driver<B> {
         }
         Ok(d)
     }
+    /// House a transport an accept has already taken from the kernel, spending
+    /// the slot that operation reserved when it was submitted.
+    ///
+    /// Releasing the reservation before creating the handle is what makes it
+    /// real: `new_handle` refuses slots that are still promised, so the only
+    /// thing that can spend this one is the accept that reserved it. A multishot
+    /// accept stays armed and reserves again for its next connection; if the
+    /// loop is at its ceiling it holds nothing, and its next connection is
+    /// refused the way a fresh submission would be.
+    fn attach_reserved(
+        &mut self,
+        transport: B::Detached,
+        id: OpId,
+        token: Token,
+        terminal: bool,
+    ) -> Result<Handle> {
+        let held = self
+            .ops
+            .get_mut(id.key)
+            .map_or(0, |op| std::mem::take(&mut op.reserved_handles));
+        self.reserved_handles -= held;
+        let attached = self.attach(transport, token);
+        if !terminal && held != 0 && self.handles.remaining() > self.reserved_handles {
+            self.reserved_handles += held;
+            if let Some(op) = self.ops.get_mut(id.key) {
+                op.reserved_handles = held;
+            } else {
+                self.reserved_handles -= held;
+            }
+        }
+        self.assert_reservations();
+        attached
+    }
     /// Register an owning transport on this loop; failure drops the rejected transport.
+    ///
+    /// Reports `ResourceLimit` at the handle ceiling, and also when the only
+    /// remaining slots are promised to accepts this loop has already armed.
     pub fn attach(&mut self, d: B::Detached, _token: Token) -> Result<Handle> {
         let h = self.new_handle(Kind::Socket)?;
         if let Err(e) = self.backend.attach(h, d) {
@@ -1371,22 +1469,27 @@ impl<B: Backend> Driver<B> {
                 Ok(Outcome::Resolved(addresses)) => OpResult::Resolved(addresses),
                 Ok(Outcome::Exited(status)) => OpResult::Exited(status),
                 Ok(Outcome::Signal(signal)) => OpResult::Signal(signal),
-                Ok(Outcome::PipeAccepted(d)) => match self.attach(d, op.token) {
-                    Ok(conn) => OpResult::PipeAccepted { conn },
-                    Err(e) => OpResult::Err(e),
-                },
-                Ok(Outcome::HandleReceived(d)) => match self.attach(d, op.token) {
-                    Ok(handle) => OpResult::HandleReceived { handle },
-                    Err(e) => OpResult::Err(e),
-                },
+                Ok(Outcome::PipeAccepted(d)) => {
+                    match self.attach_reserved(d, e.op, op.token, e.terminal) {
+                        Ok(conn) => OpResult::PipeAccepted { conn },
+                        Err(e) => OpResult::Err(e),
+                    }
+                }
+                Ok(Outcome::HandleReceived(d)) => {
+                    match self.attach_reserved(d, e.op, op.token, e.terminal) {
+                        Ok(handle) => OpResult::HandleReceived { handle },
+                        Err(e) => OpResult::Err(e),
+                    }
+                }
                 Ok(Outcome::HandleSent) => OpResult::HandleSent,
                 Err(e) => OpResult::Err(e),
                 Ok(Outcome::Connected) => OpResult::Connected,
-                Ok(Outcome::Accepted { transport, peer }) => match self.attach(transport, op.token)
-                {
-                    Ok(conn) => OpResult::Accepted { conn, peer },
-                    Err(e) => OpResult::Err(e),
-                },
+                Ok(Outcome::Accepted { transport, peer }) => {
+                    match self.attach_reserved(transport, e.op, op.token, e.terminal) {
+                        Ok(conn) => OpResult::Accepted { conn, peer },
+                        Err(e) => OpResult::Err(e),
+                    }
+                }
                 Ok(Outcome::Read { n, lease }) => OpResult::Read { n, lease },
                 Ok(Outcome::Eof) => OpResult::Eof,
                 Ok(Outcome::Wrote(n)) => OpResult::Wrote(n),

@@ -12,6 +12,7 @@ use super::{
     poller::{Poller, Ready},
     unix::Detached,
 };
+use crate::slots::{Slots, page_reserve};
 use crate::{
     backend::{Event, Operation, Outcome, Request},
     fs::watch::Ring,
@@ -55,10 +56,10 @@ impl Entry {
     }
 }
 pub(super) struct Watches {
-    entries: Vec<Option<Entry>>,
+    entries: Slots<Entry>,
     /// Indices of occupied entries, so event dispatch never scans every handle slot.
     active: Vec<usize>,
-    ops: Vec<Option<Handle>>,
+    ops: Slots<Handle>,
     ready: VecDeque<Handle>,
     cancelled: VecDeque<OpId>,
     pool: BufferPool,
@@ -90,16 +91,16 @@ fn basename(path: &FsPath) -> Box<[u8]> {
 impl Watches {
     pub fn new(config: &Config, pool: BufferPool) -> Self {
         Self {
-            entries: (0..config.max_handles).map(|_| None).collect(),
-            active: Vec::with_capacity(config.max_handles),
-            ops: vec![None; config.max_operations],
-            ready: VecDeque::with_capacity(config.max_handles),
-            cancelled: VecDeque::with_capacity(config.max_operations),
+            entries: Slots::new(config.max_handles),
+            active: Vec::with_capacity(page_reserve(config.max_handles)),
+            ops: Slots::new(config.max_operations),
+            ready: VecDeque::with_capacity(page_reserve(config.max_handles)),
+            cancelled: VecDeque::with_capacity(page_reserve(config.max_operations)),
             pool,
             #[cfg(any(target_os = "linux", target_os = "android"))]
             inotify: None,
             #[cfg(target_os = "macos")]
-            fsevents: fsevents::Streams::new(config.max_handles),
+            fsevents: fsevents::Streams::new(),
         }
     }
     #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]

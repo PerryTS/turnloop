@@ -44,7 +44,7 @@ loom.workspace = true
 role = "core"
 wasi-lib-tests = true
 loom-filters = ["models"]
-miri-filters = ["timer::tests", "table::tests"]
+miri-filters = ["timer::tests", "table::tests", "slots::tests"]
 
 [target.'cfg(all(target_os = "wasi", target_env = "p2"))'.dependencies]
 wasip2 = "1.0.3"

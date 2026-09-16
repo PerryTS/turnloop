@@ -27,6 +27,9 @@ use turnloop::*;
 struct Counting;
 use std::cell::Cell;
 thread_local! { static ACTIVE: Cell<bool> = const { Cell::new(false) }; static ALLOCS: Cell<usize> = const { Cell::new(0) }; }
+// Bytes requested while counting. A single oversized reservation is one
+// allocation, so gates about a capacity *ceiling* have to weigh it, not count it.
+thread_local! { static BYTES: Cell<usize> = const { Cell::new(0) }; }
 #[cfg(windows)]
 static ALL_THREADS_ACTIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -50,10 +53,9 @@ fn record(layout: Layout) {
             slot[2].store(layout.align(), Relaxed);
         }
     }
-    #[cfg(not(windows))]
-    let _ = layout;
     if ACTIVE.try_with(Cell::get).unwrap_or(false) {
         let _ = ALLOCS.try_with(|n| n.set(n.get() + 1));
+        let _ = BYTES.try_with(|n| n.set(n.get() + layout.size()));
     }
 }
 // SAFETY: all allocation calls are forwarded unchanged to System. Counters only
@@ -81,6 +83,112 @@ unsafe impl GlobalAlloc for Counting {
 }
 #[global_allocator]
 static ALLOCATOR: Counting = Counting;
+
+/// `max_handles` is a ceiling, not a preallocation: raising it must not make an
+/// idle loop cost more.
+///
+/// The handle table, the timer index and every backend array addressed by a slot
+/// index build page zero with the loop and another page only as the high-water
+/// mark rises. Weighed in bytes as well as counted, because one oversized
+/// reservation is a single allocation — which is exactly how the cost used to
+/// hide.
+#[test]
+fn an_idle_loop_costs_the_same_at_any_ceiling() {
+    // Take the process-wide lazy initialisation out of the measurement.
+    drop(Loop::new(Config::default()).expect("warm"));
+    let mut measured = Vec::new();
+    for max_handles in [1024usize, 1024 * 1024] {
+        let config = Config {
+            max_handles,
+            ..Config::default()
+        };
+        ALLOCS.with(|n| n.set(0));
+        BYTES.with(|n| n.set(0));
+        ACTIVE.with(|v| v.set(true));
+        let l = Loop::new(config).expect("loop");
+        ACTIVE.with(|v| v.set(false));
+        measured.push((ALLOCS.with(Cell::get), BYTES.with(Cell::get)));
+        drop(l);
+    }
+    let (small, large) = (measured[0], measured[1]);
+    assert!(
+        small.0 > 0 && small.1 > 0,
+        "the allocator must see the loop being built"
+    );
+    assert_eq!(
+        small.0, large.0,
+        "a 1024x larger ceiling made {} allocations instead of {}",
+        large.0, small.0
+    );
+    assert_eq!(
+        small.1, large.1,
+        "a 1024x larger ceiling reserved {} bytes instead of {}",
+        large.1, small.1
+    );
+}
+
+/// A loop pinned at its high-water mark allocates nothing per turn.
+///
+/// Pages are built as the mark rises, so growth allocates and a steady state
+/// does not. This is the gate that keeps paging honest: without it, a structure
+/// that quietly rebuilt itself  per turn would still satisfy the ceiling gate above.
+#[test]
+fn a_loop_at_its_high_water_mark_allocates_nothing_per_turn() {
+    // A ceiling far above the working set, so the mark below is nowhere near it.
+    let mut l = Loop::new(Config {
+        max_handles: 1024 * 1024,
+        max_operations: 1024 * 1024,
+        ..Config::default()
+    })
+    .expect("loop");
+    let mut out = Completions::with_capacity(64);
+    // Raise the high-water mark well past page zero, and hold it there.
+    let held: Vec<Handle> = (0..500)
+        .map(|i| {
+            l.timer(l.now() + Duration::from_secs(600), None, Token(i))
+                .expect("within the ceiling")
+        })
+        .collect();
+    assert!(
+        held.iter().map(|h| h.index()).max().expect("held") >= 499,
+        "the mark did not rise past page zero, so this would gate nothing"
+    );
+    // One churn cycle at the mark, to settle any first-use storage the loop
+    // reaches only when a slot is reused rather than built.
+    let churn = |l: &mut Loop, out: &mut Completions, token: u64| {
+        let h = l
+            .timer(l.now() + Duration::from_secs(600), None, Token(token))
+            .expect("a slot at the mark");
+        let op = l.timer_op(h).expect("timer op");
+        assert!(l.cancel(op));
+        l.close(h, Token(token)).expect("close");
+        let mut terminals = 0;
+        while terminals < 2 {
+            let info = l.turn(Timeout::Now, out).expect("turn");
+            assert_eq!(info.os_waits, 0, "queued work must not wait");
+            for c in out.drain() {
+                assert!(c.terminal);
+                terminals += 1;
+            }
+        }
+    };
+    churn(&mut l, &mut out, 1_000);
+    ALLOCS.with(|n| n.set(0));
+    BYTES.with(|n| n.set(0));
+    ACTIVE.with(|v| v.set(true));
+    for token in 0..1000u64 {
+        churn(&mut l, &mut out, 2_000 + token);
+    }
+    ACTIVE.with(|v| v.set(false));
+    assert_eq!(
+        (ALLOCS.with(Cell::get), BYTES.with(Cell::get)),
+        (0, 0),
+        "a loop at its high-water mark allocated while turning"
+    );
+    for h in held {
+        l.close(h, Token(0)).expect("close");
+    }
+}
 
 #[test]
 fn queued_posts_and_terminals_with_idle_udp_allocate_nothing() {

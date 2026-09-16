@@ -50,6 +50,7 @@ mod native;
 pub use native::*;
 mod completion;
 mod driver;
+mod slots;
 mod table;
 #[doc(hidden)]
 pub mod timer;

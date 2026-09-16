@@ -1,5 +1,6 @@
 //! WASI 0.2 completion backend. One poll import per turn, reusable canonical
 //! lists, and synchronous nonblocking I/O with generational cancellation.
+use crate::slots::{Slots, page_reserve};
 mod abi;
 mod fs;
 mod sockopt;
@@ -116,13 +117,13 @@ enum PollOwner {
 }
 /// WASI 0.2 pollable driver with retained canonical buffers.
 pub struct WasiP2 {
-    resources: Vec<Option<Resource>>,
-    ops: Vec<Option<Pending>>,
+    resources: Slots<Resource>,
+    ops: Slots<Pending>,
     ready: VecDeque<Handle>,
     cancelled: VecDeque<OpId>,
     handles: Vec<u32>,
     owners: Vec<PollOwner>,
-    lookups: Vec<Option<Lookup>>,
+    lookups: Slots<Lookup>,
     indices: Vec<usize>,
     poll_storage: Vec<u32>,
     scratch: Vec<u32>,
@@ -388,22 +389,27 @@ unsafe impl Backend for WasiP2 {
         self.files.submit(op, handle, request)
     }
     fn new(config: &Config, pool: BufferPool) -> Result<Self> {
+        // The most pollables this loop could ever subscribe at once. Still
+        // computed, because an overflow here is a configuration this backend
+        // cannot serve; the poll batch below reserves a page of it and grows
+        // with the pollables actually subscribed, not with the ceiling.
         let polls = config
             .max_handles
             .checked_mul(2)
             .and_then(|n| n.checked_add(config.max_operations))
             .and_then(|n| n.checked_add(1))
             .ok_or(Error::new(ErrorKind::ResourceLimit))?;
+        let batch = page_reserve(polls);
         Ok(Self {
-            resources: (0..config.max_handles).map(|_| None).collect(),
-            ops: (0..config.max_operations).map(|_| None).collect(),
-            ready: VecDeque::with_capacity(config.max_handles),
-            cancelled: VecDeque::with_capacity(config.max_operations),
-            handles: Vec::with_capacity(polls),
-            owners: Vec::with_capacity(polls),
-            lookups: (0..config.max_operations).map(|_| None).collect(),
-            indices: Vec::with_capacity(polls),
-            poll_storage: vec![0; polls],
+            resources: Slots::new(config.max_handles),
+            ops: Slots::new(config.max_operations),
+            ready: VecDeque::with_capacity(page_reserve(config.max_handles)),
+            cancelled: VecDeque::with_capacity(page_reserve(config.max_operations)),
+            handles: Vec::with_capacity(batch),
+            owners: Vec::with_capacity(batch),
+            lookups: Slots::new(config.max_operations),
+            indices: Vec::with_capacity(batch),
+            poll_storage: vec![0; batch],
             scratch: vec![0; 16400],
             files: super::wasi_fs::Files::new(config, pool.clone()),
             pool,
@@ -703,6 +709,13 @@ unsafe impl Backend for WasiP2 {
         if self.handles.is_empty() {
             // No native source can ever wake a Forever wait on this single agent.
             return Err(Error::new(ErrorKind::Unsupported));
+        }
+        // `poll` lowers its result into `poll_storage` as the canonical return
+        // arena, and returns at most one index per subscribed pollable, so the
+        // arena has to cover exactly that many `u32`s. It grows with the poll
+        // batch; at a steady set of pollables it is already large enough.
+        if self.poll_storage.len() < self.handles.len() {
+            self.poll_storage.resize(self.handles.len(), 0);
         }
         abi::poll(&self.handles, &mut self.poll_storage, &mut self.indices);
         // The private deadline pollable implements this wait's timeout, so its
