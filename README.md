@@ -46,5 +46,6 @@ soak. The workspace also builds with stable Rust 1.97.1.
 - [Design and host boundary](DESIGN.md)
 - [Contributing, checks and private test servers](CONTRIBUTING.md)
 - [Release and first-publication procedure](RELEASING.md)
+- [Multi-threaded accept](docs/multi-threaded-accept.md)
 - [Integration status and verification](docs/INTEGRATION_REPORT.md)
 - [MIT license](LICENSE)

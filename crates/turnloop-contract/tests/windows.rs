@@ -25,6 +25,8 @@ contract!(
     occupancy_classes_do_not_starve_each_other,
     long_jobs_settle_once_on_cancel_panic_and_shutdown,
     handoff_distribution,
+    handoff_accept_exactly_once,
+    kernel_accept_exactly_once,
     writev_and_shutdown,
     capacity_and_stale_ids,
     paged_growth_preserves_handles,
@@ -88,24 +90,13 @@ fn sockets_pass_to_child_and_back() {
 fn four_loops_cross_post() {
     turnloop_contract::cross_post::<Platform>(4, 1000);
 }
+/// Windows has no SO_REUSEPORT, and SO_REUSEADDR there permits *hijacking* an
+/// address rather than sharing it, so it must not stand in for either request.
+/// Both are refused, which leaves `detach`/`attach` as the only multi-core
+/// accept route on this platform — `handoff_accept_exactly_once` above.
 #[test]
 fn reuse_port_is_explicitly_unsupported() {
-    let mut driver = Loop::new(Config::default()).expect("loop");
-    let result = driver.tcp_listen(
-        ([127, 0, 0, 1], 0).into(),
-        &ListenOpts {
-            reuse_port: true,
-            ..ListenOpts::default()
-        },
-    );
-    assert!(matches!(
-        result,
-        Err(Error {
-            kind: ErrorKind::Unsupported,
-            ..
-        })
-    ));
-    assert!(!driver.alive());
+    turnloop_contract::reuse_port_refused::<Platform>(&[ReusePort::Share, ReusePort::Distribute]);
 }
 #[test]
 fn gui_event_receives_cross_thread_posts() {

@@ -45,8 +45,14 @@ pub(super) fn open(name: &PipeName, listen: Option<ListenOpts>) -> Result<(Detac
     let fd = unsafe { OwnedFd::from_raw_fd(raw) };
     socket::configure(raw)?;
     if let Some(opts) = listen {
-        if opts.backlog > i32::MAX as u32 || opts.reuse_port {
+        if opts.backlog > i32::MAX as u32 {
             return Err(Error::new(ErrorKind::InvalidInput));
+        }
+        // A filesystem socket has no port for a second bind to contend for, so
+        // there is no SO_REUSEPORT for AF_UNIX on any platform. Report that
+        // rather than binding a listener the request was never applied to.
+        if opts.reuse_port.is_enabled() {
+            return Err(Error::new(ErrorKind::Unsupported));
         }
         // SAFETY: initialized sockaddr of the advertised length, live socket.
         if unsafe { libc::bind(raw, addr.ptr(), len) } < 0 {

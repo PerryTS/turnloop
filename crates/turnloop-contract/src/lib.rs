@@ -279,12 +279,24 @@ mod native {
         long_jobs_settle_once_on_cancel_panic_and_shutdown::<B>();
     }
     #[test]
+    fn reuse_port_share_binds_twice() {
+        reuse_port_share::<B>();
+    }
+    #[test]
     fn reuse_port_distribution() {
-        reuse_port::<B>();
+        reuse_port_distribute::<B>();
     }
     #[test]
     fn accept_handoff_distribution() {
         handoff_distribution::<B>();
+    }
+    #[test]
+    fn multi_threaded_accept_by_handoff() {
+        handoff_accept_exactly_once::<B>();
+    }
+    #[test]
+    fn multi_threaded_accept_by_reuse_port() {
+        kernel_accept_exactly_once::<B>();
     }
 
     #[test]

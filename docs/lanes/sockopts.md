@@ -41,6 +41,7 @@ pub enum SocketOptionKind { NoDelay, KeepAlive, Linger, RecvBufferSize,
                             MulticastTtl, MulticastLoop }
 
 pub struct ListenOpts { reuse_port: bool, backlog: u32, accept_defaults: AcceptDefaults }
+// superseded: reuse_port is now a ReusePort request, see docs/multi-threaded-accept.md
 pub struct AcceptDefaults { nodelay: bool, keep_alive: Option<KeepAlive> }
 ```
 

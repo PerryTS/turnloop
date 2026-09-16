@@ -268,16 +268,19 @@ There are two ways a host drives a loop:
      - **Windows:** a handle's IOCP association is permanent and inescapable. Windows cannot dissociate one, rejects a second `CreateIoCompletionPort` with `ERROR_INVALID_PARAMETER`, and neither `WSADuplicateSocketW` nor `DuplicateHandle` escapes it — both produce another descriptor for the *same* socket or file object, which is where the association lives. Quiescence makes it inert (no packet can ever arrive for it), and the receiving host drives the transport with synchronous/non-blocking Winsock calls or with overlapped calls whose `OVERLAPPED.hEvent` has its low-order bit set, which suppresses the completion packet. A named-pipe instance keeps `FILE_FLAG_OVERLAPPED`, so for a pipe the tagged-`hEvent` form is the only one. The route back to completion-port-driven I/O is `attach`: an imported association is exactly what the IOCP backend's overlapped-event routing exists for.
      - **WASI 0.2/0.3 and web:** `Unsupported`. A WASI socket is a component-model resource handle in the component's own table, not a descriptor, and there is no interface that hands one to the embedder; a browser resource is a host JS object. Neither has an identity a host could act on.
    - **Reporting only:** `Loop::raw_transport(h) -> RawTransport` reports a live transport's native identity for Node's `socket._handle.fd`. The loop keeps ownership; the value is valid until the handle is closed or detached, and is for reporting and read-only queries, never for I/O, closing, mode changes or registration elsewhere.
-6. **Multi-threaded accept:**
-   - **Kernel-balanced:** where the kernel balances load (`SO_REUSEPORT` on Linux/FreeBSD), each loop gets its own listener with `ListenOpts::reuse_port`.
-   - **Everywhere else** (macOS doesn't balance, and on Windows a socket can join only one completion port): one accepting loop hands connections to other loops with `detach`/`attach`. The policy (round-robin, least-loaded) belongs to the host.
+6. **Multi-threaded accept.** One server, more than one core, without a work-stealing loop: a shared loop would have to route every completion back to its owning agent, which rebuilds the per-agent queues and wakeups this crate exists to remove. Two routes, and `ListenOpts::reuse_port` is a `ReusePort` request rather than a `bool` because the two are not the same promise. See [multi-threaded-accept.md](docs/multi-threaded-accept.md).
+   - **Kernel-distributed** (`ReusePort::Distribute`): each loop gets its own listener on the same port and the kernel picks which loop accepts each connection. `SO_REUSEPORT` on **Linux and Android**; `SO_REUSEPORT_LB` on **FreeBSD** (12.0+) — plain `SO_REUSEPORT` there keeps its original BSD meaning and does *not* distribute, so it is not the same option. **`Unsupported` on macOS and the other Apple platforms, NetBSD, OpenBSD, DragonFly, Windows, WASI and the web**, where the listener is refused at creation instead of being bound and starved.
+     - **It distributes by hash, not by load.** The listener is chosen by hashing the connection's 4-tuple; nothing asks how busy a loop is, so a loop whose agent is in a long turn keeps being given its share and those connections wait. Measured on Linux 6.17 x86-64, 64 connections over 4 loops: `[7, 12, 21, 24]`. Even distribution of connections is not even distribution of work.
+   - **`ReusePort::Share`** is the weaker request — duplicate binding, delivery unspecified — for multicast/broadcast receivers and zero-downtime restarts. It is honest about the BSD behaviour rather than hiding it: measured on macOS 26.5 arm64, two listeners sharing a port with `SO_REUSEPORT` split 32 connections `[0, 32]`, all to the last binder.
+   - **Handoff, everywhere else:** one accepting loop hands each connection to a sibling loop with `detach`/`attach`. The policy (round-robin, least-loaded) belongs to the host. This works today on every native backend and is the **only** route on Windows, where a socket joins exactly one completion port permanently.
 7. **Per-agent timers.** Each loop's timer heap belongs to its agent, which replaces Perry's owner-tagged global timer queues.
 8. **Web:** a loop per Web Worker instance. Cross-worker posting goes through host `postMessage`. With cross-origin isolation, a `SharedArrayBuffer` ring plus `Atomics.notify` can back a `Poster` without message copies.
 9. **Contract tests:**
    - N loops on N threads cross-posting under load
    - completions only on the owning thread (debug assertion)
    - detach/attach under in-flight I/O
-   - reuse-port and accept-and-hand-off distribution
+   - reuse-port share/distribute behaviour, and refusal where a platform cannot honour the request
+   - accept-and-hand-off distribution, and N loops on N threads serving one port by each route with every connection served exactly once
    - signal fan-out
    - `waitAsync` service fairness
    - a loop on a non-main thread (iOS/Android shape)
@@ -460,6 +463,7 @@ Two backends, because both versions matter now:
 | Timer wait precision | ns (epoll_pwait2 / timerfd) | ns (kevent timespec) | sub-ms via high-res waitable timer | host-dependent (Wasmtime ≈1 ms) | host-dependent (Wasmtime ≈1 ms) | host `setTimeout` (clamped by browser) |
 | TCP / UDP | non-blocking + readiness | non-blocking + readiness | overlapped Winsock | `wasi:sockets` | `wasi:sockets` | unsupported |
 | Socket options (§7.7) | full setsockopt set | full setsockopt set, no IPv4 membership by interface index | full Winsock set, no IPv4 membership by interface index | keep-alive, buffer sizes, hop limit | keep-alive, buffer sizes, hop limit | unsupported |
+| Multi-threaded accept (§5a.6) | `ReusePort::Distribute` or handoff | handoff (`Distribute` refused; macOS gives the port to the last binder) | handoff only (one IOCP per socket, permanently) | unsupported (single-threaded; no reuse interface, no `detach`) | unsupported | unsupported (no listening sockets) |
 | Outbound HTTP | protocol crate | protocol crate | protocol crate | protocol crate or `wasi:http` | protocol crate or `wasi:http` | host `fetch` |
 | WebSocket | protocol crate | protocol crate | protocol crate | protocol crate | protocol crate | host `WebSocket` |
 | Local IPC | AF_UNIX | AF_UNIX | named pipes (overlapped) | unsupported | unsupported | `postMessage` |
@@ -500,7 +504,10 @@ and work on any live socket handle, including one produced by `accept`.
   them, and the web backend refuses all of them.
 - **Bind-time options stay in the opts structs.** `SO_REUSEADDR`/`SO_REUSEPORT`
   cannot be changed on a bound socket, so they belong to `ListenOpts`/`UdpOpts`,
-  not to `SocketOption`. `IPV6_V6ONLY` is readable on a live socket and kept in
+  not to `SocketOption`. `reuse_port` is a `ReusePort` request
+  (`No`/`Share`/`Distribute`) rather than a `bool`, because `SO_REUSEPORT` means
+  different things on Linux and on the BSDs and a backend that cannot honour the
+  requested one refuses the listener (§5a.6). `IPV6_V6ONLY` is readable on a live socket and kept in
   the enum for that, but setting it after bind is refused by every OS.
 - **`ListenOpts::accept_defaults`** carries the per-connection defaults a server
   would otherwise apply by hand: `nodelay` and a keep-alive schedule, each at most

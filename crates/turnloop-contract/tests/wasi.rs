@@ -164,6 +164,16 @@ fn socket_option_accept_defaults() {
 fn socket_option_handle_validation() {
     contract::sockopts::option_handle_validation::<Platform>();
 }
+/// `wasi:sockets` has no address-reuse interface at all, so neither reuse-port
+/// request can be honoured and both are refused at listen time. That leaves WASI
+/// with no multi-core accept route: it is single-threaded in 0.2 and 0.3, and
+/// `detach` is `Unsupported` there too (a socket is a component-model resource
+/// handle in the component's own table, not a descriptor an embedder can adopt).
+#[test]
+fn reuse_port_has_no_wasi_interface() {
+    use turnloop::ReusePort;
+    contract::reuse_port_refused::<Platform>(&[ReusePort::Share, ReusePort::Distribute]);
+}
 #[test]
 fn socket_options_without_a_wasi_interface_are_unsupported() {
     use std::time::Duration;

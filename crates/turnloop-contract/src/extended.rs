@@ -171,26 +171,41 @@ pub fn pool_and_dns<B: Backend>() {
         assert!(out.is_empty());
     }
 }
-pub fn reuse_port<B: Backend>() {
+/// Whether this target's kernel can distribute accepts across listeners, which
+/// is what [`ReusePort::Distribute`] promises. Keep in step with
+/// `backend::socket::reuse_port_option`.
+pub const DISTRIBUTES: bool = cfg!(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd"
+));
+
+/// Bind two listeners to one port with `reuse` and count what each one accepts.
+///
+/// Returns `None` if the *second* bind was refused, which is how a backend
+/// without the option reports itself.
+fn two_listeners<B: Backend>(reuse: ReusePort, connections: usize) -> Option<[usize; 2]> {
     let mut a = Driver::<B>::new(Config::default()).expect("loop a");
     let mut b = Driver::<B>::new(Config::default()).expect("loop b");
     let opts = ListenOpts {
-        reuse_port: true,
+        reuse_port: reuse,
         ..ListenOpts::default()
     };
-    let ah = a.tcp_listen(localhost(), &opts).expect("listen a");
+    let ah = a.tcp_listen(localhost(), &opts).ok()?;
     let addr = a.local_addr(ah).expect("addr");
-    let bh = b.tcp_listen(addr, &opts).expect("listen b same port");
+    let bh = b
+        .tcp_listen(addr, &opts)
+        .expect("second bind of a reused port");
     a.accept_start(ah, Token(1)).expect("accept a");
     b.accept_start(bh, Token(2)).expect("accept b");
-    let clients: Vec<_> = (0..32)
+    let clients: Vec<_> = (0..connections)
         .map(|_| std::net::TcpStream::connect(addr).expect("connect"))
         .collect();
     let mut count = [0usize; 2];
     let mut out = Completions::default();
-    let until = a.now() + Duration::from_secs(3);
+    let until = a.now() + Duration::from_secs(10);
     while count.iter().sum::<usize>() < clients.len() {
-        assert!(a.now() < until);
+        assert!(a.now() < until, "only {count:?} of {connections} accepted");
         for l in [&mut a, &mut b] {
             l.turn(Timeout::Now, &mut out).expect("turn");
             for c in out.drain() {
@@ -199,15 +214,92 @@ pub fn reuse_port<B: Backend>() {
             }
         }
     }
-    assert_eq!(count.iter().sum::<usize>(), 32);
-    // DESIGN §5a explicitly says macOS does not kernel-balance SO_REUSEPORT.
-    if cfg!(any(target_os = "linux", target_os = "freebsd")) {
+    Some(count)
+}
+
+/// [`ReusePort::Share`] permits the duplicate bind and promises nothing else.
+///
+/// Every connection must still be accepted by *someone*, because both sockets
+/// hold the address. Which one is deliberately not asserted: on Linux the kernel
+/// spreads them and on macOS the last binder takes all 32, and `Share` is
+/// honest about covering both.
+pub fn reuse_port_share<B: Backend>() {
+    let Some(count) = two_listeners::<B>(ReusePort::Share, 32) else {
+        // No SO_REUSEPORT on this backend at all; reuse_port_refused covers it.
+        return;
+    };
+    assert_eq!(count.iter().sum::<usize>(), 32, "share {count:?}");
+    eprintln!("reuse-port Share accepts: {count:?}");
+}
+
+/// [`ReusePort::Distribute`] either distributes or refuses the listener.
+///
+/// This is the gate that makes the option honest. There is no third outcome: a
+/// backend may not accept the request and then leave a listener starved. The
+/// starved case is real and is what this exists to prevent — two loops sharing
+/// one port under plain `SO_REUSEPORT` on macOS 26.5 split 32 connections
+/// `[0, 32]`, so a host that developed against Linux would ship a server whose
+/// first loop never accepts anything.
+pub fn reuse_port_distribute<B: Backend>() {
+    let mut l = Driver::<B>::new(Config::default()).expect("loop");
+    let attempt = l.tcp_listen(
+        localhost(),
+        &ListenOpts {
+            reuse_port: ReusePort::Distribute,
+            ..ListenOpts::default()
+        },
+    );
+    if !DISTRIBUTES {
         assert!(
-            count.iter().all(|n| *n > 0),
-            "kernel distribution {count:?}"
+            matches!(
+                attempt,
+                Err(Error {
+                    kind: ErrorKind::Unsupported,
+                    ..
+                })
+            ),
+            "a platform that cannot distribute must refuse, got {attempt:?}"
         );
+        assert!(!l.alive(), "a refused listener leaves nothing behind");
+        return;
     }
-    eprintln!("reuse-port accepts: {count:?}");
+    assert!(attempt.is_ok(), "this platform distributes: {attempt:?}");
+    drop(l);
+    let count = two_listeners::<B>(ReusePort::Distribute, 64).expect("distribute binds");
+    assert_eq!(count.iter().sum::<usize>(), 64, "distribute {count:?}");
+    assert!(
+        count.iter().all(|n| *n > 0),
+        "every listener must be given work: {count:?}"
+    );
+    eprintln!("reuse-port Distribute accepts: {count:?}");
+}
+
+/// Backends with no address-reuse mechanism refuse both requests outright.
+///
+/// A silent no-op is the failure mode this rejects: `Unsupported` at listen time
+/// is recoverable, a listener that never accepts is not diagnosable.
+pub fn reuse_port_refused<B: Backend>(expected: &[ReusePort]) {
+    for &reuse in expected {
+        let mut l = Driver::<B>::new(Config::default()).expect("loop");
+        let attempt = l.tcp_listen(
+            localhost(),
+            &ListenOpts {
+                reuse_port: reuse,
+                ..ListenOpts::default()
+            },
+        );
+        assert!(
+            matches!(
+                attempt,
+                Err(Error {
+                    kind: ErrorKind::Unsupported,
+                    ..
+                })
+            ),
+            "{reuse:?} must be refused, got {attempt:?}"
+        );
+        assert!(!l.alive());
+    }
 }
 pub fn handoff_distribution<B: Backend>() {
     use std::io::{Read, Write};
@@ -604,4 +696,311 @@ pub fn long_jobs_settle_once_on_cancel_panic_and_shutdown<B: Backend>() {
     until("the worker rejoined the idle set", || {
         pool_stats().long_busy == 0
     });
+}
+
+// ---------------------------------------------------------------------------
+// DESIGN §5a.6: multi-threaded accept
+// ---------------------------------------------------------------------------
+
+/// Connections served by one multi-threaded-accept scenario.
+const MT_CONNECTIONS: usize = 64;
+/// Loops, each on its own thread, sharing the port.
+const MT_LOOPS: usize = 4;
+/// Handle ceiling for every loop that serves connections.
+///
+/// Far below `MT_CONNECTIONS`, and that is the point: each loop serves its
+/// connections one at a time and returns the handle, so the workload fits
+/// comfortably — but a handle leaked per connection, at accept, at `attach`, at
+/// `detach` or at `close`, exhausts the ceiling long before the run ends and
+/// turns an invisible orphan into a `ResourceLimit` failure.
+const MT_CEILING: usize = 8;
+
+fn mt_config() -> Config {
+    Config {
+        max_handles: MT_CEILING,
+        max_operations: 64,
+        ..Config::default()
+    }
+}
+
+/// Read one connection's two-byte id, echo it, close the handle and drain the
+/// close. Returns the id, so a caller can prove which connection this was.
+fn serve_one<B: Backend>(l: &mut Driver<B>, h: Handle) -> u16 {
+    let mut out = Completions::default();
+    let until = l.now() + Duration::from_secs(30);
+    let mut got: Vec<u8> = Vec::new();
+    let mut echoed = false;
+    l.read(h, ReadBuf::Pooled, Token(1)).expect("read");
+    while !echoed {
+        assert!(l.now() < until, "connection stalled with {got:?}");
+        l.turn(Timeout::Until(until), &mut out).expect("turn");
+        for c in out.drain() {
+            match c.result {
+                OpResult::Read { n, lease: Some(b) } => {
+                    assert_eq!(n, b.as_slice().len());
+                    got.extend_from_slice(b.as_slice());
+                    if got.len() < 2 {
+                        l.read(h, ReadBuf::Pooled, Token(1)).expect("read more");
+                    } else {
+                        l.write(h, WriteBuf::Owned(got.clone()), Token(2))
+                            .expect("echo");
+                    }
+                }
+                OpResult::Wrote(n) => {
+                    assert_eq!(n, got.len());
+                    echoed = true;
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+    l.close(h, Token(3)).expect("close");
+    let mut closed = false;
+    while !closed {
+        assert!(l.now() < until, "close never completed");
+        l.turn(Timeout::Until(until), &mut out).expect("release");
+        for c in out.drain() {
+            assert!(matches!(c.result, OpResult::Closed), "{:?}", c.result);
+            closed = true;
+        }
+    }
+    assert_eq!(got.len(), 2, "one id per connection");
+    u16::from_le_bytes([got[0], got[1]])
+}
+
+/// Connect, send a distinct id, and require that exact id back.
+///
+/// The echo is what makes "served exactly once" checkable from the outside: a
+/// connection dropped at handoff never answers and this fails on the read.
+fn mt_clients(addr: SocketAddr, count: usize) -> Vec<thread::JoinHandle<()>> {
+    (0..count)
+        .map(|i| {
+            thread::spawn(move || {
+                use std::io::{Read, Write};
+                let mut s = std::net::TcpStream::connect(addr).expect("connect");
+                s.set_read_timeout(Some(Duration::from_secs(30)))
+                    .expect("timeout");
+                s.write_all(&(i as u16).to_le_bytes()).expect("send id");
+                let mut b = [0u8; 2];
+                s.read_exact(&mut b).expect("echo");
+                assert_eq!(u16::from_le_bytes(b), i as u16, "wrong connection answered");
+            })
+        })
+        .collect()
+}
+
+/// Every id was served, once, by someone.
+#[track_caller]
+fn mt_verify(mut served: Vec<u16>, per_loop: &[usize], route: &str) {
+    let total: usize = per_loop.iter().sum();
+    assert_eq!(total, served.len(), "{route}: counts disagree with ids");
+    served.sort_unstable();
+    let expected: Vec<u16> = (0..MT_CONNECTIONS as u16).collect();
+    assert_eq!(
+        served, expected,
+        "{route}: every connection exactly once, none lost or duplicated"
+    );
+    eprintln!("{route}: per-loop {per_loop:?}");
+}
+
+/// One accepting loop, `MT_LOOPS` sibling loops on their own threads, each
+/// connection handed over with `detach`/`attach` and then driven to completion
+/// on the loop that adopted it.
+///
+/// This is DESIGN §5a.6's "everywhere else" route, and on Windows it is the only
+/// one: a socket joins exactly one completion port permanently, so a second loop
+/// can never be given the same listener.
+pub fn handoff_accept_exactly_once<B: Backend>() {
+    let mut acceptor = Driver::<B>::new(mt_config()).expect("acceptor");
+    let listener = acceptor
+        .tcp_listen(localhost(), &ListenOpts::default())
+        .expect("listen");
+    let addr = acceptor.local_addr(listener).expect("addr");
+    let mut senders = Vec::new();
+    let mut workers = Vec::new();
+    for _ in 0..MT_LOOPS {
+        let (tx, rx) = std::sync::mpsc::channel::<B::Detached>();
+        senders.push(tx);
+        workers.push(thread::spawn(move || {
+            let mut l = Driver::<B>::new(mt_config()).expect("worker loop");
+            let mut served = Vec::new();
+            // The acceptor drops its senders when the last connection is gone,
+            // which is this worker's only stop signal.
+            while let Ok(d) = rx.recv_timeout(Duration::from_secs(30)) {
+                let h = l.attach(d, Token(0)).expect("attach");
+                served.push(serve_one(&mut l, h));
+            }
+            assert!(!l.alive(), "worker loop still alive at shutdown");
+            served
+        }));
+    }
+    let clients = mt_clients(addr, MT_CONNECTIONS);
+    // Single-shot accept, re-armed per connection. turnloop#77 is open: a
+    // multishot accept can outrun the handle ceiling within one turn, and this
+    // loop deliberately runs at a low ceiling, so depending on multishot here
+    // would be testing that open issue rather than the handoff.
+    acceptor.accept(listener, Token(0)).expect("accept");
+    let mut handed = 0;
+    let mut out = Completions::default();
+    let until = acceptor.now() + Duration::from_secs(60);
+    while handed < MT_CONNECTIONS {
+        assert!(acceptor.now() < until, "only {handed} accepted");
+        acceptor
+            .turn(Timeout::Until(until), &mut out)
+            .expect("turn");
+        for c in out.drain() {
+            let OpResult::Accepted { conn, .. } = c.result else {
+                panic!("unexpected {:?}", c.result);
+            };
+            let d = acceptor.detach(conn).expect("detach accepted connection");
+            senders[handed % MT_LOOPS].send(d).expect("worker alive");
+            handed += 1;
+            if handed < MT_CONNECTIONS {
+                acceptor.accept(listener, Token(0)).expect("re-arm");
+            }
+        }
+    }
+    drop(senders);
+    for c in clients {
+        c.join().expect("client verified its own id came back");
+    }
+    let mut served = Vec::new();
+    let mut per_loop = Vec::new();
+    for w in workers {
+        let ids = w.join().expect("worker");
+        per_loop.push(ids.len());
+        served.extend(ids);
+    }
+    mt_verify(served, &per_loop, "handoff");
+    acceptor.close(listener, Token(9)).expect("close listener");
+    acceptor.turn(Timeout::Now, &mut out).expect("release");
+    assert!(matches!(out[0].result, OpResult::Closed));
+    assert!(!acceptor.alive(), "acceptor still alive at shutdown");
+}
+
+/// `MT_LOOPS` loops on `MT_LOOPS` threads, each with its own listener on one
+/// shared port, with the kernel choosing which loop accepts each connection.
+///
+/// This is DESIGN §5a.6's kernel-balanced route. It runs only where
+/// [`ReusePort::Distribute`] can be honoured; elsewhere the listener is refused
+/// and [`reuse_port_distribute`] is the test that proves it.
+///
+/// The share each loop receives is deliberately **not** asserted. Distribution
+/// is by 4-tuple hash, so shares are uneven by nature and asserting evenness
+/// would be asserting something the kernel never promised. What is asserted is
+/// the invariant that matters: every connection served exactly once.
+pub fn kernel_accept_exactly_once<B: Backend>() {
+    if !DISTRIBUTES {
+        return;
+    }
+    let opts = ListenOpts {
+        reuse_port: ReusePort::Distribute,
+        ..ListenOpts::default()
+    };
+    let done = Arc::new(AtomicUsize::new(0));
+    let (addr_tx, addr_rx) = std::sync::mpsc::channel::<SocketAddr>();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+    let spawn = |bind: Option<SocketAddr>,
+                 addr_tx: std::sync::mpsc::Sender<SocketAddr>,
+                 ready_tx: std::sync::mpsc::Sender<()>,
+                 done: Arc<AtomicUsize>| {
+        thread::spawn(move || {
+            let mut l = Driver::<B>::new(mt_config()).expect("worker loop");
+            let listener = l
+                .tcp_listen(bind.unwrap_or_else(localhost), &opts)
+                .expect("shared-port listen");
+            if bind.is_none() {
+                addr_tx
+                    .send(l.local_addr(listener).expect("addr"))
+                    .expect("publish addr");
+            }
+            drop(addr_tx);
+            ready_tx.send(()).expect("announce bound");
+            drop(ready_tx);
+            let mut served = Vec::new();
+            let mut out = Completions::default();
+            let until = l.now() + Duration::from_secs(60);
+            // Stop only once every connection has been served by someone: this
+            // loop cannot know its own share in advance, because the kernel
+            // decides it.
+            while done.load(Ordering::Acquire) < MT_CONNECTIONS {
+                // Single-shot, for the turnloop#77 reason in the handoff route.
+                let op = l.accept(listener, Token(0)).expect("accept");
+                let mut conn = None;
+                while conn.is_none() {
+                    assert!(l.now() < until, "accept stalled");
+                    if done.load(Ordering::Acquire) >= MT_CONNECTIONS {
+                        break;
+                    }
+                    l.turn(Timeout::After(Duration::from_millis(2)), &mut out)
+                        .expect("turn");
+                    for c in out.drain() {
+                        match c.result {
+                            OpResult::Accepted { conn: h, .. } => conn = Some(h),
+                            OpResult::Cancelled => {}
+                            other => panic!("unexpected {other:?}"),
+                        }
+                    }
+                }
+                let Some(h) = conn else {
+                    l.cancel(op);
+                    break;
+                };
+                served.push(serve_one(&mut l, h));
+                done.fetch_add(1, Ordering::AcqRel);
+            }
+            // Drain whatever the final cancelled accept left behind.
+            let mut out = Completions::default();
+            l.close(listener, Token(9)).expect("close listener");
+            let until = l.now() + Duration::from_secs(10);
+            while l.alive() {
+                assert!(l.now() < until, "listener never released");
+                l.turn(Timeout::Until(until), &mut out).expect("release");
+                for c in out.drain() {
+                    assert!(
+                        matches!(c.result, OpResult::Closed | OpResult::Cancelled),
+                        "{:?}",
+                        c.result
+                    );
+                }
+            }
+            assert!(!l.alive(), "worker loop still alive at shutdown");
+            served
+        })
+    };
+    let mut workers = vec![spawn(
+        None,
+        addr_tx.clone(),
+        ready_tx.clone(),
+        Arc::clone(&done),
+    )];
+    let addr = addr_rx.recv().expect("first listener published its port");
+    for _ in 1..MT_LOOPS {
+        workers.push(spawn(
+            Some(addr),
+            addr_tx.clone(),
+            ready_tx.clone(),
+            Arc::clone(&done),
+        ));
+    }
+    drop((addr_tx, ready_tx));
+    // No client may connect before every listener holds the port, or the early
+    // connections could only ever reach the loops that had bound.
+    for _ in 0..MT_LOOPS {
+        ready_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("all listeners bound");
+    }
+    let clients = mt_clients(addr, MT_CONNECTIONS);
+    for c in clients {
+        c.join().expect("client verified its own id came back");
+    }
+    let mut served = Vec::new();
+    let mut per_loop = Vec::new();
+    for w in workers {
+        let ids = w.join().expect("worker");
+        per_loop.push(ids.len());
+        served.extend(ids);
+    }
+    mt_verify(served, &per_loop, "reuse-port");
 }
