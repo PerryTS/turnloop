@@ -205,6 +205,12 @@ There are two ways a host drives a loop:
 - A bounded pool: default 4 threads, configurable, lazily started, shared per process or per loop (config).
 - It runs file operations, DNS resolution and host-submitted `FnOnce() -> BlockingResult + Send` jobs, and completes through the notifier.
 - Cancellation is best-effort: a job that has started runs to the end and completes as `Cancelled` if its cancel won the race.
+- **Two occupancy classes, declared by the job rather than by the pool** (`Loop::blocking_with`, issue #42). The bounded set above is right for work whose cost is a computation — hashing, compression, key derivation, a file request — and wrong for work whose cost is a *connection*: an accept loop, a per-connection protocol runtime, a synchronous client driven from its own thread. N of those saturate an N-thread pool and every later short job is refused.
+  - `Occupancy::Bounded` is the default and is exactly the behaviour above: the fixed worker set, the shared queue, `ResourceLimit` when that queue is full.
+  - `Occupancy::Long` is served by a separate worker set that starts threads on demand up to `PoolConfig::long_threads_max` (default 512) and retires them again after `PoolConfig::long_idle_timeout` (default 10 s). **The class has no queue**: a submission is given a thread immediately or refused with `ResourceLimit`, so an accepted long job never waits behind another long job — a long job that waits on a queued long job's progress would otherwise deadlock.
+  - The classes share the process, the completion port and the loop's operation table, and **no thread, queue slot or reservation**. Saturating either therefore refuses and delays nothing in the other, in both directions.
+  - Every job submitted through `blocking_with` receives a `Cancellation`, true once the job was cancelled or its loop was dropped. Nothing interrupts a running worker on any platform, so a long job that never observes it never stops; that is the price of hosting one, and it is the same price tokio's blocking pool charges.
+- **`turnloop::pool_stats()`** reports a deliberately stale, lock-free `PoolStats` — bounded `threads`/`busy`/`queued`/`reserved` and `long_threads`/`long_busy` (issue #44). It answers "should I shed load or run this inline?" before a submission is built, rather than after `ResourceLimit` has already been returned. It is not a consistent snapshot and no invariant may be built on it; the result of a submission remains the exact answer.
 - File I/O goes through the pool on every native platform in 0.x. io_uring and IOCP file I/O are later optimisations behind the same API.
   - **Typed requests** (`Loop::fs`: open, read, write, metadata, directories, namespace changes) use this one shared pool on Linux, macOS/BSD **and Windows**. Requests on one handle run FIFO; only the head is ever queued on the pool, and each accepted request reserves its queue slot, so a full queue rejects before acceptance and a queued successor always starts.
   - **Adopted descriptors** (stdio, `Detached::from_fd`/`from_handle`) keep their stream paths: reusable pool jobs on Unix, and one synchronous worker per handle on Windows. Such a handle may be a pipe or console whose read blocks indefinitely and cannot be cancelled from a shared thread; it must not occupy the pool. This is the only per-handle file worker.
@@ -538,7 +544,7 @@ No other Perry change is needed for P0.
 - Today's `spawn_async` / `spawn_blocking` / `run_pending` assume an ambient tokio `Handle` (`perry-ffi/src/async_runtime.rs:383, 431, 469, 82`), and ext crates call `Handle::current().block_on`.
 - **v2** is token-based on turnloop:
   - `spawn_async` runs on the calling thread's loop executor
-  - `spawn_blocking` goes to the shared pool
+  - `spawn_blocking` goes to the shared pool, at `Occupancy::Bounded` for a computation and `Occupancy::Long` for a caller that holds its thread for a connection's lifetime (the `node:http2` accept loop, the HTTP/2 client and request runtimes, and every database binding running `Handle::current().block_on`, until §5b replaces them)
   - `run_pending` becomes a bounded `turn`
 - **v1 signatures** are kept as shims over v2 where the semantics carry over. Ext crates that call `Handle::current().block_on` are rewritten onto the protocol crates (§5b); there is no tokio fallback.
 

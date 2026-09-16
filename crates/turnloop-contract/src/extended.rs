@@ -1,4 +1,8 @@
 use super::*;
+use std::sync::{
+    Arc, Condvar, Mutex,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 pub fn detach_inflight<B: Backend>() {
     let mut source = Driver::<B>::new(Config::default()).expect("loop");
     let (_, a, b) = pair(&mut source);
@@ -298,4 +302,306 @@ pub fn handoff_distribution<B: Backend>() {
         assert_eq!(w.join().expect("worker"), CONNECTIONS / WORKERS);
     }
     assert_eq!(accepted, CONNECTIONS);
+}
+
+/// A shared release point for fixture jobs, so a held job parks instead of
+/// polling: the tests below hold more threads than a machine has cores.
+struct Gate {
+    open: Mutex<bool>,
+    changed: Condvar,
+}
+impl Gate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            open: Mutex::new(false),
+            changed: Condvar::new(),
+        })
+    }
+    fn wait(&self) {
+        let mut open = self.open.lock().expect("gate");
+        while !*open {
+            open = self.changed.wait(open).expect("gate");
+        }
+    }
+    fn release(&self) {
+        *self.open.lock().expect("gate") = true;
+        self.changed.notify_all();
+    }
+    fn released(&self) -> bool {
+        *self.open.lock().expect("gate")
+    }
+}
+#[track_caller]
+fn until(what: &str, mut ready: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !ready() {
+        assert!(Instant::now() < deadline, "{what}");
+        thread::yield_now();
+    }
+}
+/// Collect exactly one completion for `op`, then prove nothing follows it.
+#[track_caller]
+fn settle<B: Backend>(l: &mut Driver<B>, op: OpId, out: &mut Completions) -> OpResult {
+    let until = l.now() + Duration::from_secs(30);
+    let mut result = None;
+    while result.is_none() {
+        assert!(l.now() < until, "the job never completed");
+        l.turn(Timeout::Until(until), out).expect("turn");
+        for c in out.drain() {
+            assert_eq!(c.op, Some(op), "an unexpected completion arrived");
+            assert!(c.terminal);
+            assert!(result.replace(c.result).is_none(), "delivered twice");
+        }
+    }
+    for _ in 0..5 {
+        l.turn(Timeout::Now, out).expect("drain");
+        assert!(out.is_empty(), "a second completion followed the first");
+    }
+    result.expect("settled")
+}
+/// Neither occupancy class can exhaust the other (issue #42).
+///
+/// Both halves turn on an **ordering** assertion rather than a deadline: the
+/// starved class's job must complete while the saturating class is still held.
+/// A slow machine cannot satisfy that by accident, and a pool with one class
+/// cannot satisfy it at all — 32 connection-lifetime jobs on a four-thread pool
+/// is precisely the deadlock this class exists to remove.
+pub fn occupancy_classes_do_not_starve_each_other<B: Backend>() {
+    let pool = Config::default().blocking_pool;
+    let mut l = Driver::<B>::new(Config::default()).expect("loop");
+    let mut out = Completions::default();
+    // A quiet baseline: another test's worker may still have been retiring.
+    until("the shared pool is quiet", || {
+        let s = pool_stats();
+        s.busy == 0 && s.queued == 0 && s.reserved == 0
+    });
+
+    // Direction 1: a saturated long class refuses and delays no bounded work.
+    let gate = Gate::new();
+    let held = pool.threads * 8;
+    let entered = Arc::new(AtomicUsize::new(0));
+    let long: Vec<OpId> = (0..held)
+        .map(|i| {
+            let (gate, entered) = (gate.clone(), entered.clone());
+            l.blocking_with(
+                move |_| {
+                    entered.fetch_add(1, Ordering::Release);
+                    gate.wait();
+                    Ok(Payload::U64(i as u64))
+                },
+                Occupancy::Long,
+                Token(1000 + i as u64),
+            )
+            .expect("a long job is accepted past the bounded set's size")
+        })
+        .collect();
+    // Every one is *running*: the class hands out threads rather than queueing,
+    // so this cannot be reached unless `held` threads exist at once.
+    until("every long job started", || {
+        entered.load(Ordering::Acquire) == held
+    });
+    let stats = pool_stats();
+    // Simultaneously busy is the load-bearing one: it can only be reached with
+    // `held` distinct threads, so it is what says the class really grew.
+    assert_eq!(stats.long_busy, held, "each holds a long worker of its own");
+    assert!(
+        stats.long_threads >= held,
+        "at least that many long workers"
+    );
+    assert_eq!(stats.busy, 0, "no long job occupies a bounded worker");
+    assert_eq!(stats.queued, 0, "no long job entered the bounded queue");
+    assert_eq!(stats.reserved, 0, "no long job took a queue reservation");
+    assert_eq!(stats.threads, pool.threads, "the bounded set is intact");
+
+    let short = l
+        .blocking(|| Ok(Payload::U64(7)), Token(1))
+        .expect("bounded work is still accepted");
+    assert!(
+        matches!(
+            settle(&mut l, short, &mut out),
+            OpResult::Blocking(Payload::U64(7))
+        ),
+        "a bounded job ran while eight times the bounded set was held long"
+    );
+    assert!(
+        !gate.released(),
+        "it finished before anything released the long jobs"
+    );
+
+    gate.release();
+    let mut settled = 0;
+    let deadline = l.now() + Duration::from_secs(30);
+    while settled < held {
+        assert!(l.now() < deadline, "released long jobs never completed");
+        l.turn(Timeout::Until(deadline), &mut out).expect("turn");
+        for c in out.drain() {
+            assert!(long.contains(&c.op.expect("job completion")));
+            assert!(matches!(c.result, OpResult::Blocking(Payload::U64(_))));
+            settled += 1;
+        }
+    }
+    assert_eq!(
+        settled, held,
+        "every accepted long job settled exactly once"
+    );
+
+    // Direction 2: a saturated bounded class refuses and delays no long work.
+    let gate = Gate::new();
+    let running = Arc::new(AtomicUsize::new(0));
+    let holders: Vec<OpId> = (0..pool.threads)
+        .map(|_| {
+            let (gate, running) = (gate.clone(), running.clone());
+            l.blocking(
+                move || {
+                    running.fetch_add(1, Ordering::Release);
+                    gate.wait();
+                    Ok(Payload::U64(0))
+                },
+                Token(2),
+            )
+            .expect("bounded holder")
+        })
+        .collect();
+    until("every bounded worker is occupied", || {
+        running.load(Ordering::Acquire) == pool.threads
+    });
+    let mut queued = Vec::new();
+    let refused = loop {
+        match l.blocking(|| Ok(Payload::U64(0)), Token(3)) {
+            Ok(op) => queued.push(op),
+            Err(e) => break e,
+        }
+        assert!(queued.len() <= pool.queue_capacity, "queue bound enforced");
+    };
+    assert_eq!(refused.kind, ErrorKind::ResourceLimit);
+    assert_eq!(queued.len(), pool.queue_capacity, "the queue is full");
+    assert_eq!(pool_stats().queued, pool.queue_capacity);
+
+    let long = l
+        .blocking_with(|_| Ok(Payload::U64(9)), Occupancy::Long, Token(4))
+        .expect("a long job is accepted while the bounded class refuses");
+    assert!(matches!(
+        settle(&mut l, long, &mut out),
+        OpResult::Blocking(Payload::U64(9))
+    ));
+    assert!(
+        l.blocking(|| Ok(Payload::U64(0)), Token(3)).is_err(),
+        "the bounded class was still saturated when the long job finished"
+    );
+    assert!(!gate.released(), "nothing released the bounded holders");
+
+    gate.release();
+    let mut settled = 0;
+    let expected = holders.len() + queued.len();
+    let deadline = l.now() + Duration::from_secs(60);
+    while settled < expected {
+        assert!(l.now() < deadline, "released bounded jobs never completed");
+        l.turn(Timeout::Until(deadline), &mut out).expect("turn");
+        for c in out.drain() {
+            assert!(matches!(c.result, OpResult::Blocking(Payload::U64(0))));
+            settled += 1;
+        }
+    }
+    assert_eq!(settled, expected, "every accepted bounded job settled once");
+    assert!(!l.alive());
+}
+/// A long job delivers exactly one completion on every path that is not its own
+/// return: cancellation, a panic, and the loop going away underneath it.
+pub fn long_jobs_settle_once_on_cancel_panic_and_shutdown<B: Backend>() {
+    let mut l = Driver::<B>::new(Config::default()).expect("loop");
+    let mut out = Completions::default();
+
+    // A running long job stops because it was asked to, not because it was
+    // interrupted: nothing can take a thread back from a job that never looks.
+    let started = Arc::new(AtomicBool::new(false));
+    let observed = Arc::new(AtomicBool::new(false));
+    let (running, stopped) = (started.clone(), observed.clone());
+    let op = l
+        .blocking_with(
+            move |stop| {
+                running.store(true, Ordering::Release);
+                while !stop.requested() {
+                    thread::park_timeout(Duration::from_millis(1));
+                }
+                stopped.store(true, Ordering::Release);
+                Ok(Payload::U64(1))
+            },
+            Occupancy::Long,
+            Token(1),
+        )
+        .expect("long job");
+    until("the long job is running", || {
+        started.load(Ordering::Acquire)
+    });
+    assert!(l.cancel(op));
+    assert!(!l.cancel(op), "a second cancel finds it already cancelled");
+    assert!(matches!(settle(&mut l, op, &mut out), OpResult::Cancelled));
+    assert!(
+        observed.load(Ordering::Acquire),
+        "the job returned of its own accord after seeing the request"
+    );
+
+    // A panicking long job is reported to its host and leaves the class usable.
+    // The hook is silenced so an expected panic does not read as a CI failure.
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let op = l
+        .blocking_with(
+            |_| panic!("a long job may panic"),
+            Occupancy::Long,
+            Token(2),
+        )
+        .expect("long job");
+    let result = settle(&mut l, op, &mut out);
+    std::panic::set_hook(hook);
+    assert!(
+        matches!(
+            result,
+            OpResult::Err(Error {
+                kind: ErrorKind::Other,
+                ..
+            })
+        ),
+        "unexpected {result:?}"
+    );
+    let op = l
+        .blocking_with(|_| Ok(Payload::U64(3)), Occupancy::Long, Token(3))
+        .expect("the long class still serves work");
+    assert!(matches!(
+        settle(&mut l, op, &mut out),
+        OpResult::Blocking(Payload::U64(3))
+    ));
+
+    // A dropped loop asks its outstanding long jobs to stop. Without that, a
+    // connection-lifetime job would hold its thread for the process's life and
+    // wait forever for a host that no longer exists.
+    let started = Arc::new(AtomicBool::new(false));
+    let finished = Arc::new(AtomicBool::new(false));
+    let (running, exited) = (started.clone(), finished.clone());
+    let mut doomed = Driver::<B>::new(Config::default()).expect("second loop");
+    doomed
+        .blocking_with(
+            move |stop| {
+                running.store(true, Ordering::Release);
+                while !stop.requested() {
+                    thread::park_timeout(Duration::from_millis(1));
+                }
+                exited.store(true, Ordering::Release);
+                Ok(Payload::U64(4))
+            },
+            Occupancy::Long,
+            Token(4),
+        )
+        .expect("long job");
+    until("the long job is running", || {
+        started.load(Ordering::Acquire)
+    });
+    assert!(doomed.alive(), "an accepted job keeps its loop alive");
+    drop(doomed);
+    until("shutdown released the long worker", || {
+        finished.load(Ordering::Acquire)
+    });
+    until("the worker rejoined the idle set", || {
+        pool_stats().long_busy == 0
+    });
 }

@@ -1167,12 +1167,59 @@ impl<B: Backend> Driver<B> {
         self.signal_stop(h, token)
     }
     /// Submit an owned Send closure to the bounded shared blocking pool.
+    ///
+    /// Equivalent to [`blocking_with`](Self::blocking_with) at
+    /// [`Occupancy::Bounded`], for work that does not need to observe its own
+    /// cancellation.
     pub fn blocking<F: FnOnce() -> BlockingResult + Send + 'static>(
         &mut self,
         f: F,
         token: Token,
     ) -> Result<OpId> {
         self.submit_work(crate::blocking::blocking(f), token)
+    }
+    /// Submit an owned Send closure with an explicit [`Occupancy`] class, and
+    /// hand it the [`Cancellation`] signal of its own job.
+    ///
+    /// [`Occupancy::Bounded`] behaves exactly like [`blocking`](Self::blocking):
+    /// the fixed worker set, the shared queue, `ResourceLimit` when that queue
+    /// is full. [`Occupancy::Long`] is for work that holds its thread for as
+    /// long as a connection lives; it is served by a separate, on-demand worker
+    /// set, so neither class can exhaust the other. The two share this loop's
+    /// operation table, as every operation does, and nothing else.
+    ///
+    /// Delivery is the same single completion for both classes: `Blocking` with
+    /// the payload, `Cancelled` if [`cancel`](Self::cancel) won, or `Err` if the
+    /// job panicked. A refused submission returns here and never completes.
+    ///
+    /// ```no_run
+    /// # use turnloop::*;
+    /// # fn f(l: &mut Loop, accept_one: impl Fn() -> BlockingResult + Send + 'static) -> Result<()> {
+    /// // An accept loop holds its thread until the host asks it to stop.
+    /// l.blocking_with(
+    ///     move |stop| {
+    ///         while !stop.requested() {
+    ///             accept_one()?;
+    ///         }
+    ///         Ok(Payload::U64(0))
+    ///     },
+    ///     Occupancy::Long,
+    ///     Token(1),
+    /// )?;
+    /// # Ok(()) }
+    /// ```
+    pub fn blocking_with<F: FnOnce(&Cancellation) -> BlockingResult + Send + 'static>(
+        &mut self,
+        f: F,
+        occupancy: Occupancy,
+        token: Token,
+    ) -> Result<OpId> {
+        let port = self.work_port.clone();
+        self.submit_job(
+            move |cancel| crate::blocking::blocking_cancellable(f, cancel.clone(), port),
+            occupancy,
+            token,
+        )
     }
     /// Resolve through a host resolver, or the shared native blocking pool.
     pub fn resolve(&mut self, request: crate::DnsRequest, token: Token) -> Result<OpId> {
@@ -1200,11 +1247,24 @@ impl<B: Backend> Driver<B> {
         f: Box<dyn FnOnce() -> Result<crate::blocking::WorkOutput> + Send>,
         token: Token,
     ) -> Result<OpId> {
+        self.submit_job(move |_| f, Occupancy::Bounded, token)
+    }
+    /// Take an operation slot, then hand the pool a job built around that
+    /// operation's cancellation flag. A refused submission retires the slot, so
+    /// a caller that sees an error is owed no completion.
+    fn submit_job<M>(&mut self, make: M, occupancy: Occupancy, token: Token) -> Result<OpId>
+    where
+        M: FnOnce(
+            &std::sync::Arc<std::sync::atomic::AtomicBool>,
+        ) -> Box<dyn FnOnce() -> Result<crate::blocking::WorkOutput> + Send>,
+    {
         let op = self.new_op(None, token)?;
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.ops.get_mut(op.key).expect("new op").job_cancel = Some(cancel.clone());
+        let f = make(&cancel);
         if let Err(e) = crate::blocking::submit(
             self.config.blocking_pool,
+            occupancy,
             op,
             cancel,
             self.work_port.clone(),

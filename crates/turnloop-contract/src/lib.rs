@@ -259,6 +259,14 @@ mod native {
         pool_and_dns::<B>();
     }
     #[test]
+    fn occupancy_classes_are_independent() {
+        occupancy_classes_do_not_starve_each_other::<B>();
+    }
+    #[test]
+    fn long_job_delivery() {
+        long_jobs_settle_once_on_cancel_panic_and_shutdown::<B>();
+    }
+    #[test]
     fn reuse_port_distribution() {
         reuse_port::<B>();
     }

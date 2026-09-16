@@ -28,6 +28,12 @@
 //! # fn main() {}
 //! ```
 //!
+//! Blocking work declares how long it will hold its worker. `Occupancy::Bounded`
+//! is the fixed, queued, backpressured set that short CPU-bound jobs belong on;
+//! `Occupancy::Long` is a separately accounted, on-demand set for work that holds
+//! a thread for a connection's lifetime. Neither class can exhaust the other, and
+//! `pool_stats` reports both without taking a lock.
+//!
 //! Enable the `executor` feature for `executor::LocalExecutor` and futures-io
 //! adapters. Each loop/executor belongs to its creating thread; its notifier and
 //! poster may be cloned onto other threads.
@@ -71,7 +77,7 @@ pub use backend::iocp::Detached;
 pub use backend::unix::Detached;
 
 mod blocking;
-pub use blocking::{DnsRequest, PoolConfig};
+pub use blocking::{Cancellation, DnsRequest, Occupancy, PoolConfig, PoolStats, pool_stats};
 
 mod fs;
 pub use fs::{
