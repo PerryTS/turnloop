@@ -7,6 +7,14 @@ use std::{
 };
 #[cfg(feature = "timer-btree")]
 mod btree;
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    windows
+))]
+mod scaling;
 #[cfg(feature = "timer-btree")]
 use btree::Tree as TimerQueue;
 #[cfg(not(feature = "timer-btree"))]
@@ -271,6 +279,17 @@ fn main() {
     } else {
         Counter::new()
     };
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        windows
+    ))]
+    if std::env::args().any(|a| a == "--accept-scaling") {
+        scaling::run(&counter, &scaling::Args::parse(std::env::args()));
+        return;
+    }
     #[cfg(any(
         target_vendor = "apple",
         target_os = "linux",
