@@ -10,10 +10,21 @@ Three defects, each proven by a runnable probe before anything was changed
 each now covered by a test that fails when its own fix is reverted.
 
 **h2spec's strict suite — 147 tests, a required CI job — passed with all three
-present, and passes unchanged now.** These are cases it does not reach: h2spec
-drives one stream at a time against a server that never resets a stream, never
-closes gracefully and never fills its table, so the afterlife of a terminated
-stream is invisible to it. Everything below lives in that afterlife.
+present, and passes unchanged now.** h2spec drives the subject from the peer side only. Every RST_STREAM in its
+§5.1 "Stream States" family is one *h2spec* sends — `closed: Sends a DATA frame
+after sending RST_STREAM frame`, and so on — never one the server decides to
+send, and the example server never closes gracefully. So the afterlife of a
+stream the server itself terminated, and a table filling with the slots those
+leave behind, are outside what it can reach. §5.1.2 does fill the advertised
+concurrent-stream limit, with a hundred *live* streams, and passes both before
+and after this change because its check accepts a connection error as readily as
+a stream error.
+
+Everything below lives in that afterlife, which is also why §5.1's thirteen
+cases pin the shape of the fix rather than obstruct it: the record for a stream
+the *peer* reset is deliberately kept, so frames after it stay the error §5.1
+asks for, and a HEADERS on a numerically smaller remote id stays a connection
+error for §5.1.1.
 
 ## 1. A reset stream burned its table slot, and the connection then died
 

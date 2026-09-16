@@ -724,10 +724,11 @@ fn proxy_credentials_and_cross_origin_mixed_case_headers() {
 
 // --- HTTP/2 stream-lifetime contract -----------------------------------------
 //
-// Every test below is a case h2spec's strict suite does not reach: h2spec drives
-// one stream at a time against a server that never resets, never closes
-// gracefully and never fills its table, so the afterlife of a terminated stream
-// is invisible to it.
+// h2spec's strict suite drives the subject from the peer side only: every
+// RST_STREAM in its 5.1 "Stream States" family is one h2spec sends, never one
+// the server decides to send, and its example server never closes gracefully.
+// The afterlife of a stream the server itself terminated is outside what it can
+// reach, and that is where every test below lives.
 
 /// Drive `to` until it stops making progress, returning the events it produced.
 /// The loop condition is the documented one: `consumed > 0 || event.is_some()`.
