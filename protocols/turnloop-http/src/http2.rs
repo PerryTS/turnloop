@@ -136,7 +136,7 @@ pub enum Event<'a> {
 /// | `consumed` | `event` | meaning |
 /// |---|---|---|
 /// | `0` | `None` | **stop.** A partial preface or a partial frame; read more input before calling again. |
-/// | `> 0` | `None` | **keep going.** Progress with nothing for the host: the client preface, a SETTINGS acknowledgement, PRIORITY, or an unknown frame type. |
+/// | `> 0` | `None` | **keep going.** Progress with nothing for the host: the client preface, a SETTINGS acknowledgement, PRIORITY, an unknown frame type, or a frame the peer had in flight for a stream that is already gone. |
 /// | `> 0` | `Some` | an event. In HTTP/2 an event always consumes; `consumed == 0` is only ever the stop case. |
 ///
 /// So the loop condition is `consumed > 0 || event.is_some()`:
