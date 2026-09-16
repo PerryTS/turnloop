@@ -82,6 +82,20 @@ pub enum Event<'a> {
     End,
     Upgrade,
 }
+/// One decode step: how much of `input` was consumed, and the event it
+/// produced, if any. See the [step contract](crate#the-step-contract).
+///
+/// **`consumed` and `event` are independent.** All four shapes occur:
+///
+/// | `consumed` | `event` | meaning |
+/// |---|---|---|
+/// | `0` | `None` | **stop.** More input is needed - or the message is over and the decoder is done; the step does not say which. |
+/// | `> 0` | `None` | **keep going.** A chunk-size line, a chunk CRLF or an empty trailer block: progress with nothing for the host. |
+/// | `> 0` | `Some` | an event. |
+/// | `0` | `Some` | an event that reads no input: [`Event::End`] and [`Event::Upgrade`] both arrive this way. |
+///
+/// So the loop condition is `consumed > 0 || event.is_some()`, and a host that
+/// stops on either zero alone is wrong in one of the two directions.
 #[derive(Debug)]
 pub struct Step<'a> {
     pub consumed: usize,

@@ -721,3 +721,591 @@ fn proxy_credentials_and_cross_origin_mixed_case_headers() {
             .is_none()
     );
 }
+
+// --- HTTP/2 stream-lifetime contract -----------------------------------------
+//
+// h2spec's strict suite drives the subject from the peer side only: every
+// RST_STREAM in its 5.1 "Stream States" family is one h2spec sends, never one
+// the server decides to send, and its example server never closes gracefully.
+// The afterlife of a stream the server itself terminated is outside what it can
+// reach, and that is where every test below lives.
+
+/// Drive `to` until it stops making progress, returning the events it produced.
+/// The loop condition is the documented one: `consumed > 0 || event.is_some()`.
+fn drive(to: &mut http2::Connection, input: &mut Vec<u8>) -> Result<Vec<String>, &'static str> {
+    let mut seen = Vec::new();
+    loop {
+        let step = match to.receive(input) {
+            Ok(step) => step,
+            Err(e) => return Err(e.code),
+        };
+        let consumed = step.consumed;
+        let progressed = consumed > 0 || step.event.is_some();
+        if let Some(event) = step.event {
+            seen.push(match event {
+                http2::Event::Settings => "Settings".to_string(),
+                http2::Event::Headers { stream, .. } => format!("Headers s={stream}"),
+                http2::Event::Data { stream, bytes, .. } => {
+                    format!("Data s={stream} n={}", bytes.len())
+                }
+                http2::Event::Reset { stream, code } => format!("Reset s={stream} code={code}"),
+                http2::Event::Unprocessed { stream } => format!("Unprocessed s={stream}"),
+                http2::Event::Goaway { code, .. } => format!("Goaway code={code}"),
+                http2::Event::Ping { ack, .. } => format!("Ping ack={ack}"),
+                http2::Event::WindowUpdate { stream } => format!("WindowUpdate s={stream}"),
+            });
+        }
+        input.drain(..consumed);
+        if !progressed {
+            return Ok(seen);
+        }
+    }
+}
+fn ship(from: &mut http2::Connection) -> Vec<u8> {
+    let wire = from.output().to_vec();
+    from.consume_output(wire.len()).unwrap();
+    wire
+}
+fn post_headers(path: &str) -> Vec<Header> {
+    vec![
+        Header::new(":method", "POST"),
+        Header::new(":scheme", "http"),
+        Header::new(":path", path),
+        Header::new(":authority", "localhost"),
+    ]
+}
+/// A handshaked client/server pair. The server's table holds `streams` streams;
+/// the client's is large, so only the server's is ever under test.
+fn handshake(streams: usize) -> (http2::Connection, http2::Connection) {
+    let mut server = http2::Connection::new(
+        http2::Role::Server,
+        http2::Limits {
+            streams,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut client = http2::Connection::new(http2::Role::Client, http2::Limits::default()).unwrap();
+    let mut wire = ship(&mut client);
+    drive(&mut server, &mut wire).unwrap();
+    let mut wire = ship(&mut server);
+    drive(&mut client, &mut wire).unwrap();
+    let mut wire = ship(&mut client);
+    drive(&mut server, &mut wire).unwrap();
+    (client, server)
+}
+
+/// A stream reset while it still holds unreleased DATA must not burn its table
+/// slot. `add_stream` only recycles a closed slot whose credit has been
+/// returned, so a `reset` that left `unreleased` behind leaked the slot for the
+/// life of the connection — and when the table filled, the REFUSED_STREAM came
+/// out of `receive` as a *connection* error and the session died.
+#[test]
+fn h2_reset_with_unreleased_data_keeps_its_table_slot() {
+    for release_first in [true, false] {
+        let (mut client, mut server) = handshake(2);
+        let mut accepted = 0;
+        for i in 0..6 {
+            let path = format!("/{i}");
+            let id = client
+                .open(&post_headers(&path), false)
+                .unwrap_or_else(|e| panic!("client refused open #{i}: {}", e.code));
+            assert_eq!(client.send_data(id, b"hello-body", true).unwrap(), 10);
+            let mut wire = ship(&mut client);
+            match drive(&mut server, &mut wire) {
+                // Accepted means the request arrived - not merely that the
+                // connection survived. A burnt table slot answers RST_STREAM.
+                Ok(events) => {
+                    assert_eq!(
+                        events,
+                        vec![format!("Headers s={id}"), format!("Data s={id} n=10")],
+                        "stream #{i} was refused (release_first={release_first})"
+                    );
+                    accepted += 1;
+                }
+                Err(code) => panic!(
+                    "server failed the connection on stream #{i} (release_first={release_first}): {code}"
+                ),
+            }
+            if release_first {
+                // The host that already knows about finding 1 and works around it.
+                assert_eq!(server.unreleased(id), Some(10));
+                server.release_capacity(id, 10).unwrap();
+            }
+            assert!(server.reset(id, 8).is_ok());
+            // Ship RST_STREAM and any WINDOW_UPDATEs back so the client retires
+            // its own record: the client's peer-stream limit must not be what
+            // refuses the next open.
+            let mut back = ship(&mut server);
+            drive(&mut client, &mut back).unwrap();
+        }
+        assert_eq!(accepted, 6, "release_first={release_first}");
+    }
+}
+
+/// A reset returns the stream's outstanding connection-level credit. Without
+/// it the connection window shrinks by every un-released byte of every reset
+/// stream until the peer can no longer send at all.
+#[test]
+fn h2_reset_returns_the_connection_window() {
+    let (mut client, mut server) = handshake(100);
+    let body = vec![7u8; 16384];
+    let mut charged = 0;
+    for i in 0..4 {
+        let id = client.open(&post_headers(&format!("/{i}")), false).unwrap();
+        assert_eq!(client.send_data(id, &body, false).unwrap(), 16384);
+        charged += 16384;
+        let mut wire = ship(&mut client);
+        drive(&mut server, &mut wire).unwrap();
+        server.reset(id, 8).unwrap();
+        let mut back = ship(&mut server);
+        drive(&mut client, &mut back).unwrap();
+    }
+    // Every charged byte came back as connection credit, so the client can
+    // still fill a fresh 65535-byte connection window.
+    assert!(charged > 0);
+    let id = client.open(&post_headers("/last"), false).unwrap();
+    let mut sent = 0;
+    while sent < 65535 {
+        let n = client
+            .send_data(id, &body[..(65535 - sent).min(16384)], false)
+            .unwrap();
+        assert_ne!(n, 0, "connection window shrank by {charged} reset bytes");
+        sent += n;
+    }
+    assert_eq!(sent, 65535);
+}
+
+/// Frames the peer had in flight when we reset a stream arrive after the
+/// RST_STREAM. RFC 9113 §5.1: the endpoint that *sent* RST_STREAM must be
+/// prepared to receive them, and may ignore them. Failing the connection here
+/// is a race no host can avoid.
+#[test]
+fn h2_late_frames_for_a_locally_reset_stream_are_ignored() {
+    let (mut client, mut server) = handshake(100);
+    let id = client.open(&post_headers("/x"), false).unwrap();
+    let mut wire = ship(&mut client);
+    drive(&mut server, &mut wire).unwrap();
+    server.reset(id, 8).unwrap();
+    let _ = ship(&mut server);
+    // The client has not seen the RST_STREAM yet.
+    assert_eq!(client.send_data(id, b"in-flight", false).unwrap(), 9);
+    client.reset(id, 8).unwrap();
+    let mut late = ship(&mut client);
+    let events = drive(&mut server, &mut late).expect("late frames must not fail the connection");
+    assert_eq!(events, Vec::<String>::new());
+    // The connection is still usable.
+    let next = client.open(&post_headers("/y"), true).unwrap();
+    let mut wire = ship(&mut client);
+    assert_eq!(
+        drive(&mut server, &mut wire).unwrap(),
+        vec![format!("Headers s={next}")]
+    );
+}
+
+/// A client that aborts a request resets the stream while the server's response
+/// is already on the wire. Those HEADERS and DATA arrive for a stream whose
+/// record is gone, and used to end the whole session — on the most ordinary
+/// client operation there is.
+#[test]
+fn h2_response_in_flight_when_the_client_aborts_is_ignored() {
+    let (mut client, mut server) = handshake(100);
+    let first = client.open(&post_headers("/abort"), true).unwrap();
+    let mut wire = ship(&mut client);
+    drive(&mut server, &mut wire).unwrap();
+    // The server answers; the client aborts before the answer lands.
+    server
+        .send_headers(first, &[Header::new(":status", "200")], false)
+        .unwrap();
+    server.send_data(first, b"payload", true).unwrap();
+    client.reset(first, 8).unwrap();
+    let _ = ship(&mut client);
+    let mut answer = ship(&mut server);
+    assert_eq!(
+        drive(&mut client, &mut answer).expect("an aborted request must not fail the session"),
+        Vec::<String>::new()
+    );
+    // HPACK survived the discarded block, so the next request still decodes.
+    let second = client.open(&post_headers("/next"), true).unwrap();
+    let mut wire = ship(&mut client);
+    drive(&mut server, &mut wire).unwrap();
+    server
+        .send_headers(second, &[Header::new(":status", "201")], true)
+        .unwrap();
+    let mut answer = ship(&mut server);
+    assert_eq!(
+        drive(&mut client, &mut answer).unwrap(),
+        vec![format!("Headers s={second}")]
+    );
+    // A stream the client never opened is still a connection error.
+    let mut block = Vec::new();
+    hpack::Encoder::new(4096).encode(&[Header::new(":status", "200")], &mut block);
+    let mut wire = Vec::new();
+    http2::encode_frame(1, 4, 99, &block, &mut wire).unwrap();
+    assert_eq!(drive(&mut client, &mut wire), Err("PROTOCOL_ERROR"));
+}
+
+/// A host that buffers a body and releases capacity when the application
+/// consumes it can call `release_capacity` after the stream is gone. That is a
+/// no-op — the credit went back in bulk at termination — not an error.
+#[test]
+fn h2_release_after_termination_is_a_no_op() {
+    let (mut client, mut server) = handshake(100);
+    let id = client.open(&post_headers("/x"), false).unwrap();
+    client.send_data(id, b"body", false).unwrap();
+    let mut wire = ship(&mut client);
+    drive(&mut server, &mut wire).unwrap();
+    assert_eq!(server.unreleased(id), Some(4));
+    server.reset(id, 8).unwrap();
+    assert_eq!(server.unreleased(id), None);
+    server.release_capacity(id, 4).unwrap();
+    // An id this connection has never seen is still an error.
+    assert!(server.release_capacity(99, 4).is_err());
+    assert!(server.unreleased(99).is_none());
+}
+
+/// Exceeding the concurrent-stream limit is a stream error (RFC 9113 §5.1.2),
+/// not a connection error. It was reaching `receive`'s error map as a
+/// REFUSED_STREAM with no case of its own and going out as PROTOCOL_ERROR.
+#[test]
+fn h2_stream_limit_refuses_one_stream_not_the_connection() {
+    let (mut client, mut server) = handshake(2);
+    let mut open = Vec::new();
+    for i in 0..2 {
+        let id = client.open(&post_headers(&format!("/{i}")), false).unwrap();
+        open.push(id);
+    }
+    let mut wire = ship(&mut client);
+    drive(&mut server, &mut wire).unwrap();
+    // A third concurrent stream, over the server's advertised limit of two.
+    // The client is told MAX_CONCURRENT_STREAMS=2, so build the frame by hand.
+    let third = 5;
+    let mut encoder = hpack::Encoder::new(4096);
+    let mut block = Vec::new();
+    encoder.encode(&post_headers("/third"), &mut block);
+    let mut wire = Vec::new();
+    http2::encode_frame(1, 4, third, &block, &mut wire).unwrap();
+    let events = drive(&mut server, &mut wire).expect("stream limit must not fail the connection");
+    assert_eq!(events, vec![format!("Reset s={third} code=7")]);
+    assert_eq!(
+        &server.output()[3..4],
+        &[3],
+        "RST_STREAM answers the refusal"
+    );
+    // The two live streams are untouched.
+    for id in open {
+        server
+            .send_headers(id, &[Header::new(":status", "200")], true)
+            .unwrap();
+    }
+}
+
+/// A stream opened after a graceful GOAWAY is the unavoidable race: the peer
+/// cannot have seen the GOAWAY when it opened. It used to be a connection
+/// error, decided inside `receive` where no host could reach it.
+///
+/// Node sends **no frame at all** here. Measured against Node 26.5.1 with a raw
+/// TCP peer and hand-encoded frames, so no library could shape the answer: no
+/// RST_STREAM, no second GOAWAY, no frame naming the stream; the request never
+/// reaches the application; and the session stays alive and keeps servicing
+/// frames (a PING sent afterwards is still acknowledged). RFC 9113 section 6.8
+/// makes such a stream simply "not processed", to be retried on a new
+/// connection. So the connection reports it and sends nothing: a frame it
+/// emitted could not be un-emitted, and a host that must match Node would then
+/// have no way back.
+#[test]
+fn h2_stream_after_graceful_goaway_is_unprocessed_and_unanswered() {
+    let (mut client, mut server) = handshake(100);
+    server.shutdown().unwrap();
+    let _ = ship(&mut server);
+    let late = client.open(&post_headers("/late"), true).unwrap();
+    let mut wire = ship(&mut client);
+    let events = drive(&mut server, &mut wire).expect("the GOAWAY race must not fail the session");
+    assert_eq!(events, vec![format!("Unprocessed s={late}")]);
+    assert!(
+        server.output().is_empty(),
+        "Node sends nothing here; so must we (got {:?})",
+        server.output()
+    );
+    // HPACK state survived the discarded block, so the session still decodes.
+    let again = client.open(&post_headers("/after"), true).unwrap();
+    let mut wire = ship(&mut client);
+    assert_eq!(
+        drive(&mut server, &mut wire).unwrap(),
+        vec![format!("Unprocessed s={again}")]
+    );
+
+    // The decision belongs to the host, not the connection: one that wants to
+    // answer still can, and gets exactly one RST_STREAM for the stream it names.
+    server.reset(late, 7).unwrap();
+    let out = server.output().to_vec();
+    assert_eq!(out.len(), 13, "one RST_STREAM frame and nothing else");
+    assert_eq!(out[3], 3, "RST_STREAM");
+    assert_eq!(u32::from_be_bytes(out[5..9].try_into().unwrap()), late);
+    assert_eq!(u32::from_be_bytes(out[9..13].try_into().unwrap()), 7);
+}
+
+/// GOAWAY names the last stream that was actually *processed*. A stream that was
+/// reported but declined — refused past the limit, or arriving after our own
+/// GOAWAY — must not advance it: RFC 9113 §6.8 lets the peer retry everything
+/// above `lastStreamID` on a new connection, so naming a declined stream tells
+/// the peer a request was handled when it was not, and it is silently lost.
+#[test]
+fn h2_goaway_names_the_last_processed_stream_not_the_last_seen() {
+    // A stream refused by the concurrent-stream limit.
+    let (mut client, mut server) = handshake(2);
+    let mut live = Vec::new();
+    for i in 0..2 {
+        live.push(client.open(&post_headers(&format!("/{i}")), false).unwrap());
+    }
+    let mut wire = ship(&mut client);
+    drive(&mut server, &mut wire).unwrap();
+    let processed = *live.last().unwrap();
+    let refused = processed + 2;
+    let mut block = Vec::new();
+    hpack::Encoder::new(4096).encode(&post_headers("/over"), &mut block);
+    let mut wire = Vec::new();
+    http2::encode_frame(1, 4, refused, &block, &mut wire).unwrap();
+    assert_eq!(
+        drive(&mut server, &mut wire).unwrap(),
+        vec![format!("Reset s={refused} code=7")]
+    );
+    let _ = ship(&mut server);
+    server.shutdown().unwrap();
+    let out = ship(&mut server);
+    assert_eq!(out[3], 7, "GOAWAY");
+    let named = u32::from_be_bytes(out[9..13].try_into().unwrap()) & 0x7fffffff;
+    assert_eq!(
+        named, processed,
+        "GOAWAY named {named}; stream {refused} was refused, not processed"
+    );
+
+    // And a stream arriving after the GOAWAY does not advance it either. The
+    // client's own peer-stream limit is two, so build this one by hand.
+    let late = refused + 2;
+    let mut wire = Vec::new();
+    http2::encode_frame(1, 4, late, &block, &mut wire).unwrap();
+    assert_eq!(
+        drive(&mut server, &mut wire).unwrap(),
+        vec![format!("Unprocessed s={late}")]
+    );
+    server.shutdown().unwrap();
+    let out = ship(&mut server);
+    let named = u32::from_be_bytes(out[9..13].try_into().unwrap()) & 0x7fffffff;
+    assert_eq!(named, processed, "an unprocessed stream must not be named");
+    // The declined ids are still tolerated on the wire, which is what the
+    // separate watermark buys: late frames for them must not fail the session.
+    server.release_capacity(refused, 0).unwrap();
+    assert!(server.reset(late, 7).is_ok());
+}
+
+/// `goaway` sets the code, the last stream id and the opaque debug data that
+/// `shutdown` cannot express.
+#[test]
+fn h2_goaway_carries_code_last_stream_and_opaque_data() {
+    let (mut client, mut server) = handshake(100);
+    server.goaway(11, 0, b"enhance").unwrap();
+    let mut wire = ship(&mut server);
+    assert_eq!(
+        drive(&mut client, &mut wire).unwrap(),
+        vec!["Goaway code=11"]
+    );
+    assert!(client.open(&post_headers("/after"), true).is_err());
+    // Opaque data over the peer's SETTINGS_MAX_FRAME_SIZE is refused here
+    // rather than sent for the peer to answer with FRAME_SIZE_ERROR.
+    assert_eq!(
+        server.goaway(0, 0, &vec![0; 16384]).err().map(|e| e.code),
+        Some("FRAME_SIZE_ERROR")
+    );
+}
+
+/// `Step`'s two independent zero cases, both normal, neither previously
+/// stated. A host looping while "an event came back" stalls on the second —
+/// at the client preface, before a single frame is read.
+#[test]
+fn h2_step_has_two_independent_zero_cases() {
+    let mut server = http2::Connection::new(http2::Role::Server, http2::Limits::default()).unwrap();
+    // consumed == 0, event == None: a partial preface. Wait for more input.
+    let step = server.receive(&http2::PREFACE[..5]).unwrap();
+    assert_eq!((step.consumed, step.event.is_some()), (0, false));
+
+    let mut wire = http2::PREFACE.to_vec();
+    http2::encode_frame(4, 0, 0, &[], &mut wire).unwrap(); // peer SETTINGS
+    http2::encode_frame(4, 1, 0, &[], &mut wire).unwrap(); // peer SETTINGS ack
+    http2::encode_frame(2, 0, 1, &[0, 0, 0, 0, 0], &mut wire).unwrap(); // PRIORITY
+    let mut shapes = Vec::new();
+    loop {
+        let step = server.receive(&wire).unwrap();
+        let consumed = step.consumed;
+        let progressed = consumed > 0 || step.event.is_some();
+        shapes.push((consumed, step.event.is_some()));
+        wire.drain(..consumed);
+        if !progressed {
+            break;
+        }
+    }
+    assert_eq!(
+        shapes,
+        vec![
+            (24, false), // consumed > 0, event == None: the preface. KEEP GOING.
+            (9, true),   // SETTINGS
+            (9, false),  // consumed > 0, event == None: the SETTINGS ack.
+            (14, false), // consumed > 0, event == None: PRIORITY.
+            (0, false),  // consumed == 0, event == None: exhausted. STOP.
+        ]
+    );
+    // An HTTP/2 event always consumes; only the stop case has consumed == 0.
+    assert!(shapes.iter().all(|(n, event)| !event || *n > 0));
+}
+
+/// `Event::Headers` says which of the three blocks it is, so a host does not
+/// have to duplicate the `received_head` state the core already keeps.
+#[test]
+fn h2_headers_events_name_head_informational_and_trailers() {
+    let (mut client, mut server) = handshake(100);
+    let id = client.open(&post_headers("/x"), false).unwrap();
+    let mut wire = ship(&mut client);
+    drive(&mut server, &mut wire).unwrap();
+    server
+        .send_headers(id, &[Header::new(":status", "103")], false)
+        .unwrap();
+    server
+        .send_headers(id, &[Header::new(":status", "200")], false)
+        .unwrap();
+    server
+        .send_headers(id, &[Header::new("x-trailer", "1")], true)
+        .unwrap();
+    let mut wire = ship(&mut server);
+    let mut kinds = Vec::new();
+    loop {
+        let step = client.receive(&wire).unwrap();
+        let consumed = step.consumed;
+        let progressed = consumed > 0 || step.event.is_some();
+        if let Some(http2::Event::Headers { kind, .. }) = step.event {
+            kinds.push(kind);
+        }
+        wire.drain(..consumed);
+        if !progressed {
+            break;
+        }
+    }
+    assert_eq!(
+        kinds,
+        vec![
+            http2::HeadersKind::Informational,
+            http2::HeadersKind::Head,
+            http2::HeadersKind::Trailers,
+        ]
+    );
+}
+
+/// The HTTP/1 analogue of the same contract (PerryTS/turnloop#50): `Event::End`
+/// arrives with `consumed == 0`, so "consumed means progress" is wrong there in
+/// the opposite direction, and `State::Done` then returns the stop shape
+/// forever.
+#[test]
+fn http1_step_zero_cases_are_the_mirror_image() {
+    let mut decoder = Decoder::new(Mode::Response, Default::default());
+    let mut shapes = Vec::new();
+    let mut wire =
+        b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n4\r\nbody\r\n0\r\n\r\n".to_vec();
+    for _ in 0..9 {
+        let step = decoder.receive(&wire).unwrap();
+        let consumed = step.consumed;
+        shapes.push((consumed, step.event.is_some()));
+        wire.drain(..consumed);
+    }
+    assert_eq!(
+        shapes,
+        vec![
+            (47, true), // Head
+            (3, false), // consumed > 0, event == None: the chunk-size line.
+            (4, true),  // Body
+            (2, false), // consumed > 0, event == None: the chunk CRLF.
+            (3, false), // consumed > 0, event == None: the terminating size.
+            (2, false), // consumed > 0, event == None: the empty trailer block.
+            (0, true),  // consumed == 0, event == Some(End): #50's shape.
+            (0, false), // State::Done: the stop shape, and it never changes.
+            (0, false),
+        ]
+    );
+}
+
+/// The step contract is only worth stating if the conditions it rules out
+/// actually break. These two loops are the ones hosts wrote, one per decoder.
+#[test]
+fn step_contract_rejects_both_wrong_loop_conditions() {
+    // HTTP/2, "loop while an event came back": stalls at the client preface,
+    // before a single frame is read, so the connection never starts.
+    let mut server = http2::Connection::new(http2::Role::Server, http2::Limits::default()).unwrap();
+    let mut wire = http2::PREFACE.to_vec();
+    http2::encode_frame(4, 0, 0, &[], &mut wire).unwrap();
+    let full = wire.len();
+    let mut events = 0;
+    loop {
+        let step = server.receive(&wire).unwrap();
+        let consumed = step.consumed;
+        let Some(_event) = step.event else { break };
+        events += 1;
+        wire.drain(..consumed);
+    }
+    assert_eq!(events, 0);
+    assert_eq!(wire.len(), full, "not one byte was read");
+    // And the stall is not recoverable in place: `receive` has already advanced
+    // past the preface, so a host that did not drain `consumed` now feeds it
+    // back and the connection fails.
+    assert_eq!(
+        server.receive(&wire).err().map(|e| e.code),
+        Some("FRAME_SIZE_ERROR")
+    );
+
+    // The documented condition reaches the peer's SETTINGS.
+    let mut server = http2::Connection::new(http2::Role::Server, http2::Limits::default()).unwrap();
+    let mut events = 0;
+    loop {
+        let step = server.receive(&wire).unwrap();
+        let consumed = step.consumed;
+        let progressed = consumed > 0 || step.event.is_some();
+        events += usize::from(step.event.is_some());
+        wire.drain(..consumed);
+        if !progressed {
+            break;
+        }
+    }
+    assert_eq!(events, 1);
+    assert!(wire.is_empty());
+
+    // HTTP/1, "loop while input was consumed": drops `Event::End`, which reads
+    // no input at all (PerryTS/turnloop#50).
+    let message = b"HTTP/1.1 204 No Content\r\n\r\n";
+    let mut decoder = Decoder::new(Mode::Response, Default::default());
+    let mut wire = message.to_vec();
+    let mut ended = false;
+    loop {
+        let step = decoder.receive(&wire).unwrap();
+        if step.consumed == 0 {
+            break;
+        }
+        ended |= matches!(step.event, Some(Event::End));
+        wire.drain(..step.consumed);
+    }
+    assert!(
+        !ended,
+        "Event::End consumes nothing, so this loop never sees it"
+    );
+    // The documented condition does see it.
+    let mut decoder = Decoder::new(Mode::Response, Default::default());
+    let mut wire = message.to_vec();
+    let mut ended = false;
+    loop {
+        let step = decoder.receive(&wire).unwrap();
+        let consumed = step.consumed;
+        let progressed = consumed > 0 || step.event.is_some();
+        ended |= matches!(step.event, Some(Event::End));
+        wire.drain(..consumed);
+        if !progressed {
+            break;
+        }
+    }
+    assert!(ended);
+}

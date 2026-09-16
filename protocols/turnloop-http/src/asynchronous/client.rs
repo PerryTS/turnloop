@@ -399,6 +399,7 @@ impl<B: Backend> Client<B> {
                                 stream,
                                 headers,
                                 end_stream,
+                                ..
                             } if stream == id => {
                                 if response.is_none() {
                                     let status = headers
@@ -488,6 +489,7 @@ impl<B: Backend> Client<B> {
                                         stream,
                                         headers,
                                         end_stream,
+                                        ..
                                     } if stream == id => {
                                         if response.is_none() {
                                             let status = headers
