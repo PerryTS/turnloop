@@ -212,6 +212,75 @@ pub struct TcpOpts {
     /// Disable the TCP Nagle algorithm for latency-sensitive small writes.
     pub nodelay: bool,
 }
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+/// What a second bind of the same address is allowed to do.
+///
+/// `SO_REUSEPORT` is spelled the same on Linux and on the BSDs and **does not
+/// mean the same thing**. On Linux it both permits the duplicate bind and
+/// distributes incoming connections across every listener holding the address.
+/// On macOS and the other BSDs the same option permits the duplicate bind and
+/// then hands new connections to the socket that bound *last*, so a second
+/// listener silently takes the whole port and the first one accepts nothing.
+///
+/// A `bool` cannot express that difference, so it is not one. Each variant here
+/// names the behaviour the caller is asking the kernel for, and a backend that
+/// cannot provide it refuses the listener with `Unsupported` at creation rather
+/// than binding a socket that will never be given any work.
+///
+/// The variants are ordered by strength, and a platform may satisfy a request
+/// with something stronger: [`Share`](Self::Share) on Linux is the same
+/// `setsockopt` as [`Distribute`](Self::Distribute) and does distribute. What a
+/// variant guarantees is a floor, never a ceiling.
+pub enum ReusePort {
+    /// Exclusive bind: no other socket may hold this address (the default).
+    #[default]
+    No,
+    /// Permit the duplicate bind, and promise nothing about delivery.
+    ///
+    /// Several sockets may hold the address at once; which one receives a given
+    /// connection or datagram is the platform's business. This is the variant
+    /// for the traditional BSD uses — receiving multicast or broadcast datagrams
+    /// in several processes, and handing a port to a replacement process during
+    /// a zero-downtime restart — where last-binder-wins is the desired effect
+    /// rather than a defect.
+    ///
+    /// Supported wherever `SO_REUSEPORT` exists: Linux, Android, macOS and the
+    /// BSDs. `Unsupported` on Windows, WASI and the web, and on Unix local
+    /// (`AF_UNIX`) listeners.
+    Share,
+    /// Permit the duplicate bind **and** spread incoming connections across
+    /// every listener holding the address.
+    ///
+    /// This is the kernel-balanced route of DESIGN §5a: N loops on N threads
+    /// each bind the same port, and the kernel decides which loop accepts each
+    /// connection, with no shared accept lock and no handoff.
+    ///
+    /// **It distributes by hash, not by load.** Linux selects the listener by
+    /// hashing the connection's address 4-tuple; FreeBSD's `SO_REUSEPORT_LB`
+    /// does the same. Neither asks how busy a listener is, so a loop whose agent
+    /// is blocked in a long turn keeps being given its share of new connections
+    /// and they wait in its queue. Even distribution of *connections* is not
+    /// even distribution of *work*, and a host that needs the latter wants the
+    /// handoff route ([`Loop::detach`]/[`Loop::attach`]), where the policy is
+    /// the host's to write.
+    ///
+    /// Supported on Linux and Android (`SO_REUSEPORT`) and on FreeBSD
+    /// (`SO_REUSEPORT_LB`, FreeBSD 12.0+). **`Unsupported` on macOS and other
+    /// Apple platforms, on NetBSD, OpenBSD and DragonFly, on Windows, on WASI
+    /// and on the web** — none of them has an option that distributes, and
+    /// accepting the request by setting plain `SO_REUSEPORT` would produce
+    /// exactly the silently-starved listener this variant exists to prevent.
+    ///
+    /// [`Loop::detach`]: crate::Driver::detach
+    /// [`Loop::attach`]: crate::Driver::attach
+    Distribute,
+}
+impl ReusePort {
+    /// Whether this request needs a duplicate bind at all.
+    pub const fn is_enabled(self) -> bool {
+        !matches!(self, Self::No)
+    }
+}
 #[derive(Clone, Copy, Debug)]
 /// Listener backlog, kernel reuse-port configuration and accepted-socket defaults.
 ///
@@ -220,8 +289,8 @@ pub struct TcpOpts {
 /// by the backend to every TCP listener it binds (TIME_WAIT rebinding). Neither
 /// can be changed on a socket that is already bound, so neither is an option.
 pub struct ListenOpts {
-    /// Enable SO_REUSEPORT when supported; macOS does not promise balanced accepts.
-    pub reuse_port: bool,
+    /// What a second bind of this address may do; see [`ReusePort`].
+    pub reuse_port: ReusePort,
     /// Maximum pending connection backlog requested from the OS.
     pub backlog: u32,
     /// Options applied to every connection this listener accepts.
@@ -230,7 +299,7 @@ pub struct ListenOpts {
 impl Default for ListenOpts {
     fn default() -> Self {
         Self {
-            reuse_port: false,
+            reuse_port: ReusePort::No,
             backlog: 128,
             accept_defaults: AcceptDefaults::EMPTY,
         }
@@ -393,9 +462,13 @@ pub enum SocketOptionKind {
 /// UDP binding options. Reuse is bind-time only and stays here, not in
 /// [`SocketOption`]; everything changeable on a live socket is an option.
 pub struct UdpOpts {
-    /// Enable SO_REUSEPORT when supported; macOS does not promise balanced accepts.
-    /// Defaults to false: a live UDP endpoint cannot be shared by another bind.
-    pub reuse_port: bool,
+    /// What a second bind of this address may do; see [`ReusePort`].
+    ///
+    /// Defaults to [`ReusePort::No`]: a live UDP endpoint cannot be shared by
+    /// another bind. [`ReusePort::Share`] is the variant multicast and broadcast
+    /// receivers want; [`ReusePort::Distribute`] spreads *datagrams* across the
+    /// bound sockets on the platforms that can, and is refused elsewhere.
+    pub reuse_port: ReusePort,
 }
 
 /// The fd/event is borrowed from the driver; it must never be closed by the host.

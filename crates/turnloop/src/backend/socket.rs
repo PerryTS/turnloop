@@ -1,5 +1,5 @@
 use super::poller::last_error;
-use crate::{Error, ErrorKind, Result};
+use crate::{Error, ErrorKind, Result, ReusePort};
 use std::{
     mem::{size_of, zeroed},
     net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
@@ -94,6 +94,37 @@ impl Addr {
             }
             _ => Err(Error::new(ErrorKind::InvalidInput)),
         }
+    }
+}
+/// The `SOL_SOCKET` option that honours a [`ReusePort`] request on this target,
+/// or `None` when nothing needs to be set.
+///
+/// This is the single place the platform split lives. `SO_REUSEPORT` is spelled
+/// identically on Linux and the BSDs and means different things:
+///
+/// * **Linux and Android** distribute incoming connections across every listener
+///   bound with `SO_REUSEPORT`, selecting one by hashing the connection's
+///   4-tuple. One option satisfies both requests.
+/// * **FreeBSD** keeps `SO_REUSEPORT` at its original BSD meaning — duplicate
+///   binding, with new connections going to the socket that bound last — and
+///   added a separate `SO_REUSEPORT_LB` in 12.0 that distributes. So the two
+///   requests are two different options here.
+/// * **macOS and the other Apple platforms, NetBSD, OpenBSD and DragonFly** have
+///   only the original option. A [`ReusePort::Distribute`] request is refused
+///   rather than silently answered with `SO_REUSEPORT`: measured on macOS 15,
+///   two loops binding one port with `SO_REUSEPORT` split 32 connections
+///   `[0, 32]` — the first listener is not merely under-served, it is never
+///   given anything at all.
+pub(crate) fn reuse_port_option(reuse: ReusePort) -> Result<Option<i32>> {
+    match reuse {
+        ReusePort::No => Ok(None),
+        ReusePort::Share => Ok(Some(libc::SO_REUSEPORT)),
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        ReusePort::Distribute => Ok(Some(libc::SO_REUSEPORT)),
+        #[cfg(target_os = "freebsd")]
+        ReusePort::Distribute => Ok(Some(libc::SO_REUSEPORT_LB)),
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
+        ReusePort::Distribute => Err(Error::new(ErrorKind::Unsupported)),
     }
 }
 pub(crate) fn option(fd: RawFd, level: i32, name: i32, value: i32) -> Result<()> {

@@ -581,7 +581,7 @@ unsafe impl Backend for Unix {
             Open::Tcp { addr, opts } => (
                 addr,
                 Kind::Tcp,
-                false,
+                ReusePort::No,
                 0,
                 opts.nodelay,
                 AcceptDefaults::EMPTY,
@@ -613,11 +613,11 @@ unsafe impl Backend for Unix {
             // TCP listeners need address reuse for TIME_WAIT. Default UDP binds
             // must stay exclusive: on Linux SO_REUSEADDR also permits two live
             // bind(:0) sockets to receive the same ephemeral endpoint.
-            if kind == Kind::Listener || reuse {
+            if kind == Kind::Listener || reuse.is_enabled() {
                 socket::option(fd.as_raw_fd(), libc::SOL_SOCKET, libc::SO_REUSEADDR, 1)?;
             }
-            if reuse {
-                socket::option(fd.as_raw_fd(), libc::SOL_SOCKET, libc::SO_REUSEPORT, 1)?;
+            if let Some(option) = super::socket::reuse_port_option(reuse)? {
+                socket::option(fd.as_raw_fd(), libc::SOL_SOCKET, option, 1)?;
             }
             let a = Addr::new(addr);
             // SAFETY: sockaddr pointer and length refer to initialized storage.
@@ -1248,7 +1248,9 @@ mod udp_tests {
         let mut checked = 0;
         for addr in ["127.0.0.1:0", "[::1]:0"] {
             let mut l = Loop::new(Config::default()).expect("loop");
-            let opts = UdpOpts { reuse_port: true };
+            let opts = UdpOpts {
+                reuse_port: ReusePort::Share,
+            };
             let first = l
                 .udp_bind(addr.parse().expect("address"), &opts)
                 .expect("first bind");

@@ -1345,7 +1345,7 @@ unsafe impl Backend for Iocp {
                 )
             }
             Open::Listener { addr, opts } => {
-                if opts.reuse_port {
+                if opts.reuse_port.is_enabled() {
                     return Err(unsupported());
                 }
                 sockopt::validate_accept_defaults(opts.accept_defaults, Kind::Listener)?;
@@ -1360,7 +1360,7 @@ unsafe impl Backend for Iocp {
                 (transport, None, None)
             }
             Open::Udp { addr, opts } => {
-                if opts.reuse_port {
+                if opts.reuse_port.is_enabled() {
                     return Err(unsupported());
                 }
                 let socket = socket::create(addr.is_ipv6(), true)?;
@@ -1372,7 +1372,7 @@ unsafe impl Backend for Iocp {
                 )
             }
             Open::PipeListener { name, opts } => {
-                if opts.reuse_port {
+                if opts.reuse_port.is_enabled() {
                     return Err(unsupported());
                 }
                 sockopt::validate_accept_defaults(opts.accept_defaults, Kind::PipeListener)?;

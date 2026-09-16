@@ -426,7 +426,7 @@ unsafe impl Backend for WasiP3 {
                 if opts.nodelay {
                     return Err(Error::new(ErrorKind::Unsupported));
                 }
-                (addr, Kind::Tcp, false, 0, AcceptDefaults::EMPTY)
+                (addr, Kind::Tcp, ReusePort::No, 0, AcceptDefaults::EMPTY)
             }
             Open::Listener { addr, opts } => (
                 addr,
@@ -439,7 +439,9 @@ unsafe impl Backend for WasiP3 {
                 (addr, Kind::Udp, opts.reuse_port, 0, AcceptDefaults::EMPTY)
             }
         };
-        if reuse {
+        // wasi:sockets has no address-reuse interface at all, so neither
+        // Share nor Distribute can be honoured. Both are refused.
+        if reuse.is_enabled() {
             return Err(Error::new(ErrorKind::Unsupported));
         }
         sockopt::validate_accept_defaults(accept_defaults)?;
