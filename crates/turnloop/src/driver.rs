@@ -175,6 +175,21 @@ impl<B: Backend> Driver<B> {
             _local: PhantomData,
         })
     }
+    /// Reserved slots are a subset of free ones.
+    ///
+    /// Every path that moves either side keeps this: a reserving submission
+    /// checks it before promising, `new_handle` refuses to spend a promised
+    /// slot, and a delivery releases its promise before taking the slot. Drift
+    /// here means an armed accept can arrive with nowhere to put its connection,
+    /// which is silent until a connection is destroyed for it.
+    fn assert_reservations(&self) {
+        debug_assert!(
+            self.reserved_handles <= self.handles.remaining(),
+            "{} handle slots promised but only {} free",
+            self.reserved_handles,
+            self.handles.remaining()
+        );
+    }
     fn assert_owner(&self) {
         debug_assert_eq!(
             self.thread,
@@ -218,6 +233,7 @@ impl<B: Backend> Driver<B> {
         if matches!(kind, Kind::Socket | Kind::File) {
             self.refs += 1;
         }
+        self.assert_reservations();
         Ok(Handle {
             owner: self.owner,
             key,
@@ -835,6 +851,7 @@ impl<B: Backend> Driver<B> {
         let op = self.new_op(Some(h), token)?;
         self.reserved_handles += reserve;
         self.ops.get_mut(op.key).expect("new op").reserved_handles = reserve;
+        self.assert_reservations();
         if let Err(e) = self.backend.submit(Request {
             op,
             handle: h,
@@ -1067,6 +1084,7 @@ impl<B: Backend> Driver<B> {
                 self.reserved_handles -= held;
             }
         }
+        self.assert_reservations();
         attached
     }
     /// Register an owning transport on this loop; failure drops the rejected transport.
