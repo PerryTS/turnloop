@@ -101,6 +101,16 @@ can avoid, and RFC 9113 requires each to be tolerated:
   "reset a stream mid-body" case.
 - **RST_STREAM for a gone stream**: crossed resets are normal; ignored.
 - **WINDOW_UPDATE for a gone stream** (§6.9): ignored.
+- **HEADERS for a stream *this endpoint itself opened* and has retired**: the
+  response a client aborted while it was already on the wire. The block is
+  decoded (HPACK is connection state) and discarded, no event and no second
+  RST_STREAM. This one was fatal before the change too — `finish_headers`
+  answered `STREAM_CLOSED` on a connection error — so it is a defect of the same
+  family rather than a consequence, and a client abort is the most ordinary
+  operation there is. Only a locally opened id is unambiguous here, which is why
+  the rule is not `seen(id)`: a *remote* id at or below `last_remote` may never
+  have existed, and h2spec §5.1.1 requires a HEADERS on one of those to stay a
+  connection error.
 
 A frame for a stream id this connection has *never used* is still a connection
 error, which is what keeps h2spec's `5.1 idle` tests green. The distinction is
@@ -140,7 +150,7 @@ the record disappear under it.
 
 | check | result |
 |---|---|
-| `cargo test -p turnloop-http --all-features` | 27 codecs (14 new), 19 interop, 7 server, doctest, all pass |
+| `cargo test --workspace --all-features -- --test-threads=1` | 437 passed, 0 failed, 20 ignored (fixture-backed) |
 | `python3 scripts/ci/h2spec.py` | **147 tests, 147 passed, 0 failed, 0 skipped** |
 | sabotage: revert each fix in turn | each named test fails; see below |
 | `cargo fmt --all --check`, clippy (default + all-features, all-targets) | clean |
@@ -153,6 +163,7 @@ reverted in place and the suite re-run:
 
 | reverted | tests that fail |
 |---|---|
+| a client's in-flight response after its own reset is fatal | `h2_response_in_flight_when_the_client_aborts_is_ignored` |
 | `reset` returns no credit, frees no slot | `h2_reset_with_unreleased_data_keeps_its_table_slot`, `h2_reset_returns_the_connection_window`, `h2_release_after_termination_is_a_no_op`, `h2_late_frames_for_a_locally_reset_stream_are_ignored` |
 | post-GOAWAY stream is a connection error | `h2_stream_after_graceful_goaway_is_refused_not_fatal` |
 | stream limit is a connection error | `h2_stream_limit_refuses_one_stream_not_the_connection` |
@@ -198,6 +209,14 @@ the identical two zero cases and no words about them.
 
 - Server push: `turnloop_http::http2` rejects PUSH_PROMISE outright and Perry
   does not implement `createPushResponse`; unchanged.
+- **Trailers pipelined onto a stream the server refused.** A peer that sends
+  HEADERS + DATA + trailer HEADERS in one burst onto a stream refused for the
+  GOAWAY race or the stream limit still fails the connection on the trailer
+  block, because a *remote* id at or below `last_remote` cannot be distinguished
+  from one that was never opened, and h2spec §5.1.1 depends on that staying an
+  error. The DATA in the same burst is tolerated, so the behaviour is
+  inconsistent; making it precise needs the refused ids remembered, which is
+  state this change deliberately does not add. Unchanged from before.
 - Rapid-reset (CVE-2023-44487) accounting. A refused stream costs an HPACK
   decode and one RST_STREAM, the same as before for an accepted-then-reset
   stream, so this change neither adds nor removes that exposure — but the crate

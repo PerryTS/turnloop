@@ -901,6 +901,48 @@ fn h2_late_frames_for_a_locally_reset_stream_are_ignored() {
     );
 }
 
+/// A client that aborts a request resets the stream while the server's response
+/// is already on the wire. Those HEADERS and DATA arrive for a stream whose
+/// record is gone, and used to end the whole session — on the most ordinary
+/// client operation there is.
+#[test]
+fn h2_response_in_flight_when_the_client_aborts_is_ignored() {
+    let (mut client, mut server) = handshake(100);
+    let first = client.open(&post_headers("/abort"), true).unwrap();
+    let mut wire = ship(&mut client);
+    drive(&mut server, &mut wire).unwrap();
+    // The server answers; the client aborts before the answer lands.
+    server
+        .send_headers(first, &[Header::new(":status", "200")], false)
+        .unwrap();
+    server.send_data(first, b"payload", true).unwrap();
+    client.reset(first, 8).unwrap();
+    let _ = ship(&mut client);
+    let mut answer = ship(&mut server);
+    assert_eq!(
+        drive(&mut client, &mut answer).expect("an aborted request must not fail the session"),
+        Vec::<String>::new()
+    );
+    // HPACK survived the discarded block, so the next request still decodes.
+    let second = client.open(&post_headers("/next"), true).unwrap();
+    let mut wire = ship(&mut client);
+    drive(&mut server, &mut wire).unwrap();
+    server
+        .send_headers(second, &[Header::new(":status", "201")], true)
+        .unwrap();
+    let mut answer = ship(&mut server);
+    assert_eq!(
+        drive(&mut client, &mut answer).unwrap(),
+        vec![format!("Headers s={second}")]
+    );
+    // A stream the client never opened is still a connection error.
+    let mut block = Vec::new();
+    hpack::Encoder::new(4096).encode(&[Header::new(":status", "200")], &mut block);
+    let mut wire = Vec::new();
+    http2::encode_frame(1, 4, 99, &block, &mut wire).unwrap();
+    assert_eq!(drive(&mut client, &mut wire), Err("PROTOCOL_ERROR"));
+}
+
 /// A host that buffers a body and releases capacity when the application
 /// consumes it can call `release_capacity` after the stream is gone. That is a
 /// no-op — the credit went back in bulk at termination — not an error.

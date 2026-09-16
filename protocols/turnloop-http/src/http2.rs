@@ -169,6 +169,15 @@ pub struct Step<'a> {
     pub consumed: usize,
     pub event: Option<Event<'a>>,
 }
+/// What to do with a header block that does not belong to a live stream.
+#[derive(Debug, Clone, Copy)]
+enum Disposal {
+    /// Refuse the stream: decode the block, discard it, answer RST_STREAM.
+    Refuse(u32),
+    /// Frames the peer had in flight for a stream that is gone: decode the
+    /// block, discard it, and answer nothing. A second RST_STREAM would loop.
+    Discard,
+}
 #[derive(Debug)]
 struct Stream {
     id: u32,
@@ -214,10 +223,10 @@ pub struct Connection {
     block: Vec<u8>,
     scratch: Vec<u8>,
     continuation: Option<(u32, bool, usize)>,
-    /// The error code a refused stream's header block is answered with once it
-    /// has been decoded and discarded. HPACK is connection state, so a refused
-    /// block still has to advance the decoder.
-    refusing: Option<u32>,
+    /// What to do with the header block being assembled, when it does not
+    /// belong to a live stream. HPACK is connection state, so such a block
+    /// still has to advance the decoder before it is thrown away.
+    disposal: Option<Disposal>,
     output: Vec<u8>,
     output_pos: usize,
     draining: bool,
@@ -251,7 +260,7 @@ impl Connection {
             block: Vec::new(),
             scratch: Vec::new(),
             continuation: None,
-            refusing: None,
+            disposal: None,
             output: Vec::new(),
             output_pos: 0,
             draining: false,
@@ -748,31 +757,40 @@ impl Connection {
                 if f.stream == 0 {
                     return Err(protocol("HEADERS on connection"));
                 }
+                self.disposal = None;
                 if self.index(f.stream).is_err() {
-                    if self.role != Role::Server
-                        || f.stream % 2 == 0
-                        || f.stream <= self.last_remote
-                    {
-                        return Err(protocol("invalid new stream"));
-                    }
-                    self.last_remote = f.stream;
-                    // A stream this connection cannot accept is refused with
-                    // RST_STREAM(REFUSED_STREAM), never by failing the
-                    // connection: after a graceful GOAWAY the peer cannot yet
-                    // have seen it (RFC 9113 section 6.8), and exceeding the
-                    // concurrent-stream limit is a stream error (section
-                    // 5.1.2). The block is still decoded below - HPACK is
-                    // connection state, and skipping one desynchronises every
-                    // block that follows.
-                    self.refusing = if self.draining {
-                        Some(7)
-                    } else {
-                        match self.add_stream(f.stream) {
-                            Ok(_) => None,
-                            Err(e) if e.code == "REFUSED_STREAM" => Some(7),
-                            Err(e) => return Err(e),
+                    if self.role != Role::Server {
+                        // A response the peer already had in flight when we
+                        // reset the stream. Its record is gone, so decode the
+                        // block to keep HPACK in step and ignore it (RFC 9113
+                        // section 5.1). Only a stream we opened ourselves is
+                        // unambiguous here; anything else is idle.
+                        if !self.seen(f.stream) {
+                            return Err(protocol("invalid new stream"));
                         }
-                    };
+                        self.disposal = Some(Disposal::Discard);
+                    } else if f.stream % 2 == 0 || f.stream <= self.last_remote {
+                        return Err(protocol("invalid new stream"));
+                    } else {
+                        self.last_remote = f.stream;
+                        // A stream this connection cannot accept is refused
+                        // with RST_STREAM(REFUSED_STREAM), never by failing the
+                        // connection: after a graceful GOAWAY the peer cannot
+                        // yet have seen it (RFC 9113 section 6.8), and
+                        // exceeding the concurrent-stream limit is a stream
+                        // error (section 5.1.2). The block is still decoded
+                        // below - HPACK is connection state, and skipping one
+                        // desynchronises every block that follows.
+                        self.disposal = if self.draining {
+                            Some(Disposal::Refuse(7))
+                        } else {
+                            match self.add_stream(f.stream) {
+                                Ok(_) => None,
+                                Err(e) if e.code == "REFUSED_STREAM" => Some(Disposal::Refuse(7)),
+                                Err(e) => return Err(e),
+                            }
+                        };
+                    }
                 }
                 let mut payload = unpadded(f)?;
                 if f.flags & 32 != 0 {
@@ -788,7 +806,7 @@ impl Connection {
                 self.append_block(payload)?;
                 let end = f.flags & 1 != 0;
                 if f.flags & 4 != 0 {
-                    step.event = Some(self.finish_block(f.stream, end)?);
+                    step.event = self.finish_block(f.stream, end)?;
                 } else {
                     self.continuation = Some((f.stream, end, 0));
                 }
@@ -801,7 +819,7 @@ impl Connection {
                 self.append_block(f.payload)?;
                 if f.flags & 4 != 0 {
                     self.continuation = None;
-                    step.event = Some(self.finish_block(id, end)?);
+                    step.event = self.finish_block(id, end)?;
                 } else {
                     self.continuation = Some((id, end, count + 1));
                 }
@@ -981,20 +999,22 @@ impl Connection {
         self.block.extend_from_slice(bytes);
         Ok(())
     }
-    /// Complete a header block: either the stream's own, or a refused one.
-    fn finish_block(&mut self, id: u32, end: bool) -> Result<Event<'static>> {
-        match self.refusing.take() {
-            Some(code) => self.refuse_headers(id, code),
-            None => self.finish_headers(id, end),
-        }
-    }
-    /// Answer a refused stream with RST_STREAM. The block is decoded and thrown
-    /// away first: HPACK state belongs to the connection, not the stream.
-    fn refuse_headers(&mut self, id: u32, code: u32) -> Result<Event<'static>> {
+    /// Complete a header block: the stream's own, or one being thrown away.
+    fn finish_block(&mut self, id: u32, end: bool) -> Result<Option<Event<'static>>> {
+        let Some(disposal) = self.disposal.take() else {
+            return self.finish_headers(id, end).map(Some);
+        };
+        // Decode before discarding: HPACK state belongs to the connection, not
+        // the stream, and a skipped block desynchronises every block after it.
         let mut headers = Vec::new();
         self.decoder.decode(&self.block, &mut headers)?;
-        self.frame(3, 0, id, &code.to_be_bytes())?;
-        Ok(Event::Reset { stream: id, code })
+        match disposal {
+            Disposal::Refuse(code) => {
+                self.frame(3, 0, id, &code.to_be_bytes())?;
+                Ok(Some(Event::Reset { stream: id, code }))
+            }
+            Disposal::Discard => Ok(None),
+        }
     }
     fn finish_headers(&mut self, id: u32, end: bool) -> Result<Event<'static>> {
         let mut headers = Vec::new();
