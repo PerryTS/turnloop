@@ -749,6 +749,7 @@ fn drive(to: &mut http2::Connection, input: &mut Vec<u8>) -> Result<Vec<String>,
                     format!("Data s={stream} n={}", bytes.len())
                 }
                 http2::Event::Reset { stream, code } => format!("Reset s={stream} code={code}"),
+                http2::Event::Unprocessed { stream } => format!("Unprocessed s={stream}"),
                 http2::Event::Goaway { code, .. } => format!("Goaway code={code}"),
                 http2::Event::Ping { ack, .. } => format!("Ping ack={ack}"),
                 http2::Event::WindowUpdate { stream } => format!("WindowUpdate s={stream}"),
@@ -1000,27 +1001,102 @@ fn h2_stream_limit_refuses_one_stream_not_the_connection() {
 }
 
 /// A stream opened after a graceful GOAWAY is the unavoidable race: the peer
-/// cannot have seen the GOAWAY when it opened. Node answers
-/// RST_STREAM(REFUSED_STREAM) and keeps the session; this used to be a
-/// connection error, and the decision was inside `receive` where no host could
-/// reach it.
+/// cannot have seen the GOAWAY when it opened. It used to be a connection
+/// error, decided inside `receive` where no host could reach it.
+///
+/// Node sends **no frame at all** here. Measured against Node 26.5.1 with a raw
+/// TCP peer and hand-encoded frames, so no library could shape the answer: no
+/// RST_STREAM, no second GOAWAY, no frame naming the stream; the request never
+/// reaches the application; and the session stays alive and keeps servicing
+/// frames (a PING sent afterwards is still acknowledged). RFC 9113 section 6.8
+/// makes such a stream simply "not processed", to be retried on a new
+/// connection. So the connection reports it and sends nothing: a frame it
+/// emitted could not be un-emitted, and a host that must match Node would then
+/// have no way back.
 #[test]
-fn h2_stream_after_graceful_goaway_is_refused_not_fatal() {
+fn h2_stream_after_graceful_goaway_is_unprocessed_and_unanswered() {
     let (mut client, mut server) = handshake(100);
     server.shutdown().unwrap();
     let _ = ship(&mut server);
     let late = client.open(&post_headers("/late"), true).unwrap();
     let mut wire = ship(&mut client);
     let events = drive(&mut server, &mut wire).expect("the GOAWAY race must not fail the session");
-    assert_eq!(events, vec![format!("Reset s={late} code=7")]);
-    assert_eq!(
-        &server.output()[3..4],
-        &[3],
-        "RST_STREAM, not a second GOAWAY"
+    assert_eq!(events, vec![format!("Unprocessed s={late}")]);
+    assert!(
+        server.output().is_empty(),
+        "Node sends nothing here; so must we (got {:?})",
+        server.output()
     );
-    // HPACK state survived the refused block: the session still decodes.
-    let mut back = ship(&mut server);
-    drive(&mut client, &mut back).unwrap();
+    // HPACK state survived the discarded block, so the session still decodes.
+    let again = client.open(&post_headers("/after"), true).unwrap();
+    let mut wire = ship(&mut client);
+    assert_eq!(
+        drive(&mut server, &mut wire).unwrap(),
+        vec![format!("Unprocessed s={again}")]
+    );
+
+    // The decision belongs to the host, not the connection: one that wants to
+    // answer still can, and gets exactly one RST_STREAM for the stream it names.
+    server.reset(late, 7).unwrap();
+    let out = server.output().to_vec();
+    assert_eq!(out.len(), 13, "one RST_STREAM frame and nothing else");
+    assert_eq!(out[3], 3, "RST_STREAM");
+    assert_eq!(u32::from_be_bytes(out[5..9].try_into().unwrap()), late);
+    assert_eq!(u32::from_be_bytes(out[9..13].try_into().unwrap()), 7);
+}
+
+/// GOAWAY names the last stream that was actually *processed*. A stream that was
+/// reported but declined — refused past the limit, or arriving after our own
+/// GOAWAY — must not advance it: RFC 9113 §6.8 lets the peer retry everything
+/// above `lastStreamID` on a new connection, so naming a declined stream tells
+/// the peer a request was handled when it was not, and it is silently lost.
+#[test]
+fn h2_goaway_names_the_last_processed_stream_not_the_last_seen() {
+    // A stream refused by the concurrent-stream limit.
+    let (mut client, mut server) = handshake(2);
+    let mut live = Vec::new();
+    for i in 0..2 {
+        live.push(client.open(&post_headers(&format!("/{i}")), false).unwrap());
+    }
+    let mut wire = ship(&mut client);
+    drive(&mut server, &mut wire).unwrap();
+    let processed = *live.last().unwrap();
+    let refused = processed + 2;
+    let mut block = Vec::new();
+    hpack::Encoder::new(4096).encode(&post_headers("/over"), &mut block);
+    let mut wire = Vec::new();
+    http2::encode_frame(1, 4, refused, &block, &mut wire).unwrap();
+    assert_eq!(
+        drive(&mut server, &mut wire).unwrap(),
+        vec![format!("Reset s={refused} code=7")]
+    );
+    let _ = ship(&mut server);
+    server.shutdown().unwrap();
+    let out = ship(&mut server);
+    assert_eq!(out[3], 7, "GOAWAY");
+    let named = u32::from_be_bytes(out[9..13].try_into().unwrap()) & 0x7fffffff;
+    assert_eq!(
+        named, processed,
+        "GOAWAY named {named}; stream {refused} was refused, not processed"
+    );
+
+    // And a stream arriving after the GOAWAY does not advance it either. The
+    // client's own peer-stream limit is two, so build this one by hand.
+    let late = refused + 2;
+    let mut wire = Vec::new();
+    http2::encode_frame(1, 4, late, &block, &mut wire).unwrap();
+    assert_eq!(
+        drive(&mut server, &mut wire).unwrap(),
+        vec![format!("Unprocessed s={late}")]
+    );
+    server.shutdown().unwrap();
+    let out = ship(&mut server);
+    let named = u32::from_be_bytes(out[9..13].try_into().unwrap()) & 0x7fffffff;
+    assert_eq!(named, processed, "an unprocessed stream must not be named");
+    // The declined ids are still tolerated on the wire, which is what the
+    // separate watermark buys: late frames for them must not fail the session.
+    server.release_capacity(refused, 0).unwrap();
+    assert!(server.reset(late, 7).is_ok());
 }
 
 /// `goaway` sets the code, the last stream id and the opaque debug data that

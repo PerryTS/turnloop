@@ -108,13 +108,30 @@ pub enum Event<'a> {
         bytes: &'a [u8],
         end_stream: bool,
     },
-    /// The stream is over. It may name a stream the host never saw opened: the
-    /// connection refuses a stream it cannot accept — one arriving after a
-    /// GOAWAY, or past the concurrent-stream limit — before any
-    /// [`Event::Headers`] for it is produced.
+    /// The stream is over. It may name a stream the host never saw opened: a
+    /// stream past the concurrent-stream limit is refused with
+    /// RST_STREAM(REFUSED_STREAM) before any [`Event::Headers`] for it is
+    /// produced (RFC 9113 section 5.1.2 requires a stream error there, and
+    /// Node answers the same way — measured).
     Reset {
         stream: u32,
         code: u32,
+    },
+    /// The peer opened a stream after a graceful GOAWAY, above the last stream
+    /// id that GOAWAY named, and **nothing has been sent for it**. RFC 9113
+    /// section 6.8 makes such a stream simply "not processed" — the peer is
+    /// expected to retry it on a new connection — and Node emits no frame at
+    /// all here (measured against Node 26.5.1 with a raw peer: no RST_STREAM,
+    /// no GOAWAY, the session stays alive and the request never reaches the
+    /// application).
+    ///
+    /// The header block was decoded and discarded, because HPACK is connection
+    /// state. The connection deliberately does not answer for the host: a frame
+    /// it emitted could not be un-emitted, so a host that must match Node would
+    /// have no way back. A host that wants to answer may call
+    /// [`Connection::reset`].
+    Unprocessed {
+        stream: u32,
     },
     Goaway {
         last_stream: u32,
@@ -169,13 +186,19 @@ pub struct Step<'a> {
     pub consumed: usize,
     pub event: Option<Event<'a>>,
 }
-/// What to do with a header block that does not belong to a live stream.
+/// What to do with a header block that does not belong to a live stream. Every
+/// arm decodes the block first: HPACK is connection state, and a block that is
+/// skipped desynchronises every block after it.
 #[derive(Debug, Clone, Copy)]
 enum Disposal {
-    /// Refuse the stream: decode the block, discard it, answer RST_STREAM.
+    /// Past the concurrent-stream limit: answer RST_STREAM and report it.
+    /// RFC 9113 section 5.1.2 requires a stream error here.
     Refuse(u32),
-    /// Frames the peer had in flight for a stream that is gone: decode the
-    /// block, discard it, and answer nothing. A second RST_STREAM would loop.
+    /// Opened after our graceful GOAWAY: send nothing, report it, and let the
+    /// host decide. See [`Event::Unprocessed`].
+    Unprocessed,
+    /// Frames the peer had in flight for a stream that is gone: discard in
+    /// silence. The host already knows - it is the side that ended the stream.
     Discard,
 }
 #[derive(Debug)]
@@ -209,7 +232,16 @@ pub struct Connection {
     limits: Limits,
     streams: Vec<Stream>,
     next_id: u32,
+    /// Highest remote stream id this connection has accepted **for processing**.
+    /// GOAWAY names it, so a stream that was reported but not processed - one
+    /// refused past the stream limit, or arriving after our own GOAWAY - must
+    /// not advance it: RFC 9113 section 6.8 lets the peer retry everything above
+    /// it on a new connection, and claiming one is processed loses that request.
     last_remote: u32,
+    /// Highest remote stream id seen on the wire, processed or not. The
+    /// monotonicity check and [`Connection::seen`] use this, so frames the peer
+    /// had in flight for a stream we declined are still tolerated.
+    highest_remote: u32,
     send_window: i64,
     recv_window: i64,
     initial_send: i64,
@@ -247,6 +279,7 @@ impl Connection {
             streams: Vec::with_capacity(limits.streams),
             next_id: if role == Role::Client { 1 } else { 2 },
             last_remote: 0,
+            highest_remote: 0,
             send_window: 65535,
             recv_window: 65535,
             initial_send: 65535,
@@ -364,7 +397,7 @@ impl Connection {
         } else if (id % 2 == 1) == (self.role == Role::Client) {
             id < self.next_id
         } else {
-            id <= self.last_remote
+            id <= self.highest_remote
         }
     }
     /// `STREAM_CLOSED` for a stream this connection has finished with, and the
@@ -600,11 +633,17 @@ impl Connection {
     /// unreleased DATA — the ordinary "one stream errors while its siblings are
     /// live" case — costs the connection nothing. Frames the peer already had
     /// in flight for the stream are then ignored rather than failing the
-    /// connection (RFC 9113 section 5.1), and resetting it again is a no-op.
+    /// connection (RFC 9113 section 5.1).
+    ///
+    /// The frame is sent even when the stream has no record left — it may have
+    /// been reset already, or refused before one existed, as after
+    /// [`Event::Unprocessed`]. Encoding what the host asks for is this type's
+    /// job; deciding not to is the host's. Only an id this connection has never
+    /// used is an error.
     pub fn reset(&mut self, id: u32, code: u32) -> Result<()> {
         let Ok(i) = self.index(id) else {
             return if self.seen(id) {
-                Ok(())
+                self.frame(3, 0, id, &code.to_be_bytes())
             } else {
                 Err(protocol("unknown or idle stream"))
             };
@@ -617,9 +656,9 @@ impl Connection {
         self.frame(6, 0, 0, &data)
     }
     /// Graceful close: GOAWAY(NO_ERROR) naming the last stream this connection
-    /// has processed, then drain. Streams the peer opens before it sees the
-    /// frame are refused with RST_STREAM(REFUSED_STREAM); they do not fail the
-    /// connection.
+    /// has processed, then drain. A stream the peer opens before it sees the
+    /// frame does not fail the connection and is not answered: it arrives as
+    /// [`Event::Unprocessed`] and the host decides.
     pub fn shutdown(&mut self) -> Result<()> {
         self.goaway(0, self.last_remote, &[])
     }
@@ -769,23 +808,31 @@ impl Connection {
                             return Err(protocol("invalid new stream"));
                         }
                         self.disposal = Some(Disposal::Discard);
-                    } else if f.stream % 2 == 0 || f.stream <= self.last_remote {
+                    } else if f.stream % 2 == 0 || f.stream <= self.highest_remote {
                         return Err(protocol("invalid new stream"));
                     } else {
-                        self.last_remote = f.stream;
-                        // A stream this connection cannot accept is refused
-                        // with RST_STREAM(REFUSED_STREAM), never by failing the
-                        // connection: after a graceful GOAWAY the peer cannot
-                        // yet have seen it (RFC 9113 section 6.8), and
-                        // exceeding the concurrent-stream limit is a stream
-                        // error (section 5.1.2). The block is still decoded
-                        // below - HPACK is connection state, and skipping one
-                        // desynchronises every block that follows.
+                        self.highest_remote = f.stream;
+                        // A stream this connection cannot accept never fails
+                        // the connection. The two reasons answer differently,
+                        // and both were measured against Node 26.5.1 with a raw
+                        // peer rather than assumed:
+                        //
+                        // * after a graceful GOAWAY, the stream is above the id
+                        //   that GOAWAY named and is simply not processed (RFC
+                        //   9113 section 6.8). Node sends no frame at all, so
+                        //   neither do we - the host is told and decides.
+                        // * past the concurrent-stream limit, RFC 9113 section
+                        //   5.1.2 requires a stream error, and Node answers
+                        //   RST_STREAM(REFUSED_STREAM).
                         self.disposal = if self.draining {
-                            Some(Disposal::Refuse(7))
+                            Some(Disposal::Unprocessed)
                         } else {
                             match self.add_stream(f.stream) {
-                                Ok(_) => None,
+                                Ok(_) => {
+                                    // Accepted for processing, so GOAWAY may name it.
+                                    self.last_remote = f.stream;
+                                    None
+                                }
                                 Err(e) if e.code == "REFUSED_STREAM" => Some(Disposal::Refuse(7)),
                                 Err(e) => return Err(e),
                             }
@@ -1013,6 +1060,7 @@ impl Connection {
                 self.frame(3, 0, id, &code.to_be_bytes())?;
                 Ok(Some(Event::Reset { stream: id, code }))
             }
+            Disposal::Unprocessed => Ok(Some(Event::Unprocessed { stream: id })),
             Disposal::Discard => Ok(None),
         }
     }

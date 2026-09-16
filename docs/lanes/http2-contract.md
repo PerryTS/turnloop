@@ -9,6 +9,12 @@ Three defects, each proven by a runnable probe before anything was changed
 (Perry's `docs/turnloop/http2-contract-probe.rs`, branch `turnloop/http2`), and
 each now covered by a test that fails when its own fix is reverted.
 
+**One of the three briefs' premises was wrong and had to be measured out.** The
+brief stated that Node answers a post-GOAWAY stream with
+`RST_STREAM(REFUSED_STREAM)`; it sends no frame at all. See §2 — the correction,
+the raw-socket measurement behind it, and why the fix is now "report and send
+nothing" rather than a different hard-coded answer.
+
 **h2spec's strict suite — 147 tests, a required CI job — passed with all three
 present, and passes unchanged now.** h2spec drives the subject from the peer
 side only: every RST_STREAM in its §5.1 "Stream States" family is one *h2spec*
@@ -67,14 +73,119 @@ untouched.
 After `shutdown()`, `receive`'s HEADERS arm rejected a new stream with
 `protocol("invalid new stream")` — a **connection** error — because `draining`
 was set. The race is unavoidable: a peer that opens a stream during a graceful
-close cannot have seen the GOAWAY yet. Node answers
-`RST_STREAM(REFUSED_STREAM)` and keeps the session. The decision sat inside
-`receive_inner`, so no host could choose otherwise.
+close cannot have seen the GOAWAY yet. The decision sat inside `receive_inner`,
+so no host could choose otherwise.
 
-**Fix.** A stream that arrives while draining is refused with
-RST_STREAM(REFUSED_STREAM) and the session continues, matching Node and RFC 9113
-§6.8. The refused header block is still **decoded and discarded**: HPACK is
-connection state, and skipping one block desynchronises every block after it.
+### The premise this lane was given was wrong, and it was measured out
+
+The brief for this work stated, as fact, that *"Node answers
+`RST_STREAM(REFUSED_STREAM)` and keeps the session"*. This lane's first fix
+implemented that, and an earlier draft of this document asserted it. **It is not
+what Node does.** A sibling lane measured it, and rather than take that on
+trust this lane measured it again independently, with a raw TCP peer and
+hand-built frames — no HTTP/2 library anywhere in the client, so nothing under
+test could shape the answer (`nodeprobe/` in this lane's scratch; Node 26.5.1,
+`http2.createServer`, one stream held open so the session cannot finish
+draining, `session.close()` for the graceful GOAWAY, then HEADERS on an id above
+`lastStreamID`):
+
+```
+after /close:
+   <- HEADERS stream=3 flags=4
+   <- DATA stream=3 flags=1
+   <- GOAWAY stream=0 flags=0 last=3 code=0
+--> sending HEADERS on stream 5 (above lastStreamID 3)
+Node's answer to the late stream:
+   (NO FRAMES AT ALL)
+VERDICT: RST_STREAM for the late stream: NO
+VERDICT: any frame at all naming stream 5: NO
+```
+
+Node sends **nothing**. The Node application never sees the stream (no `stream`
+event fires). The control matters as much as the result: *no frames* could also
+mean *stopped reading*, so the probe sends a PING afterwards —
+
+```
+--> control: PING after the late stream
+   <- PING stream=0 flags=1
+CONTROL: session alive and processing our frames: YES (PING ACK)
+CONTROL: transport still open: YES
+```
+
+— so the session is alive and still servicing our frames. nghttp2 simply does
+not process a HEADERS above the GOAWAY's `lastStreamID`, which is RFC 9113
+§6.8's "not processed": the peer is expected to retry it on a new connection.
+
+The ladder, then: a connection error (before) is clearly wrong;
+`RST_STREAM(REFUSED_STREAM)` (this lane's first attempt) is closer but still not
+Node; silence is Node.
+
+**Fix.** A stream that arrives while draining is reported as
+`Event::Unprocessed { stream }` and **no frame is sent**. The header block is
+still decoded and discarded, because HPACK is connection state.
+
+### Why the core sends nothing rather than choosing for the host
+
+This is the more important half, and it is the criticism that applies to this
+lane's own first fix. The original defect was never "turnloop picks the wrong
+answer" — it was *"the decision is inside `receive_inner`, so no host can choose
+otherwise"*. Swapping one hard-coded answer for another leaves that intact.
+
+The two directions are not symmetrical. `output()`/`consume_output()` is a byte
+stream: a host cannot retract a frame the core has already encoded into it
+without parsing and splicing its own core's output, which is not a supported
+operation and should never be one. Emitting is irreversible. Staying silent is
+not: a host that wants to answer calls `reset(id, code)` and gets exactly one
+RST_STREAM. So the permissive direction preserves every option and the emitting
+direction destroys one — and it destroys precisely the option a host that must
+match Node needs.
+
+That is also why `reset` now sends for a stream with no record, instead of
+treating it as a no-op. Encoding what the host asks for is this type's job;
+deciding not to is the host's. (Nothing depended on the old idempotence; a host
+that resets twice now sends two frames, which is a host bug with a harmless
+consequence. RFC 9113 §5.4.2's anti-looping rule is about answering a *received*
+RST_STREAM, which this is not.)
+
+### A stream reported but not processed must not be named by GOAWAY
+
+Splitting the decision surfaced a second thing. `last_remote` was doing two
+jobs: the id GOAWAY names, and the "have I seen this id" watermark that decides
+whether a late frame is tolerated or a connection error. Those stopped being the
+same quantity the moment a stream could be *reported but declined* — refused
+past the limit, or arriving after our own GOAWAY.
+
+RFC 9113 §6.8 lets the peer retry every stream above `lastStreamID` on a new
+connection. Naming a declined stream therefore tells the peer that request was
+handled when it was not, and it is silently dropped rather than retried — in
+exactly the graceful-close path this fix exists for. The field is now two:
+
+* `last_remote` — highest remote id accepted **for processing**; GOAWAY names it.
+* `highest_remote` — highest remote id **seen**; the monotonicity check and
+  `seen()` use it, so frames the peer had in flight for a declined stream are
+  still tolerated.
+
+Both halves are pinned by `h2_goaway_names_the_last_processed_stream_not_the_last_seen`:
+collapsing them one way makes GOAWAY over-claim, and the other way makes late
+frames for a declined stream fatal again.
+
+### What is *not* copied from Node, and why
+
+REFUSED_STREAM's real trigger is `maxConcurrentStreams`, and this lane measured
+both of Node's regimes with the same raw peer:
+
+| when the limit is exceeded | Node 26.5.1 sends |
+|---|---|
+| before the peer ACKs our SETTINGS | `RST_STREAM stream=5 code=7` (REFUSED_STREAM); the other streams live |
+| after the peer ACKs our SETTINGS | `RST_STREAM code=2` then `GOAWAY code=2`, connection closed |
+
+turnloop implements the first and **not** the second. RFC 9113 §5.1.2 says a
+HEADERS that causes the advertised limit to be exceeded *MUST* be treated as a
+stream error of type STREAM_CLOSED or REFUSED_STREAM; Node's second regime is a
+connection error instead. h2spec §5.1.2 exercises this case, so the RFC-shaped
+answer is also the one the required gate checks. A host that wants Node's
+stricter policy has `settings_awaiting_ack`-equivalent knowledge available to it
+and can escalate; the core does not escalate on its behalf.
 
 ## 3. `Step`'s zero cases are now a stated, tested contract
 
@@ -151,9 +262,20 @@ the record disappear under it.
   The connection already enforced the distinction; the host had to keep its own
   `received_head` to recover it. **Breaking** for an exhaustive pattern without
   `..`; two in-crate sites and one test were updated.
-- `Event::Reset` may now name a stream the host never saw opened — a refusal is
-  decided before any `Event::Headers` for that stream exists. Documented on the
-  variant.
+- **Breaking, and worth calling out separately:** `Event` gained a variant, so an
+  exhaustive `match` on it needs one more arm. Perry's committed contract probe
+  stops compiling until it gets one — a one-line change, and a deliberate signal
+  rather than a silent behaviour shift.
+- `Event::Unprocessed { stream }` — a stream the peer opened after a graceful
+  GOAWAY, for which **nothing has been sent**. The host decides whether to
+  answer.
+- `Event::Reset` may now name a stream the host never saw opened — a
+  concurrent-stream-limit refusal is decided before any `Event::Headers` for
+  that stream exists. Documented on the variant.
+- `Connection::reset` now sends for a stream with no record left (already reset,
+  or refused before one existed) rather than treating it as a no-op, so a host
+  can answer an `Event::Unprocessed`. An id this connection never used is still
+  an error.
 - `send_headers`/`send_data` for a terminated stream report `STREAM_CLOSED`
   rather than the idle/unknown protocol error.
 
@@ -176,7 +298,11 @@ final tree:
 | reverted | tests that fail |
 |---|---|
 | `reset` returns no credit, frees no slot | `h2_reset_with_unreleased_data_keeps_its_table_slot`, `h2_reset_returns_the_connection_window`, `h2_release_after_termination_is_a_no_op`, `h2_late_frames_for_a_locally_reset_stream_are_ignored`, `h2_response_in_flight_when_the_client_aborts_is_ignored` |
-| post-GOAWAY stream is a connection error | `h2_stream_after_graceful_goaway_is_refused_not_fatal` |
+| post-GOAWAY stream is a connection error | `h2_stream_after_graceful_goaway_is_unprocessed_and_unanswered` |
+| post-GOAWAY stream answers RST_STREAM (the refuted premise) | `h2_stream_after_graceful_goaway_is_unprocessed_and_unanswered` |
+| `reset` will not answer for a stream with no record | `h2_stream_after_graceful_goaway_is_unprocessed_and_unanswered` |
+| GOAWAY names the last stream *seen* rather than processed | `h2_goaway_names_the_last_processed_stream_not_the_last_seen` |
+| declined ids drop out of `seen()` | `h2_goaway_names_…`, `h2_stream_after_graceful_goaway_…` |
 | stream limit is a connection error | `h2_stream_limit_refuses_one_stream_not_the_connection` |
 | late DATA for a gone stream is fatal | `h2_late_frames_for_a_locally_reset_stream_are_ignored`, `h2_response_in_flight_when_the_client_aborts_is_ignored` |
 | a client's in-flight response after its own reset is fatal | `h2_response_in_flight_when_the_client_aborts_is_ignored` |
@@ -198,11 +324,13 @@ of it changed — re-run against the fixed crate:
 -- server releases capacity, THEN resets --
    streams the server accepted: 6
 == gap 3: a stream opened after a graceful GOAWAY ==
-  server after late stream: ["Reset s=1 code=7"]   (was CONNECTION ERROR PROTOCOL_ERROR)
-  server emitted frame kind=3 (7 = GOAWAY)         (was kind=7)
+  server after late stream: ["Unprocessed s=1"]    (was CONNECTION ERROR PROTOCOL_ERROR)
+                                                   (and no "server emitted frame" line at all)
 ```
 
-`kind=3` is RST_STREAM. The probe's own label is left as it was printed.
+The probe prints its `server emitted frame kind=` line only when the server has
+at least a frame header of output. Its absence is the probe independently
+confirming that nothing was sent — which is what Node does.
 
 ## One unrelated Windows defect, surfaced by CI
 
@@ -262,6 +390,21 @@ the way this one did. Worth doing; worth scoping and reviewing as its own
 change rather than riding along with a protocol fix. The one cheap piece that
 does not need the design settled is `turnloop_websocket::Received`, which has
 the identical two zero cases and no words about them.
+
+## What this cost, and the lesson that is not about HTTP/2
+
+The premise that Node answers `RST_STREAM(REFUSED_STREAM)` after a graceful
+GOAWAY travelled through three briefs and was implemented once before anyone put
+a socket against Node. It is the same failure mode as the h2spec blind spot in
+§0, seen from the other side: h2spec passed with four defects present because it
+only drives from the peer side, and a stated behaviour survived three hand-offs
+because nobody drove the peer at all. Both are cases of a claim nobody could
+falsify from where they were standing.
+
+The cheap guard is the one this lane used twice by accident and once on purpose:
+**put a raw socket against the reference implementation, and include a control
+that distinguishes "it did nothing" from "it stopped listening".** The PING after
+the late stream is what turns "no frames" from a guess into a measurement.
 
 ## Not done
 
