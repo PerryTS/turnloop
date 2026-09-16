@@ -608,6 +608,9 @@ unsafe impl Backend for Unix {
         if backlog > i32::MAX as u32 {
             return Err(Error::new(ErrorKind::InvalidInput));
         }
+        // Resolved before the socket exists, so a request this platform cannot
+        // honour never reaches the kernel at all.
+        let reuse_option = super::socket::reuse_port_option(reuse)?;
         let fd = socket::create(addr, kind == Kind::Udp)?;
         if kind != Kind::Tcp {
             // TCP listeners need address reuse for TIME_WAIT. Default UDP binds
@@ -616,7 +619,7 @@ unsafe impl Backend for Unix {
             if kind == Kind::Listener || reuse.is_enabled() {
                 socket::option(fd.as_raw_fd(), libc::SOL_SOCKET, libc::SO_REUSEADDR, 1)?;
             }
-            if let Some(option) = super::socket::reuse_port_option(reuse)? {
+            if let Some(option) = reuse_option {
                 socket::option(fd.as_raw_fd(), libc::SOL_SOCKET, option, 1)?;
             }
             let a = Addr::new(addr);
