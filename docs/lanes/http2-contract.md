@@ -124,7 +124,8 @@ the record disappear under it.
 - `Connection::goaway(code, last_stream, opaque)` — the GOAWAY form `shutdown`
   cannot express (`session.goaway(code, lastStreamID, opaqueData)` in Node).
   `shutdown` is now `goaway(0, last_remote, &[])`; the bytes on the wire are
-  unchanged.
+  unchanged. Opaque data over the peer's `SETTINGS_MAX_FRAME_SIZE` is refused
+  here rather than sent for the peer to answer with `FRAME_SIZE_ERROR`.
 - `Event::Headers` gains `kind: HeadersKind::{Head, Informational, Trailers}`.
   The connection already enforced the distinction; the host had to keep its own
   `received_head` to recover it. **Breaking** for an exhaustive pattern without

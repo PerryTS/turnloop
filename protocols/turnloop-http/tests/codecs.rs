@@ -992,6 +992,12 @@ fn h2_goaway_carries_code_last_stream_and_opaque_data() {
         vec!["Goaway code=11"]
     );
     assert!(client.open(&post_headers("/after"), true).is_err());
+    // Opaque data over the peer's SETTINGS_MAX_FRAME_SIZE is refused here
+    // rather than sent for the peer to answer with FRAME_SIZE_ERROR.
+    assert_eq!(
+        server.goaway(0, 0, &vec![0; 16384]).err().map(|e| e.code),
+        Some("FRAME_SIZE_ERROR")
+    );
 }
 
 /// `Step`'s two independent zero cases, both normal, neither previously

@@ -621,6 +621,11 @@ impl Connection {
         if last_stream > 0x7fffffff {
             return Err(protocol("invalid last stream"));
         }
+        // The peer would answer a GOAWAY over its own SETTINGS_MAX_FRAME_SIZE
+        // with FRAME_SIZE_ERROR, so refuse the opaque data here instead.
+        if 8 + opaque.len() > self.peer_frame {
+            return Err(frame_error());
+        }
         self.draining = true;
         self.scratch.clear();
         self.scratch.extend_from_slice(&last_stream.to_be_bytes());
