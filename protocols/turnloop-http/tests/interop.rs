@@ -370,7 +370,20 @@ fn serve_h2(mut socket: TcpStream, total: usize) {
         match socket.read(&mut tail) {
             Ok(0) => break,
             Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => break,
+            // This is a raw std socket, so it does not get the normalisation the
+            // crate applies everywhere else: Windows reports the local end of a
+            // departed peer as WSAECONNABORTED, and `backend/iocp/socket.rs`
+            // (`ERROR_CONNECTION_ABORTED`) and `types.rs` both fold that into
+            // `ConnectionReset`. Both mean the peer is gone after a verified
+            // exchange, which is a valid end to this drain.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                ) =>
+            {
+                break;
+            }
             Err(e) => panic!("peer did not finish shutdown: {e}"),
         }
     }
