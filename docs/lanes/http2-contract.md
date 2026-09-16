@@ -204,6 +204,35 @@ of it changed — re-run against the fixed crate:
 
 `kind=3` is RST_STREAM. The probe's own label is left as it was printed.
 
+## One unrelated Windows defect, surfaced by CI
+
+`test-native (windows-2025, all-features)` failed on
+`turnloop-http/interop::curl_and_node_h2_hundred_streams_against_native_server`:
+
+```
+thread '<unnamed>' panicked at protocols\turnloop-http\tests\interop.rs:374:
+peer did not finish shutdown: An established connection was aborted by the
+software in your host machine. (os error 10053)
+```
+
+Pre-existing, and not this branch's, established three ways rather than asserted:
+
+1. The server's wire bytes for that exact 100-stream exchange are **identical to
+   `main`'s** — 2955 bytes, same FNV-1a — replayed against both trees.
+2. The panic is in the socket drain *after* `count == total` is asserted and the
+   Node client has printed `100 verified`.
+3. Windows **default** and **executor** ran the same test in the same run, curl
+   leg included, and passed 9/9. Same code, different outcome — a race.
+
+The drain breaks on EOF and `ConnectionReset` but not `ConnectionAborted`, and
+Windows reports the local end of a departed peer as WSAECONNABORTED. The crate
+never sees this because it folds the two together everywhere —
+`backend/iocp/socket.rs` maps `ERROR_CONNECTION_ABORTED` to `ConnectionReset`,
+and `types.rs` and both WASI backends do the same. This test reads a raw
+`std::net::TcpStream`, so it is the one place that gets the un-normalised kind.
+Folded it the same way; re-running until the race went the other way would have
+left the next lane to find it again.
+
 ## Should the step contract be generalised to every sans-I/O decoder?
 
 Recommendation: **not as part of this**, and the reason is in the evidence.
