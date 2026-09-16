@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0-alpha.5](https://github.com/PerryTS/turnloop/compare/turnloop-v0.1.0-alpha.4...turnloop-v0.1.0-alpha.5) - 2026-09-16
+
+### Other
+
+- Page the slot tables so a capacity ceiling costs nothing idle ([#76](https://github.com/PerryTS/turnloop/pull/76))
+- A long-occupancy job class for the blocking pool ([#74](https://github.com/PerryTS/turnloop/pull/74))
+- Reserve extra descriptor numbers across the fork
+- Keep the child fixture buildable on targets without processes
+- Pass extra child descriptors and control the child session at spawn
+
 ## [0.1.0-alpha.4](https://github.com/PerryTS/turnloop/compare/turnloop-v0.1.0-alpha.3...turnloop-v0.1.0-alpha.4) - 2026-09-15
 
 ### Other
