@@ -159,21 +159,39 @@ the record disappear under it.
 | `check-paths.py`, `feature_modes.py`, `no-tokio.sh` | pass |
 
 A green test proves nothing if the code under it never ran, so each fix was
-reverted in place and the suite re-run:
+reverted in place and the suite re-run. Every row was re-measured against the
+final tree:
 
 | reverted | tests that fail |
 |---|---|
-| a client's in-flight response after its own reset is fatal | `h2_response_in_flight_when_the_client_aborts_is_ignored` |
-| `reset` returns no credit, frees no slot | `h2_reset_with_unreleased_data_keeps_its_table_slot`, `h2_reset_returns_the_connection_window`, `h2_release_after_termination_is_a_no_op`, `h2_late_frames_for_a_locally_reset_stream_are_ignored` |
+| `reset` returns no credit, frees no slot | `h2_reset_with_unreleased_data_keeps_its_table_slot`, `h2_reset_returns_the_connection_window`, `h2_release_after_termination_is_a_no_op`, `h2_late_frames_for_a_locally_reset_stream_are_ignored`, `h2_response_in_flight_when_the_client_aborts_is_ignored` |
 | post-GOAWAY stream is a connection error | `h2_stream_after_graceful_goaway_is_refused_not_fatal` |
 | stream limit is a connection error | `h2_stream_limit_refuses_one_stream_not_the_connection` |
-| late DATA for a gone stream is fatal | `h2_late_frames_for_a_locally_reset_stream_are_ignored` |
+| late DATA for a gone stream is fatal | `h2_late_frames_for_a_locally_reset_stream_are_ignored`, `h2_response_in_flight_when_the_client_aborts_is_ignored` |
+| a client's in-flight response after its own reset is fatal | `h2_response_in_flight_when_the_client_aborts_is_ignored` |
+| GOAWAY opaque data is not size-checked | `h2_goaway_carries_code_last_stream_and_opaque_data` |
 
 The first row is why `h2_reset_with_unreleased_data_keeps_its_table_slot`
 asserts the *events* each stream produced and not merely that the connection
 survived: with only the refusal fix in place, a burnt slot answers RST_STREAM
 and the connection lives, so "6 connections survived" passes while "6 streams
 were accepted" does not.
+
+And the artefact that specified the work — Perry's committed probe, not one line
+of it changed — re-run against the fixed crate:
+
+```
+== gap 1: a reset stream's table slot ==
+-- server resets WITHOUT releasing capacity --
+   streams the server accepted: 6            (was 2)
+-- server releases capacity, THEN resets --
+   streams the server accepted: 6
+== gap 3: a stream opened after a graceful GOAWAY ==
+  server after late stream: ["Reset s=1 code=7"]   (was CONNECTION ERROR PROTOCOL_ERROR)
+  server emitted frame kind=3 (7 = GOAWAY)         (was kind=7)
+```
+
+`kind=3` is RST_STREAM. The probe's own label is left as it was printed.
 
 ## Should the step contract be generalised to every sans-I/O decoder?
 
