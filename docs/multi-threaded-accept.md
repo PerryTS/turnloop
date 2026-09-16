@@ -70,6 +70,18 @@ over 4 loops gave `[970, 1016, 1019, 995]` — but the *work* behind each
 connection is still not what was balanced. If a host needs load-sensitive
 placement, that is the handoff route, where the policy is the host's to write.
 
+### Neither route has a thundering herd
+
+Worth saying because it is the usual objection to multi-threaded accept, and it
+applies to a shape turnloop does not have. A herd comes from several threads
+waiting on **one** listening socket and all being woken for one connection.
+
+Under `Distribute` each loop has its **own** listener with its own accept queue,
+and the kernel delivers to exactly one of them, so exactly one loop wakes. Under
+the handoff route exactly one loop is accepting at all. The cost each route pays
+is elsewhere: uneven shares for the first, and a per-connection `detach`/`attach`
+plus a cross-thread wake for the second.
+
 ## The handoff route
 
 `Loop::detach(h) -> Detached` (which is `Send`) and `Loop::attach(d, tok)`.
