@@ -183,14 +183,15 @@ const ACCEPT: Token = Token(u64::MAX);
 
 /// Connect, send one payload, read it back, close. Repeated by each client
 /// thread until the run's connection budget is spent.
-fn client(addr: SocketAddr, payload: usize, budget: &AtomicUsize) -> usize {
+///
+/// `issued` is a ticket counter rather than a countdown: every thread takes the
+/// next number and stops once the numbers run past the budget, so the work is
+/// claimed exactly once with a single `fetch_add` and no compare-exchange loop.
+fn client(addr: SocketAddr, payload: usize, issued: &AtomicUsize, budget: usize) -> usize {
     let request = vec![0x5a_u8; payload];
     let mut response = vec![0_u8; payload];
     let mut done = 0;
-    while budget
-        .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
-        .is_ok()
-    {
+    while issued.fetch_add(1, Ordering::AcqRel) < budget {
         let mut s = TcpStream::connect(addr).expect("connect");
         s.set_nodelay(true).expect("nodelay");
         s.set_read_timeout(Some(Duration::from_secs(30)))
@@ -230,18 +231,18 @@ pub fn run(counter: &Counter, args: &Args) {
         }
     }
     let served = Arc::new(AtomicUsize::new(0));
-    let budget = Arc::new(AtomicUsize::new(args.connections));
+    let issued = Arc::new(AtomicUsize::new(0));
     let (addr, threads) = match args.route {
         Route::ReusePort => reuse_port_servers(args, &served),
         Route::Handoff => handoff_servers(args, &served),
     };
     let before = counter.read().expect("counter");
     let start = Instant::now();
-    let payload = args.payload;
+    let (payload, budget) = (args.payload, args.connections);
     let clients: Vec<_> = (0..args.clients)
         .map(|_| {
-            let budget = Arc::clone(&budget);
-            thread::spawn(move || client(addr, payload, &budget))
+            let issued = Arc::clone(&issued);
+            thread::spawn(move || client(addr, payload, &issued, budget))
         })
         .collect();
     let driven: usize = clients.into_iter().map(|c| c.join().expect("client")).sum();
