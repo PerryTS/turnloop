@@ -1,5 +1,6 @@
 //! WASI 0.2 completion backend. One poll import per turn, reusable canonical
 //! lists, and synchronous nonblocking I/O with generational cancellation.
+use crate::slots::{Slots, page_reserve};
 mod abi;
 mod fs;
 mod sockopt;
@@ -116,13 +117,13 @@ enum PollOwner {
 }
 /// WASI 0.2 pollable driver with retained canonical buffers.
 pub struct WasiP2 {
-    resources: Vec<Option<Resource>>,
-    ops: Vec<Option<Pending>>,
+    resources: Slots<Resource>,
+    ops: Slots<Pending>,
     ready: VecDeque<Handle>,
     cancelled: VecDeque<OpId>,
     handles: Vec<u32>,
     owners: Vec<PollOwner>,
-    lookups: Vec<Option<Lookup>>,
+    lookups: Slots<Lookup>,
     indices: Vec<usize>,
     poll_storage: Vec<u32>,
     scratch: Vec<u32>,
@@ -395,13 +396,13 @@ unsafe impl Backend for WasiP2 {
             .and_then(|n| n.checked_add(1))
             .ok_or(Error::new(ErrorKind::ResourceLimit))?;
         Ok(Self {
-            resources: (0..config.max_handles).map(|_| None).collect(),
-            ops: (0..config.max_operations).map(|_| None).collect(),
-            ready: VecDeque::with_capacity(config.max_handles),
-            cancelled: VecDeque::with_capacity(config.max_operations),
+            resources: Slots::new(config.max_handles),
+            ops: Slots::new(config.max_operations),
+            ready: VecDeque::with_capacity(page_reserve(config.max_handles)),
+            cancelled: VecDeque::with_capacity(page_reserve(config.max_operations)),
             handles: Vec::with_capacity(polls),
             owners: Vec::with_capacity(polls),
-            lookups: (0..config.max_operations).map(|_| None).collect(),
+            lookups: Slots::new(config.max_operations),
             indices: Vec::with_capacity(polls),
             poll_storage: vec![0; polls],
             scratch: vec![0; 16400],

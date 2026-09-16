@@ -552,7 +552,7 @@ No other Perry change is needed for P0.
 
 **Hard rules**, enforced by tests and CI benchmarks:
 
-1. **Allocations:** zero heap allocations per read, write, timer or accept after warm-up (checked with a counting allocator in tests).
+1. **Allocations:** zero heap allocations per read, write, timer or accept after warm-up (checked with a counting allocator in tests). *Warm-up* includes reaching a high-water mark: `Config::max_handles` and `Config::max_operations` are ceilings whose slot storage is built in pages as the mark rises (§10a), so passing a new mark allocates a page and a loop at its mark allocates nothing. **Contract tests:** a loop built with a 1024x larger ceiling makes the same allocations, and requests the same bytes, as the smaller one; a loop pinned at a high-water mark 500 handles above page zero turns 1000 times without allocating.
 2. **Wake:** zero syscalls on `notify()` while the loop is running (checked with a syscall-counting harness: `strace -c` / `ktrace` / ETW in CI smoke tests).
 3. **OS waits and discovery** (amended by tl-i01b, see the rationale below):
    1. A `turn` makes at most one OS wait.
@@ -565,6 +565,44 @@ No other Perry change is needed for P0.
 4. **Ticks:** no fixed-interval ticks and no minimum wait floor.
 4a. **No spin.** A turn with nothing ready and a future deadline blocks until that deadline, at the precision in §7.6. It never returns immediately and never degrades into a zero-timeout poll loop. Hosts must pass exact deadlines (`Instant`, not truncated milliseconds). The Linux A/B measured what happens otherwise: 37,607 turns for 50 timers, ~70× user instructions. A backend whose timeout is implemented by a private wakeup source — epoll's timerfd, the IOCP deadline packet, the WASI 0.2 deadline pollable, the WASI 0.3 deadline subtask — reports that wake as a **zero-event** wait, exactly as a timed OS wait that returned nothing; real I/O or notifier events arriving in the same call still make it non-empty. **Contract tests:** with an idle registered socket and a 0.5 ms / 2 ms / 10 ms timer, turns per expiry ≤ 2 and zero-event OS waits ≤ 1 per expiry, on every backend; and (tl-i02) each of the sixty expiries at those delays costs exactly one blocking wait that observed no native event, identically with the loop idle and with a registered-but-idle native operation, with no allocation, while a call that carries real bytes is not counted empty.
 5. **Instruction budgets per operation** (Linux, cgu=1, `perf stat -e instructions:u,instructions:k`): TCP read / write / accept, timer start + cancel, notify + turn round trip, blocking job round trip, idle turn. **Values to be set from the attribution run of today's tokio bridge**, with a target below the tokio-bridge cost and within X % of a hand-written epoll loop. The CI gate compares against a committed baseline, with a control probe that must not move.
+
+### 10a. Capacities are ceilings, not reservations
+
+`max_handles` and `max_operations` name the largest number of slots a loop may
+ever hold. They are not preallocations: slots live in fixed-size pages built on
+demand, page zero with the loop and another when the high-water mark crosses into
+it. An idle loop therefore costs one page of each structure whatever its ceiling,
+which is what makes a large default ceiling and a loop per agent (§5a) affordable
+at once — the alternative forced hosts to choose between refusing connections and
+paying for a loop they mostly do not use.
+
+Substituting pages for a flat vector is safe because of how slots are addressed.
+A slot is named by its index and reused under a generation, so **adding a page
+moves no existing slot and invalidates no handle or operation id**; pages are
+separately allocated, so a slot's *address* is stable too, which the backends that
+hand a slot's address to the kernel rely on. Indices are handed out
+lowest-free-first, so the materialised prefix tracks the loop's high-water mark,
+not its ceiling.
+
+Two things stay contiguous and sized by their ceiling. The Windows `OVERLAPPED`
+slab (`kernel`, and the `bridges` parallel to it) maps a completion packet's
+pointer back to an operation index by pointer arithmetic over one allocation;
+paging it needs a different reverse map, which is its own change. The cross-thread
+result rings are lock-free and index by a power-of-two mask, where the capacity is
+also the backpressure bound. `pooled_buffers` is a separate question, tracked in
+#43: it is the remaining per-loop cost that scales with configuration.
+
+**Reaching the ceiling is backpressure.** An operation whose completion creates a
+handle — an accept, a handle receive — reserves its handle slot when it is
+submitted. An accept the kernel has been asked to perform therefore always has
+somewhere to put its connection, and at the ceiling the *submission* is refused
+with `ResourceLimit` instead, before the kernel is asked. The pending connection
+stays in the listener's backlog, which is the queue meant to absorb it. This
+replaces accepting a connection and then destroying it for want of a slot, which
+is what a host at its ceiling did before, and is why it surfaced as a connection
+refusal rather than a delay. A multishot accept holds one such reservation, so it
+is protected for one connection at a time; bounding a whole batch needs a per-turn
+native event budget on `Backend::poll`, which is a separate change.
 
 **Rule 3 rationale (tl-i01b, spec-owner decision, 2026-09-15).** The original rule 3 ("none when completions are already queued") forbade even a zero-timeout poll. Backend revision 2 has no separate no-wait discovery primitive: `poll(Duration::ZERO)` is the only way to learn about fresh readiness or completions, and on Unix, after cached readiness reaches `EAGAIN`, only the poller marks a resource ready again. libuv and Node make the same trade: `uv_run` computes `uv_backend_timeout()`, which is zero while pending, idle or closing work exists, and still calls `uv__io_poll` with that zero timeout (see the libuv [loop API](https://docs.libuv.org/en/v1.x/loop.html) and [`src/unix/core.c`](https://github.com/libuv/libuv/blob/v1.x/src/unix/core.c)). The [tl-i01 probes](docs/lanes/tl-i01.md#evidence--specification-decision) showed that skipping discovery breaks the unchanged fairness contract: skipping the native step whenever work was queued failed the timer/I/O/post fairness test after two seconds, and a guard that only drained cached work delivered 64 posts with zero reads and failed the same fairness test. A separate no-wait collection API on all six backends is not justified before measurement. Rule 4a and its raw zero-event accounting are unchanged: an empty discovery poll still counts toward the same no-spin bound.
 

@@ -8,6 +8,7 @@ use super::{
     poller::{Poller, Ready, last_error},
     socket::{self, Addr},
 };
+use crate::slots::{Slots, page_reserve};
 use crate::{
     backend::{Backend, Event, Operation, Outcome, PollInfo, Request},
     *,
@@ -135,8 +136,8 @@ struct Pending {
 /// Completion engine shared by kqueue and epoll, with native process and signal services.
 pub struct Unix {
     poller: SystemPoller,
-    resources: Vec<Option<Resource>>,
-    ops: Vec<Option<Pending>>,
+    resources: Slots<Resource>,
+    ops: Slots<Pending>,
     ready: VecDeque<Handle>,
     cancelled: VecDeque<OpId>,
     polled: Vec<Ready>,
@@ -298,10 +299,10 @@ unsafe impl Backend for Unix {
     fn new(config: &Config, pool: BufferPool) -> Result<Self> {
         Ok(Self {
             poller: SystemPoller::new(config.events_per_turn)?,
-            resources: (0..config.max_handles).map(|_| None).collect(),
-            ops: (0..config.max_operations).map(|_| None).collect(),
-            ready: VecDeque::with_capacity(config.max_handles),
-            cancelled: VecDeque::with_capacity(config.max_operations),
+            resources: Slots::new(config.max_handles),
+            ops: Slots::new(config.max_operations),
+            ready: VecDeque::with_capacity(page_reserve(config.max_handles)),
+            cancelled: VecDeque::with_capacity(page_reserve(config.max_operations)),
             polled: Vec::with_capacity(config.events_per_turn),
             files: super::files::Files::new(config, pool.clone()),
             watches: super::watch::Watches::new(config, pool.clone()),

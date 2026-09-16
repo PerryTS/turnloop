@@ -9,6 +9,7 @@ use super::{
     Detached, os_error,
     port::{Entry, Port},
 };
+use crate::slots::{Slots, page_reserve};
 use crate::{
     backend::{Event, Operation, Outcome, Request},
     fs::watch::Ring,
@@ -149,11 +150,11 @@ fn same_name(a: &[u16], b: &[u16]) -> bool {
 }
 
 pub(super) struct Watches {
-    entries: Vec<Option<Watch>>,
+    entries: Slots<Watch>,
     active: Vec<usize>,
     /// Released watches whose last request awaits its acknowledgement.
     retired: Vec<Watch>,
-    ops: Vec<Option<Handle>>,
+    ops: Slots<Handle>,
     ready: VecDeque<Handle>,
     finished: VecDeque<(OpId, Result<()>)>,
     pool: BufferPool,
@@ -162,12 +163,12 @@ pub(super) struct Watches {
 impl Watches {
     pub fn new(config: &Config, pool: BufferPool, port: Arc<Port>) -> Self {
         Self {
-            entries: (0..config.max_handles).map(|_| None).collect(),
-            active: Vec::with_capacity(config.max_handles),
-            retired: Vec::with_capacity(config.max_handles),
-            ops: vec![None; config.max_operations],
-            ready: VecDeque::with_capacity(config.max_handles),
-            finished: VecDeque::with_capacity(config.max_operations),
+            entries: Slots::new(config.max_handles),
+            active: Vec::with_capacity(page_reserve(config.max_handles)),
+            retired: Vec::with_capacity(page_reserve(config.max_handles)),
+            ops: Slots::new(config.max_operations),
+            ready: VecDeque::with_capacity(page_reserve(config.max_handles)),
+            finished: VecDeque::with_capacity(page_reserve(config.max_operations)),
             pool,
             port,
         }

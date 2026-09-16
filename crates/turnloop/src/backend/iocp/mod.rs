@@ -1,5 +1,6 @@
 //! Native IOCP completion backend. Kernel storage is pinned separately from Rust
 //! operation metadata and survives cancellation until the OS acknowledgement.
+use crate::slots::{Slots, page_reserve};
 mod bridge;
 mod integration;
 mod ipc;
@@ -271,9 +272,12 @@ impl crate::backend::Wake for IocpWake {
 }
 /// One IOCP per host-driven loop, with fixed operation storage and an opt-in GUI helper.
 pub struct Iocp {
-    resources: Vec<Option<Resource>>,
-    ops: Vec<Option<Pending>>,
+    resources: Slots<Resource>,
+    ops: Slots<Pending>,
     kernel: Box<[UnsafeCell<Kernel>]>,
+    /// One per `kernel` slot, so it is sized with that slab rather than paged:
+    /// a bridge holds its slot's pinned address, and the reverse map from an
+    /// `OVERLAPPED` pointer back to an operation index needs `kernel` contiguous.
     bridges: Vec<Option<bridge::Bridge>>,
     ready: VecDeque<usize>,
     pool_waiting: VecDeque<OpId>,
@@ -285,7 +289,7 @@ pub struct Iocp {
     event: Option<EventIntegration>,
     notifier: Option<Notifier>,
     services: services::Services,
-    workers: Vec<Option<[sync_io::Worker; 2]>>,
+    workers: Slots<[sync_io::Worker; 2]>,
     deadline: Option<Instant>,
     failure: Option<Error>,
     next_listener_key: usize,
@@ -1113,12 +1117,12 @@ unsafe impl Backend for Iocp {
             .collect::<Result<Vec<_>>>()?;
         let watches = watch::Watches::new(config, pool.clone(), Arc::clone(&port));
         Ok(Self {
-            resources: (0..config.max_handles).map(|_| None).collect(),
-            ops: (0..config.max_operations).map(|_| None).collect(),
+            resources: Slots::new(config.max_handles),
+            ops: Slots::new(config.max_operations),
             kernel,
             bridges,
-            ready: VecDeque::with_capacity(config.max_operations),
-            pool_waiting: VecDeque::with_capacity(config.max_operations),
+            ready: VecDeque::with_capacity(page_reserve(config.max_operations)),
+            pool_waiting: VecDeque::with_capacity(page_reserve(config.max_operations)),
             pool,
             wake: Arc::new(IocpWake {
                 port: Arc::clone(&port),
@@ -1130,7 +1134,7 @@ unsafe impl Backend for Iocp {
             event: None,
             notifier: None,
             services: services::Services::new(config.max_handles),
-            workers: (0..config.max_handles).map(|_| None).collect(),
+            workers: Slots::new(config.max_handles),
             deadline: None,
             failure: None,
             next_listener_key: pipes::FIRST_KEY,
@@ -1683,7 +1687,7 @@ impl Drop for Iocp {
             }
         }
         self.failure = None; // teardown no longer arms host deadlines
-        for i in 0..self.ops.len() {
+        for i in 0..self.ops.materialised() {
             if let Some(p) = &self.ops[i] {
                 let op = p.request.op;
                 if self.cancel(op).is_err() {

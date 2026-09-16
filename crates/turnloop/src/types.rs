@@ -16,7 +16,7 @@ macro_rules! id {
             pub(crate) key: u64,
         }
         impl $name {
-            /// Slot index, for preallocated backend operation/resource storage.
+            /// Slot index, for paged backend operation/resource storage.
             pub fn index(self) -> usize {
                 self.key as u32 as usize
             }
@@ -166,8 +166,18 @@ impl Timeout {
 /// Fixed loop capacities and shared blocking-pool configuration.
 pub struct Config {
     /// Maximum simultaneously allocated handles, including closed results awaiting delivery.
+    ///
+    /// A ceiling, not a reservation: slot storage is built in pages as the loop's
+    /// high-water mark rises, so an idle loop costs the same whatever this is and
+    /// a large value is affordable for a loop per agent. Reaching it refuses an
+    /// accept at submission, before the kernel is asked for a connection, so
+    /// pending connections wait in the listener's backlog rather than being
+    /// accepted and destroyed.
     pub max_handles: usize,
     /// Maximum outstanding operations, including terminal results awaiting delivery.
+    ///
+    /// A ceiling paged like [`Config::max_handles`], except for the Windows
+    /// `OVERLAPPED` slab, which stays contiguous.
     pub max_operations: usize,
     /// Native event budget and per-source completion reserve.
     pub events_per_turn: usize,

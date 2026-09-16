@@ -1,15 +1,21 @@
 use super::{Entry, Instant};
-/// Preallocated four-ary heap with an index for immediate O(log n) cancellation.
-/// Keys encode the slot index in their low 32 bits; one deadline per slot.
+use crate::slots::Slots;
+/// Four-ary heap with an index for immediate O(log n) cancellation. Keys encode
+/// the slot index in their low 32 bits; one deadline per slot.
+///
+/// `capacity` is a ceiling, not a preallocation: the position index is built in
+/// pages as slots are used, and the heap itself grows with the timers actually
+/// armed, so a loop that arms none costs nothing for a large ceiling.
 pub struct Heap {
     heap: Vec<Entry>,
-    positions: Vec<usize>,
+    /// Each armed slot's position in `heap`; vacant means that slot has no timer.
+    positions: Slots<usize>,
 }
 impl Heap {
     pub fn new(capacity: usize) -> Self {
         Self {
-            heap: Vec::with_capacity(capacity),
-            positions: vec![usize::MAX; capacity],
+            heap: Vec::with_capacity(crate::slots::PAGE.min(capacity)),
+            positions: Slots::new(capacity),
         }
     }
     pub fn len(&self) -> usize {
@@ -23,23 +29,23 @@ impl Heap {
     }
     pub fn insert(&mut self, id: u64, at: Instant) {
         let i = id as u32 as usize;
-        assert_eq!(self.positions[i], usize::MAX, "one timer per slot");
-        self.positions[i] = self.heap.len();
+        assert!(self.positions[i].is_none(), "one timer per slot");
+        self.positions[i] = Some(self.heap.len());
         self.heap.push(Entry { id, at });
         self.up(self.heap.len() - 1);
     }
     pub fn cancel(&mut self, id: u64) -> bool {
         let i = id as u32 as usize;
-        let Some(&p) = self.positions.get(i) else {
+        let Some(&Some(p)) = self.positions.get(i) else {
             return false;
         };
-        if p == usize::MAX || self.heap[p].id != id {
+        if self.heap[p].id != id {
             return false;
         }
         self.heap.swap_remove(p);
-        self.positions[i] = usize::MAX;
+        self.positions[i] = None;
         if p < self.heap.len() {
-            self.positions[self.heap[p].id as u32 as usize] = p;
+            self.positions[self.heap[p].id as u32 as usize] = Some(p);
             if p > 0 && self.heap[p] < self.heap[(p - 1) / 4] {
                 self.up(p);
             } else {
@@ -58,8 +64,8 @@ impl Heap {
     }
     fn swap(&mut self, a: usize, b: usize) {
         self.heap.swap(a, b);
-        self.positions[self.heap[a].id as u32 as usize] = a;
-        self.positions[self.heap[b].id as u32 as usize] = b;
+        self.positions[self.heap[a].id as u32 as usize] = Some(a);
+        self.positions[self.heap[b].id as u32 as usize] = Some(b);
     }
     fn up(&mut self, mut p: usize) {
         while p > 0 {

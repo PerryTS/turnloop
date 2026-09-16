@@ -27,6 +27,9 @@ contract!(
     handoff_distribution,
     writev_and_shutdown,
     capacity_and_stale_ids,
+    paged_growth_preserves_handles,
+    accept_reserves_its_handle_slot,
+    an_armed_accept_keeps_its_slot,
     ready_timer_liveness,
     pooled_lease_backpressure,
     io_and_posts_progress_with_repeating_timers

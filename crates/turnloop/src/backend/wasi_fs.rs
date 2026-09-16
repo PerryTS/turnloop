@@ -6,6 +6,7 @@
 //!
 //! Paths resolve only against preopened directories: an absolute path uses the
 //! preopen with the longest matching name, a relative path the preopen named `.`.
+use crate::slots::{Slots, page_reserve};
 use crate::{
     backend::{Event, Outcome},
     fs::{
@@ -133,10 +134,10 @@ struct Pending {
 }
 pub(super) struct Files<A: Api> {
     preopens: Option<Vec<(A::Descriptor, String)>>,
-    objects: Vec<Option<Object<A>>>,
-    ops: Vec<Option<Pending>>,
-    heads: Vec<Option<usize>>,
-    tails: Vec<Option<usize>>,
+    objects: Slots<Object<A>>,
+    ops: Slots<Pending>,
+    heads: Slots<usize>,
+    tails: Slots<usize>,
     ready: VecDeque<usize>,
     waiting: VecDeque<usize>,
     cancelled: VecDeque<OpId>,
@@ -146,13 +147,13 @@ impl<A: Api> Files<A> {
     pub fn new(config: &Config, pool: BufferPool) -> Self {
         Self {
             preopens: None,
-            objects: (0..config.max_handles).map(|_| None).collect(),
-            ops: (0..config.max_operations).map(|_| None).collect(),
-            heads: vec![None; config.max_handles],
-            tails: vec![None; config.max_handles],
-            ready: VecDeque::with_capacity(config.max_operations),
-            waiting: VecDeque::with_capacity(config.max_operations),
-            cancelled: VecDeque::with_capacity(config.max_operations),
+            objects: Slots::new(config.max_handles),
+            ops: Slots::new(config.max_operations),
+            heads: Slots::new(config.max_handles),
+            tails: Slots::new(config.max_handles),
+            ready: VecDeque::with_capacity(page_reserve(config.max_operations)),
+            waiting: VecDeque::with_capacity(page_reserve(config.max_operations)),
+            cancelled: VecDeque::with_capacity(page_reserve(config.max_operations)),
             pool,
         }
     }
@@ -362,7 +363,7 @@ fn resolve<'a, D>(preopens: &'a [(D, String)], path: &'a FsPath) -> Result<(&'a 
 }
 fn execute<A: Api>(
     preopens: &[(A::Descriptor, String)],
-    objects: &mut [Option<Object<A>>],
+    objects: &mut Slots<Object<A>>,
     handle: Option<Handle>,
     request: FsRequest,
 ) -> Result<FsOutput> {
