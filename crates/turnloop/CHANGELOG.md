@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0-alpha.6](https://github.com/PerryTS/turnloop/compare/turnloop-v0.1.0-alpha.5...turnloop-v0.1.0-alpha.6) - 2026-09-17
+
+### Other
+
+- allocate a ring's slots zeroed instead of writing every one ([#89](https://github.com/PerryTS/turnloop/pull/89))
+- Multi-threaded accept: a reuse-port request that names its promise, and the handoff proven ([#83](https://github.com/PerryTS/turnloop/pull/83))
+
 ## [0.1.0-alpha.5](https://github.com/PerryTS/turnloop/compare/turnloop-v0.1.0-alpha.4...turnloop-v0.1.0-alpha.5) - 2026-09-16
 
 ### Other
