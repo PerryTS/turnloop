@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0-alpha.6](https://github.com/PerryTS/turnloop/compare/turnloop-http-v0.1.0-alpha.5...turnloop-http-v0.1.0-alpha.6) - 2026-09-17
+
+### Other
+
+- A terminated HTTP/2 stream no longer takes the connection with it ([#85](https://github.com/PerryTS/turnloop/pull/85))
+
 ## [0.1.0-alpha.3](https://github.com/PerryTS/turnloop/compare/turnloop-http-v0.1.0-alpha.2...turnloop-http-v0.1.0-alpha.3) - 2026-09-15
 
 ### Other
