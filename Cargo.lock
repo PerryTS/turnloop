@@ -570,7 +570,7 @@ dependencies = [
  "js-sys",
  "libc",
  "r-efi 5.3.0",
- "wasip2",
+ "wasip2 1.0.4+wasi-0.2.12",
  "wasm-bindgen",
 ]
 
@@ -1769,7 +1769,7 @@ dependencies = [
  "js-sys",
  "libc",
  "loom",
- "wasip2",
+ "wasip2 2.0.0+wasi-0.2.12",
  "wasip3",
  "wasm-bindgen",
  "windows-sys 0.61.2",
@@ -1795,7 +1795,7 @@ dependencies = [
  "libc",
  "turnloop",
  "turnloop-wasi-random",
- "wasip2",
+ "wasip2 2.0.0+wasi-0.2.12",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "wasm-bindgen-test",
@@ -2057,11 +2057,20 @@ checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
 
 [[package]]
 name = "wasip2"
-version = "1.0.3+wasi-0.2.9"
+version = "1.0.4+wasi-0.2.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20064672db26d7cdc89c7798c48a0fdfac8213434a1186e5ef29fd560ae223d6"
+checksum = "b67efb37e106e55ce722a510d6b5f9c17f083e5fc79afc2badeb12cc313d9487"
 dependencies = [
  "wit-bindgen 0.57.1",
+]
+
+[[package]]
+name = "wasip2"
+version = "2.0.0+wasi-0.2.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "96744b5e833bfd2d84c6faa7569693ce9e04a47c0a4d5519e6442f18af1a0fed"
+dependencies = [
+ "wit-bindgen 0.61.1",
 ]
 
 [[package]]
@@ -2311,9 +2320,6 @@ name = "wit-bindgen"
 version = "0.57.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
-dependencies = [
- "bitflags",
-]
 
 [[package]]
 name = "wit-bindgen"
