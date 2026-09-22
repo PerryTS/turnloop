@@ -24,7 +24,10 @@ final mailbox delivery; the core never retries a message automatically.
 
 TLS options correspond to secure/requireTLS/ignoreTLS: Implicit for secure=true
 (or host's port-465 default), Required, None for ignoreTLS, otherwise
-Opportunistic. STARTTLS is followed by a fresh EHLO and capability parsing. AUTH
+Opportunistic. Required never reaches `Ready` in the clear: if the server does not
+offer STARTTLS or refuses it, the session fails with code `ETLS` before any AUTH is
+sent, so hosts need no `Ready` guard of their own. STARTTLS is followed by a fresh
+EHLO and capability parsing. AUTH
 PLAIN, LOGIN and XOAUTH2 are selectable; OAuth token acquisition/refresh is host
 policy. No CRAM-MD5. PIPELINING sends MAIL and all RCPT commands together, drains
 all responses and sends DATA only with an accepted recipient. SIZE uses

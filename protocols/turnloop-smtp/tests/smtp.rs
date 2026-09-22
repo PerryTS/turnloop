@@ -92,6 +92,89 @@ fn ehlo_fallback_required_tls_and_deadline() {
     assert_eq!(c.poll_event(), Some(Event::Closed));
     assert_eq!(c.poll_event(), None);
 }
+/// Drains every queued event.
+fn events(c: &mut Connection) -> Vec<Event> {
+    std::iter::from_fn(|| c.poll_event()).collect()
+}
+#[test]
+fn required_tls_never_reaches_ready_in_the_clear() {
+    let now = Instant::now();
+    let required = || {
+        let mut c = Connection::new(Config {
+            tls: Tls::Required,
+            auth: Some(Auth::Plain {
+                user: "user".into(),
+                password: "secret".into(),
+            }),
+            ..Config::default()
+        })
+        .expect("fixture operation must succeed");
+        c.connected(now).expect("fixture operation must succeed");
+        c.receive(b"220 hi\r\n", now)
+            .expect("fixture operation must succeed");
+        assert_eq!(c.output(), b"EHLO [127.0.0.1]\r\n");
+        discard(&mut c);
+        c
+    };
+    let refused = |events: &[Event]| {
+        assert_eq!(events.len(), 3, "{events:?}");
+        assert!(
+            matches!(&events[0], Event::Failed { token: None, error, .. }
+                if error.code == "ETLS" && error.command == "STARTTLS"
+                    && error.message.contains("STARTTLS")),
+            "{events:?}"
+        );
+        assert_eq!(events[1..], [Event::CloseTransport, Event::Closed]);
+    };
+    // EHLO without STARTTLS: fail before any AUTH exchange leaves in the clear.
+    let mut c = required();
+    c.receive(b"250-hi\r\n250 AUTH PLAIN\r\n", now)
+        .expect("fixture operation must succeed");
+    refused(&events(&mut c));
+    assert!(c.output().is_empty(), "no AUTH may follow");
+    assert_eq!(c.state(), State::Closed);
+    // STARTTLS advertised but refused by the server.
+    let mut c = required();
+    c.receive(b"250-hi\r\n250-STARTTLS\r\n250 AUTH PLAIN\r\n", now)
+        .expect("fixture operation must succeed");
+    assert_eq!(c.output(), b"STARTTLS\r\n");
+    discard(&mut c);
+    c.receive(b"454 TLS not available\r\n", now)
+        .expect("fixture operation must succeed");
+    let drained = events(&mut c);
+    assert!(
+        matches!(&drained[0], Event::Failed { error, .. }
+            if error.code == "ETLS" && error.response_code == Some(454)),
+        "{drained:?}"
+    );
+    assert!(!drained.contains(&Event::Ready));
+    assert!(c.output().is_empty());
+    // STARTTLS accepted: Ready follows only after the host's upgrade.
+    let mut c = required();
+    c.receive(b"250-hi\r\n250-STARTTLS\r\n250 AUTH PLAIN\r\n", now)
+        .expect("fixture operation must succeed");
+    discard(&mut c);
+    c.receive(b"220 go ahead\r\n", now)
+        .expect("fixture operation must succeed");
+    assert_eq!(events(&mut c), [Event::UpgradeTls]);
+    assert_eq!(c.state(), State::Tls);
+    c.tls_established(now)
+        .expect("fixture operation must succeed");
+    discard(&mut c);
+    c.receive(b"250-hi\r\n250 AUTH PLAIN\r\n", now)
+        .expect("fixture operation must succeed");
+    assert!(c.output().starts_with(b"AUTH PLAIN "));
+    discard(&mut c);
+    c.receive(b"235 ok\r\n", now)
+        .expect("fixture operation must succeed");
+    assert_eq!(events(&mut c), [Event::Ready]);
+    // Opportunistic TLS, by contrast, proceeds in the clear.
+    let mut c = Connection::new(Config::default()).expect("fixture operation must succeed");
+    c.connected(now).expect("fixture operation must succeed");
+    c.receive(b"220 hi\r\n250 hi\r\n", now)
+        .expect("fixture operation must succeed");
+    assert_eq!(events(&mut c), [Event::Ready]);
+}
 #[test]
 fn malformed_multiline_and_injection_are_rejected() {
     let now = Instant::now();

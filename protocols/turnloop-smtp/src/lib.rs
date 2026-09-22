@@ -18,9 +18,16 @@ use std::{
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tls {
+    /// Never attempt STARTTLS (nodemailer `ignoreTLS`).
     None,
+    /// Upgrade with STARTTLS when the server offers it, otherwise stay in the clear.
     Opportunistic,
+    /// Upgrade with STARTTLS or fail. A server that does not offer STARTTLS, or
+    /// refuses it, yields `Failed` with code `ETLS` before any AUTH is sent,
+    /// followed by `CloseTransport` and `Closed`; `Ready` is never reached in
+    /// the clear (nodemailer `requireTLS`).
     Required,
+    /// TLS from the first byte (nodemailer `secure`).
     Implicit,
 }
 #[derive(Clone)]
@@ -589,7 +596,25 @@ impl Connection {
         self.tx.extend_from_slice(self.auth_encoded.as_bytes());
         self.tx.extend_from_slice(b"\r\n");
     }
+    /// Whether the configured TLS policy forbids a plaintext session.
+    fn tls_mandatory(&self) -> bool {
+        matches!(self.config.tls, Tls::Required | Tls::Implicit)
+    }
+    /// The only transition to `Ready`. `after_ehlo` already refuses to AUTH in
+    /// the clear under `Tls::Required`; this re-checks at the transition itself so
+    /// no path can hand the host a plaintext session its policy forbids.
     fn ready(&mut self) {
+        if self.tls_mandatory() && !self.secure {
+            self.fail(error(
+                "ETLS",
+                "STARTTLS",
+                "TLS is required but the SMTP session was never encrypted",
+                None,
+                "",
+            ));
+            self.close_transport();
+            return;
+        }
         self.state = State::Ready;
         self.events.push_back(Event::Ready);
     }
@@ -900,3 +925,48 @@ pub fn encode_data(content: &[u8], out: &mut Vec<u8>) -> usize {
 
 #[cfg(feature = "turnloop")]
 pub mod asynchronous;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    /// Reaching the Ready transition in the clear, by any path, must fail the
+    /// session under a mandatory TLS policy rather than report `Ready`.
+    #[test]
+    fn ready_refuses_plaintext_under_mandatory_tls() {
+        let now = Instant::now();
+        for (tls, allowed) in [
+            (Tls::Required, false),
+            (Tls::Implicit, false),
+            (Tls::Opportunistic, true),
+            (Tls::None, true),
+        ] {
+            let mut c = Connection::new(Config {
+                tls,
+                ..Config::default()
+            })
+            .expect("config");
+            c.connected(now).expect("connected");
+            c.state = State::Ehlo;
+            // Skip after_ehlo's STARTTLS decision, as a future path might.
+            c.authenticate();
+            let events: Vec<_> = std::iter::from_fn(|| c.poll_event()).collect();
+            let events: Vec<_> = events
+                .into_iter()
+                .filter(|e| *e != Event::UpgradeTls)
+                .collect();
+            if allowed {
+                assert_eq!(events, [Event::Ready], "{tls:?}");
+                assert_eq!(c.state(), State::Ready);
+            } else {
+                assert_eq!(events.len(), 3, "{tls:?}: {events:?}");
+                assert!(
+                    matches!(&events[0], Event::Failed { token: None, error, .. }
+                        if error.code == "ETLS" && error.message.contains("never encrypted")),
+                    "{tls:?}: {events:?}"
+                );
+                assert_eq!(events[1..], [Event::CloseTransport, Event::Closed]);
+                assert_eq!(c.state(), State::Closed);
+            }
+        }
+    }
+}
