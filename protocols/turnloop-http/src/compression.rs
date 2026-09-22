@@ -15,7 +15,8 @@ pub fn decode(encoding: &str, input: &[u8], output: &mut Vec<u8>, limit: usize) 
         if step.finished {
             return Ok(());
         }
-        if step.consumed == 0 && step.written == 0 {
+        // All input was given with `end`, so wanting more means truncation.
+        if step.needs_input {
             return Err(corrupt());
         }
     }
@@ -23,11 +24,26 @@ pub fn decode(encoding: &str, input: &[u8], output: &mut Vec<u8>, limit: usize) 
 
 /// A single incremental decode step. Retain input after `consumed`, and consume
 /// output before calling again. No internal input/output staging allocation.
+///
+/// A step returns for exactly one of three reasons, and says which:
+///
+/// | `finished` | `needs_input` | stopped because | next |
+/// |---|---|---|---|
+/// | `true` | `false` | the body is complete | nothing; `reset` for another body |
+/// | `false` | `true` | every input byte the decoder can use is used | more input, or `end = true` |
+/// | `false` | `false` | `output` is full (`written == output.len()`) | drain, then call again |
+///
+/// So a host sizes its scratch buffer from the third case - it filled the
+/// buffer - and reads from the transport only in the second. The unconsumed
+/// tail of the input in the second case is a partial header or trailer the
+/// decoder cannot use yet; keep it and append to it.
 #[derive(Debug)]
 pub struct DecodeStep {
     pub consumed: usize,
     pub written: usize,
     pub finished: bool,
+    /// The decoder stopped for input, not for output space. See the table.
+    pub needs_input: bool,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Stage {
@@ -191,6 +207,12 @@ impl StreamingDecoder {
         self.failed = false;
         Ok(())
     }
+    /// Decode as far as `input` and `output` allow: the call returns only when
+    /// the body is finished, the decoder needs more input, or `output` is full,
+    /// and [`DecodeStep`] says which. One call per transport read and one per
+    /// full output buffer is enough; there is no need to loop until a step
+    /// makes no progress.
+    ///
     /// `end` means no more encoded bytes will arrive, not that output is unbounded.
     pub fn process(&mut self, input: &[u8], output: &mut [u8], end: bool) -> Result<DecodeStep> {
         if self.failed {
@@ -203,6 +225,28 @@ impl StreamingDecoder {
         result
     }
     fn process_inner(&mut self, input: &[u8], output: &mut [u8], end: bool) -> Result<DecodeStep> {
+        // Run single engine steps until one of the three stop reasons holds, so
+        // the step that comes back names which one it was.
+        let mut consumed = 0;
+        let mut written = 0;
+        loop {
+            let step = self.step_once(&input[consumed..], &mut output[written..], end)?;
+            consumed += step.consumed;
+            written += step.written;
+            let stalled = step.consumed == 0 && step.written == 0;
+            if step.finished || written == output.len() || stalled {
+                return Ok(DecodeStep {
+                    consumed,
+                    written,
+                    finished: step.finished,
+                    needs_input: !step.finished && written < output.len(),
+                });
+            }
+        }
+    }
+    /// One call into the engine. It may stop short of all three reasons: at a
+    /// gzip member boundary, after a header, or wherever the engine returns.
+    fn step_once(&mut self, input: &[u8], output: &mut [u8], end: bool) -> Result<DecodeStep> {
         if self.done {
             if !input.is_empty() {
                 return Err(corrupt());
@@ -211,6 +255,7 @@ impl StreamingDecoder {
                 consumed: 0,
                 written: 0,
                 finished: true,
+                needs_input: false,
             });
         }
         if output.is_empty() {
@@ -218,6 +263,7 @@ impl StreamingDecoder {
                 consumed: 0,
                 written: 0,
                 finished: false,
+                needs_input: false,
             });
         }
         let mut consumed = 0;
@@ -278,6 +324,7 @@ impl StreamingDecoder {
                                 consumed: 0,
                                 written: 0,
                                 finished: false,
+                                needs_input: false,
                             });
                         }
                         let zlib = input[0] & 15 == 8
@@ -338,6 +385,7 @@ impl StreamingDecoder {
                         consumed: 0,
                         written: 0,
                         finished: true,
+                        needs_input: false,
                     });
                 }
                 let result = decoder
@@ -364,6 +412,7 @@ impl StreamingDecoder {
                         consumed: 0,
                         written: 0,
                         finished: true,
+                        needs_input: false,
                     });
                 }
                 let mut source = input;
@@ -373,6 +422,7 @@ impl StreamingDecoder {
                             consumed: 0,
                             written: 0,
                             finished: false,
+                            needs_input: false,
                         });
                     }
                     decoder.reset(&mut source).map_err(|_| corrupt())?;
@@ -411,6 +461,7 @@ impl StreamingDecoder {
             consumed,
             written,
             finished,
+            needs_input: false,
         })
     }
 }
