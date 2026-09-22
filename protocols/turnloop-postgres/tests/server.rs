@@ -23,7 +23,6 @@ struct Results {
 struct Driver {
     core: Connection,
     io: Transport,
-    password: Vec<u8>,
     ssl: bool,
     scram: bool,
     plus: bool,
@@ -40,10 +39,9 @@ impl Driver {
     }
     fn connect_to(port: u16, user: &str, ssl: SslMode) -> Self {
         eprintln!("PostgreSQL connecting as {user}, SSL mode {ssl:?}");
-        let password = b"fixture-password".to_vec();
         let config = Config {
             user: user.into(),
-            password: password.clone(),
+            password: b"fixture-password".to_vec(),
             ssl,
             connect_deadline: Some(Instant::now() + Duration::from_secs(10)),
             ..Config::default()
@@ -52,7 +50,6 @@ impl Driver {
         let mut d = Self {
             core,
             io: Transport::connect(port),
-            password,
             ssl: false,
             scram: false,
             plus: false,
@@ -103,8 +100,9 @@ impl Driver {
                     } else {
                         ChannelBinding::unsupported()
                     };
+                    let scram = ScramSha256::new(&self.core.config().password, binding);
                     self.core
-                        .start_scram(ScramSha256::new(&self.password, binding))
+                        .start_scram(scram)
                         .expect("fixture operation must succeed");
                     self.scram = true;
                     self.plus = plus;

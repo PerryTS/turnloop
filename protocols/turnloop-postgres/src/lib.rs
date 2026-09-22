@@ -133,7 +133,8 @@ pub enum Outcome {
 #[derive(Debug)]
 pub enum Event<'a> {
     UpgradeTls,
-    /// Build upstream ScramSha256 outside the core (its constructor reads entropy).
+    /// Build upstream ScramSha256 outside the core (its constructor reads entropy)
+    /// from `Connection::config().password`, then call `start_scram`.
     ScramNeeded {
         plus: bool,
     },
@@ -527,6 +528,11 @@ impl Connection {
         )?;
         self.state = State::Auth;
         Ok(())
+    }
+    /// The configuration this connection was built from. On `ScramNeeded`,
+    /// build `ScramSha256` from `config().password`; the host keeps no copy.
+    pub fn config(&self) -> &Config {
+        &self.config
     }
     pub fn output(&self) -> &[u8] {
         &self.output[self.output_at..]

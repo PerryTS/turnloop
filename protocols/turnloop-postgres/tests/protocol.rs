@@ -316,6 +316,7 @@ fn scram_and_plus_verify_server_signature_and_reject_bad_verifier() {
                 SslMode::Disable
             },
             channel_binding_required: plus,
+            password: b"secret".to_vec(),
             ..Config::default()
         })
         .expect("fixture operation must succeed");
@@ -342,7 +343,10 @@ fn scram_and_plus_verify_server_signature_and_reject_bad_verifier() {
         } else {
             ChannelBinding::unsupported()
         };
-        let scram = ScramSha256::new(b"secret", binding);
+        // The consumed Config still supplies the password; the host keeps no
+        // copy. The server signature below is derived from "secret".
+        assert_eq!(c.config().password, b"secret");
+        let scram = ScramSha256::new(&c.config().password, binding);
         let first = std::str::from_utf8(scram.message())
             .expect("fixture operation must succeed")
             .to_owned();

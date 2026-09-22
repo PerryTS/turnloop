@@ -103,7 +103,6 @@ impl<B: Backend, S: Stream> Client<B, S> {
         binding: Option<&[u8]>,
         at: Instant,
     ) -> io::Result<Self> {
-        let password = config.password.clone();
         let mut driver = AsyncConnection::new(
             Transport::Plain(stream),
             crate::Connection::new(config).map_err(io::Error::other)?,
@@ -164,9 +163,10 @@ impl<B: Backend, S: Stream> Client<B, S> {
                     } else {
                         ChannelBinding::unsupported()
                     };
+                    let scram = ScramSha256::new(&driver.core().config().password, channel);
                     driver
                         .core_mut()
-                        .start_scram(ScramSha256::new(&password, channel))
+                        .start_scram(scram)
                         .map_err(io::Error::other)?;
                 }
                 if ready {
