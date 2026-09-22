@@ -468,7 +468,8 @@ impl<'a> CursorBatch<'a> {
                 .and_then(|v| v.as_document()),
         })
     }
-    pub fn rows(&self) -> impl Iterator<Item = Result<&'a RawDocument>> {
+    /// The iterator borrows the reply, not this batch, so it may outlive `self`.
+    pub fn rows(&self) -> impl Iterator<Item = Result<&'a RawDocument>> + use<'a> {
         self.documents.into_iter().map(|v| match v {
             Ok(RawBsonRef::Document(d)) => Ok(d),
             _ => Err(Error::protocol("Cursor batch contains non-document")),
