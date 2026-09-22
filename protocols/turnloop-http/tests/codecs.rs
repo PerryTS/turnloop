@@ -1384,3 +1384,153 @@ fn http1_request_side_raises_upgrade() {
         assert_eq!(names.last().map(String::as_str), Some("end 0"), "{names:?}");
     }
 }
+
+fn status_head(status: u16, headers: &[(&str, &str)]) -> Head {
+    Head {
+        method: String::new(),
+        target: String::new(),
+        status,
+        version: 1,
+        headers: headers.iter().map(|(n, v)| Header::new(n, v)).collect(),
+        keep_alive: true,
+    }
+}
+
+/// PerryTS/turnloop#47, part 1: Node's `res.writeHead(404, "Nope")`.
+#[test]
+fn http1_encoder_writes_a_custom_reason_phrase() {
+    let head = status_head(404, &[]);
+    let mut wire = Vec::new();
+    Encoder::start_with_reason(&head, "Nope", BodyLength::Empty, &mut wire).unwrap();
+    assert_eq!(wire, b"HTTP/1.1 404 Nope\r\n\r\n");
+    wire.clear();
+    Encoder::start_with_reason(&head, "", BodyLength::Empty, &mut wire).unwrap();
+    assert_eq!(wire, b"HTTP/1.1 404 \r\n\r\n", "an empty phrase is legal");
+    wire.clear();
+    Encoder::start(&head, BodyLength::Empty, &mut wire).unwrap();
+    assert_eq!(
+        wire, b"HTTP/1.1 404 Not Found\r\n\r\n",
+        "start keeps the canonical one"
+    );
+    // Refused before anything is written: a phrase that would inject a header,
+    // and a phrase on a request line, which has no place for one.
+    wire.clear();
+    for reason in ["a\r\nset-cookie: x", "a\nb", "nul\0"] {
+        assert!(
+            Encoder::start_with_reason(&head, reason, BodyLength::Empty, &mut wire).is_err(),
+            "{reason:?}"
+        );
+    }
+    let request = Request::new("http://localhost/", "GET")
+        .unwrap()
+        .head(false);
+    assert!(Encoder::start_with_reason(&request, "OK", BodyLength::Empty, &mut wire).is_err());
+    assert!(wire.is_empty());
+}
+
+/// PerryTS/turnloop#47, part 2: a body that ends at EOF, as an HTTP/1.0-style
+/// response with no framing does. Decoded back, it is one body ended by `eof`.
+#[test]
+fn http1_encoder_writes_a_close_delimited_body() {
+    let head = status_head(200, &[("content-type", "text/plain")]);
+    let mut wire = Vec::new();
+    let mut encoder = Encoder::start(&head, BodyLength::CloseDelimited, &mut wire).unwrap();
+    encoder.body(b"until ", &mut wire).unwrap();
+    encoder.body(b"close", &mut wire).unwrap();
+    encoder.finish(&[], &mut wire).unwrap();
+    assert_eq!(
+        wire, b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\n\r\nuntil close",
+        "no framing header, no chunk markup, nothing after the body"
+    );
+    let mut decoder = Decoder::new(Mode::Response, Limits::default());
+    decoder.response_to("GET");
+    let mut body = Vec::new();
+    let mut input = wire.as_slice();
+    loop {
+        let step = decoder.receive(input).unwrap();
+        if let Some(Event::Body(b)) = step.event {
+            body.extend_from_slice(b);
+        }
+        input = &input[step.consumed..];
+        if input.is_empty() {
+            break;
+        }
+    }
+    decoder.eof().unwrap();
+    assert!(matches!(
+        decoder.receive(&[]).unwrap().event,
+        Some(Event::End)
+    ));
+    assert_eq!(body, b"until close");
+
+    // Trailers need chunked framing; framing headers contradict EOF framing;
+    // a request cannot be close-delimited; 204 and 304 carry no body.
+    let mut encoder = Encoder::start(&head, BodyLength::CloseDelimited, &mut wire).unwrap();
+    assert!(encoder.finish(&[Header::new("x", "y")], &mut wire).is_err());
+    wire.clear();
+    for bad in [
+        status_head(200, &[("content-length", "5")]),
+        status_head(200, &[("transfer-encoding", "chunked")]),
+        status_head(204, &[]),
+        status_head(304, &[]),
+        Request::new("http://localhost/", "POST")
+            .unwrap()
+            .head(false),
+    ] {
+        assert!(Encoder::start(&bad, BodyLength::CloseDelimited, &mut wire).is_err());
+    }
+    assert!(wire.is_empty());
+}
+
+/// PerryTS/turnloop#47, part 3: a response that advertises a length and sends
+/// no body. `Known(0)` and `Known(n)` both refuse this head; `Omitted` writes
+/// it verbatim, and a client decoding a HEAD response reads it as complete.
+#[test]
+fn http1_encoder_writes_a_body_forbidden_response() {
+    let head = status_head(200, &[("content-length", "1234")]);
+    let mut wire = Vec::new();
+    assert!(Encoder::start(&head, BodyLength::Known(0), &mut wire).is_err());
+    assert!(Encoder::start(&head, BodyLength::Empty, &mut wire).is_err());
+    let mut encoder = Encoder::start(&head, BodyLength::Omitted, &mut wire).unwrap();
+    assert!(encoder.body(b"x", &mut wire).is_err());
+    encoder.body(b"", &mut wire).unwrap();
+    encoder.finish(&[], &mut wire).unwrap();
+    assert_eq!(wire, b"HTTP/1.1 200 OK\r\ncontent-length: 1234\r\n\r\n");
+    let mut decoder = Decoder::new(Mode::Response, Limits::default());
+    decoder.response_to("HEAD");
+    let head_step = decoder.receive(&wire).unwrap();
+    assert_eq!(head_step.consumed, wire.len());
+    assert!(matches!(
+        decoder.receive(&[]).unwrap().event,
+        Some(Event::End)
+    ));
+    assert!(decoder.reusable());
+
+    // A HEAD response may advertise chunked coding, and a 304 its length.
+    for head in [
+        status_head(200, &[("transfer-encoding", "chunked")]),
+        status_head(304, &[("content-length", "1234")]),
+        status_head(204, &[]),
+    ] {
+        wire.clear();
+        Encoder::start(&head, BodyLength::Omitted, &mut wire)
+            .unwrap()
+            .finish(&[], &mut wire)
+            .unwrap();
+        assert!(wire.ends_with(b"\r\n\r\n"));
+        assert!(!wire.windows(2).any(|w| w == b"0\r"), "no chunk markup");
+    }
+    // A 204 or 1xx may not advertise one (RFC 9110 8.6), and a request is not
+    // a response to HEAD.
+    wire.clear();
+    for bad in [
+        status_head(204, &[("content-length", "0")]),
+        status_head(103, &[("content-length", "4")]),
+        Request::new("http://localhost/", "GET")
+            .unwrap()
+            .head(false),
+    ] {
+        assert!(Encoder::start(&bad, BodyLength::Omitted, &mut wire).is_err());
+    }
+    assert!(wire.is_empty());
+}
