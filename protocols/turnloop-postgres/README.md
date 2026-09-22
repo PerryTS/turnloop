@@ -48,7 +48,10 @@ and RSA-PSS are supported; MD5/SHA-1 signatures use SHA-256. Unsupported algorit
 
 1. Construct `Connection::new(Config { .. })`. The host resolves the address,
    connects TCP/Unix transport and supplies any absolute connection deadline.
-2. Transmit `output()`. Acknowledge **only actually written bytes** with
+   **Construction already queues output**: `output()` holds the StartupMessage
+   (or the SSLRequest when `ssl` is `Prefer`/`Require`) before any transport
+   exists. Do not assume it starts empty; step 2 must run first once connected.
+2. Transmit `output()`, starting with those bytes. Acknowledge **only actually written bytes** with
    `consume_output(n)`. Retain the borrow until write completion, or copy into a
    reusable host write buffer; never hold a raw pointer while mutating the core.
 3. Feed plaintext with `receive(bytes)`, then repeatedly pull `next_event()` until

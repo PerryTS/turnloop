@@ -527,6 +527,19 @@ pub struct Connection {
     reason: Error,
 }
 impl Connection {
+    /// Validate `config` and queue the first message, so `output()` is already
+    /// non-empty on return: the StartupMessage, or with `SslMode::Prefer`/
+    /// `Require` the SSLRequest. Send it as soon as the transport connects;
+    /// nothing else will produce it.
+    ///
+    /// ```
+    /// use turnloop_postgres::{Config, Connection, SslMode};
+    /// let c = Connection::new(Config::default())?;
+    /// assert!(c.output().windows(5).any(|w| w == b"user\0"), "StartupMessage");
+    /// let tls = Connection::new(Config { ssl: SslMode::Require, ..Config::default() })?;
+    /// assert_eq!(tls.output(), [0, 0, 0, 8, 4, 210, 22, 47], "SSLRequest");
+    /// # Ok::<(), turnloop_postgres::Error>(())
+    /// ```
     pub fn new(config: Config) -> Result<Self> {
         if config.max_buffer < 1024
             || config.max_buffer > i32::MAX as usize
