@@ -393,10 +393,14 @@ impl StreamingDecoder {
                     .map_err(|_| corrupt())?;
                 consumed = result.bytes_read;
                 written = result.bytes_written;
-                *boundary = result.remaining == 0;
-                finished = result.remaining == 0 && end && consumed == input.len();
-                if result.remaining != 0 && end && consumed == input.len() && written < output.len()
-                {
+                // A call that moves nothing reports the size of the *next*
+                // frame's header, which says nothing about the frame that just
+                // ended: only progress may move the boundary.
+                if consumed > 0 || written > 0 {
+                    *boundary = result.remaining == 0;
+                }
+                finished = *boundary && end && consumed == input.len();
+                if !*boundary && end && consumed == input.len() && written < output.len() {
                     return Err(corrupt());
                 }
             }

@@ -1741,3 +1741,35 @@ fn streaming_decoder_says_whether_it_needs_input_or_output_space() {
     let step = decoder.process(b"\x1f", &mut [], false).unwrap();
     assert!(!step.needs_input && !step.finished);
 }
+
+/// A host learns that the body is over after it has fed the last byte - an
+/// HTTP/1 `End` arrives in a later step - so `end` often comes with no input.
+/// Native zstd used to lose its frame boundary on the empty step between.
+#[test]
+fn streaming_decoder_finishes_when_end_follows_the_last_byte() {
+    use turnloop_http::compression::StreamingDecoder;
+    for coding in CODINGS {
+        let wire = encode_with(coding, STREAMED);
+        let mut decoder = StreamingDecoder::new(coding, 1000).unwrap();
+        let mut out = [0; 1000];
+        let (mut pending, mut result) = (Vec::new(), Vec::new());
+        for byte in &wire {
+            pending.push(*byte);
+            let step = decoder.process(&pending, &mut out, false).unwrap();
+            pending.drain(..step.consumed);
+            result.extend_from_slice(&out[..step.written]);
+        }
+        assert!(pending.is_empty(), "{coding}");
+        // An idle step with nothing new, then the end. (Brotli marks its own
+        // end, so it may already be finished; the others wait for `end`.)
+        let step = decoder.process(&[], &mut out, false).unwrap();
+        assert_eq!(step.written, 0, "{coding}");
+        assert!(
+            step.needs_input || coding == "br" && step.finished,
+            "{coding}"
+        );
+        let step = decoder.process(&[], &mut out, true).unwrap();
+        assert!(step.finished, "{coding}");
+        assert_eq!(result, STREAMED, "{coding}");
+    }
+}
