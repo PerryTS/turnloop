@@ -31,6 +31,159 @@ fn handshakes_subprotocol_and_bad_key() {
     assert!(client.verify(&response).is_err());
     assert!(ClientHandshake::new("localhost", "/", [0; 16], vec!["a".into(), "a".into()]).is_err());
 }
+/// Three masked client text frames, the last cut after 5 of its 11 bytes: the
+/// shape a transport read that splits a frame produces.
+fn three_messages_last_split() -> (Vec<u8>, Vec<u8>) {
+    let mut client = Connection::new(Role::Client, config());
+    let mut wire = Vec::new();
+    for text in ["one", "two", "three"] {
+        client.send(Message::text(text), &mut wire).unwrap();
+    }
+    assert_eq!(wire.len(), 9 + 9 + 11);
+    let rest = wire.split_off(9 + 9 + 5);
+    (wire, rest)
+}
+/// Drive with the documented condition, `consumed > 0 || message.is_some()`.
+fn drain(server: &mut Connection, input: &mut Vec<u8>, seen: &mut Vec<(usize, Option<Message>)>) {
+    let mut reply = Vec::new();
+    loop {
+        let step = server.receive(input, &mut reply).unwrap();
+        let progressed = step.consumed > 0 || step.message.is_some();
+        input.drain(..step.consumed);
+        seen.push((step.consumed, step.message));
+        if !progressed {
+            return;
+        }
+    }
+}
+/// `Received`'s shapes (PerryTS/turnloop#86). tungstenite reads input into its
+/// own buffer and parses from that buffer before it reads again, so a message
+/// can complete from bytes an earlier call consumed: `consumed == 0` with a
+/// message is normal, and `consumed == 0` alone does not mean "stop".
+#[test]
+fn received_consumed_and_message_are_independent() {
+    let (mut input, rest) = three_messages_last_split();
+    let mut server = Connection::new(Role::Server, config());
+    let mut seen = Vec::new();
+    drain(&mut server, &mut input, &mut seen);
+    assert_eq!(
+        seen,
+        vec![
+            // Everything was read in; the first message came out of it.
+            (23, Some(Message::text("one"))),
+            // consumed == 0 with a message: parsed from the buffer. KEEP GOING.
+            (0, Some(Message::text("two"))),
+            // consumed == 0, no message: 5 bytes of a frame header. STOP.
+            (0, None),
+        ]
+    );
+    assert!(input.is_empty());
+
+    let mut input = rest;
+    let mut seen = Vec::new();
+    drain(&mut server, &mut input, &mut seen);
+    assert_eq!(seen, vec![(6, Some(Message::text("three"))), (0, None)]);
+
+    // consumed > 0 with no message: a partial frame, all of it taken in.
+    // Calling again is harmless and returns the stop shape.
+    let (mut input, _) = three_messages_last_split();
+    input.truncate(5);
+    let mut server = Connection::new(Role::Server, config());
+    let mut seen = Vec::new();
+    drain(&mut server, &mut input, &mut seen);
+    assert_eq!(seen, vec![(5, None), (0, None)]);
+}
+/// The conditions the step contract rules out, and the one it does not.
+#[test]
+fn received_rejects_the_wrong_loop_conditions() {
+    // "Loop while bytes were consumed" loses "two": it arrives in a step that
+    // consumed nothing, which this loop reads as the stop signal.
+    let (mut input, rest) = three_messages_last_split();
+    let mut server = Connection::new(Role::Server, config());
+    let mut reply = Vec::new();
+    let mut messages = Vec::new();
+    loop {
+        let step = server.receive(&input, &mut reply).unwrap();
+        if step.consumed == 0 {
+            break;
+        }
+        input.drain(..step.consumed);
+        messages.extend(step.message);
+    }
+    input.extend_from_slice(&rest);
+    loop {
+        let step = server.receive(&input, &mut reply).unwrap();
+        if step.consumed == 0 {
+            break;
+        }
+        input.drain(..step.consumed);
+        messages.extend(step.message);
+    }
+    assert_eq!(
+        messages,
+        vec![Message::text("one"), Message::text("three")],
+        "\"two\" came back with consumed == 0 and was dropped"
+    );
+
+    // "Read the transport whenever the input is empty" stalls: after "one"
+    // there is no input left, but "two" is complete in the connection's own
+    // buffer. A host that waits for the peer here waits forever if the peer
+    // is waiting for an answer to "two".
+    let (mut input, _) = three_messages_last_split();
+    let mut server = Connection::new(Role::Server, config());
+    let step = server.receive(&input, &mut reply).unwrap();
+    input.drain(..step.consumed);
+    assert_eq!(step.message, Some(Message::text("one")));
+    assert!(input.is_empty(), "nothing left to hand in...");
+    let step = server.receive(&input, &mut reply).unwrap();
+    assert_eq!(
+        (step.consumed, step.message),
+        (0, Some(Message::text("two"))),
+        "...and yet a message was waiting"
+    );
+
+    // "Loop while a message came back" is safe for this type, unlike
+    // http2::Step: a step without a message has always taken in all of its
+    // input, so nothing is stranded when such a host goes back to the
+    // transport. Pinned here because it rests on how tungstenite reads.
+    let (mut input, rest) = three_messages_last_split();
+    let mut server = Connection::new(Role::Server, config());
+    let mut messages = Vec::new();
+    for chunk in [None, Some(rest)] {
+        input.extend(chunk.into_iter().flatten());
+        loop {
+            let step = server.receive(&input, &mut reply).unwrap();
+            input.drain(..step.consumed);
+            let Some(message) = step.message else { break };
+            messages.push(message);
+        }
+        assert!(input.is_empty());
+    }
+    assert_eq!(
+        messages,
+        ["one", "two", "three"].map(Message::text).to_vec()
+    );
+}
+/// `receive` is not idempotent. It takes `consumed` bytes into its own buffer,
+/// so a host that does not drain them and feeds them again gets every message
+/// in them twice - silently, with no error to notice.
+#[test]
+fn received_is_not_idempotent() {
+    let (input, _) = three_messages_last_split();
+    let one = &input[..9];
+    let mut server = Connection::new(Role::Server, config());
+    let mut reply = Vec::new();
+    let first = server.receive(one, &mut reply).unwrap();
+    assert_eq!(
+        (first.consumed, first.message),
+        (9, Some(Message::text("one")))
+    );
+    let again = server.receive(one, &mut reply).unwrap();
+    assert_eq!(
+        (again.consumed, again.message),
+        (9, Some(Message::text("one")))
+    );
+}
 #[test]
 fn masking_fragmentation_ping_pong_close_and_limits() {
     let mut client = Connection::new(Role::Client, config());
@@ -131,6 +284,7 @@ fn serve(mut socket: TcpStream) {
     loop {
         let event = ws.receive(&input, &mut output).unwrap();
         input.drain(..event.consumed);
+        let progressed = event.consumed > 0 || event.message.is_some();
         if let Some(message) = event.message {
             match message {
                 Message::Text(text) => {
@@ -154,7 +308,9 @@ fn serve(mut socket: TcpStream) {
         }
         socket.write_all(&output).unwrap();
         output.clear();
-        if input.is_empty() {
+        // Not `input.is_empty()`: a message can be complete in the
+        // connection's own buffer with no input left to hand in.
+        if !progressed {
             let mut b = [0; 1024];
             let n = socket.read(&mut b).unwrap();
             assert!(n > 0);
