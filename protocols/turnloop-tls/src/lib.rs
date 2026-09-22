@@ -5,6 +5,25 @@
 //! `TransmitTlsData` only after the host has completed all writes. Plaintext
 //! records borrow rustls storage; consume them before advancing the state.
 //!
+//! # Configuration
+//! [`ClientConfig::new`] and [`ServerConfig::new`] cover static TLS: roots or a
+//! certificate chain, a key and ALPN. A host that needs a rustls decision those
+//! constructors do not expose (client certificates, SNI resolvers, custom
+//! verifiers, ticketers, protocol versions) builds the rustls config itself and
+//! wraps it with [`ClientConfig::from_rustls`] / [`ServerConfig::from_rustls`],
+//! passing [`HostTime::time_provider`] to `builder_with_details` so certificate
+//! validity keeps following the time handed to `process`.
+//!
+//! # Crypto provider
+//! The default `ring` feature makes `ring` the provider `new` uses when the host
+//! names none. [`ClientOptions::provider`] and [`ServerConfig::with_provider`]
+//! select any other rustls [`CryptoProvider`],
+//! such as aws-lc-rs. With `default-features = false` this crate links no
+//! provider of its own: `new` then uses the one the host passes, or the
+//! process-default provider installed with rustls, and fails if there is neither.
+//! Without `ring`, `tls_server_end_point` is unavailable; hash the certificate
+//! with the algorithm [`tls_server_end_point_hash`] selects instead.
+//!
 //! # Getting started on turnloop
 //! Enable the `turnloop` feature for the `asynchronous` module. The embedding
 //! host owns `LocalExecutor` and calls `turn`; adapters await its streams and
@@ -15,6 +34,7 @@
 use rustls::{
     CertificateError, DigitallySignedStruct, Error, SignatureScheme,
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+    crypto::CryptoProvider,
     pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime, pem::PemObject},
 };
 use std::{
@@ -31,6 +51,48 @@ pub use rustls::unbuffered::{ConnectionState, UnbufferedStatus};
 /// Wall time supplied by the host, never sampled from an operating-system clock.
 #[derive(Debug)]
 struct SuppliedTime(AtomicU64);
+
+/// A shared wall clock that only the host advances.
+///
+/// Every connection made from a configuration stores the `unix_seconds` passed to
+/// its `process` call here, and rustls reads it back through
+/// [`time_provider`](Self::time_provider) when checking certificate validity.
+/// Pass that provider to `rustls::ClientConfig::builder_with_details` (or the
+/// server equivalent) before handing the result to `from_rustls`.
+#[derive(Debug, Clone)]
+pub struct HostTime(Arc<SuppliedTime>);
+impl HostTime {
+    pub fn new(unix_seconds: u64) -> Self {
+        Self(Arc::new(SuppliedTime(AtomicU64::new(unix_seconds))))
+    }
+    pub fn set(&self, unix_seconds: u64) {
+        self.0.0.store(unix_seconds, Ordering::Relaxed);
+    }
+    pub fn unix_seconds(&self) -> u64 {
+        self.0.0.load(Ordering::Relaxed)
+    }
+    /// The rustls time provider backed by this clock.
+    pub fn time_provider(&self) -> Arc<dyn rustls::time_provider::TimeProvider> {
+        self.0.clone()
+    }
+}
+
+/// The provider `new` uses when the host names none: `ring` when that feature is
+/// enabled, otherwise the rustls process default.
+fn default_provider() -> Result<Arc<CryptoProvider>, Error> {
+    #[cfg(feature = "ring")]
+    {
+        Ok(Arc::new(rustls::crypto::ring::default_provider()))
+    }
+    #[cfg(not(feature = "ring"))]
+    {
+        CryptoProvider::get_default().cloned().ok_or_else(|| {
+            Error::General(
+                "no rustls crypto provider: pass one or install a process default".into(),
+            )
+        })
+    }
+}
 impl rustls::time_provider::TimeProvider for SuppliedTime {
     fn current_time(&self) -> Option<UnixTime> {
         Some(UnixTime::since_unix_epoch(Duration::from_secs(
@@ -49,6 +111,10 @@ pub struct ClientOptions {
     pub extra_ca_pem: Vec<u8>,
     pub reject_unauthorized: bool,
     pub enable_sni: bool,
+    /// The rustls crypto provider for handshakes and signature checks. `None`
+    /// uses `ring` with the default `ring` feature, otherwise the process-default
+    /// provider. Naming one lets a host link exactly one provider.
+    pub provider: Option<Arc<CryptoProvider>>,
 }
 impl Default for ClientOptions {
     fn default() -> Self {
@@ -58,6 +124,7 @@ impl Default for ClientOptions {
             extra_ca_pem: Vec::new(),
             reject_unauthorized: true,
             enable_sni: true,
+            provider: None,
         }
     }
 }
@@ -65,12 +132,15 @@ impl Default for ClientOptions {
 #[derive(Clone)]
 pub struct ClientConfig {
     config: Arc<rustls::ClientConfig>,
-    time: Arc<SuppliedTime>,
+    time: HostTime,
 }
 impl ClientConfig {
     pub fn new(options: ClientOptions, unix_seconds: u64) -> Result<Self, Error> {
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let time = Arc::new(SuppliedTime(AtomicU64::new(unix_seconds)));
+        let provider = match options.provider {
+            Some(provider) => provider,
+            None => default_provider()?,
+        };
+        let time = HostTime::new(unix_seconds);
         let mut roots = rustls::RootCertStore::empty();
         if let Some(ca) = options.ca {
             for cert in ca {
@@ -82,10 +152,11 @@ impl ClientConfig {
                 roots.add(cert.map_err(|e| Error::General(e.to_string()))?)?;
             }
         }
-        let mut config = rustls::ClientConfig::builder_with_details(provider.clone(), time.clone())
-            .with_safe_default_protocol_versions()?
-            .with_root_certificates(roots)
-            .with_no_client_auth();
+        let mut config =
+            rustls::ClientConfig::builder_with_details(provider.clone(), time.time_provider())
+                .with_safe_default_protocol_versions()?
+                .with_root_certificates(roots)
+                .with_no_client_auth();
         if !options.reject_unauthorized {
             config
                 .dangerous()
@@ -93,10 +164,17 @@ impl ClientConfig {
         }
         config.alpn_protocols = options.alpn;
         config.enable_sni = options.enable_sni;
-        Ok(Self {
-            config: Arc::new(config),
-            time,
-        })
+        Ok(Self::from_rustls(Arc::new(config), time))
+    }
+    /// Wrap a rustls configuration the host built itself. Build it with
+    /// `builder_with_details(provider, time.time_provider())` so certificate
+    /// validity follows the time passed to `process`; with any other time
+    /// provider rustls keeps using that one, and `process` only updates `time`.
+    pub fn from_rustls(config: Arc<rustls::ClientConfig>, time: HostTime) -> Self {
+        Self { config, time }
+    }
+    pub fn rustls_config(&self) -> &Arc<rustls::ClientConfig> {
+        &self.config
     }
     /// Reuse this configuration across connections to share the session cache.
     pub fn connect(&self, name: ServerName<'static>) -> Result<Client, Error> {
@@ -112,29 +190,44 @@ impl ClientConfig {
 #[derive(Clone)]
 pub struct ServerConfig {
     config: Arc<rustls::ServerConfig>,
-    time: Arc<SuppliedTime>,
+    time: HostTime,
 }
 impl ServerConfig {
+    /// Uses `ring` with the default `ring` feature, otherwise the process-default
+    /// provider; see [`with_provider`](Self::with_provider).
     pub fn new(
         chain: Vec<CertificateDer<'static>>,
         key: PrivateKeyDer<'static>,
         alpn: Vec<Vec<u8>>,
         unix_seconds: u64,
     ) -> Result<Self, Error> {
-        let time = Arc::new(SuppliedTime(AtomicU64::new(unix_seconds)));
-        let mut config = rustls::ServerConfig::builder_with_details(
-            Arc::new(rustls::crypto::ring::default_provider()),
-            time.clone(),
-        )
-        .with_safe_default_protocol_versions()?
-        .with_no_client_auth()
-        .with_single_cert(chain, key)?;
+        Self::with_provider(default_provider()?, chain, key, alpn, unix_seconds)
+    }
+    /// [`new`](Self::new) with an explicit rustls crypto provider.
+    pub fn with_provider(
+        provider: Arc<CryptoProvider>,
+        chain: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+        alpn: Vec<Vec<u8>>,
+        unix_seconds: u64,
+    ) -> Result<Self, Error> {
+        let time = HostTime::new(unix_seconds);
+        let mut config = rustls::ServerConfig::builder_with_details(provider, time.time_provider())
+            .with_safe_default_protocol_versions()?
+            .with_no_client_auth()
+            .with_single_cert(chain, key)?;
         config.alpn_protocols = alpn;
         // Rustls's default stateful session cache avoids a clock-reading ticketer.
-        Ok(Self {
-            config: Arc::new(config),
-            time,
-        })
+        Ok(Self::from_rustls(Arc::new(config), time))
+    }
+    /// Wrap a rustls configuration the host built itself; see
+    /// [`ClientConfig::from_rustls`] for how `time` reaches certificate checks.
+    /// A ticketer the host configures may read its own clock.
+    pub fn from_rustls(config: Arc<rustls::ServerConfig>, time: HostTime) -> Self {
+        Self { config, time }
+    }
+    pub fn rustls_config(&self) -> &Arc<rustls::ServerConfig> {
+        &self.config
     }
     pub fn accept(&self) -> Result<Server, Error> {
         Ok(Server {
@@ -147,13 +240,15 @@ impl ServerConfig {
 }
 
 mod channel_binding;
+#[cfg(feature = "ring")]
 pub use channel_binding::tls_server_end_point;
+pub use channel_binding::{EndPointHash, tls_server_end_point_hash};
 
 macro_rules! endpoint {
     ($name:ident, $connection:ty, $data:ty) => {
         pub struct $name {
             inner: $connection,
-            time: Arc<SuppliedTime>,
+            time: HostTime,
             deadline: Option<Instant>,
             timed_out: bool,
         }
@@ -164,7 +259,7 @@ macro_rules! endpoint {
                 incoming: &'i mut [u8],
                 unix_seconds: u64,
             ) -> UnbufferedStatus<'c, 'i, $data> {
-                self.time.0.store(unix_seconds, Ordering::Relaxed);
+                self.time.set(unix_seconds);
                 if self.timed_out {
                     return UnbufferedStatus {
                         discard: 0,
@@ -247,7 +342,7 @@ pub fn node_error_code(error: &Error) -> &'static str {
 
 #[derive(Debug)]
 struct Unverified {
-    provider: Arc<rustls::crypto::CryptoProvider>,
+    provider: Arc<CryptoProvider>,
 }
 impl ServerCertVerifier for Unverified {
     fn verify_server_cert(

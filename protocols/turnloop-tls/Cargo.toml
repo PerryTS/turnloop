@@ -12,20 +12,25 @@ categories = ["network-programming"]
 documentation = "https://docs.rs/turnloop-tls"
 
 [features]
+default = ["ring"]
 turnloop = ["dep:turnloop-io"]
+# The default crypto provider and the RFC 5929 hash. Disable default features and
+# pass a provider (or install a rustls process default) to link only that one.
+ring = ["dep:ring", "rustls/ring"]
 
 [dependencies]
 turnloop-io = { workspace = true, optional = true }
 
-rustls.workspace = true
-ring.workspace = true
+# Not the workspace rustls entry, which enables ring for every member.
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
+ring = { workspace = true, optional = true }
 webpki-roots.workspace = true
 
 [dev-dependencies]
 rcgen.workspace = true
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
-ring = { workspace = true, features = ["wasm32_unknown_unknown_js"] }
+ring = { workspace = true, optional = true, features = ["wasm32_unknown_unknown_js"] }
 rustls-pki-types = { workspace = true, features = ["web"] }
 
 [lints]

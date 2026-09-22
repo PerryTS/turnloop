@@ -55,6 +55,7 @@ pub mod compression;
 pub mod hpack;
 pub mod http1;
 pub mod http2;
+pub mod multipart;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Error {

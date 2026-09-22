@@ -12,6 +12,10 @@ categories = ["network-programming"]
 documentation = "https://docs.rs/turnloop-http"
 
 [features]
+default = ["ring"]
+# turnloop-tls's default crypto provider. Disable default features to link only
+# the rustls provider the host passes to turnloop-tls.
+ring = ["turnloop-tls/ring"]
 turnloop = ["dep:turnloop-io", "turnloop-tls/turnloop"]
 
 pure-rust-zstd = ["dep:turnloop-zstd-decoder"]
@@ -28,7 +32,8 @@ flate2.workspace = true
 brotli.workspace = true
 base64.workspace = true
 percent-encoding.workspace = true
-turnloop-tls.workspace = true
+# Not the workspace entry, so that the host decides whether ring is linked.
+turnloop-tls = { path = "../turnloop-tls", version = "0.1.0-alpha.6", default-features = false }
 
 [dev-dependencies]
 rcgen.workspace = true

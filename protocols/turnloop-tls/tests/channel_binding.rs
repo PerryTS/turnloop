@@ -39,6 +39,33 @@ fn real_signature_algorithms_match_independent_certificate_digests() {
 }
 
 #[test]
+fn provider_neutral_hash_selection_matches_the_ring_digest() {
+    use turnloop_tls::{EndPointHash, tls_server_end_point_hash};
+    let names: Vec<_> = include_str!("certificates/digests.txt")
+        .lines()
+        .map(|line| line.split_once(' ').expect("name and digest").0)
+        .collect();
+    let mut selected = [0; 3];
+    for (certificate, name) in CERTIFICATES.iter().zip(names) {
+        let hash = tls_server_end_point_hash(certificate);
+        let expected = match tls_server_end_point(certificate).map(|d| d.as_ref().len()) {
+            None => None,
+            Some(32) => Some(EndPointHash::Sha256),
+            Some(48) => Some(EndPointHash::Sha384),
+            Some(64) => Some(EndPointHash::Sha512),
+            Some(n) => panic!("{name}: unexpected digest length {n}"),
+        };
+        assert_eq!(hash, expected, "{name}");
+        if let Some(hash) = hash {
+            selected[hash as usize] += 1;
+        }
+        assert!(tls_server_end_point_hash(&certificate[..certificate.len() - 1]).is_none());
+    }
+    // SHA-256: RSA MD5/SHA-1/SHA-256, ECDSA SHA-256, PSS SHA-1/SHA-256.
+    assert_eq!(selected, [6, 4, 3]);
+}
+
+#[test]
 fn truncated_and_malformed_certificates_never_produce_binding() {
     let mut truncated = 0;
     for certificate in &CERTIFICATES[..13] {
