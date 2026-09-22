@@ -51,11 +51,17 @@ impl<'a> Cursor<'a> {
         }
     }
 }
+/// Per-column wire metadata that decides how a value is decoded. Rows carry it
+/// for every column (`Row::columns`, `Row::typed`), so a host can apply its own
+/// policy by MySQL column type without tracking `Column` events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ColumnTypeInfo {
     pub column_type: ColumnType,
     pub flags: ColumnFlags,
     pub character_set: u16,
+    /// Declared fractional-second digits for temporal columns (0..=6); 0x1f
+    /// (31) for columns without a fixed scale.
+    pub decimals: u8,
 }
 #[derive(Debug, Clone, Copy)]
 pub struct Column<'a> {
@@ -102,6 +108,7 @@ impl<'a> Column<'a> {
                 column_type,
                 flags,
                 character_set,
+                decimals,
             },
         })
     }
@@ -150,6 +157,20 @@ impl<'a> Row<'a> {
             binary,
             at: 0,
         })
+    }
+    /// Wire metadata of every column in this row, in value order.
+    pub fn columns(&self) -> &'a [ColumnTypeInfo] {
+        self.columns
+    }
+    /// Pair each remaining value with its column's wire metadata, ready for
+    /// `types::decode` or a host's own per-type policy. Validation is the same
+    /// as iterating the row itself.
+    pub fn typed(
+        self,
+    ) -> impl ExactSizeIterator<Item = Result<(ColumnTypeInfo, RawValue<'a>)>> + 'a {
+        let columns = &self.columns[self.at..];
+        self.zip(columns)
+            .map(|(value, info)| value.map(|value| (*info, value)))
     }
     fn value(&mut self, index: usize) -> Result<RawValue<'a>> {
         if !self.binary {
@@ -284,6 +305,7 @@ mod tests {
             column_type,
             flags: ColumnFlags::empty(),
             character_set: 45,
+            decimals: 0,
         }
     }
     fn text() -> [ColumnTypeInfo; 2] {
@@ -322,6 +344,43 @@ mod tests {
             Some(Err(Error::Protocol("trailing packet bytes")))
         );
         assert_eq!(row.next(), None);
+    }
+    #[test]
+    fn rows_carry_column_type_metadata_alongside_values() {
+        use mysql_common::proto::MySerialize;
+        let mut bytes = Vec::new();
+        mysql_common::packets::Column::new(ColumnType::MYSQL_TYPE_DATETIME)
+            .with_decimals(3)
+            .serialize(&mut bytes);
+        let column = Column::parse(&bytes).expect("valid column");
+        let datetime = column.type_info;
+        assert_eq!(datetime.column_type, ColumnType::MYSQL_TYPE_DATETIME);
+        assert_eq!(datetime.decimals, 3);
+        assert_eq!(column.decimals, 3);
+        let columns = [
+            ColumnTypeInfo {
+                character_set: 63,
+                ..info(ColumnType::MYSQL_TYPE_TIME)
+            },
+            ColumnTypeInfo {
+                character_set: 63,
+                ..info(ColumnType::MYSQL_TYPE_BIT)
+            },
+            datetime,
+        ];
+        let row = Row::parse(b"\x0801:02:03\x01\x01\xfb", &columns, false).expect("valid");
+        assert_eq!(row.columns(), columns);
+        let typed = row.typed();
+        assert_eq!(typed.len(), 3);
+        let typed: Vec<_> = typed.collect::<Result<_>>().expect("valid row");
+        assert_eq!(
+            typed,
+            [
+                (columns[0], RawValue::Bytes(b"01:02:03")),
+                (columns[1], RawValue::Bytes(b"\x01")),
+                (columns[2], RawValue::Null),
+            ]
+        );
     }
     #[test]
     fn binary_rows_validate_the_header_eagerly_and_scalars_lazily() {

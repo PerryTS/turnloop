@@ -9,6 +9,12 @@ pub struct Options {
     pub big_number_strings: bool,
     pub date_strings: bool,
     pub json_strings: bool,
+    /// mysql2's binary-protocol DATETIME/TIMESTAMP string policy: cut the
+    /// fractional seconds of a formatted `date_strings` value to the column's
+    /// declared `decimals` (DATETIME(3) gives `.123`, not `.123000`). Without
+    /// it all six digits are kept. Text-protocol values already arrive with the
+    /// declared digits and are returned verbatim either way.
+    pub truncate_fraction_to_decimals: bool,
 }
 #[derive(Debug, Clone, PartialEq)]
 pub enum Date<'a> {
@@ -31,6 +37,9 @@ pub enum JsValue<'a> {
     Buffer(Cow<'a, [u8]>),
     Json(&'a str),
     Date(Date<'a>),
+    /// A GEOMETRY value (4-byte little-endian SRID, then WKB). mysql2 turns it
+    /// into point/array objects; like `Json` and `Date` that is host work.
+    Geometry(&'a [u8]),
 }
 fn utf8(b: &[u8]) -> Result<&str> {
     std::str::from_utf8(b)
@@ -52,7 +61,13 @@ fn bigint(value: i128, options: Options) -> JsValue<'static> {
     }
 }
 /// Invoke this default conversion after a host typeCast hook chooses `next()`;
-/// raw fields and Column metadata are also available without conversion.
+/// raw fields and Column metadata are also available without conversion
+/// (`Row::typed` pairs every value with its `ColumnTypeInfo`).
+///
+/// The policy is chosen by MySQL column type first. `character_set == 63`
+/// (binary) is reported for every non-string column, so it only selects Buffer
+/// for the string/BLOB family; TIME stays a string, BIT a Buffer and GEOMETRY a
+/// `Geometry` request, matching mysql2.
 pub fn decode<'a>(
     info: ColumnTypeInfo,
     value: RawValue<'a>,
@@ -98,7 +113,9 @@ pub fn decode<'a>(
                     JsValue::Json(utf8(bytes)?)
                 }
             }
-            16 | 255 => JsValue::Buffer(bytes.into()),
+            11 => JsValue::String(utf8(bytes)?.into()),
+            16 => JsValue::Buffer(bytes.into()),
+            255 => JsValue::Geometry(bytes),
             _ if info.character_set == 63 => JsValue::Buffer(bytes.into()),
             _ => JsValue::String(utf8(bytes)?.into()),
         },
@@ -129,8 +146,15 @@ pub fn decode<'a>(
                 } else {
                     let mut s =
                         format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}");
-                    if microsecond != 0 {
-                        s.push_str(&format!(".{microsecond:06}"));
+                    let digits = if options.truncate_fraction_to_decimals {
+                        usize::from(info.decimals.min(6))
+                    } else {
+                        6
+                    };
+                    if microsecond != 0 && digits > 0 {
+                        let fraction = format!("{microsecond:06}");
+                        s.push('.');
+                        s.push_str(&fraction[..digits]);
                     }
                     s
                 };
@@ -169,7 +193,79 @@ mod tests {
             column_type: t,
             flags: ColumnFlags::empty(),
             character_set: 45,
+            decimals: 0,
         }
+    }
+    /// MySQL reports charset 63 for every non-string column; the column type,
+    /// not the charset, must pick TIME/BIT/GEOMETRY's policy.
+    #[test]
+    fn binary_charset_does_not_collapse_time_bit_and_geometry() {
+        let binary = |t| ColumnTypeInfo {
+            character_set: 63,
+            ..info(t)
+        };
+        let decode = |t, bytes| decode(binary(t), RawValue::Bytes(bytes), Options::default());
+        assert_eq!(
+            decode(ColumnType::MYSQL_TYPE_TIME, b"-838:59:59.5"),
+            Ok(JsValue::String("-838:59:59.5".into()))
+        );
+        assert_eq!(
+            decode(ColumnType::MYSQL_TYPE_BIT, &[0b101]),
+            Ok(JsValue::Buffer(Cow::Borrowed(&[0b101])))
+        );
+        let point = [0, 0, 0, 0, 1, 1, 0, 0, 0];
+        assert_eq!(
+            decode(ColumnType::MYSQL_TYPE_GEOMETRY, &point),
+            Ok(JsValue::Geometry(&point))
+        );
+        assert_eq!(
+            decode(ColumnType::MYSQL_TYPE_VAR_STRING, b"\xff\x00"),
+            Ok(JsValue::Buffer(Cow::Borrowed(b"\xff\x00"))),
+            "VARBINARY still follows the binary charset"
+        );
+    }
+    #[test]
+    fn datetime_fraction_follows_the_column_decimals_on_request() {
+        let value = || RawValue::Scalar(Value::Date(2026, 9, 22, 10, 11, 12, 123_456));
+        let datetime = |decimals| ColumnTypeInfo {
+            decimals,
+            ..info(ColumnType::MYSQL_TYPE_DATETIME)
+        };
+        let strings = Options {
+            date_strings: true,
+            ..Options::default()
+        };
+        let truncated = Options {
+            truncate_fraction_to_decimals: true,
+            ..strings
+        };
+        assert_eq!(
+            decode(datetime(3), value(), strings),
+            Ok(JsValue::String("2026-09-22 10:11:12.123456".into()))
+        );
+        assert_eq!(
+            decode(datetime(3), value(), truncated),
+            Ok(JsValue::String("2026-09-22 10:11:12.123".into()))
+        );
+        assert_eq!(
+            decode(datetime(6), value(), truncated),
+            Ok(JsValue::String("2026-09-22 10:11:12.123456".into()))
+        );
+        assert_eq!(
+            decode(datetime(0), value(), truncated),
+            Ok(JsValue::String("2026-09-22 10:11:12".into()))
+        );
+        assert_eq!(
+            decode(
+                ColumnTypeInfo {
+                    decimals: 2,
+                    ..info(ColumnType::MYSQL_TYPE_TIMESTAMP)
+                },
+                value(),
+                truncated
+            ),
+            Ok(JsValue::String("2026-09-22 10:11:12.12".into()))
+        );
     }
     #[test]
     fn node_conversion_options() {

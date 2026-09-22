@@ -105,17 +105,22 @@ Each value is validated and decoded once, as the iterator reaches it (the last
 one also rejects trailing bytes); the first error ends the row. Such an error
 is a parsing error: abort the connection.
 `types::decode` implements a default conversion policy. `Column` retains names,
-original names/table/schema, flags, charset, length, decimals and wire type.
+original names/table/schema, flags, charset, length, decimals and wire type;
+every `Row` also carries its columns' `ColumnTypeInfo` (type, flags, charset,
+decimals) via `Row::columns` and `Row::typed`, so a host can implement its own
+policy per MySQL column type without reimplementing value decoding.
 
 | MySQL type | Default policy / host action |
 |---|---|
 | integer, FLOAT, DOUBLE | Number; TINYINT(1) remains numeric |
 | BIGINT | Number by default; support_big_numbers preserves unsafe-range values as strings; big_number_strings forces strings when enabled |
 | DECIMAL/NEWDECIMAL | exact string; decimal_numbers opts into f64 |
-| DATE/DATETIME/TIMESTAMP | explicit Date request with raw text/calendar components; date_strings formats strings |
-| TIME | string, including negative and >24-hour values |
+| DATE/DATETIME/TIMESTAMP | explicit Date request with raw text/calendar components; date_strings formats strings; truncate_fraction_to_decimals cuts binary-protocol fractions to the column's decimals like mysql2 |
+| TIME | string, including negative and >24-hour values (by column type, even though its charset is 63) |
 | JSON | explicit host JSON parse request; json_strings returns raw text |
-| BLOB/binary charset 63, BIT, geometry | Buffer bytes |
+| BIT | Buffer bytes |
+| GEOMETRY | explicit Geometry request with the SRID+WKB bytes; the host builds mysql2's objects |
+| BLOB/other string types with binary charset 63 | Buffer bytes |
 | text | UTF-8 string; other character sets require host decoding |
 | NULL | Null |
 
@@ -124,7 +129,7 @@ behavior), parses JSON and materializes row objects or rowsAsArray tuples.
 The protocol preserves microseconds; JS Date loses sub-millisecond precision.
 `typeCast` can inspect Column and RawValue in the event-dispatch layer and invoke
 `types::decode` for next(). Callback invocation, field.string/buffer single-use
-semantics and field.geometry parsing are adapter work, not core callbacks.
+semantics and building field.geometry objects are adapter work, not core callbacks.
 Per-type dateStrings arrays are not implemented (only the boolean option).
 BIGINT inside JSON is still host policy. This is documented surface support,
 not a drop-in mysql2 API.
