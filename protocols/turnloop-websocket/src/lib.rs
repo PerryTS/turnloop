@@ -60,6 +60,56 @@ pub struct Connection {
     terminal: bool,
     peer_close: Option<u16>,
 }
+/// One [`Connection::receive`] step: how much of `input` was taken, and the
+/// message it completed, if any.
+///
+/// **`consumed` and `message` are independent**, as they are for
+/// `turnloop_http`'s `Step`. `receive` reads input into the connection's own
+/// buffer and parses from that buffer before it reads again, so the bytes a
+/// message is made of may have been consumed by an earlier call:
+///
+/// | `consumed` | `message` | meaning |
+/// |---|---|---|
+/// | `0` | `None` | **stop.** Nothing complete is buffered and the input is empty; read more from the transport before calling again. |
+/// | `> 0` | `None` | **keep going.** The input was taken in, all of it, but completes no message yet: a partial frame, or a non-final fragment. The next call returns the stop shape unless more input arrived. |
+/// | `> 0` | `Some` | a message, possibly with input left over. |
+/// | `0` | `Some` | a message completed from bytes an earlier call consumed - the second of two frames that arrived in one read, say. Normal, and easy to drop. |
+///
+/// So the loop condition is the same one-liner, `consumed > 0 ||
+/// message.is_some()`:
+///
+/// ```
+/// # use turnloop_websocket::*;
+/// # let mut connection = Connection::new(Role::Server, WebSocketConfig::default());
+/// # let (mut input, mut replies) = (Vec::new(), Vec::new());
+/// loop {
+///     let step = connection.receive(&input, &mut replies)?;
+///     input.drain(..step.consumed);
+///     let progressed = step.consumed > 0 || step.message.is_some();
+///     if let Some(message) = step.message {
+///         let _ = message;
+///     }
+///     connection.flush(&mut replies)?; // automatic pong/close replies
+///     if !progressed {
+///         break; // read more bytes from the transport, then continue
+///     }
+/// }
+/// # Ok::<(), Error>(())
+/// ```
+///
+/// Looping while `consumed > 0` **drops messages**: the `0`/`Some` step reads
+/// as "stop" and its message is never looked at. Reading the transport
+/// whenever `input` is empty **stalls** on the same step: no input is left,
+/// yet a message is waiting, and a peer waiting for its answer never sends
+/// the bytes that would wake the host. Looping while a message came back is,
+/// for this type, safe - a step with no message has always taken in all of
+/// its input, so nothing is stranded - but it is not the documented
+/// condition, and the one above works for every step type in the workspace.
+///
+/// `receive` is not idempotent. The `consumed` bytes are in the connection's
+/// buffer once it returns, so input that is fed again without being drained
+/// is parsed again: a complete message in it is delivered twice, with no
+/// error to notice.
 pub struct Received {
     pub consumed: usize,
     pub message: Option<Message>,
@@ -73,6 +123,8 @@ impl Connection {
             peer_close: None,
         }
     }
+    /// One decode step. `consumed` and `message` are independent, and
+    /// `consumed == 0` does not by itself mean "stop": see [`Received`].
     pub fn receive(&mut self, input: &[u8], output: &mut Vec<u8>) -> Result<Received, Error> {
         if self.terminal {
             return Err(Error::AlreadyClosed);
