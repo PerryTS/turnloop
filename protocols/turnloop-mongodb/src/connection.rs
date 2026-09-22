@@ -84,7 +84,9 @@ impl Connection {
             max_write_batch_size: 100_000,
         }
     }
-    /// `nonce` must come from a host CSPRNG if credentials are configured.
+    /// `nonce` must come from a host CSPRNG if credentials are configured: at least
+    /// 16 printable bytes, fresh per connection. See the crate's
+    /// [host entropy](crate#host-entropy) obligations.
     pub fn connected(&mut self, now: Instant, nonce: &str) -> Result<()> {
         if self.state != State::New {
             return Err(Error::protocol("Connection already started"));

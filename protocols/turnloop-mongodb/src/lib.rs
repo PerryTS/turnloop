@@ -9,6 +9,19 @@
 //! host owns `LocalExecutor` and calls `turn`; adapters await its streams and
 //! deadline futures. See the crate README and turnloop-io for ownership, streaming
 //! and cancellation examples. Default features retain the sans-I/O API.
+//!
+//! # Host entropy
+//! Every random or unique value comes from the host; nothing here reads OS
+//! entropy or a clock. The obligations, all described in one place in the
+//! [README's Host entropy section](https://github.com/PerryTS/turnloop/blob/main/protocols/turnloop-mongodb/README.md#host-entropy):
+//! - a CSPRNG SCRAM nonce for [`Connection::connected`] when credentials are set;
+//! - an `_id` on every inserted document, from [`command::ObjectIdGenerator`]
+//!   (the server otherwise assigns one the host never learns);
+//! - random session UUIDs for [`session::Session::new`] and
+//!   [`operation::RetrySession`];
+//! - selection entropy for [`topology::Topology::choose`].
+//!
+//! The `turnloop` feature's client supplies all but the `_id`.
 #![deny(unsafe_op_in_unsafe_fn)]
 #![forbid(unsafe_code)]
 

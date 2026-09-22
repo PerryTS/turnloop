@@ -1,6 +1,8 @@
 //! crud/crud.md §§ Read/Write Operations, Write Models and Results.
 //! Builders retain capacity. Inputs and options are borrowed raw BSON; IDs and
 //! wall-clock ObjectId timestamps are supplied by the host (no ObjectId::new()).
+//! Inserted documents need an `_id` before sending; see [`ObjectIdGenerator`] and
+//! the crate's [host entropy](crate#host-entropy) obligations.
 use crate::{Error, ErrorKind, Result, wire::BsonWriter};
 use bson::{
     Document,
@@ -718,6 +720,12 @@ impl<'a> BulkBatcher<'a> {
 }
 /// ObjectId generator with host-supplied process entropy and wall-clock seconds.
 /// BSON ObjectId specification § Generation: 4 timestamp, 5 random, 3 counter bytes.
+///
+/// Nothing in this crate adds a missing `_id`: an insert without one still
+/// succeeds, but the server assigns an id the host never learns. Create one
+/// generator per process from 5 random bytes and a random counter start, and
+/// give every inserted document an `_id` from it. This is one of the crate's
+/// [host entropy](crate#host-entropy) obligations.
 pub struct ObjectIdGenerator {
     random: [u8; 5],
     counter: u32,
