@@ -51,6 +51,33 @@ pub struct PoolConfig {
     /// for peak long occupancy only while it lasts. Reuse within the window
     /// costs no thread creation.
     pub long_idle_timeout: Duration,
+    /// Ceiling on one loop's pool-delivered operations whose result has not
+    /// been delivered yet (issue #88). Unlike the fields above, this one is
+    /// **per loop**: it is not part of the process-wide configuration, and loops
+    /// that differ only here share one pool.
+    ///
+    /// Every operation whose result a pool worker or helper thread hands back
+    /// counts against it from acceptance until its completion is taken off the
+    /// loop's result ring: [`Driver::blocking`](crate::Driver::blocking) and
+    /// [`Driver::blocking_with`](crate::Driver::blocking_with) jobs of both
+    /// occupancy classes, lookups served by the pool, typed filesystem requests
+    /// on native targets and [`Driver::external_wait`](crate::Driver::external_wait)
+    /// registrations. A submission that would exceed it is refused with
+    /// [`ErrorKind::ResourceLimit`] before the work exists, the way a full
+    /// [`queue_capacity`](Self::queue_capacity) refuses one.
+    ///
+    /// The loop's result ring is sized by this ceiling (capped at
+    /// [`Config::max_operations`](crate::Config::max_operations), which bounds
+    /// every operation anyway), not by `max_operations` itself. The ring must
+    /// be able to hold every undelivered result at once — a worker that finds
+    /// it full has nowhere to put a result — so this is the number that makes
+    /// the ring safe, and a host that raises `max_operations` for I/O no longer
+    /// pays for a result ring its pool work will never fill.
+    ///
+    /// `queue_capacity` does not bound the same thing: a bounded job leaves the
+    /// queue when a worker takes it, long jobs never enter it, and a finished
+    /// job's result can wait in the ring while the queue refills.
+    pub max_undelivered: usize,
 }
 impl Default for PoolConfig {
     fn default() -> Self {
@@ -59,6 +86,19 @@ impl Default for PoolConfig {
             queue_capacity: 1024,
             long_threads_max: 512,
             long_idle_timeout: Duration::from_secs(10),
+            max_undelivered: 4096,
+        }
+    }
+}
+impl PoolConfig {
+    /// The fields fixed process-wide by the first submission. `max_undelivered`
+    /// belongs to each loop and is left out, so it never makes two loops'
+    /// configurations disagree.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn process_wide(self) -> Self {
+        Self {
+            max_undelivered: 0,
+            ..self
         }
     }
 }
@@ -203,6 +243,11 @@ impl WorkPort {
     pub fn is_empty(&self) -> bool {
         self.queue.is_empty()
     }
+    /// Slots in the result ring, for tests of its sizing.
+    #[cfg(all(test, not(loom), not(target_arch = "wasm32")))]
+    pub(crate) fn capacity(&self) -> usize {
+        self.queue.capacity()
+    }
     pub fn pop(&self) -> Option<WorkResult> {
         self.queue.pop()
     }
@@ -229,8 +274,10 @@ impl WorkPort {
         if self.closed.load(Ordering::Acquire) {
             return;
         }
-        // One reserved core operation credit per job remains held until delivery.
-        // Thus this separate queue (>= max_operations) cannot overflow.
+        // Every producer here is an operation the driver admitted against
+        // `PoolConfig::max_undelivered`, and it keeps that credit until its
+        // result is popped from this ring, which is at least that large.
+        // Thus the ring cannot overflow; a full ring is a broken invariant.
         assert!(
             self.queue.push(result).is_ok(),
             "blocking completion credit invariant"
@@ -453,7 +500,7 @@ mod native {
             .get_or_init(|| start(config))
             .as_ref()
             .map_err(|&e| e)?;
-        if pool.config != config {
+        if pool.config.process_wide() != config.process_wide() {
             return Err(Error::new(ErrorKind::InvalidInput));
         }
         Ok(pool)

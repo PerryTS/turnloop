@@ -8,7 +8,7 @@
 //! sockets are themselves unsupported (DESIGN §7.5).
 use crate::slots::Slots;
 use crate::{
-    backend::{Backend, Event, Operation, Outcome, PollInfo, Request, Wake},
+    backend::{Backend, Budget, Event, Operation, Outcome, PollInfo, Request, Wake},
     *,
 };
 use js_sys::{Function, Uint8Array};
@@ -322,6 +322,8 @@ unsafe impl Backend for Web {
     fn poll(
         &mut self,
         timeout: Option<Duration>,
+        // No listener exists on the web: nothing here creates a handle.
+        _budget: Budget,
         events: &mut Vec<Event<Detached>>,
     ) -> Result<PollInfo> {
         if timeout != Some(Duration::ZERO) {

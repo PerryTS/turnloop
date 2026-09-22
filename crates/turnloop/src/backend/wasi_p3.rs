@@ -9,7 +9,7 @@ mod return_storage;
 mod sockopt;
 mod wait_set;
 use crate::{
-    backend::{Backend, Event, Filesystem, Operation, Outcome, PollInfo, Request, Wake},
+    backend::{Backend, Budget, Event, Filesystem, Operation, Outcome, PollInfo, Request, Wake},
     *,
 };
 use std::{
@@ -99,6 +99,8 @@ struct Resource {
     heads: [Option<usize>; 2],
     tails: [Option<usize>; 2],
     queued: bool,
+    /// Listed in `throttled`: a ready multishot accept held back by the budget.
+    throttled: bool,
 }
 #[derive(Clone, Copy)]
 enum WaitKind {
@@ -136,6 +138,11 @@ pub struct WasiP3 {
     resources: Slots<Resource>,
     ops: Slots<Pending>,
     ready: VecDeque<Handle>,
+    /// Listeners whose multishot accept is ready but out of budget: neither
+    /// runnable nor subscribed, until a poll with a positive budget (#77).
+    throttled: VecDeque<Handle>,
+    /// Connections multishot accepts may still deliver in the current poll.
+    accepts: usize,
     cancelled: VecDeque<OpId>,
     pool: BufferPool,
     wake: Arc<WasiWake>,
@@ -241,6 +248,7 @@ impl WasiP3 {
             heads: [None; 2],
             tails: [None; 2],
             queued: false,
+            throttled: false,
         });
         Ok(())
     }
@@ -248,9 +256,48 @@ impl WasiP3 {
         let Some(r) = self.resources.get_mut(h.index()).and_then(Option::as_mut) else {
             return;
         };
-        if r.handle == h && !r.queued && (0..2).any(|d| r.ready[d] && r.heads[d].is_some()) {
+        if r.handle != h || r.queued {
+            return;
+        }
+        let held = self.accepts == 0 && r.ready[0] && holds_throttled(&self.ops, r.heads[0]);
+        if (0..2).any(|d| r.ready[d] && r.heads[d].is_some() && !(d == 0 && held)) {
             r.queued = true;
             self.ready.push_back(h);
+        } else if held && !r.throttled {
+            r.throttled = true;
+            self.throttled.push_back(h);
+            // A parked accept whose read already fired keeps its outcome in
+            // `code`, which `execute` consumes once the budget resumes it; only
+            // `finish_wait` would otherwise take the waitable out of the set.
+            // Leave it there and every wait while the ceiling holds could return
+            // it again at once, a spin that produces nothing (rule 4a). Removing
+            // it runs no side effect and loses no connection; `finish_wait`
+            // removes it again harmlessly, since `join(_, 0)` is idempotent.
+            if let Some(p) = r.heads[0].and_then(|i| self.ops[i].as_ref())
+                && let Some((waitable, _)) = p.wait
+                && p.code.is_some()
+                && waitable != 0
+            {
+                self.wait_set.remove(waitable);
+            }
+        }
+    }
+    /// Start a poll with `budget`: a positive one resumes every held listener.
+    fn begin(&mut self, budget: Budget) {
+        self.accepts = budget.accepts;
+        if self.accepts == 0 {
+            return;
+        }
+        while let Some(h) = self.throttled.pop_front() {
+            if let Some(r) = self
+                .resources
+                .get_mut(h.index())
+                .and_then(Option::as_mut)
+                .filter(|r| r.handle == h)
+            {
+                r.throttled = false;
+                self.schedule(h);
+            }
         }
     }
     fn unlink(&mut self, h: Handle, i: usize, d: usize) {
@@ -305,6 +352,10 @@ impl WasiP3 {
                 let Some(i) = r.heads[d] else {
                     continue;
                 };
+                if self.accepts == 0 && holds_throttled(&self.ops, Some(i)) {
+                    // Out of budget: `schedule` below parks the listener.
+                    continue;
+                }
                 let p = self.ops[i].as_mut().expect("queued op");
                 let result = execute(r, p, &self.pool, &self.wait_set);
                 let event = match result {
@@ -330,6 +381,9 @@ impl WasiP3 {
                     }),
                 };
                 if let Some(e) = event {
+                    if Budget::spends(&e) {
+                        self.accepts -= 1;
+                    }
                     if e.terminal {
                         self.unlink(h, i, d);
                         self.ops[i] = None;
@@ -357,6 +411,8 @@ unsafe impl Backend for WasiP3 {
             resources: Slots::new(config.max_handles),
             ops: Slots::new(config.max_operations),
             ready: VecDeque::with_capacity(page_reserve(config.max_handles)),
+            throttled: VecDeque::with_capacity(page_reserve(config.max_handles)),
+            accepts: usize::MAX,
             cancelled: VecDeque::with_capacity(page_reserve(config.max_operations)),
             files: super::wasi_fs::Files::new(config, pool.clone()),
             pool,
@@ -582,8 +638,10 @@ unsafe impl Backend for WasiP3 {
     fn poll(
         &mut self,
         timeout: Option<Duration>,
+        budget: Budget,
         events: &mut Vec<Event<Detached>>,
     ) -> Result<PollInfo> {
+        self.begin(budget);
         while events.len() < events.capacity() {
             let Some(op) = self.cancelled.pop_front() else {
                 break;
@@ -677,6 +735,7 @@ unsafe impl Backend for WasiP3 {
         self.files.release(h);
         if self.get(h).is_ok() {
             self.ready.retain(|&at| at != h);
+            self.throttled.retain(|&at| at != h);
             self.resources[h.index()] = None;
         }
     }
@@ -1154,4 +1213,11 @@ fn quiesce(p: &mut Pending, set: &WaitSet, r: &mut Resource) {
             wait_set::subtask_drop(waitable);
         }
     }
+}
+
+/// Whether the operation at the head of a direction is one the budget throttles.
+fn holds_throttled(ops: &Slots<Pending>, head: Option<usize>) -> bool {
+    head.and_then(|i| ops.get(i))
+        .and_then(Option::as_ref)
+        .is_some_and(|p| Budget::throttles(&p.request.operation))
 }

@@ -1,5 +1,5 @@
 use crate::{
-    backend::{Backend, Event, Filesystem, Operation, Outcome, Request},
+    backend::{Backend, Budget, Event, Filesystem, Operation, Outcome, Request},
     fs::FsOutput,
     table::Table,
     timer::DriverTimerQueue as TimerQueue,
@@ -50,12 +50,19 @@ struct Op {
     /// A typed filesystem request (pool service or backend, per `B::FILESYSTEM`).
     fs: bool,
     /// Handle slots this operation holds against the ceiling, released when it
-    /// retires. Non-zero only for operations whose completion creates a handle.
+    /// retires. Non-zero only for single-shot operations whose completion
+    /// creates a handle; a multishot accept draws on `multishot_reserved`.
     reserved_handles: usize,
+    /// A multishot accept, counted in `multishot_armed`, whose connections the
+    /// backend delivers against the poll's `Budget` (turnloop#77).
+    multishot: bool,
     /// Counted in `native_pending`: a socket-handle operation or a request the
     /// backend accepted natively (such as WASI DNS). DESIGN §10 rule 3 keys
     /// queued-turn discovery on these operations.
     native: bool,
+    /// Delivers through the loop's result ring (`WorkPort`), and so holds one
+    /// of `PoolConfig::max_undelivered` credits until it retires.
+    port: bool,
     job_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     previous: Option<OpId>,
     next: Option<OpId>,
@@ -101,7 +108,17 @@ pub struct Driver<B: Backend> {
     /// Handle slots promised to accepts and handle receives that have been asked
     /// for but not yet delivered. See [`Driver::submit`].
     reserved_handles: usize,
+    /// Armed multishot accepts, and the part of `reserved_handles` promised to
+    /// them: one each, as far as the ceiling allows. The promises are pooled
+    /// rather than owned per operation, because the poll budget is shared by
+    /// every multishot accept, and any of them may spend any of these slots.
+    multishot_armed: usize,
+    multishot_reserved: usize,
     native_pending: usize,
+    /// Operations delivering through `work_port` that have not retired: the
+    /// ring's occupancy can never exceed this, and admission keeps it at or
+    /// below `PoolConfig::max_undelivered`, which sizes the ring (issue #88).
+    undelivered: usize,
     config: Config,
     _local: PhantomData<Rc<()>>,
 }
@@ -115,6 +132,7 @@ impl<B: Backend> Driver<B> {
             || config.events_per_turn == 0
             || config.post_capacity == 0
             || config.pooled_buffer_size == 0
+            || config.blocking_pool.max_undelivered == 0
         {
             return Err(Error::new(ErrorKind::InvalidInput));
         }
@@ -129,7 +147,15 @@ impl<B: Backend> Driver<B> {
         let notifier = Notifier::new(backend.waker());
         backend.set_notifier(notifier.clone());
         let poster = Poster::new(config.post_capacity, notifier.clone());
-        let work_port = crate::blocking::WorkPort::new(config.max_operations, notifier.clone());
+        // Sized by the results that can be undelivered at once, not by every
+        // operation the loop may hold: see `PoolConfig::max_undelivered`.
+        let work_port = crate::blocking::WorkPort::new(
+            config
+                .blocking_pool
+                .max_undelivered
+                .min(config.max_operations),
+            notifier.clone(),
+        );
         let owner = loop {
             let current = NEXT_OWNER.load(Ordering::Relaxed);
             let next = current
@@ -170,10 +196,56 @@ impl<B: Backend> Driver<B> {
             refs: 0,
             outstanding: 0,
             reserved_handles: 0,
+            multishot_armed: 0,
+            multishot_reserved: 0,
             native_pending: 0,
+            undelivered: 0,
             config,
             _local: PhantomData,
         })
+    }
+    /// Rebuild this loop from a new `config`, in place (issue #43).
+    ///
+    /// A loop's configuration is fixed when it is built, so raising a profile —
+    /// a process that starts doing network I/O, say — means building a new loop.
+    /// Dropping the old one to do that is a cancellation nobody asked for: a pool
+    /// job it accepted still runs, and its result is discarded because its loop
+    /// is gone, so the job's completion never arrives. This is the checked way
+    /// to replace a loop, which refuses instead of losing anything.
+    ///
+    /// The loop is rebuilt only when it owns nothing a new loop could not
+    /// deliver: no handle, no operation in flight (pool jobs, pool lookups,
+    /// typed file requests and external waits included), no completion awaiting
+    /// delivery and no queued post. Otherwise this is `WouldBlock` and nothing
+    /// changes: turn the loop until that work has been delivered, then retry —
+    /// the same contract as [`detach`](Self::detach). A `config` that
+    /// [`Driver::new`] would reject fails the same way, also without changing
+    /// anything.
+    ///
+    /// On success this is a new loop. Handles, operation ids, [`Notifier`]s,
+    /// [`Poster`]s and an [`integration`](Self::integration) primitive obtained
+    /// before belong to the old one and no longer reach it: fetch new ones.
+    /// Quiesce other threads' posters first: a post that lands between the
+    /// check and the rebuild goes down with the old loop, exactly as it would if
+    /// the loop were dropped, and later ones are refused with `NotFound`.
+    ///
+    /// Growing the old loop in place instead is not offered: its capacities size
+    /// structures that cannot grow under live use — the lock-free post and
+    /// result rings that other threads are writing into, and the Windows
+    /// `OVERLAPPED` slab whose addresses the kernel holds.
+    pub fn rebuild(&mut self, config: Config) -> Result<()> {
+        self.assert_owner();
+        if self.outstanding != 0
+            || self.handles.remaining() != self.config.max_handles
+            || !self.queued.is_empty()
+            || !self.poster.is_empty()
+            || !self.work_port.is_empty()
+        {
+            return Err(Error::new(ErrorKind::WouldBlock));
+        }
+        debug_assert_eq!(self.undelivered, 0, "every pool operation is outstanding");
+        *self = Self::new(config)?;
+        Ok(())
     }
     /// Reserved slots are a subset of free ones.
     ///
@@ -259,7 +331,9 @@ impl<B: Backend> Driver<B> {
                 external_wait: false,
                 fs: false,
                 reserved_handles: 0,
+                multishot: false,
                 native,
+                port: false,
                 previous,
                 next: None,
             })
@@ -291,12 +365,40 @@ impl<B: Backend> Driver<B> {
             key,
         })
     }
+    /// Refuse a submission whose result would have no room in the result ring.
+    ///
+    /// Checked before anything is created, like the pool's own queue limit, so
+    /// a refused submission owes no completion. See `PoolConfig::max_undelivered`.
+    fn admit_port(&self) -> Result<()> {
+        if self.undelivered >= self.config.blocking_pool.max_undelivered {
+            return Err(Error::new(ErrorKind::ResourceLimit));
+        }
+        Ok(())
+    }
+    /// Charge an admitted operation to the result ring until it retires.
+    fn charge_port(&mut self, op: OpId) {
+        let op = self.ops.get_mut(op.key).expect("admitted op");
+        debug_assert!(!op.port);
+        op.port = true;
+        self.undelivered += 1;
+        debug_assert!(self.undelivered <= self.config.blocking_pool.max_undelivered);
+    }
     fn retire(&mut self, id: OpId) -> Option<Op> {
         let op = self.ops.remove(id.key)?;
         self.connect_deadlines.cancel(id.key);
         self.reserved_handles -= op.reserved_handles;
+        if op.multishot {
+            self.multishot_armed -= 1;
+            if self.multishot_reserved > self.multishot_armed {
+                self.multishot_reserved -= 1;
+                self.reserved_handles -= 1;
+            }
+        }
         if op.native {
             self.native_pending -= 1;
+        }
+        if op.port {
+            self.undelivered -= 1;
         }
         if let Some(previous) = op.previous {
             self.ops.get_mut(previous.key).expect("previous").next = op.next;
@@ -856,6 +958,7 @@ impl<B: Backend> Driver<B> {
             operation,
             Operation::Accept { .. } | Operation::RecvHandle
         ));
+        let multishot = matches!(operation, Operation::Accept { multishot: true });
         // Only a reserving operation is gated: reads, writes and everything else
         // on an existing handle must still work at the ceiling.
         if reserve != 0 && self.handles.remaining() < self.reserved_handles + reserve {
@@ -863,7 +966,14 @@ impl<B: Backend> Driver<B> {
         }
         let op = self.new_op(Some(h), token)?;
         self.reserved_handles += reserve;
-        self.ops.get_mut(op.key).expect("new op").reserved_handles = reserve;
+        let new = self.ops.get_mut(op.key).expect("new op");
+        if multishot {
+            new.multishot = true;
+            self.multishot_armed += 1;
+            self.multishot_reserved += 1;
+        } else {
+            new.reserved_handles = reserve;
+        }
         self.assert_reservations();
         if let Err(e) = self.backend.submit(Request {
             op,
@@ -1072,33 +1182,52 @@ impl<B: Backend> Driver<B> {
     ///
     /// Releasing the reservation before creating the handle is what makes it
     /// real: `new_handle` refuses slots that are still promised, so the only
-    /// thing that can spend this one is the accept that reserved it. A multishot
-    /// accept stays armed and reserves again for its next connection; if the
-    /// loop is at its ceiling it holds nothing, and its next connection is
-    /// refused the way a fresh submission would be.
+    /// thing that can spend this one is the accept that reserved it.
+    ///
+    /// A multishot accept spends one of the slots pooled for every multishot
+    /// accept, if any is left, and the pool is then refilled as far as the
+    /// ceiling allows. The backend delivered this connection within the poll's
+    /// [`Budget`], which counts exactly the free slots not promised to
+    /// single-shot operations, so there is room for it either way.
     fn attach_reserved(
         &mut self,
         transport: B::Detached,
         id: OpId,
         token: Token,
-        terminal: bool,
     ) -> Result<Handle> {
-        let held = self
-            .ops
-            .get_mut(id.key)
-            .map_or(0, |op| std::mem::take(&mut op.reserved_handles));
-        self.reserved_handles -= held;
-        let attached = self.attach(transport, token);
-        if !terminal && held != 0 && self.handles.remaining() > self.reserved_handles {
-            self.reserved_handles += held;
-            if let Some(op) = self.ops.get_mut(id.key) {
-                op.reserved_handles = held;
-            } else {
-                self.reserved_handles -= held;
+        let multishot = self.ops.get(id.key).is_some_and(|op| op.multishot);
+        let attached = if multishot {
+            if self.multishot_reserved != 0 {
+                self.multishot_reserved -= 1;
+                self.reserved_handles -= 1;
             }
-        }
+            let attached = self.attach(transport, token);
+            while self.multishot_reserved < self.multishot_armed
+                && self.handles.remaining() > self.reserved_handles
+            {
+                self.multishot_reserved += 1;
+                self.reserved_handles += 1;
+            }
+            attached
+        } else {
+            let held = self
+                .ops
+                .get_mut(id.key)
+                .map_or(0, |op| std::mem::take(&mut op.reserved_handles));
+            self.reserved_handles -= held;
+            self.attach(transport, token)
+        };
         self.assert_reservations();
         attached
+    }
+    /// What the backend may deliver in the next poll (turnloop#77): every free
+    /// handle slot that no single-shot accept or handle receive is holding. A
+    /// multishot accept's connections are counted against it, so a batch can
+    /// never outrun the ceiling; nothing else is.
+    fn budget(&self) -> Budget {
+        Budget {
+            accepts: self.handles.remaining() - (self.reserved_handles - self.multishot_reserved),
+        }
     }
     /// Register an owning transport on this loop; failure drops the rejected transport.
     ///
@@ -1122,8 +1251,10 @@ impl<B: Backend> Driver<B> {
         deadline: Option<Instant>,
         token: Token,
     ) -> Result<OpId> {
+        self.admit_port()?;
         let op = self.new_op(None, token)?;
         self.ops.get_mut(op.key).expect("new wait").external_wait = true;
+        self.charge_port(op);
         if let Err(e) =
             crate::external_wait::submit(op, self.work_port.clone(), condition, expected, deadline)
         {
@@ -1148,6 +1279,9 @@ impl<B: Backend> Driver<B> {
         } else {
             Kind::Socket
         };
+        if B::FILESYSTEM == Filesystem::Pool {
+            self.admit_port()?;
+        }
         let target = request.handle();
         if let Some(h) = target {
             let r = self.resource(h)?;
@@ -1175,6 +1309,9 @@ impl<B: Backend> Driver<B> {
             }
         };
         self.ops.get_mut(op.key).expect("new request").fs = true;
+        if B::FILESYSTEM == Filesystem::Pool {
+            self.charge_port(op);
+        }
         let accepted = match B::FILESYSTEM {
             #[cfg(not(target_arch = "wasm32"))]
             Filesystem::Pool => self.files.submit(op, handle, request),
@@ -1369,7 +1506,9 @@ impl<B: Backend> Driver<B> {
             &std::sync::Arc<std::sync::atomic::AtomicBool>,
         ) -> Box<dyn FnOnce() -> Result<crate::blocking::WorkOutput> + Send>,
     {
+        self.admit_port()?;
         let op = self.new_op(None, token)?;
+        self.charge_port(op);
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.ops.get_mut(op.key).expect("new op").job_cancel = Some(cancel.clone());
         let f = make(&cancel);
@@ -1482,23 +1621,19 @@ impl<B: Backend> Driver<B> {
                 Ok(Outcome::Resolved(addresses)) => OpResult::Resolved(addresses),
                 Ok(Outcome::Exited(status)) => OpResult::Exited(status),
                 Ok(Outcome::Signal(signal)) => OpResult::Signal(signal),
-                Ok(Outcome::PipeAccepted(d)) => {
-                    match self.attach_reserved(d, e.op, op.token, e.terminal) {
-                        Ok(conn) => OpResult::PipeAccepted { conn },
-                        Err(e) => OpResult::Err(e),
-                    }
-                }
-                Ok(Outcome::HandleReceived(d)) => {
-                    match self.attach_reserved(d, e.op, op.token, e.terminal) {
-                        Ok(handle) => OpResult::HandleReceived { handle },
-                        Err(e) => OpResult::Err(e),
-                    }
-                }
+                Ok(Outcome::PipeAccepted(d)) => match self.attach_reserved(d, e.op, op.token) {
+                    Ok(conn) => OpResult::PipeAccepted { conn },
+                    Err(e) => OpResult::Err(e),
+                },
+                Ok(Outcome::HandleReceived(d)) => match self.attach_reserved(d, e.op, op.token) {
+                    Ok(handle) => OpResult::HandleReceived { handle },
+                    Err(e) => OpResult::Err(e),
+                },
                 Ok(Outcome::HandleSent) => OpResult::HandleSent,
                 Err(e) => OpResult::Err(e),
                 Ok(Outcome::Connected) => OpResult::Connected,
                 Ok(Outcome::Accepted { transport, peer }) => {
-                    match self.attach_reserved(transport, e.op, op.token, e.terminal) {
+                    match self.attach_reserved(transport, e.op, op.token) {
                         Ok(conn) => OpResult::Accepted { conn, peer },
                         Err(e) => OpResult::Err(e),
                     }
@@ -1557,7 +1692,7 @@ impl<B: Backend> Driver<B> {
             if timeout == Some(Duration::ZERO) || queued || notified || !self.notifier.park() {
                 timeout = Some(Duration::ZERO);
             }
-            let poll = self.backend.poll(timeout, &mut self.events);
+            let poll = self.backend.poll(timeout, self.budget(), &mut self.events);
             self.notifier.running();
             let poll = poll?;
             waits = poll.waits;
@@ -1953,6 +2088,7 @@ mod clock_contract {
         fn poll(
             &mut self,
             timeout: Option<Duration>,
+            _budget: Budget,
             events: &mut Vec<Event<()>>,
         ) -> Result<PollInfo> {
             assert_eq!(timeout, Some(Duration::ZERO));
@@ -2356,5 +2492,49 @@ impl Driver<crate::backend::web::Web> {
             return Err(e);
         }
         Ok(h)
+    }
+}
+
+#[cfg(all(test, not(loom), not(target_arch = "wasm32")))]
+mod result_ring {
+    use super::*;
+    /// The result ring holds every result that may be undelivered at once, and
+    /// no more: `max_undelivered`, capped by `max_operations` (issue #88).
+    #[test]
+    fn is_sized_by_undelivered_results_not_by_operations() {
+        let pool = PoolConfig {
+            max_undelivered: 100,
+            ..PoolConfig::default()
+        };
+        let l = Loop::new(Config {
+            max_operations: 32_768,
+            blocking_pool: pool,
+            ..Config::default()
+        })
+        .expect("loop");
+        assert_eq!(
+            l.work_port.capacity(),
+            128,
+            "a large I/O ceiling is not paid for"
+        );
+        let l = Loop::new(Config {
+            max_operations: 16,
+            ..Config::default()
+        })
+        .expect("loop");
+        assert_eq!(
+            l.work_port.capacity(),
+            16,
+            "never more than every operation"
+        );
+        let none = PoolConfig {
+            max_undelivered: 0,
+            ..PoolConfig::default()
+        };
+        let refused = Loop::new(Config {
+            blocking_pool: none,
+            ..Config::default()
+        });
+        assert_eq!(refused.err().map(|e| e.kind), Some(ErrorKind::InvalidInput));
     }
 }

@@ -231,6 +231,18 @@ fn nodelay_accept_default_rejects_the_listener() {
 fn no_spin() {
     contract::no_spin::<Platform>();
 }
+/// turnloop#77: a multishot accept waits at the handle ceiling without
+/// destroying connections, and a turn at the ceiling blocks instead of spinning.
+#[test]
+fn multishot_accept_waits_at_the_handle_ceiling() {
+    contract::multishot_accept_respects_the_handle_ceiling::<Platform>();
+}
+/// A connection that reaches an already-started accept once the budget is
+/// spent waits without a spin (0.3: the fired waitable leaves the wait-set).
+#[test]
+fn multishot_accept_parked_after_its_read_fired() {
+    contract::multishot_accept_parked_after_its_read_fired::<Platform>();
+}
 /// DESIGN §10.4a and the `PollInfo` contract: the private WASI deadline
 /// pollable (0.2) / subtask (0.3) is this wait's timeout, not native work.
 #[test]

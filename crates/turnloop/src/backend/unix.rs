@@ -10,7 +10,7 @@ use super::{
 };
 use crate::slots::{Slots, page_reserve};
 use crate::{
-    backend::{Backend, Event, Operation, Outcome, PollInfo, Request},
+    backend::{Backend, Budget, Event, Operation, Outcome, PollInfo, Request},
     *,
 };
 use std::{
@@ -126,6 +126,8 @@ struct Resource {
     heads: [Option<usize>; 2],
     tails: [Option<usize>; 2],
     queued: bool,
+    /// Listed in `throttled`: a ready multishot accept held back by the budget.
+    throttled: bool,
 }
 struct Pending {
     request: Request,
@@ -139,6 +141,12 @@ pub struct Unix {
     resources: Slots<Resource>,
     ops: Slots<Pending>,
     ready: VecDeque<Handle>,
+    /// Listeners whose multishot accept is ready but out of budget. They are
+    /// not runnable, so they neither count as work nor shorten a wait, and they
+    /// return to `ready` at the first poll with a positive budget (turnloop#77).
+    throttled: VecDeque<Handle>,
+    /// Connections multishot accepts may still deliver in the current poll.
+    accepts: usize,
     cancelled: VecDeque<OpId>,
     polled: Vec<Ready>,
     pool: BufferPool,
@@ -191,6 +199,7 @@ impl Unix {
             heads: [None; 2],
             tails: [None; 2],
             queued: false,
+            throttled: false,
         });
         Ok(())
     }
@@ -198,9 +207,34 @@ impl Unix {
         let Some(r) = self.resources.get_mut(h.index()).and_then(Option::as_mut) else {
             return;
         };
-        if r.handle == h && !r.queued && (0..2).any(|d| r.ready[d] && r.heads[d].is_some()) {
+        if r.handle != h || r.queued {
+            return;
+        }
+        let held = self.accepts == 0 && r.ready[0] && holds_throttled(&self.ops, r.heads[0]);
+        if (0..2).any(|d| r.ready[d] && r.heads[d].is_some() && !(d == 0 && held)) {
             r.queued = true;
             self.ready.push_back(h);
+        } else if held && !r.throttled {
+            r.throttled = true;
+            self.throttled.push_back(h);
+        }
+    }
+    /// Start a poll with `budget`: a positive one resumes every held listener.
+    fn begin(&mut self, budget: Budget) {
+        self.accepts = budget.accepts;
+        if self.accepts == 0 {
+            return;
+        }
+        while let Some(h) = self.throttled.pop_front() {
+            if let Some(r) = self
+                .resources
+                .get_mut(h.index())
+                .and_then(Option::as_mut)
+                .filter(|r| r.handle == h)
+            {
+                r.throttled = false;
+                self.schedule(h);
+            }
         }
     }
     fn unlink(&mut self, h: Handle, i: usize, d: usize) {
@@ -255,6 +289,11 @@ impl Unix {
                 let Some(i) = r.heads[d] else {
                     continue;
                 };
+                if self.accepts == 0 && holds_throttled(&self.ops, Some(i)) {
+                    // Out of budget: the connection stays in the backlog, and
+                    // `schedule` below parks the listener until a later poll.
+                    continue;
+                }
                 let p = self.ops[i].as_mut().expect("queued op");
                 let result = execute(r, p, &self.pool);
                 let event = match result {
@@ -276,6 +315,9 @@ impl Unix {
                     }),
                 };
                 if let Some(e) = event {
+                    if Budget::spends(&e) {
+                        self.accepts -= 1;
+                    }
                     if e.terminal {
                         self.unlink(h, i, d);
                         self.ops[i] = None;
@@ -286,6 +328,12 @@ impl Unix {
             self.schedule(h);
         }
     }
+}
+/// Whether the operation at the head of a direction is one the budget throttles.
+fn holds_throttled(ops: &Slots<Pending>, head: Option<usize>) -> bool {
+    head.and_then(|i| ops.get(i))
+        .and_then(Option::as_ref)
+        .is_some_and(|p| Budget::throttles(&p.request.operation))
 }
 // SAFETY: all I/O executes synchronously in poll; a terminal event removes its
 // request, and owned descriptors/requests are dropped without outstanding native
@@ -302,6 +350,8 @@ unsafe impl Backend for Unix {
             resources: Slots::new(config.max_handles),
             ops: Slots::new(config.max_operations),
             ready: VecDeque::with_capacity(page_reserve(config.max_handles)),
+            throttled: VecDeque::with_capacity(page_reserve(config.max_handles)),
+            accepts: usize::MAX,
             cancelled: VecDeque::with_capacity(page_reserve(config.max_operations)),
             polled: Vec::with_capacity(config.events_per_turn),
             files: super::files::Files::new(config, pool.clone()),
@@ -757,8 +807,10 @@ unsafe impl Backend for Unix {
     fn poll(
         &mut self,
         timeout: Option<Duration>,
+        budget: Budget,
         events: &mut Vec<Event<Detached>>,
     ) -> Result<PollInfo> {
+        self.begin(budget);
         while events.len() < events.capacity() {
             let Some(op) = self.cancelled.pop_front() else {
                 break;
@@ -817,6 +869,7 @@ unsafe impl Backend for Unix {
                 let _ = self.poller.deregister(fd);
             }
             self.ready.retain(|&at| at != h);
+            self.throttled.retain(|&at| at != h);
             self.resources[h.index()] = None;
         }
         // Closing the final descriptor removes its registration from epoll/kqueue.
@@ -837,6 +890,7 @@ unsafe impl Backend for Unix {
         }
         // Remove a stale scheduling entry before the slot can be reused.
         self.ready.retain(|&at| at != h);
+        self.throttled.retain(|&at| at != h);
         Ok(self.resources[h.index()]
             .take()
             .expect("validated")
@@ -1316,7 +1370,7 @@ mod udp_tests {
                     })
                     .expect("old receive");
                 backend
-                    .poll(Some(Duration::ZERO), &mut events)
+                    .poll(Some(Duration::ZERO), Budget::UNLIMITED, &mut events)
                     .expect("arm old receive");
                 assert!(events.is_empty());
                 assert_eq!(
@@ -1333,7 +1387,7 @@ mod udp_tests {
                 assert!(backend.polled.iter().any(|e| e.key == old.key() && e.read));
                 backend.cancel(old_op).expect("cancel old receive");
                 backend
-                    .poll(Some(Duration::ZERO), &mut events)
+                    .poll(Some(Duration::ZERO), Budget::UNLIMITED, &mut events)
                     .expect("acknowledgement");
                 assert_eq!(events.len(), 1);
                 assert_eq!(events[0].op, old_op);
@@ -1388,14 +1442,18 @@ mod udp_tests {
                 );
                 backend.release(old); // A stale handle must not release the new fd.
                 backend
-                    .poll(Some(Duration::ZERO), &mut events)
+                    .poll(Some(Duration::ZERO), Budget::UNLIMITED, &mut events)
                     .expect("arm replacement receive");
                 assert!(events.is_empty(), "old event batch crossed generations");
                 // A stale event is not a completion, and must not cause a no-spin
                 // violation after the new socket reports EAGAIN.
                 let at = Instant::now() + Duration::from_millis(2);
                 let info = backend
-                    .poll(Some(Duration::from_millis(2)), &mut events)
+                    .poll(
+                        Some(Duration::from_millis(2)),
+                        Budget::UNLIMITED,
+                        &mut events,
+                    )
                     .expect("new empty socket waits");
                 assert!(events.is_empty(), "old datagram crossed socket lifetime");
                 assert_eq!(info.waits, 1);
@@ -1403,7 +1461,7 @@ mod udp_tests {
                 assert!(Instant::now() >= at);
                 assert_eq!(peer.send_to(b"new", endpoint).expect("new packet"), 3);
                 backend
-                    .poll(Some(Duration::from_secs(1)), &mut events)
+                    .poll(Some(Duration::from_secs(1)), Budget::UNLIMITED, &mut events)
                     .expect("new delivery");
                 assert_eq!(events.len(), 1);
                 let event = events.pop().expect("one completion");
@@ -1422,7 +1480,7 @@ mod udp_tests {
                     other => panic!("unexpected reused-socket result: {other:?}"),
                 }
                 backend
-                    .poll(Some(Duration::ZERO), &mut events)
+                    .poll(Some(Duration::ZERO), Budget::UNLIMITED, &mut events)
                     .expect("no duplicates");
                 assert!(events.is_empty());
                 Ok(())
@@ -1485,7 +1543,7 @@ mod process_races {
             .expect("exit operation");
         let mut events = Vec::with_capacity(4);
         backend
-            .poll(Some(Duration::ZERO), &mut events)
+            .poll(Some(Duration::ZERO), Budget::UNLIMITED, &mut events)
             .expect("exit poll");
         assert_eq!(events.len(), 1);
         assert!(matches!(
@@ -1497,7 +1555,7 @@ mod process_races {
         ));
         events.clear();
         backend
-            .poll(Some(Duration::ZERO), &mut events)
+            .poll(Some(Duration::ZERO), Budget::UNLIMITED, &mut events)
             .expect("duplicate check");
         assert!(events.is_empty());
         let mut code = 0;

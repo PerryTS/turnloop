@@ -34,6 +34,10 @@ contract!(
     paged_growth_preserves_handles,
     accept_reserves_its_handle_slot,
     an_armed_accept_keeps_its_slot,
+    multishot_accept_respects_the_handle_ceiling,
+    multishot_accept_parked_after_its_read_fired,
+    undelivered_pool_results_are_bounded,
+    rebuild_never_drops_pool_completions,
     ready_timer_liveness,
     pooled_lease_backpressure,
     io_and_posts_progress_with_repeating_timers
