@@ -41,7 +41,10 @@ caching_sha2 RSA authentication obtains fresh OAEP entropy from the TLS provider
 Construct Config and Connection, connect transport in the host, then feed
 plaintext into `receive`. Pull `next_event` until None; `Progress` means a control
 packet was consumed and polling should continue. Write `output`, acknowledging
-only successfully written bytes via `consume_output`. Borrowed outputs/events
+only successfully written bytes via `consume_output`. When it returns `true`, an
+event is ready without further input: call `next_event` immediately. COM_STMT_CLOSE
+and COM_QUIT get no server reply, so that acknowledgement is their only wakeup;
+a completion-driven host needs no timer for them. Borrowed outputs/events
 remain valid until the next mutable call. Preserve the output borrow through
 write completion or copy into a reusable host transport buffer.
 

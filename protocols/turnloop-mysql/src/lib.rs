@@ -270,7 +270,14 @@ impl Connection {
     pub fn output(&self) -> &[u8] {
         &self.output[self.output_at..]
     }
-    pub fn consume_output(&mut self, n: usize) -> Result<()> {
+    /// Acknowledge `n` written bytes of `output()`.
+    ///
+    /// Returns `true` when an event is now deliverable without further input,
+    /// in which case the host must call `next_event()` right away. This matters
+    /// for COM_STMT_CLOSE and COM_QUIT: the server never answers them, so their
+    /// `Completed` / `Closed` is produced by this acknowledgement itself and no
+    /// read completion or timer would otherwise wake a completion-driven host.
+    pub fn consume_output(&mut self, n: usize) -> Result<bool> {
         if n > self.output().len() {
             return Err(Error::State("invalid output acknowledgement"));
         }
@@ -278,8 +285,11 @@ impl Connection {
         if self.output_at == self.output.len() {
             self.output.clear();
             self.output_at = 0;
+            if self.state == State::NoResponse {
+                self.complete(Outcome::Success);
+            }
         }
-        Ok(())
+        Ok(self.completion.is_some() || (self.state == State::Closing && self.output.is_empty()))
     }
     pub fn receive(&mut self, b: &[u8]) -> Result<()> {
         if matches!(
@@ -650,9 +660,6 @@ impl Connection {
         self.state = State::Ready;
     }
     pub fn next_event(&mut self) -> Result<Option<Event<'_>>> {
-        if self.state == State::NoResponse && self.output().is_empty() {
-            self.complete(Outcome::Success);
-        }
         if let Some(outcome) = self.completion.take() {
             let p = self
                 .pending

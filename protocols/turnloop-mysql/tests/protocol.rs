@@ -468,6 +468,83 @@ fn local_infile_enabled_is_an_explicit_borrowed_request() {
         })
     ));
 }
+/// Prepare `id` with no parameters or columns; the server's reply completes it.
+fn prepare_statement(c: &mut Connection, token: Token, id: u32) -> Statement {
+    c.prepare(token, "DO 1", None)
+        .expect("fixture operation must succeed");
+    flush(c);
+    let mut prepare = vec![0];
+    prepare.extend_from_slice(&id.to_le_bytes());
+    prepare.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0]);
+    c.receive(&frame(1, &prepare))
+        .expect("fixture operation must succeed");
+    let Some(Event::Prepared { statement, .. }) =
+        c.next_event().expect("fixture operation must succeed")
+    else {
+        panic!("expected Prepared")
+    };
+    assert!(matches!(
+        c.next_event().expect("fixture operation must succeed"),
+        Some(Event::Completed { .. })
+    ));
+    statement
+}
+/// A completion-driven host only calls into the connection when a write or a
+/// read completes. COM_STMT_CLOSE and COM_QUIT get no reply, so the write
+/// acknowledgement alone must say "call next_event() now"; no timer is used.
+#[test]
+fn no_reply_commands_complete_from_the_write_acknowledgement() {
+    let mut c = ready();
+    let stmt = prepare_statement(&mut c, 1, 17);
+    c.close_statement(2, stmt.id)
+        .expect("fixture operation must succeed");
+    let close = c.output().to_vec();
+    assert_eq!(close, frame(0, &[0x19, 17, 0, 0, 0]));
+    assert!(c.next_event().expect("unwritten close").is_none());
+    // Partial write completion: nothing to deliver yet.
+    assert!(!c.consume_output(3).expect("fixture operation must succeed"));
+    assert!(c.next_event().expect("half-written close").is_none());
+    // Final write completion: the only wakeup this command will ever get.
+    assert!(
+        c.consume_output(close.len() - 3)
+            .expect("fixture operation must succeed"),
+        "acknowledging COM_STMT_CLOSE must ask for next_event()"
+    );
+    assert!(matches!(
+        c.next_event().expect("fixture operation must succeed"),
+        Some(Event::Completed {
+            token: 2,
+            outcome: Outcome::Success
+        })
+    ));
+    assert!(c.next_event().expect("drained").is_none());
+    assert!(c.can_accept());
+
+    // A command that does get a reply is not reported early.
+    c.ping(3).expect("fixture operation must succeed");
+    let n = c.output().len();
+    assert!(!c.consume_output(n).expect("fixture operation must succeed"));
+    assert!(c.next_event().expect("awaiting reply").is_none());
+    c.receive(&ok(1, 0, 2))
+        .expect("fixture operation must succeed");
+    while c.next_event().expect("ping reply").is_some() {}
+
+    c.quit().expect("fixture operation must succeed");
+    assert_eq!(c.output(), frame(0, &[1]));
+    assert!(c.next_event().expect("unwritten quit").is_none());
+    let n = c.output().len();
+    assert!(
+        c.consume_output(n).expect("fixture operation must succeed"),
+        "acknowledging COM_QUIT must ask for next_event()"
+    );
+    assert!(matches!(
+        c.next_event().expect("fixture operation must succeed"),
+        Some(Event::Closed {
+            reason: Error::Cancelled
+        })
+    ));
+    assert!(c.next_event().expect("closed").is_none());
+}
 /// `can_accept` is the admission rule itself: whenever it is false a command is
 /// rejected without side effects, and whenever it is true the next one is taken.
 #[test]
