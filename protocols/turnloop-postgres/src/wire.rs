@@ -96,6 +96,36 @@ impl<'a> Iterator for Fields<'a> {
     }
 }
 impl ExactSizeIterator for Fields<'_> {}
+impl Fields<'_> {
+    /// Copy the unread field descriptions out of the connection's buffer.
+    /// One allocation; the result outlives every later mutable call.
+    pub fn into_owned(self) -> OwnedFields {
+        OwnedFields {
+            data: self.cursor.0.into(),
+            remaining: self.remaining,
+        }
+    }
+}
+/// Owned RowDescription. `fields()` iterates it exactly like the borrowed form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedFields {
+    data: Box<[u8]>,
+    remaining: u16,
+}
+impl OwnedFields {
+    pub fn fields(&self) -> Fields<'_> {
+        Fields {
+            cursor: Cursor(&self.data),
+            remaining: self.remaining,
+        }
+    }
+    pub fn len(&self) -> usize {
+        self.remaining as usize
+    }
+    pub fn is_empty(&self) -> bool {
+        self.remaining == 0
+    }
+}
 
 /// Borrowed, already validated PostgreSQL row. Iteration never allocates.
 #[derive(Debug, Clone, Copy)]
@@ -137,6 +167,41 @@ impl<'a> Iterator for Row<'a> {
     }
 }
 impl ExactSizeIterator for Row<'_> {}
+impl Row<'_> {
+    /// Copy the unread values out of the connection's buffer in one allocation,
+    /// so the row can be retained past the next mutable call on the connection.
+    pub fn into_owned(self) -> OwnedRow {
+        OwnedRow {
+            data: self.cursor.0.into(),
+            remaining: self.remaining,
+        }
+    }
+}
+/// Owned, already validated DataRow. `row()` lends the same borrowed iterator,
+/// so one host decoder serves both forms; `get` indexes a column directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedRow {
+    data: Box<[u8]>,
+    remaining: u16,
+}
+impl OwnedRow {
+    pub fn row(&self) -> Row<'_> {
+        Row {
+            cursor: Cursor(&self.data),
+            remaining: self.remaining,
+        }
+    }
+    /// `None` past the last column; `Some(None)` is SQL NULL.
+    pub fn get(&self, index: usize) -> Option<Option<&[u8]>> {
+        self.row().nth(index)?.ok()
+    }
+    pub fn len(&self) -> usize {
+        self.remaining as usize
+    }
+    pub fn is_empty(&self) -> bool {
+        self.remaining == 0
+    }
+}
 
 /// ErrorResponse and NoticeResponse retain every field, including future fields.
 #[derive(Clone, Copy, Debug)]
@@ -165,7 +230,30 @@ impl std::fmt::Debug for ConnectionFailure {
         f.debug_map().entries(self.server_error().fields()).finish()
     }
 }
+/// Owned ErrorResponse/NoticeResponse with every field, including future ones.
+#[derive(Clone, PartialEq, Eq)]
+pub struct OwnedServerError(Box<[u8]>);
+impl OwnedServerError {
+    pub fn server_error(&self) -> ServerError<'_> {
+        ServerError(&self.0)
+    }
+}
+impl std::fmt::Display for OwnedServerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let error = self.server_error();
+        write!(f, "{}: {}", error.code(), error.message())
+    }
+}
+impl std::fmt::Debug for OwnedServerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map().entries(self.server_error().fields()).finish()
+    }
+}
 impl<'a> ServerError<'a> {
+    /// Copy every field out of the connection's buffer in one allocation.
+    pub fn into_owned(self) -> OwnedServerError {
+        OwnedServerError(self.0.into())
+    }
     pub(crate) fn parse(body: &'a [u8]) -> Result<Self> {
         let mut c = Cursor(body);
         while c.u8()? != 0 {

@@ -28,7 +28,9 @@ pub mod pool;
 pub mod types;
 mod wire;
 use wire::Cursor;
-pub use wire::{ConnectionFailure, Field, Fields, Row, ServerError};
+pub use wire::{
+    ConnectionFailure, Field, Fields, OwnedFields, OwnedRow, OwnedServerError, Row, ServerError,
+};
 
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 mod host_time;
@@ -188,6 +190,225 @@ pub enum Event<'a> {
     Closed {
         reason: Error,
     },
+}
+/// [`Event`] with every borrowed payload copied out, for hosts that retain
+/// rows, errors or notifications past the next mutable call. `as_event` lends
+/// it back in borrowed form, so one host handler can consume either.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnedEvent {
+    UpgradeTls,
+    ScramNeeded {
+        plus: bool,
+    },
+    Connected,
+    ParameterStatus {
+        name: String,
+        value: String,
+    },
+    Fields {
+        token: Token,
+        fields: OwnedFields,
+    },
+    Row {
+        token: Token,
+        row: OwnedRow,
+    },
+    CommandComplete {
+        token: Token,
+        tag: String,
+        row_count: Option<u64>,
+    },
+    Error {
+        token: Option<Token>,
+        error: OwnedServerError,
+    },
+    Notice(OwnedServerError),
+    Notification {
+        process_id: i32,
+        channel: String,
+        payload: String,
+    },
+    CopyIn {
+        token: Token,
+        binary: bool,
+        column_formats: Vec<u8>,
+    },
+    CopyOut {
+        token: Token,
+        binary: bool,
+        column_formats: Vec<u8>,
+    },
+    CopyData {
+        token: Token,
+        data: Vec<u8>,
+    },
+    CopyDone {
+        token: Token,
+    },
+    Completed {
+        token: Token,
+        outcome: Outcome,
+        transaction: TransactionStatus,
+    },
+    Closed {
+        reason: Error,
+    },
+}
+impl Event<'_> {
+    /// Copy the event out of the connection's buffer. Only borrowed payloads
+    /// allocate: each string, byte slice, row, field list or diagnostic once.
+    pub fn into_owned(self) -> OwnedEvent {
+        match self {
+            Self::UpgradeTls => OwnedEvent::UpgradeTls,
+            Self::ScramNeeded { plus } => OwnedEvent::ScramNeeded { plus },
+            Self::Connected => OwnedEvent::Connected,
+            Self::ParameterStatus { name, value } => OwnedEvent::ParameterStatus {
+                name: name.into(),
+                value: value.into(),
+            },
+            Self::Fields { token, fields } => OwnedEvent::Fields {
+                token,
+                fields: fields.into_owned(),
+            },
+            Self::Row { token, row } => OwnedEvent::Row {
+                token,
+                row: row.into_owned(),
+            },
+            Self::CommandComplete {
+                token,
+                tag,
+                row_count,
+            } => OwnedEvent::CommandComplete {
+                token,
+                tag: tag.into(),
+                row_count,
+            },
+            Self::Error { token, error } => OwnedEvent::Error {
+                token,
+                error: error.into_owned(),
+            },
+            Self::Notice(error) => OwnedEvent::Notice(error.into_owned()),
+            Self::Notification {
+                process_id,
+                channel,
+                payload,
+            } => OwnedEvent::Notification {
+                process_id,
+                channel: channel.into(),
+                payload: payload.into(),
+            },
+            Self::CopyIn {
+                token,
+                binary,
+                column_formats,
+            } => OwnedEvent::CopyIn {
+                token,
+                binary,
+                column_formats: column_formats.into(),
+            },
+            Self::CopyOut {
+                token,
+                binary,
+                column_formats,
+            } => OwnedEvent::CopyOut {
+                token,
+                binary,
+                column_formats: column_formats.into(),
+            },
+            Self::CopyData { token, data } => OwnedEvent::CopyData {
+                token,
+                data: data.into(),
+            },
+            Self::CopyDone { token } => OwnedEvent::CopyDone { token },
+            Self::Completed {
+                token,
+                outcome,
+                transaction,
+            } => OwnedEvent::Completed {
+                token,
+                outcome,
+                transaction,
+            },
+            Self::Closed { reason } => OwnedEvent::Closed { reason },
+        }
+    }
+}
+impl OwnedEvent {
+    /// Borrow the retained event in the form `next_event` produced it.
+    pub fn as_event(&self) -> Event<'_> {
+        match self {
+            Self::UpgradeTls => Event::UpgradeTls,
+            Self::ScramNeeded { plus } => Event::ScramNeeded { plus: *plus },
+            Self::Connected => Event::Connected,
+            Self::ParameterStatus { name, value } => Event::ParameterStatus { name, value },
+            Self::Fields { token, fields } => Event::Fields {
+                token: *token,
+                fields: fields.fields(),
+            },
+            Self::Row { token, row } => Event::Row {
+                token: *token,
+                row: row.row(),
+            },
+            Self::CommandComplete {
+                token,
+                tag,
+                row_count,
+            } => Event::CommandComplete {
+                token: *token,
+                tag,
+                row_count: *row_count,
+            },
+            Self::Error { token, error } => Event::Error {
+                token: *token,
+                error: error.server_error(),
+            },
+            Self::Notice(error) => Event::Notice(error.server_error()),
+            Self::Notification {
+                process_id,
+                channel,
+                payload,
+            } => Event::Notification {
+                process_id: *process_id,
+                channel,
+                payload,
+            },
+            Self::CopyIn {
+                token,
+                binary,
+                column_formats,
+            } => Event::CopyIn {
+                token: *token,
+                binary: *binary,
+                column_formats,
+            },
+            Self::CopyOut {
+                token,
+                binary,
+                column_formats,
+            } => Event::CopyOut {
+                token: *token,
+                binary: *binary,
+                column_formats,
+            },
+            Self::CopyData { token, data } => Event::CopyData {
+                token: *token,
+                data,
+            },
+            Self::CopyDone { token } => Event::CopyDone { token: *token },
+            Self::Completed {
+                token,
+                outcome,
+                transaction,
+            } => Event::Completed {
+                token: *token,
+                outcome: outcome.clone(),
+                transaction: *transaction,
+            },
+            Self::Closed { reason } => Event::Closed {
+                reason: reason.clone(),
+            },
+        }
+    }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {

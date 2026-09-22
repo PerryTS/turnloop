@@ -707,3 +707,115 @@ fn nonlocalized_severity_controls_statement_error_recovery() {
         })
     ));
 }
+
+#[test]
+fn owned_events_survive_later_input_and_lend_back_the_borrowed_form() {
+    let mut c = ready();
+    c.query(1, "SELECT answer, note", None).expect("query");
+    flush(&mut c);
+    let mut fields = vec![0, 2];
+    for name in [b"answer\0".as_slice(), b"note\0"] {
+        fields.extend_from_slice(name);
+        fields.extend_from_slice(&[
+            0, 0, 0, 9, 0, 1, 0, 0, 0, 23, 0, 4, 255, 255, 255, 255, 0, 0,
+        ]);
+    }
+    let first = [
+        frame(b'T', &fields),
+        frame(b'D', &[0, 2, 0, 0, 0, 2, b'4', b'2', 255, 255, 255, 255]),
+        frame(b'N', b"SNOTICE\0C00000\0Mfirst notice\0\0"),
+        frame(b'A', b"\0\0\0\x07chan\0hello\0"),
+    ]
+    .concat();
+    c.receive(&first).expect("first batch");
+    let mut retained = Vec::new();
+    while let Some(event) = c.next_event().expect("event") {
+        retained.push(event.into_owned());
+    }
+    assert_eq!(retained.len(), 4);
+    // The next receive compacts the input buffer over the bytes those events
+    // borrowed; the owned copies must be unaffected.
+    let second = [
+        frame(b'D', &[0, 2, 0, 0, 0, 2, b'9', b'9', 0, 0, 0, 1, b'x']),
+        frame(b'C', b"SELECT 2\0"),
+        frame(b'Z', b"I"),
+    ]
+    .concat();
+    c.receive(&second).expect("second batch");
+    while let Some(event) = c.next_event().expect("event") {
+        retained.push(event.into_owned());
+    }
+    assert_eq!(retained.len(), 7);
+
+    let OwnedEvent::Fields { token: 1, fields } = &retained[0] else {
+        panic!("fields: {:?}", retained[0]);
+    };
+    assert_eq!(fields.len(), 2);
+    let names: Vec<_> = fields
+        .fields()
+        .map(|f| {
+            let f = f.expect("field");
+            (f.name.to_owned(), f.table_id, f.data_type_id)
+        })
+        .collect();
+    assert_eq!(
+        names,
+        [("answer".to_owned(), 9, 23), ("note".to_owned(), 9, 23)]
+    );
+    let OwnedEvent::Row { token: 1, row } = &retained[1] else {
+        panic!("row: {:?}", retained[1]);
+    };
+    assert_eq!(row.len(), 2);
+    assert_eq!(row.get(0), Some(Some(b"42".as_slice())));
+    assert_eq!(row.get(1), Some(None));
+    assert_eq!(row.get(2), None);
+    let OwnedEvent::Notice(notice) = &retained[2] else {
+        panic!("notice: {:?}", retained[2]);
+    };
+    assert_eq!(notice.server_error().message(), "first notice");
+    assert_eq!(notice.to_string(), "00000: first notice");
+    assert_eq!(
+        retained[3],
+        OwnedEvent::Notification {
+            process_id: 7,
+            channel: "chan".into(),
+            payload: "hello".into(),
+        }
+    );
+    let OwnedEvent::Row {
+        row: second_row, ..
+    } = &retained[4]
+    else {
+        panic!("second row: {:?}", retained[4]);
+    };
+    assert_eq!(second_row.get(0), Some(Some(b"99".as_slice())));
+    assert_eq!(second_row.get(1), Some(Some(b"x".as_slice())));
+    assert_eq!(
+        retained[5],
+        OwnedEvent::CommandComplete {
+            token: 1,
+            tag: "SELECT 2".into(),
+            row_count: Some(2),
+        }
+    );
+    assert_eq!(
+        retained[6],
+        OwnedEvent::Completed {
+            token: 1,
+            outcome: Outcome::Success,
+            transaction: TransactionStatus::Idle,
+        }
+    );
+
+    // A handler written for borrowed events consumes retained ones unchanged.
+    let Event::Row { token: 1, row } = retained[1].as_event() else {
+        panic!("borrowed row");
+    };
+    let values: Vec<_> = row.map(|v| v.expect("value")).collect();
+    assert_eq!(values, [Some(b"42".as_slice()), None]);
+    assert!(matches!(
+        retained[2].as_event(),
+        Event::Notice(error) if error.code() == "00000"
+    ));
+    assert_eq!(retained[1].as_event().into_owned(), retained[1]);
+}

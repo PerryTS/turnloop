@@ -74,7 +74,11 @@ and RSA-PSS are supported; MD5/SHA-1 signatures use SHA-256. Unsupported algorit
    all tokens, then emits one `Closed`. Rejected command calls accept no token.
 
 Every event borrows storage until the next mutable call. Materialize JS rows,
-errors, notifications and fields before advancing. ParameterStatus events allow
+errors, notifications and fields before advancing, or retain them with
+`Event::into_owned()`: the resulting `OwnedEvent` holds `OwnedRow`, `OwnedFields`
+and `OwnedServerError` (also available from `Row`/`Fields`/`ServerError::into_owned`),
+each one copy of its wire bytes. `OwnedEvent::as_event()` lends it back as the
+borrowed `Event`, so one handler serves both forms. ParameterStatus events allow
 hosts to retain whatever session parameters they need; the core does not copy
 an unbounded parameter dictionary. No event calls a host callback itself.
 
