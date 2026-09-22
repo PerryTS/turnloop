@@ -1773,3 +1773,113 @@ fn streaming_decoder_finishes_when_end_follows_the_last_byte() {
         assert_eq!(result, STREAMED, "{coding}");
     }
 }
+
+/// Decode `wire` with `decoder`, `input` bytes per read and `output` bytes of
+/// scratch, honouring `needs_input` exactly: read only when it asks.
+fn decode_streamed(
+    decoder: &mut turnloop_http::compression::StreamingDecoder,
+    wire: &[u8],
+    input: usize,
+    output: usize,
+) -> Result<Vec<u8>, turnloop_http::Error> {
+    let (mut fed, mut pending, mut result) = (0, Vec::new(), Vec::new());
+    let mut out = vec![0; output];
+    loop {
+        let step = decoder.process(&pending, &mut out, fed == wire.len())?;
+        pending.drain(..step.consumed);
+        result.extend_from_slice(&out[..step.written]);
+        if step.finished {
+            return Ok(result);
+        }
+        if step.needs_input {
+            assert!(fed < wire.len(), "asked for input after `end`");
+            let next = (fed + input).min(wire.len());
+            pending.extend_from_slice(&wire[fed..next]);
+            fed = next;
+        }
+    }
+}
+
+/// PerryTS/turnloop#79: a `Content-Encoding` list, and repeated header lines,
+/// decode as one chain, innermost (first-listed) last.
+#[test]
+fn streaming_decoder_applies_a_content_encoding_list_innermost_last() {
+    use turnloop_http::compression::{MAX_CODINGS, StreamingDecoder, decode};
+    let body: Vec<u8> = (0..20_000u32)
+        .flat_map(|i| (i % 97).to_le_bytes())
+        .collect();
+    // `gzip, br`: gzip was applied first, so br is outermost.
+    let wire = encode_with("br", &encode_with("gzip", &body));
+    for (input, output) in [(wire.len(), 1 << 20), (1, 7), (1000, 3), (7, 1 << 16)] {
+        let mut decoder = StreamingDecoder::new("gzip, br", 1 << 20).unwrap();
+        let decoded = decode_streamed(&mut decoder, &wire, input, output).unwrap();
+        assert!(decoded == body, "{input}/{output}");
+        // Reused for a second body of the same chain.
+        decoder.reset(1 << 20).unwrap();
+        let decoded = decode_streamed(&mut decoder, &wire, input, output).unwrap();
+        assert!(decoded == body, "reset {input}/{output}");
+    }
+    // Two header lines are the same list, in order.
+    let head = Head {
+        method: String::new(),
+        target: String::new(),
+        status: 200,
+        version: 1,
+        headers: vec![
+            Header::new("content-encoding", "gzip"),
+            Header::new("x-other", "br"),
+            Header::new("Content-Encoding", "br"),
+        ],
+        keep_alive: true,
+    };
+    let mut decoder =
+        StreamingDecoder::from_codings(head.values("content-encoding"), 1 << 20).unwrap();
+    assert!(decode_streamed(&mut decoder, &wire, 4096, 4096).unwrap() == body);
+    // The other order is a different coding, and fails.
+    let mut decoder = StreamingDecoder::new("br, gzip", 1 << 20).unwrap();
+    assert!(decode_streamed(&mut decoder, &wire, 4096, 4096).is_err());
+
+    // The legal `gzip, gzip` that P11 saw fail, with case, `x-gzip`, identity
+    // and empty elements - and the convenience `decode` takes a list too.
+    let twice = encode_with("gzip", &encode_with("gzip", STREAMED));
+    for list in ["gzip, gzip", "GZIP,x-gzip", " gzip ,, identity, Gzip "] {
+        let mut out = Vec::new();
+        decode(list, &twice, &mut out, 1000).unwrap();
+        assert_eq!(out, STREAMED, "{list}");
+    }
+    // Every coding under every other.
+    for inner in CODINGS {
+        for outer in ["gzip", "deflate", "br"] {
+            let wire = encode_with(outer, &encode_with(inner, STREAMED));
+            for (input, output) in [(1, 5), (1, 1000), (1000, 5), (wire.len(), 1000)] {
+                let mut decoder = StreamingDecoder::from_codings([inner, outer], 1000).unwrap();
+                let decoded = decode_streamed(&mut decoder, &wire, input, output);
+                assert!(
+                    decoded.as_deref() == Ok(STREAMED),
+                    "{inner}, {outer} {input}/{output}: {decoded:?}"
+                );
+            }
+        }
+    }
+
+    // Truncation anywhere in the chain is still an error.
+    let mut decoder = StreamingDecoder::new("gzip, br", 1 << 20).unwrap();
+    assert!(decode_streamed(&mut decoder, &wire[..wire.len() - 1], 64, 64).is_err());
+    // The limit bounds the decoded body.
+    let mut decoder = StreamingDecoder::new("gzip, br", body.len() - 1).unwrap();
+    let error = decode_streamed(&mut decoder, &wire, 4096, 4096).unwrap_err();
+    assert_eq!(error.code, "UND_ERR_RES_EXCEEDED_MAX_SIZE");
+    // Unknown codings and over-long chains are refused up front.
+    for list in ["gzip, compress", "gzip, br\u{e9}"] {
+        let error = StreamingDecoder::new(list, 1000).err().map(|e| e.code);
+        assert_eq!(error, Some("UND_ERR_NOT_SUPPORTED"), "{list}");
+    }
+    let chain = ["gzip"; MAX_CODINGS].join(", ");
+    assert!(StreamingDecoder::new(&chain, 1000).is_ok());
+    let error = StreamingDecoder::new(&format!("{chain}, gzip"), 1000).err();
+    assert_eq!(error.map(|e| e.code), Some("UND_ERR_NOT_SUPPORTED"));
+    // No coding at all is identity.
+    let mut out = Vec::new();
+    decode(" , identity", b"plain", &mut out, 100).unwrap();
+    assert_eq!(out, b"plain");
+}

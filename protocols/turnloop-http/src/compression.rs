@@ -23,7 +23,8 @@ pub fn decode(encoding: &str, input: &[u8], output: &mut Vec<u8>, limit: usize) 
 }
 
 /// A single incremental decode step. Retain input after `consumed`, and consume
-/// output before calling again. No internal input/output staging allocation.
+/// output before calling again. A single coding stages nothing internally; a
+/// chain stages between its codings in buffers allocated at construction.
 ///
 /// A step returns for exactly one of three reasons, and says which:
 ///
@@ -86,19 +87,51 @@ enum Engine {
         boundary: bool,
     },
 }
+/// Content codings one decoder accepts in a chain. A list is attacker-chosen and
+/// every coding adds state and a staging buffer; undici stops at five as well.
+pub const MAX_CODINGS: usize = 5;
+/// Bytes staged between two codings of a chain, above the 8 KiB a gzip header
+/// may take, so the inner coding can always see a whole header.
+const STAGE_BYTES: usize = 16 * 1024;
+/// Incremental decoder for a `Content-Encoding` value: one coding, or a list
+/// of them applied in order (see [`StreamingDecoder::from_codings`]).
 pub struct StreamingDecoder {
+    /// The innermost coding - listed first, decoded last - writing the
+    /// caller's output. The only coding when the list has one.
+    codec: Codec,
+    /// The other codings, outermost (listed last) first, each with the bytes it
+    /// has produced and the next coding has not yet taken. Empty, and so never
+    /// allocated, for a single coding.
+    outer: Vec<Staged>,
+    limit: usize,
+    failed: bool,
+}
+/// One coding's decoder state.
+struct Codec {
     engine: Engine,
     total: usize,
-    limit: usize,
     done: bool,
-    failed: bool,
+}
+/// An outer coding of a chain and the output it has staged for the next one.
+struct Staged {
+    codec: Codec,
+    buffer: Box<[u8]>,
+    start: usize,
+    end: usize,
+}
+fn unsupported() -> Error {
+    Error::new("UND_ERR_NOT_SUPPORTED", "unsupported content encoding")
 }
 fn corrupt() -> Error {
     Error::new("UND_ERR_SOCKET", "invalid or incomplete compressed body")
 }
-impl StreamingDecoder {
-    pub fn new(encoding: &str, limit: usize) -> Result<Self> {
-        let engine = match encoding {
+impl Codec {
+    fn new(token: &[u8]) -> Result<Self> {
+        // Content codings are case-insensitive (RFC 9110 section 8.4.1).
+        let name = std::str::from_utf8(token)
+            .map_err(|_| unsupported())?
+            .to_ascii_lowercase();
+        let engine = match name.as_str() {
             "" | "identity" => Engine::Identity,
             "gzip" | "x-gzip" => Engine::Deflate {
                 decoder: flate2::Decompress::new(false),
@@ -145,24 +178,15 @@ impl StreamingDecoder {
                 reset: true,
                 boundary: false,
             },
-            _ => {
-                return Err(Error::new(
-                    "UND_ERR_NOT_SUPPORTED",
-                    "unsupported content encoding",
-                ));
-            }
+            _ => return Err(unsupported()),
         };
         Ok(Self {
             engine,
             total: 0,
-            limit,
             done: false,
-            failed: false,
         })
     }
-    /// Reuse algorithm and scratch storage for another body of the same encoding.
-    /// Warm up with the largest expected body shape before measuring allocations.
-    pub fn reset(&mut self, limit: usize) -> Result<()> {
+    fn reset(&mut self) -> Result<()> {
         match &mut self.engine {
             Engine::Identity => {}
             Engine::Deflate {
@@ -202,35 +226,22 @@ impl StreamingDecoder {
             }
         }
         self.total = 0;
-        self.limit = limit;
         self.done = false;
-        self.failed = false;
         Ok(())
     }
-    /// Decode as far as `input` and `output` allow: the call returns only when
-    /// the body is finished, the decoder needs more input, or `output` is full,
-    /// and [`DecodeStep`] says which. One call per transport read and one per
-    /// full output buffer is enough; there is no need to loop until a step
-    /// makes no progress.
-    ///
-    /// `end` means no more encoded bytes will arrive, not that output is unbounded.
-    pub fn process(&mut self, input: &[u8], output: &mut [u8], end: bool) -> Result<DecodeStep> {
-        if self.failed {
-            return Err(corrupt());
-        }
-        let result = self.process_inner(input, output, end);
-        if result.is_err() {
-            self.failed = true;
-        }
-        result
-    }
-    fn process_inner(&mut self, input: &[u8], output: &mut [u8], end: bool) -> Result<DecodeStep> {
+    fn run(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+        end: bool,
+        limit: usize,
+    ) -> Result<DecodeStep> {
         // Run single engine steps until one of the three stop reasons holds, so
         // the step that comes back names which one it was.
         let mut consumed = 0;
         let mut written = 0;
         loop {
-            let step = self.step_once(&input[consumed..], &mut output[written..], end)?;
+            let step = self.step_once(&input[consumed..], &mut output[written..], end, limit)?;
             consumed += step.consumed;
             written += step.written;
             let stalled = step.consumed == 0 && step.written == 0;
@@ -246,7 +257,13 @@ impl StreamingDecoder {
     }
     /// One call into the engine. It may stop short of all three reasons: at a
     /// gzip member boundary, after a header, or wherever the engine returns.
-    fn step_once(&mut self, input: &[u8], output: &mut [u8], end: bool) -> Result<DecodeStep> {
+    fn step_once(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+        end: bool,
+        limit: usize,
+    ) -> Result<DecodeStep> {
         if self.done {
             if !input.is_empty() {
                 return Err(corrupt());
@@ -453,7 +470,7 @@ impl StreamingDecoder {
                 }
             }
         }
-        if written > self.limit.saturating_sub(self.total) {
+        if written > limit.saturating_sub(self.total) {
             return Err(Error::new(
                 "UND_ERR_RES_EXCEEDED_MAX_SIZE",
                 "decoded body exceeds limit",
@@ -467,6 +484,184 @@ impl StreamingDecoder {
             finished,
             needs_input: false,
         })
+    }
+}
+impl Staged {
+    /// Move the unread bytes to the front, so the free space is contiguous.
+    fn compact(&mut self) {
+        if self.start > 0 {
+            self.buffer.copy_within(self.start..self.end, 0);
+            self.end -= self.start;
+            self.start = 0;
+        }
+    }
+}
+impl StreamingDecoder {
+    /// A decoder for one `Content-Encoding` header value, which may be a list
+    /// (`"gzip, br"`). The same as [`from_codings`](Self::from_codings) with
+    /// that one value.
+    pub fn new(encoding: &str, limit: usize) -> Result<Self> {
+        Self::from_codings([encoding], limit)
+    }
+    /// A decoder for a `Content-Encoding` field: pass every header line's
+    /// value, in order. Repeated lines are merged as for any list-valued field
+    /// (RFC 9110 section 5.3), and each value may itself be a comma-separated
+    /// list.
+    ///
+    /// Codings are listed in the order they were applied, so they are decoded
+    /// in reverse: in `gzip, br` the last-listed `br` is outermost and decoded
+    /// first. Names are case-insensitive, `x-gzip` is `gzip`, and `identity`
+    /// and empty list elements are skipped; no coding at all decodes as
+    /// identity. An unknown coding, or more than [`MAX_CODINGS`], fails with
+    /// `UND_ERR_NOT_SUPPORTED`.
+    ///
+    /// One coding decodes straight into the caller's output as before. Each
+    /// further coding stages its output in a fixed 16 KiB buffer allocated
+    /// here and kept across [`reset`](Self::reset); `limit` bounds every
+    /// coding's output, not only the last, so an outer coding cannot expand
+    /// without bound into an inner one that produces nothing.
+    pub fn from_codings<I>(values: I, limit: usize) -> Result<Self>
+    where
+        I: IntoIterator,
+        I::Item: AsRef<[u8]>,
+    {
+        let mut codecs = Vec::new();
+        for value in values {
+            for token in value.as_ref().split(|b| *b == b',') {
+                let token = token.trim_ascii();
+                if token.is_empty() || token.eq_ignore_ascii_case(b"identity") {
+                    continue;
+                }
+                if codecs.len() == MAX_CODINGS {
+                    return Err(Error::new(
+                        "UND_ERR_NOT_SUPPORTED",
+                        "too many content codings",
+                    ));
+                }
+                codecs.push(Codec::new(token)?);
+            }
+        }
+        let mut codecs = codecs.into_iter();
+        let codec = match codecs.next() {
+            Some(codec) => codec,
+            None => Codec::new(b"identity")?,
+        };
+        let outer = codecs
+            .rev()
+            .map(|codec| Staged {
+                codec,
+                buffer: vec![0; STAGE_BYTES].into_boxed_slice(),
+                start: 0,
+                end: 0,
+            })
+            .collect();
+        Ok(Self {
+            codec,
+            outer,
+            limit,
+            failed: false,
+        })
+    }
+    /// Reuse algorithm and scratch storage for another body of the same encoding.
+    /// Warm up with the largest expected body shape before measuring allocations.
+    pub fn reset(&mut self, limit: usize) -> Result<()> {
+        self.codec.reset()?;
+        for stage in &mut self.outer {
+            stage.codec.reset()?;
+            stage.start = 0;
+            stage.end = 0;
+        }
+        self.limit = limit;
+        self.failed = false;
+        Ok(())
+    }
+    /// Decode as far as `input` and `output` allow: the call returns only when
+    /// the body is finished, the decoder needs more input, or `output` is full,
+    /// and [`DecodeStep`] says which. One call per transport read and one per
+    /// full output buffer is enough; there is no need to loop until a step
+    /// makes no progress.
+    ///
+    /// `end` means no more encoded bytes will arrive, not that output is unbounded.
+    pub fn process(&mut self, input: &[u8], output: &mut [u8], end: bool) -> Result<DecodeStep> {
+        if self.failed {
+            return Err(corrupt());
+        }
+        let result = self.process_inner(input, output, end);
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+    fn process_inner(&mut self, input: &[u8], output: &mut [u8], end: bool) -> Result<DecodeStep> {
+        let limit = self.limit;
+        let Some((last, earlier)) = self.outer.split_last_mut() else {
+            return self.codec.run(input, output, end, limit);
+        };
+        if self.codec.done {
+            // Finished: the same answer, or error, a single coding gives.
+            return self.codec.run(input, output, end, limit);
+        }
+        let mut consumed = 0;
+        let mut written = 0;
+        loop {
+            let mut progress = false;
+            // Outermost first: each stage decodes what the one before it staged
+            // (the first, the caller's input) into its own buffer. A stage's
+            // input is complete once the stage feeding it is done.
+            for i in 0..=earlier.len() {
+                let (before, rest) = earlier.split_at_mut(i);
+                let stage = match rest.first_mut() {
+                    Some(stage) => stage,
+                    None => &mut *last,
+                };
+                stage.compact();
+                if stage.end == stage.buffer.len() {
+                    continue;
+                }
+                let step = match before.last_mut() {
+                    None => {
+                        let step = stage.codec.run(
+                            &input[consumed..],
+                            &mut stage.buffer[stage.end..],
+                            end,
+                            limit,
+                        )?;
+                        consumed += step.consumed;
+                        step
+                    }
+                    Some(feed) => {
+                        let step = stage.codec.run(
+                            &feed.buffer[feed.start..feed.end],
+                            &mut stage.buffer[stage.end..],
+                            feed.codec.done,
+                            limit,
+                        )?;
+                        feed.start += step.consumed;
+                        step
+                    }
+                };
+                stage.end += step.written;
+                progress |= step.consumed > 0 || step.written > 0;
+            }
+            // The innermost coding decodes the last stage into the caller's output.
+            let step = self.codec.run(
+                &last.buffer[last.start..last.end],
+                &mut output[written..],
+                last.codec.done,
+                limit,
+            )?;
+            last.start += step.consumed;
+            written += step.written;
+            progress |= step.consumed > 0 || step.written > 0;
+            if step.finished || written == output.len() || !progress {
+                return Ok(DecodeStep {
+                    consumed,
+                    written,
+                    finished: step.finished,
+                    needs_input: !step.finished && written < output.len(),
+                });
+            }
+        }
     }
 }
 fn gzip_header(input: &[u8]) -> Result<Option<usize>> {

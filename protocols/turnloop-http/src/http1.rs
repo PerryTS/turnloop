@@ -47,6 +47,16 @@ impl Head {
             .find(|h| h.name.eq_ignore_ascii_case(name))
             .map(|h| h.value.as_slice())
     }
+    /// Every value of a header that may repeat, in wire order. [`get`](Self::get)
+    /// returns only the first line; a list-valued field such as
+    /// `Content-Encoding` needs all of them, for example
+    /// `StreamingDecoder::from_codings(head.values("content-encoding"), limit)`.
+    pub fn values<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a [u8]> + 'a {
+        self.headers
+            .iter()
+            .filter(move |h| h.name.eq_ignore_ascii_case(name))
+            .map(|h| h.value.as_slice())
+    }
     pub fn token(&self, name: &str, token: &str) -> bool {
         self.headers
             .iter()

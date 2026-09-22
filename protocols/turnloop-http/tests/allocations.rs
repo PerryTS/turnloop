@@ -149,15 +149,23 @@ fn streaming_decompressors_reuse_scratch() {
     gzip.write_all(body).unwrap();
     let mut deflate = flate2::write::ZlibEncoder::new(Vec::new(), Default::default());
     deflate.write_all(body).unwrap();
-    let mut brotli = Vec::new();
-    {
-        let mut writer = brotli::CompressorWriter::new(&mut brotli, 4096, 4, 22);
-        writer.write_all(body).unwrap();
-    }
+    let brotli_of = |bytes: &[u8]| {
+        let mut out = Vec::new();
+        {
+            let mut writer = brotli::CompressorWriter::new(&mut out, 4096, 4, 22);
+            writer.write_all(bytes).unwrap();
+        }
+        out
+    };
+    let brotli = brotli_of(body);
+    let gzip = gzip.finish().unwrap();
+    // A chain stages between its codings in buffers kept across `reset`.
+    let chain = brotli_of(&gzip);
     let cases = [
-        ("gzip", gzip.finish().unwrap()),
+        ("gzip", gzip),
         ("deflate", deflate.finish().unwrap()),
         ("br", brotli),
+        ("gzip, br", chain),
         (
             "zstd",
             "28b52ffd2038cd000098616c6c6f636174696f6e2070726f66696c65200100d933c3"
