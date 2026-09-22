@@ -1309,3 +1309,78 @@ fn step_contract_rejects_both_wrong_loop_conditions() {
     }
     assert!(ended);
 }
+
+/// Drive a request decoder to its stop step with the documented loop, naming
+/// each event and its `consumed`. Returns the names and the retained bytes.
+fn request_events(decoder: &mut Decoder, wire: &[u8]) -> (Vec<String>, Vec<u8>) {
+    let mut wire = wire.to_vec();
+    let mut names = Vec::new();
+    loop {
+        let step = decoder.receive(&wire).unwrap();
+        let consumed = step.consumed;
+        let progressed = consumed > 0 || step.event.is_some();
+        match step.event {
+            Some(Event::Head(h)) => names.push(format!("head {} {consumed}", h.method)),
+            Some(Event::Body(b)) => names.push(format!("body {} {consumed}", b.len())),
+            Some(Event::End) => names.push(format!("end {consumed}")),
+            Some(Event::Upgrade) => names.push(format!("upgrade {consumed}")),
+            Some(other) => names.push(format!("{other:?}")),
+            None => {}
+        }
+        wire.drain(..consumed);
+        if !progressed {
+            return (names, wire);
+        }
+    }
+}
+
+/// PerryTS/turnloop#46: a server decoding an upgrade request sees
+/// `Event::Upgrade`, as a client decoding the `101` does, and the bytes after it
+/// stay with the host. The decision is the host's, so a decline keeps HTTP/1.
+#[test]
+fn http1_request_side_raises_upgrade() {
+    let ws = b"GET /chat HTTP/1.1\r\nHost: a\r\nConnection: keep-alive, Upgrade\r\n\
+               Upgrade: websocket\r\n\r\n\x81\x05hello";
+    let mut decoder = Decoder::new(Mode::Request, Limits::default());
+    let (names, rest) = request_events(&mut decoder, ws);
+    assert_eq!(names, ["head GET 84", "upgrade 0"]);
+    assert_eq!(
+        rest, b"\x81\x05hello",
+        "the next protocol's bytes are untouched"
+    );
+    // Declining is ordinary: the decoder is reusable like after `End`.
+    assert!(decoder.reusable());
+    decoder.reset().unwrap();
+    let (names, _) = request_events(&mut decoder, b"GET / HTTP/1.1\r\nHost: a\r\n\r\n");
+    assert_eq!(names, ["head GET 27", "end 0"], "the flag does not leak");
+
+    // A request body is delivered first; the upgrade follows it.
+    let mut decoder = Decoder::new(Mode::Request, Limits::default());
+    let (names, rest) = request_events(
+        &mut decoder,
+        b"POST / HTTP/1.1\r\nHost: a\r\nConnection: upgrade\r\nUpgrade: h2c\r\n\
+          Content-Length: 3\r\n\r\nabcNEXT",
+    );
+    assert_eq!(names, ["head POST 82", "body 3 3", "upgrade 0"]);
+    assert_eq!(rest, b"NEXT");
+
+    // CONNECT asks to leave HTTP/1 as well.
+    let mut decoder = Decoder::new(Mode::Request, Limits::default());
+    let (names, rest) = request_events(
+        &mut decoder,
+        b"CONNECT a:443 HTTP/1.1\r\nHost: a:443\r\n\r\n\x16\x03\x01",
+    );
+    assert_eq!(names, ["head CONNECT 39", "upgrade 0"]);
+    assert_eq!(rest, b"\x16\x03\x01");
+
+    // Neither half alone is an upgrade, and HTTP/1.0 ignores it (RFC 9110 7.8).
+    for wire in [
+        b"GET / HTTP/1.1\r\nHost: a\r\nUpgrade: websocket\r\n\r\n".as_slice(),
+        b"GET / HTTP/1.1\r\nHost: a\r\nConnection: upgrade\r\n\r\n",
+        b"GET / HTTP/1.0\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n",
+    ] {
+        let mut decoder = Decoder::new(Mode::Request, Limits::default());
+        let (names, _) = request_events(&mut decoder, wire);
+        assert_eq!(names.last().map(String::as_str), Some("end 0"), "{names:?}");
+    }
+}

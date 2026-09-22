@@ -54,9 +54,19 @@ impl Head {
             .any(|h| tokens(&h.value).any(|t| t.eq_ignore_ascii_case(token.as_bytes())))
     }
 }
+/// Which side of the connection a [`Decoder`] reads.
+///
+/// The two modes raise the same [`Event`]s, [`Event::Upgrade`] included: a
+/// server decoding an upgrade or CONNECT request sees it just as a client
+/// decoding the `101` or `2xx` does. What differs is who decides. In
+/// [`Mode::Response`] the peer has already switched protocols, so the decoder
+/// is finished with the connection. In [`Mode::Request`] the peer has only
+/// asked, and the host answers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
+    /// Server side: decode requests.
     Request,
+    /// Client side: decode responses. Call [`Decoder::response_to`] first.
     Response,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,7 +89,30 @@ pub enum Event<'a> {
     Informational(Head),
     Body(&'a [u8]),
     Trailers(Vec<Header>),
+    /// The message is complete. Reads no input: see [`Step`].
     End,
+    /// The message is complete, and it leaves HTTP/1 or asks to. Raised
+    /// *instead of* [`Event::End`], with `consumed == 0`, as the last event of
+    /// the message. Every byte after it belongs to the next protocol, so the
+    /// host takes its retained input along.
+    ///
+    /// Both [`Mode`]s raise it:
+    ///
+    /// * [`Mode::Response`]: a `101 Switching Protocols`, or a `2xx` answer to a
+    ///   request passed to [`Decoder::response_to`] as `CONNECT`. The switch has
+    ///   happened, so the decoder is never [`reusable`](Decoder::reusable)
+    ///   afterwards.
+    /// * [`Mode::Request`]: an HTTP/1.1 request with an `Upgrade` header and
+    ///   the `upgrade` token in `Connection` (RFC 9110 section 7.8), or any
+    ///   `CONNECT` request. It follows the request body, if there is one. The
+    ///   switch has **not** happened: answering `101` (or `2xx` for CONNECT) is
+    ///   the host's decision. A host that accepts stops feeding this decoder.
+    ///   A host that declines sends an ordinary response and may carry on: the
+    ///   decoder is [`reusable`](Decoder::reusable) on the same terms as after
+    ///   [`Event::End`], and [`Decoder::reset`] resumes HTTP/1.
+    ///
+    /// An `Upgrade` header on an HTTP/1.0 request is ignored, as RFC 9110
+    /// section 7.8 requires, and that request ends with [`Event::End`].
     Upgrade,
 }
 /// One decode step: how much of `input` was consumed, and the event it
@@ -109,6 +142,8 @@ pub struct Decoder {
     head_request: bool,
     connect_request: bool,
     keep_alive: bool,
+    /// The request being read asks to leave HTTP/1, so it ends in `Upgrade`.
+    upgrade_request: bool,
 }
 fn invalid(message: &'static str) -> Error {
     Error::new("HPE_INVALID_HEADER_TOKEN", message)
@@ -202,6 +237,7 @@ impl Decoder {
             head_request: false,
             connect_request: false,
             keep_alive: false,
+            upgrade_request: false,
         }
     }
     /// Must precede response parsing. Pipelining is intentionally not provided.
@@ -288,6 +324,12 @@ impl Decoder {
                 head.keep_alive = !head.token("connection", "close")
                     && (head.version == 1 || head.token("connection", "keep-alive"));
                 self.keep_alive = head.keep_alive;
+                // RFC 9110 7.8: an Upgrade in an HTTP/1.0 request is ignored.
+                self.upgrade_request = self.mode == Mode::Request
+                    && (head.method == "CONNECT"
+                        || (head.version == 1
+                            && head.get("upgrade").is_some()
+                            && head.token("connection", "upgrade")));
                 step.consumed = end;
                 if self.mode == Mode::Response
                     && (100..200).contains(&head.status)
@@ -430,7 +472,11 @@ impl Decoder {
             }
             State::End => {
                 self.state = State::Done;
-                step.event = Some(Event::End);
+                step.event = Some(if self.upgrade_request {
+                    Event::Upgrade
+                } else {
+                    Event::End
+                });
             }
             State::Upgrade => {
                 self.state = State::Done;
