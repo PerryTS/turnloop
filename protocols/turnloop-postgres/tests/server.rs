@@ -397,7 +397,10 @@ fn all_common_types_in_text_binary_and_arrays() {
         assert_eq!(text.fields[0].1, oid);
         let text_value =
             decode(oid, 0, text.rows[0][0].as_deref()).expect("fixture operation must succeed");
-        assert!(!matches!(text_value, Value::Null | Value::Raw { .. }));
+        assert!(!matches!(
+            text_value,
+            Value::Null | Value::Raw { .. } | Value::Unknown { .. }
+        ));
         d.core
             .execute(
                 2,

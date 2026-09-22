@@ -127,7 +127,7 @@ The core has no JavaScript objects; the adapter applies these policies.
 | json/jsonb | JSON text (jsonb version removed) | host JSON.parse |
 | uuid | UUID text (binary formatted canonically) | string |
 | arrays of these | nested Array; NULL preserved | nested JS arrays |
-| unknown OID | text string or tagged binary Raw | custom parser or string fallback |
+| unknown OID | `Unknown { oid, text }` (never `Text`) or tagged binary `Raw` | custom parser or string fallback |
 
 JS Date milliseconds discard microseconds; the host must handle timezone,
 BC dates and infinity. Binary temporal values retain PostgreSQL's 2000 epoch and
