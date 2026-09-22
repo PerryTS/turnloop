@@ -61,7 +61,9 @@ the byte stream after it. Each accepted command yields exactly one Completed;
 server Error and result Ok events are informational. Close emits one Closed.
 Command rejection accepts no token. There are no callbacks from this core.
 
-MySQL permits one active command. Busy calls return backpressure; the adapter
+MySQL permits one active command. Busy calls return backpressure;
+`can_accept()` reports that exact admission decision up front (the command
+methods call it themselves), so a host queue never copies the rule. The adapter
 queues commands in JS submission order. This prevents unsynchronized packet
 sequence resets. COM_QUERY supports multiple result sets (multiple statements
 are opt-in); EOF negotiation deliberately selects legacy EOF, which MySQL 9.6

@@ -403,8 +403,16 @@ impl Connection {
         self.state = State::Auth;
         Ok(())
     }
+    /// Whether a command submitted now would be admitted. This is the exact rule
+    /// every command method applies: the session is authenticated and idle, the
+    /// previous command's `Completed` has been delivered and all output has been
+    /// acknowledged. A host queue can gate submission on it instead of copying
+    /// the preconditions. Unlike `is_ready`, it also requires flushed output.
+    pub fn can_accept(&self) -> bool {
+        self.state == State::Ready && self.pending.is_none() && self.output().is_empty()
+    }
     fn accept(&self) -> Result<()> {
-        if self.state != State::Ready || self.pending.is_some() || !self.output().is_empty() {
+        if !self.can_accept() {
             Err(Error::State("connection busy or closed"))
         } else {
             Ok(())

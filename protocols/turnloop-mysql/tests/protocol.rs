@@ -468,3 +468,55 @@ fn local_infile_enabled_is_an_explicit_borrowed_request() {
         })
     ));
 }
+/// `can_accept` is the admission rule itself: whenever it is false a command is
+/// rejected without side effects, and whenever it is true the next one is taken.
+#[test]
+fn can_accept_reports_the_exact_admission_decision() {
+    let mut c = Connection::new(Config::default()).expect("fixture operation must succeed");
+    assert!(!c.can_accept());
+    assert_eq!(
+        c.ping(1),
+        Err(Error::State("connection busy or closed")),
+        "handshake in progress"
+    );
+    let mut c = ready();
+    assert!(c.can_accept());
+    c.query(1, "SELECT 1", None)
+        .expect("admitted when can_accept is true");
+    let request = c.output().len();
+    assert!(!c.can_accept());
+    assert!(c.ping(2).is_err());
+    assert_eq!(
+        c.output().len(),
+        request,
+        "a rejected command adds no bytes"
+    );
+    c.consume_output(request - 1)
+        .expect("fixture operation must succeed");
+    assert!(!c.can_accept(), "unacknowledged output");
+    assert!(c.ping(2).is_err());
+    c.consume_output(1).expect("fixture operation must succeed");
+    assert!(!c.can_accept(), "command still pending");
+    assert!(c.ping(2).is_err());
+    c.receive(&ok(1, 0, 2))
+        .expect("fixture operation must succeed");
+    assert!(matches!(
+        c.next_event().expect("fixture operation must succeed"),
+        Some(Event::Ok { token: 1, .. })
+    ));
+    assert!(!c.can_accept(), "Completed not yet delivered");
+    assert!(c.ping(2).is_err());
+    assert!(matches!(
+        c.next_event().expect("fixture operation must succeed"),
+        Some(Event::Completed {
+            token: 1,
+            outcome: Outcome::Success
+        })
+    ));
+    assert!(c.can_accept());
+    c.ping(2).expect("admitted when can_accept is true");
+    assert_eq!(flush(&mut c), frame(0, &[0x0e]));
+    c.abort(Error::Transport);
+    assert!(!c.can_accept());
+    assert!(c.quit().is_err());
+}
