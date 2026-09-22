@@ -128,7 +128,37 @@ pub enum Event<'a> {
 /// | `0` | `Some` | an event that reads no input: [`Event::End`] and [`Event::Upgrade`] both arrive this way. |
 ///
 /// So the loop condition is `consumed > 0 || event.is_some()`, and a host that
-/// stops on either zero alone is wrong in one of the two directions.
+/// stops on either zero alone is wrong in one of the two directions:
+///
+/// ```
+/// # use turnloop_http::http1::{Decoder, Event, Mode};
+/// # let mut decoder = Decoder::new(Mode::Response, Default::default());
+/// # decoder.response_to("GET");
+/// # let mut input = b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nhi".to_vec();
+/// let mut ended = false;
+/// loop {
+///     let step = decoder.receive(&input)?;
+///     let consumed = step.consumed;
+///     let progressed = consumed > 0 || step.event.is_some();
+///     // Body borrows `input`, so handle the event before draining.
+///     ended |= matches!(step.event, Some(Event::End));
+///     input.drain(..consumed);
+///     if !progressed {
+///         break; // read more bytes from the transport, then continue
+///     }
+/// }
+/// // `End` came from a step after the last byte was consumed.
+/// assert!(ended && input.is_empty() && decoder.reusable());
+/// # Ok::<(), turnloop_http::Error>(())
+/// ```
+///
+/// **The zero-consumption event is the trap.** The step that consumes the last
+/// byte of a message does not carry `End`; the *next* call does, and it reads
+/// nothing. A host that loops while it has input - or stops when a step
+/// consumed nothing - never makes that call, and the finished message sits in
+/// the decoder until the peer's idle timeout closes the connection.
+/// [`Decoder::wants_step`] names the pending call for a host that keys its
+/// loop on input rather than on steps.
 #[derive(Debug)]
 pub struct Step<'a> {
     pub consumed: usize,
@@ -247,6 +277,22 @@ impl Decoder {
     }
     pub fn reusable(&self) -> bool {
         self.state == State::Done && self.keep_alive
+    }
+    /// True when the decoder holds an event that reads no input, so the host
+    /// must call [`receive`](Self::receive) again even with nothing new to feed
+    /// it - an empty slice will do. That event is [`Event::End`] or
+    /// [`Event::Upgrade`]. It becomes pending when the last body byte, the
+    /// final chunk or the head of a bodiless message is consumed, and after
+    /// [`eof`](Self::eof) ends a close-delimited body.
+    ///
+    /// This is the signal a host that drives on "bytes to feed" is missing.
+    /// Such a host stops once its buffer is empty and never sees `End`: the
+    /// message sits finished inside the decoder, the connection is not
+    /// [`reusable`](Self::reusable), and only the peer's idle timeout ends the
+    /// exchange. Loop while `!input.is_empty() || decoder.wants_step()`, or use
+    /// the [`Step`] contract's condition, which covers the same case.
+    pub fn wants_step(&self) -> bool {
+        matches!(self.state, State::End | State::Upgrade)
     }
     pub fn reset(&mut self) -> Result<()> {
         if !self.reusable() {

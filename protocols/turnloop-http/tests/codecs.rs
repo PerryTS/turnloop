@@ -1396,6 +1396,77 @@ fn status_head(status: u16, headers: &[(&str, &str)]) -> Head {
     }
 }
 
+/// PerryTS/turnloop#50, as P6 and P11 hit it: a host that feeds the decoder
+/// "while there is input" hands over every byte of a keep-alive response and
+/// never sees `End`, because `End` comes from a later step that reads nothing.
+/// `wants_step` is the signal that step is owed.
+#[test]
+fn http1_end_needs_a_step_after_the_last_byte() {
+    let responses: [&[u8]; 3] = [
+        b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhello",
+        b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+        b"HTTP/1.1 204 No Content\r\n\r\n",
+    ];
+    for wire in responses {
+        // The loop both lanes wrote: stop once every byte is handed over.
+        let mut decoder = Decoder::new(Mode::Response, Limits::default());
+        decoder.response_to("GET");
+        let mut input = wire.to_vec();
+        let mut ended = false;
+        while !input.is_empty() {
+            let step = decoder.receive(&input).unwrap();
+            ended |= matches!(step.event, Some(Event::End));
+            input.drain(..step.consumed);
+        }
+        assert!(!ended, "every byte consumed, and still no End");
+        assert!(!decoder.reusable(), "so the connection cannot be pooled");
+        assert!(decoder.wants_step(), "but the decoder says a step is owed");
+
+        // The same loop, keyed on wants_step as well, completes the message.
+        let mut decoder = Decoder::new(Mode::Response, Limits::default());
+        decoder.response_to("GET");
+        let mut input = wire.to_vec();
+        let mut events = Vec::new();
+        while !input.is_empty() || decoder.wants_step() {
+            let step = decoder.receive(&input).unwrap();
+            events.push((step.consumed, matches!(step.event, Some(Event::End))));
+            input.drain(..step.consumed);
+        }
+        assert_eq!(events.last(), Some(&(0, true)), "End reads nothing");
+        assert!(decoder.reusable());
+        assert!(!decoder.wants_step(), "and nothing more is owed");
+    }
+
+    // `eof` ending a close-delimited body also leaves `End` owed.
+    let mut decoder = Decoder::new(Mode::Response, Limits::default());
+    decoder.response_to("GET");
+    let head = b"HTTP/1.1 200 OK\r\n\r\n";
+    assert_eq!(decoder.receive(head).unwrap().consumed, head.len());
+    assert_eq!(decoder.receive(b"body").unwrap().consumed, 4);
+    assert!(
+        !decoder.wants_step(),
+        "a close-delimited body is open until EOF"
+    );
+    decoder.eof().unwrap();
+    assert!(decoder.wants_step());
+    assert!(matches!(
+        decoder.receive(&[]).unwrap().event,
+        Some(Event::End)
+    ));
+    assert!(!decoder.wants_step());
+
+    // And an upgrade, on either side, is the same shape.
+    let mut decoder = Decoder::new(Mode::Request, Limits::default());
+    let wire = b"GET / HTTP/1.1\r\nHost: a\r\nConnection: upgrade\r\nUpgrade: x\r\n\r\n";
+    assert_eq!(decoder.receive(wire).unwrap().consumed, wire.len());
+    assert!(decoder.wants_step());
+    assert!(matches!(
+        decoder.receive(&[]).unwrap().event,
+        Some(Event::Upgrade)
+    ));
+    assert!(!decoder.wants_step());
+}
+
 /// PerryTS/turnloop#47, part 1: Node's `res.writeHead(404, "Nope")`.
 #[test]
 fn http1_encoder_writes_a_custom_reason_phrase() {
