@@ -8,7 +8,8 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 use turnloop_smtp::{
-    Auth, Capabilities, Config, Connection, Envelope, Event, State, Tls, encode_data,
+    Auth, Capabilities, Config, Connection, DataEncoder, Envelope, Event, State, StreamBody, Tls,
+    encode_data,
     message::{self, FileAttachment, Mail},
 };
 fn discard(c: &mut Connection) {
@@ -56,6 +57,233 @@ fn normalization_and_dot_stuffing() {
     encode_data(b"x\r\n", &mut out);
     assert_eq!(out, b"x\r\n.\r\n");
 }
+/// Content whose every hazard can land on a chunk boundary: an embedded
+/// CRLF.CRLF (the DATA terminator), leading dots, CRLF/bare CR/bare LF, and a
+/// CR immediately followed by a line-leading dot.
+const HAZARDS: &[u8] = b".lead\r\nbody\r\n.\r\nafter\r\r\n\n.x\r.y\n..z\r\nlast.";
+#[test]
+fn incremental_dot_stuffing_is_split_invariant() {
+    let mut whole = Vec::new();
+    let whole_size = encode_data(HAZARDS, &mut whole);
+    assert!(
+        whole.windows(7).any(|w| w == b"\r\n..\r\na"),
+        "the embedded terminator is stuffed"
+    );
+    // Every split into two and three chunks, including empty chunks.
+    for i in 0..=HAZARDS.len() {
+        for j in i..=HAZARDS.len() {
+            let mut encoder = DataEncoder::new();
+            let mut out = Vec::new();
+            for chunk in [&HAZARDS[..i], &HAZARDS[i..j], &HAZARDS[j..]] {
+                encoder.encode(chunk, &mut out);
+            }
+            assert_eq!(encoder.finish(&mut out), whole_size, "split {i}/{j}");
+            assert_eq!(out, whole, "split {i}/{j}");
+        }
+    }
+    // The terminator split exactly as CRLF | .CRLF and CR | LF.CRLF.
+    for parts in [
+        &[&b"a\r\n"[..], b".\r\nb"][..],
+        &[b"a\r", b"\n.\r\nb"],
+        &[b"a\r\n.", b"\r\nb"],
+        &[b"a", b"\r", b"\n", b".", b"\r", b"\n", b"b"],
+    ] {
+        let mut encoder = DataEncoder::new();
+        let mut out = Vec::new();
+        for part in parts {
+            encoder.encode(part, &mut out);
+        }
+        encoder.finish(&mut out);
+        assert_eq!(out, b"a\r\n..\r\nb\r\n.\r\n", "{parts:?}");
+    }
+    // Byte-at-a-time, and the encoder resets after finish.
+    let mut encoder = DataEncoder::new();
+    for round in 0..2 {
+        let mut out = Vec::new();
+        for byte in HAZARDS {
+            encoder.encode(std::slice::from_ref(byte), &mut out);
+        }
+        assert_eq!(encoder.finish(&mut out), whole_size, "round {round}");
+        assert_eq!(out, whole, "round {round}");
+    }
+}
+/// Drives one message from MAIL to the 354 reply, returning every byte the
+/// client wrote; `stream` chooses `start_send` over `send`.
+fn to_data(c: &mut Connection, token: u64, stream: Option<StreamBody>) -> Vec<u8> {
+    let now = Instant::now();
+    match stream {
+        Some(body) => c.start_send(token, envelope(), "<id@example.test>".into(), body, now),
+        None => c.send(token, envelope(), "<id@example.test>".into(), HAZARDS, now),
+    }
+    .expect("fixture operation must succeed");
+    let mut wire = c.output().to_vec();
+    discard(c);
+    c.receive(b"250 mail\r\n250 ok\r\n550 no such user\r\n", now)
+        .expect("fixture operation must succeed");
+    assert_eq!(c.output(), b"DATA\r\n");
+    wire.extend_from_slice(c.output());
+    discard(c);
+    c.receive(b"354 go ahead\r\n", now)
+        .expect("fixture operation must succeed");
+    wire.extend_from_slice(c.output());
+    discard(c);
+    wire
+}
+fn hazards_body() -> StreamBody {
+    let mut out = Vec::new();
+    StreamBody {
+        size: Some(encode_data(HAZARDS, &mut out) as u64),
+        eight_bit: false,
+    }
+}
+#[test]
+fn streamed_send_writes_the_one_shot_bytes() {
+    let now = Instant::now();
+    let mut oneshot = plain_ready(true);
+    let expected = to_data(&mut oneshot, 1, None);
+    assert!(expected.ends_with(b"\r\nlast.\r\n.\r\n"));
+    for split in [1, 7, 13, 14, 15, 16, HAZARDS.len()] {
+        let mut c = plain_ready(true);
+        let mut wire = to_data(&mut c, 2, Some(hazards_body()));
+        assert_eq!(c.poll_event(), Some(Event::BodyReady { token: 2 }));
+        assert!(c.can_send_body());
+        for chunk in HAZARDS.chunks(split) {
+            c.send_chunk(chunk, now)
+                .expect("fixture operation must succeed");
+            // Draining between chunks keeps only the current chunk buffered.
+            wire.extend_from_slice(c.output());
+            discard(&mut c);
+        }
+        c.finish_body(now).expect("fixture operation must succeed");
+        assert!(!c.can_send_body());
+        wire.extend_from_slice(c.output());
+        discard(&mut c);
+        assert_eq!(wire, expected, "chunks of {split}");
+        assert!(c.send_chunk(b"late", now).is_err());
+        assert!(c.finish_body(now).is_err());
+        assert!(c.output().is_empty());
+        c.receive(b"250 queued\r\n", now)
+            .expect("fixture operation must succeed");
+        assert!(matches!(
+            c.poll_event(),
+            Some(Event::Sent { token: 2, info })
+                if info.accepted == ["ok@example.test"] && info.rejected.len() == 1
+        ));
+        assert_eq!(c.state(), State::Ready);
+        assert_eq!(c.poll_event(), None);
+    }
+    // SIZE is optional for a stream, and a body may be empty.
+    let mut c = plain_ready(true);
+    c.start_send(3, envelope(), "id".into(), StreamBody::default(), now)
+        .expect("fixture operation must succeed");
+    assert_eq!(
+        &c.output()[..c.output().iter().position(|b| *b == b'\n').expect("line") + 1],
+        b"MAIL FROM:<a@example.test>\r\n"
+    );
+    assert!(c.send_chunk(b"early", now).is_err(), "no body before 354");
+    discard(&mut c);
+    c.receive(b"250 mail\r\n250 ok\r\n250 ok\r\n", now)
+        .expect("fixture operation must succeed");
+    discard(&mut c);
+    c.receive(b"354 go ahead\r\n", now)
+        .expect("fixture operation must succeed");
+    assert_eq!(c.poll_event(), Some(Event::BodyReady { token: 3 }));
+    c.finish_body(now).expect("fixture operation must succeed");
+    assert_eq!(c.output(), b".\r\n");
+}
+#[test]
+fn streamed_send_failures_never_terminate_a_partial_body() {
+    let now = Instant::now();
+    // Undeclared 8-bit content cannot be retracted: fail and close, no ".".
+    let mut c = plain_ready(true);
+    to_data(&mut c, 4, Some(hazards_body()));
+    assert_eq!(c.poll_event(), Some(Event::BodyReady { token: 4 }));
+    c.send_chunk(b"Subject: x\r\n\r\n", now)
+        .expect("fixture operation must succeed");
+    discard(&mut c);
+    let e = c.send_chunk("ü".as_bytes(), now).unwrap_err();
+    assert_eq!(e.code, "EMESSAGE");
+    assert!(c.output().is_empty(), "nothing, least of all a terminator");
+    assert!(
+        matches!(c.poll_event(), Some(Event::Failed { token: Some(4), error, .. }) if error.code == "EMESSAGE")
+    );
+    assert_eq!(c.poll_event(), Some(Event::CloseTransport));
+    assert_eq!(c.poll_event(), Some(Event::Closed));
+    // A declared 8-bit body is sent with BODY=8BITMIME and accepted.
+    let mut c = plain_ready(true);
+    let wire = to_data(
+        &mut c,
+        5,
+        Some(StreamBody {
+            size: None,
+            eight_bit: true,
+        }),
+    );
+    assert!(wire.starts_with(b"MAIL FROM:<a@example.test> BODY=8BITMIME\r\n"));
+    assert_eq!(c.poll_event(), Some(Event::BodyReady { token: 5 }));
+    c.send_chunk("ü\n".as_bytes(), now)
+        .expect("fixture operation must succeed");
+    c.finish_body(now).expect("fixture operation must succeed");
+    assert_eq!(c.output(), "ü\r\n.\r\n".as_bytes());
+    // A server reply while the body is open ends the session: RSET would be
+    // read as message content.
+    let mut c = plain_ready(true);
+    to_data(&mut c, 6, Some(hazards_body()));
+    assert_eq!(c.poll_event(), Some(Event::BodyReady { token: 6 }));
+    c.send_chunk(b"partial", now)
+        .expect("fixture operation must succeed");
+    discard(&mut c);
+    c.receive(b"250 premature\r\n", now)
+        .expect("fixture operation must succeed");
+    assert!(
+        matches!(c.poll_event(), Some(Event::Failed { token: Some(6), error, .. }) if error.code == "EMESSAGE")
+    );
+    assert_eq!(c.poll_event(), Some(Event::CloseTransport));
+    assert_eq!(c.poll_event(), Some(Event::Closed));
+    assert!(c.output().is_empty());
+    assert!(!c.can_send_body());
+    // DATA refused: no body is requested, and RSET recovers the session.
+    let mut c = plain_ready(true);
+    c.start_send(7, envelope(), "id".into(), hazards_body(), now)
+        .expect("fixture operation must succeed");
+    discard(&mut c);
+    c.receive(b"250 mail\r\n250 ok\r\n250 ok\r\n", now)
+        .expect("fixture operation must succeed");
+    discard(&mut c);
+    c.receive(b"554 no\r\n", now)
+        .expect("fixture operation must succeed");
+    assert!(matches!(
+        c.poll_event(),
+        Some(Event::Failed { token: Some(7), .. })
+    ));
+    assert_eq!(c.output(), b"RSET\r\n");
+    assert!(c.send_chunk(b"x", now).is_err());
+    // Declarations are checked before any envelope byte is written.
+    let mut c = plain_ready(false);
+    let unsupported = StreamBody {
+        size: None,
+        eight_bit: true,
+    };
+    assert_eq!(
+        c.start_send(8, envelope(), "id".into(), unsupported, now)
+            .unwrap_err()
+            .code,
+        "EMESSAGE"
+    );
+    let mut c = plain_ready(true);
+    let too_big = StreamBody {
+        size: Some(10_001),
+        eight_bit: false,
+    };
+    assert!(
+        c.start_send(9, envelope(), "id".into(), too_big, now)
+            .unwrap_err()
+            .message
+            .contains("SIZE")
+    );
+    assert!(c.output().is_empty());
+    assert_eq!(c.state(), State::Ready);
+}
 #[test]
 fn ehlo_fallback_required_tls_and_deadline() {
     let now = Instant::now();
@@ -91,6 +319,89 @@ fn ehlo_fallback_required_tls_and_deadline() {
     assert_eq!(c.poll_event(), Some(Event::CloseTransport));
     assert_eq!(c.poll_event(), Some(Event::Closed));
     assert_eq!(c.poll_event(), None);
+}
+/// Drains every queued event.
+fn events(c: &mut Connection) -> Vec<Event> {
+    std::iter::from_fn(|| c.poll_event()).collect()
+}
+#[test]
+fn required_tls_never_reaches_ready_in_the_clear() {
+    let now = Instant::now();
+    let required = || {
+        let mut c = Connection::new(Config {
+            tls: Tls::Required,
+            auth: Some(Auth::Plain {
+                user: "user".into(),
+                password: "secret".into(),
+            }),
+            ..Config::default()
+        })
+        .expect("fixture operation must succeed");
+        c.connected(now).expect("fixture operation must succeed");
+        c.receive(b"220 hi\r\n", now)
+            .expect("fixture operation must succeed");
+        assert_eq!(c.output(), b"EHLO [127.0.0.1]\r\n");
+        discard(&mut c);
+        c
+    };
+    let refused = |events: &[Event]| {
+        assert_eq!(events.len(), 3, "{events:?}");
+        assert!(
+            matches!(&events[0], Event::Failed { token: None, error, .. }
+                if error.code == "ETLS" && error.command == "STARTTLS"
+                    && error.message.contains("STARTTLS")),
+            "{events:?}"
+        );
+        assert_eq!(events[1..], [Event::CloseTransport, Event::Closed]);
+    };
+    // EHLO without STARTTLS: fail before any AUTH exchange leaves in the clear.
+    let mut c = required();
+    c.receive(b"250-hi\r\n250 AUTH PLAIN\r\n", now)
+        .expect("fixture operation must succeed");
+    refused(&events(&mut c));
+    assert!(c.output().is_empty(), "no AUTH may follow");
+    assert_eq!(c.state(), State::Closed);
+    // STARTTLS advertised but refused by the server.
+    let mut c = required();
+    c.receive(b"250-hi\r\n250-STARTTLS\r\n250 AUTH PLAIN\r\n", now)
+        .expect("fixture operation must succeed");
+    assert_eq!(c.output(), b"STARTTLS\r\n");
+    discard(&mut c);
+    c.receive(b"454 TLS not available\r\n", now)
+        .expect("fixture operation must succeed");
+    let drained = events(&mut c);
+    assert!(
+        matches!(&drained[0], Event::Failed { error, .. }
+            if error.code == "ETLS" && error.response_code == Some(454)),
+        "{drained:?}"
+    );
+    assert!(!drained.contains(&Event::Ready));
+    assert!(c.output().is_empty());
+    // STARTTLS accepted: Ready follows only after the host's upgrade.
+    let mut c = required();
+    c.receive(b"250-hi\r\n250-STARTTLS\r\n250 AUTH PLAIN\r\n", now)
+        .expect("fixture operation must succeed");
+    discard(&mut c);
+    c.receive(b"220 go ahead\r\n", now)
+        .expect("fixture operation must succeed");
+    assert_eq!(events(&mut c), [Event::UpgradeTls]);
+    assert_eq!(c.state(), State::Tls);
+    c.tls_established(now)
+        .expect("fixture operation must succeed");
+    discard(&mut c);
+    c.receive(b"250-hi\r\n250 AUTH PLAIN\r\n", now)
+        .expect("fixture operation must succeed");
+    assert!(c.output().starts_with(b"AUTH PLAIN "));
+    discard(&mut c);
+    c.receive(b"235 ok\r\n", now)
+        .expect("fixture operation must succeed");
+    assert_eq!(events(&mut c), [Event::Ready]);
+    // Opportunistic TLS, by contrast, proceeds in the clear.
+    let mut c = Connection::new(Config::default()).expect("fixture operation must succeed");
+    c.connected(now).expect("fixture operation must succeed");
+    c.receive(b"220 hi\r\n250 hi\r\n", now)
+        .expect("fixture operation must succeed");
+    assert_eq!(events(&mut c), [Event::Ready]);
 }
 #[test]
 fn malformed_multiline_and_injection_are_rejected() {
@@ -507,6 +818,7 @@ fn test_socket(mode: Mode) {
                     );
                     failed = true;
                 }
+                Event::BodyReady { .. } => panic!("one-shot send streams no body"),
                 Event::CloseTransport => {}
                 Event::Closed => break,
             }

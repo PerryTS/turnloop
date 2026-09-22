@@ -1,6 +1,8 @@
 //! crud/crud.md §§ Read/Write Operations, Write Models and Results.
 //! Builders retain capacity. Inputs and options are borrowed raw BSON; IDs and
 //! wall-clock ObjectId timestamps are supplied by the host (no ObjectId::new()).
+//! Inserted documents need an `_id` before sending; see [`ObjectIdGenerator`] and
+//! the crate's [host entropy](crate#host-entropy) obligations.
 use crate::{Error, ErrorKind, Result, wire::BsonWriter};
 use bson::{
     Document,
@@ -468,7 +470,8 @@ impl<'a> CursorBatch<'a> {
                 .and_then(|v| v.as_document()),
         })
     }
-    pub fn rows(&self) -> impl Iterator<Item = Result<&'a RawDocument>> {
+    /// The iterator borrows the reply, not this batch, so it may outlive `self`.
+    pub fn rows(&self) -> impl Iterator<Item = Result<&'a RawDocument>> + use<'a> {
         self.documents.into_iter().map(|v| match v {
             Ok(RawBsonRef::Document(d)) => Ok(d),
             _ => Err(Error::protocol("Cursor batch contains non-document")),
@@ -533,16 +536,39 @@ impl Cursor {
         Ok(true)
     }
 }
+/// Counts and error detail of an insert/update/delete reply.
+///
+/// MongoDB reports a failed write *inside* a successful command: a duplicate
+/// key answers `ok: 1` with a `writeErrors` array, and an unsatisfied write
+/// concern answers `ok: 1` with `writeConcernError`. `ok` alone is therefore no
+/// verdict. [`WriteResult::parse`] is the verdict: it runs
+/// [`Error::from_response`] first and fails on either field, so a caller never
+/// needs to call `from_response` beforehand. [`WriteResult::decode`] keeps them
+/// as data for aggregation (as [`BulkResult`] does); check
+/// [`WriteResult::succeeded`] on what it returns.
 #[derive(Debug)]
 pub struct WriteResult<'a> {
     pub count: i64,
     pub modified_count: i64,
     pub upserted: Option<&'a RawArray>,
+    /// Never nonempty in a [`WriteResult::parse`] result.
     pub write_errors: Option<&'a RawArray>,
+    /// Never present in a [`WriteResult::parse`] result.
     pub write_concern_error: Option<&'a RawDocument>,
 }
 impl<'a> WriteResult<'a> {
+    /// Succeeds only for a write that fully succeeded. `ok: 0`, a nonempty
+    /// `writeErrors` (a [`ErrorKind::BulkWrite`] error) and a
+    /// `writeConcernError` (a [`ErrorKind::Server`] error) all fail with the
+    /// error [`Error::from_response`] builds, full server response included.
     pub fn parse(r: &'a RawDocument) -> Result<Self> {
+        Error::from_response(r)?;
+        Self::decode(r)
+    }
+    /// Fails only when the command itself failed (`ok: 0`) or the reply is
+    /// malformed; per-document and write-concern errors are returned in the
+    /// fields, so callers must consult [`WriteResult::succeeded`].
+    pub fn decode(r: &'a RawDocument) -> Result<Self> {
         if crate::error::number(r, "ok").unwrap_or(0.0) == 0.0 {
             Error::from_response(r)?;
         }
@@ -561,6 +587,12 @@ impl<'a> WriteResult<'a> {
                 .flatten()
                 .and_then(|v| v.as_document()),
         })
+    }
+    /// False when any document failed or the write concern was not satisfied.
+    pub fn succeeded(&self) -> bool {
+        self.write_errors
+            .is_none_or(|a| a.into_iter().next().is_none())
+            && self.write_concern_error.is_none()
     }
 }
 fn integer(d: &RawDocument, k: &str) -> Result<i64> {
@@ -582,7 +614,7 @@ pub struct BulkResult {
 }
 impl BulkResult {
     pub fn accept(&mut self, reply: &RawDocument, offset: i32, ordered: bool) -> Result<bool> {
-        let result = WriteResult::parse(reply)?;
+        let result = WriteResult::decode(reply)?;
         self.count += result.count;
         self.modified_count += result.modified_count;
         let mut errors = false;
@@ -688,6 +720,12 @@ impl<'a> BulkBatcher<'a> {
 }
 /// ObjectId generator with host-supplied process entropy and wall-clock seconds.
 /// BSON ObjectId specification § Generation: 4 timestamp, 5 random, 3 counter bytes.
+///
+/// Nothing in this crate adds a missing `_id`: an insert without one still
+/// succeeds, but the server assigns an id the host never learns. Create one
+/// generator per process from 5 random bytes and a random counter start, and
+/// give every inserted document an `_id` from it. This is one of the crate's
+/// [host entropy](crate#host-entropy) obligations.
 pub struct ObjectIdGenerator {
     random: [u8; 5],
     counter: u32,
