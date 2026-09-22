@@ -106,6 +106,10 @@ fn refused_connect() {
     contract::refused_connect_once::<Platform>();
 }
 #[test]
+fn connect_timeout() {
+    contract::tcp_connect_timeout::<Platform>();
+}
+#[test]
 fn ref_unref() {
     contract::ref_unref::<Platform>();
 }

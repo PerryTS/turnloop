@@ -10,7 +10,9 @@ impl Output for crate::Connection {
         self.output()
     }
     fn consume_output(&mut self, n: usize) -> io::Result<()> {
-        self.consume_output(n).map_err(io::Error::other)
+        // The driver polls `event` after every drain, so the "call next_event
+        // now" signal is already honoured here.
+        self.consume_output(n).map(drop).map_err(io::Error::other)
     }
 }
 impl SansIo for crate::Connection {

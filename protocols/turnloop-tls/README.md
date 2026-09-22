@@ -5,13 +5,25 @@ ciphertext buffers, wall time and handshake deadlines. Handle each returned stat
 consume borrowed plaintext before advancing, and acknowledge encrypted writes only
 after their transport completion. No socket, scheduler or runtime is created.
 
-Client/server configurations share the workspace’s ring provider (rustls defaults
+By default client/server configurations use the ring provider (rustls defaults
 are disabled), including native Windows and wasm32. Browser entropy and PKI web
 features are enabled explicitly; building ring for wasm needs a wasm-capable C
 compiler. WASI obtains entropy through its host. No FIPS/PQ guarantee is claimed.
 
+The provider is a host choice: `ClientOptions::provider` and
+`ServerConfig::with_provider` take any rustls `CryptoProvider` (aws-lc-rs, for
+example). `ring` is a default feature; with `default-features = false` the crate
+links no provider of its own, and `new` uses the provider the host passes or the
+rustls process default. Without `ring`, `tls_server_end_point` is unavailable and
+`tls_server_end_point_hash` names the hash for the host to compute.
+
 Mozilla roots, host-supplied extra PEM, explicit replacement CAs, SNI and ALPN are
 supported. See public API docs and `tests/tls.rs` for checked handshake examples.
+Anything else rustls can configure (client certificates, SNI resolvers, custom
+verifiers, ticketers) goes through `ClientConfig::from_rustls` /
+`ServerConfig::from_rustls`: build the rustls config with
+`builder_with_details(provider, host_time.time_provider())` so certificate checks
+keep following the wall time passed to `process`.
 PEM parsing uses rustls-pki-types through rustls’s maintained re-export.
 
 ## Getting started on turnloop

@@ -652,8 +652,24 @@ impl Decoders {
         if !options.decompress {
             return Ok(());
         }
-        let encoding = std::str::from_utf8(head.get("content-encoding").unwrap_or(b"identity"))
-            .map_err(io::Error::other)?;
+        // Repeated Content-Encoding lines are one list (RFC 9110 section 5.3).
+        // The common single-line case borrows; only a repeated field pays for
+        // joining the lines into one cache key.
+        let joined;
+        let encoding = if head.values("content-encoding").nth(1).is_some() {
+            let mut key = Vec::new();
+            for value in head.values("content-encoding") {
+                if !key.is_empty() {
+                    key.extend_from_slice(b", ");
+                }
+                key.extend_from_slice(value);
+            }
+            joined = String::from_utf8(key).map_err(io::Error::other)?;
+            joined.as_str()
+        } else {
+            std::str::from_utf8(head.get("content-encoding").unwrap_or(b"identity"))
+                .map_err(io::Error::other)?
+        };
         if encoding == "identity" {
             return Ok(());
         }
@@ -712,5 +728,63 @@ impl Decoders {
         }
         self.input.drain(..offset);
         Ok(())
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn gzip(bytes: &[u8]) -> Vec<u8> {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(bytes).expect("gzip into a Vec");
+        encoder.finish().expect("gzip into a Vec")
+    }
+    fn head(encodings: &[&str]) -> Head {
+        Head {
+            method: String::new(),
+            target: String::new(),
+            status: 200,
+            version: 1,
+            headers: encodings
+                .iter()
+                .map(|value| Header::new("Content-Encoding", value))
+                .collect(),
+            keep_alive: true,
+        }
+    }
+    fn decode(decoders: &mut Decoders, head: &Head, wire: &[u8]) -> io::Result<Vec<u8>> {
+        decoders.start(head, &Options::default())?;
+        let mut out = Vec::new();
+        decoders.feed(wire, true, &mut |bytes| {
+            out.extend_from_slice(bytes);
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// PerryTS/turnloop#79: repeated Content-Encoding lines are one list, so
+    /// two `gzip` lines decode twice rather than once.
+    #[test]
+    fn repeated_content_encoding_lines_decode_as_one_list() {
+        let body = b"a body compressed twice, one coding per header line".repeat(50);
+        let wire = gzip(&gzip(&body));
+        let mut decoders = Decoders::default();
+        assert_eq!(
+            decode(&mut decoders, &head(&["gzip", "gzip"]), &wire).unwrap(),
+            body
+        );
+        // The same chain on one line shares the joined cache entry.
+        assert_eq!(
+            decode(&mut decoders, &head(&["gzip, gzip"]), &wire).unwrap(),
+            body
+        );
+        assert_eq!(decoders.cache.len(), 1);
+        // A single line still decodes once.
+        let once = gzip(&body);
+        assert_eq!(
+            decode(&mut decoders, &head(&["gzip"]), &once).unwrap(),
+            body
+        );
     }
 }

@@ -44,3 +44,16 @@ fn pending_write_can_replace_its_buffer() {
         turnloop::backend::Platform,
     >();
 }
+
+#[test]
+fn host_operations_complete_beside_executor_futures() {
+    turnloop_contract::executor_contract::host_operations_share_the_loop::<
+        turnloop::backend::Platform,
+    >();
+}
+
+#[test]
+fn single_connection_presets_carry_a_request() {
+    turnloop_contract::executor_contract::single_connection_presets::<turnloop::backend::Platform>(
+    );
+}

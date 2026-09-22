@@ -28,7 +28,9 @@ pub mod pool;
 pub mod types;
 mod wire;
 use wire::Cursor;
-pub use wire::{ConnectionFailure, Field, Fields, Row, ServerError};
+pub use wire::{
+    ConnectionFailure, Field, Fields, OwnedFields, OwnedRow, OwnedServerError, Row, ServerError,
+};
 
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 mod host_time;
@@ -45,10 +47,18 @@ pub enum Error {
     State(&'static str),
     Limit,
     Timeout,
-    Transport,
+    /// The transport failed. The host may attach its own diagnostic (for
+    /// example `ECONNREFUSED`); it reaches every `Outcome::Aborted` and `Closed`.
+    Transport(Option<TransportFailure>),
     /// The server terminated the session; preserves SQLSTATE and every field.
     ConnectionAborted(ConnectionFailure),
     Cancelled,
+}
+impl Error {
+    /// A transport failure carrying the host's I/O error kind, OS code and text.
+    pub fn transport(error: &std::io::Error) -> Self {
+        Self::Transport(Some(error.into()))
+    }
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -56,7 +66,10 @@ impl fmt::Display for Error {
             Self::Protocol(s) | Self::State(s) => f.write_str(s),
             Self::Limit => f.write_str("protocol buffer limit exceeded"),
             Self::Timeout => f.write_str("Connection terminated due to timeout"),
-            Self::Transport => f.write_str("Connection terminated unexpectedly"),
+            Self::Transport(None) => f.write_str("Connection terminated unexpectedly"),
+            Self::Transport(Some(failure)) => {
+                write!(f, "Connection terminated unexpectedly: {failure}")
+            }
             Self::ConnectionAborted(error) => write!(f, "Connection aborted: {error}"),
             Self::Cancelled => f.write_str("Connection terminated"),
         }
@@ -65,12 +78,56 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 impl From<Error> for std::io::Error {
     fn from(error: Error) -> Self {
-        let kind = match error {
-            Error::ConnectionAborted(_) | Error::Transport => std::io::ErrorKind::ConnectionAborted,
+        let kind = match &error {
+            Error::Transport(Some(failure)) => failure.kind(),
+            Error::ConnectionAborted(_) | Error::Transport(None) => {
+                std::io::ErrorKind::ConnectionAborted
+            }
             Error::Timeout => std::io::ErrorKind::TimedOut,
             _ => std::io::ErrorKind::Other,
         };
         Self::new(kind, error)
+    }
+}
+/// Host-supplied transport diagnostic. Clones share one copy of the message,
+/// so aborting a pipeline of tokens allocates nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransportFailure {
+    kind: std::io::ErrorKind,
+    code: Option<i32>,
+    message: std::sync::Arc<str>,
+}
+impl TransportFailure {
+    /// `code` is whatever error number the host reports (OS errno, libuv code).
+    pub fn new(
+        kind: std::io::ErrorKind,
+        code: Option<i32>,
+        message: impl Into<std::sync::Arc<str>>,
+    ) -> Self {
+        Self {
+            kind,
+            code,
+            message: message.into(),
+        }
+    }
+    pub fn kind(&self) -> std::io::ErrorKind {
+        self.kind
+    }
+    pub fn code(&self) -> Option<i32> {
+        self.code
+    }
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+impl From<&std::io::Error> for TransportFailure {
+    fn from(error: &std::io::Error) -> Self {
+        Self::new(error.kind(), error.raw_os_error(), error.to_string())
+    }
+}
+impl fmt::Display for TransportFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
     }
 }
 impl From<std::io::Error> for Error {
@@ -131,7 +188,8 @@ pub enum Outcome {
 #[derive(Debug)]
 pub enum Event<'a> {
     UpgradeTls,
-    /// Build upstream ScramSha256 outside the core (its constructor reads entropy).
+    /// Build upstream ScramSha256 outside the core (its constructor reads entropy)
+    /// from `Connection::config().password`, then call `start_scram`.
     ScramNeeded {
         plus: bool,
     },
@@ -188,6 +246,225 @@ pub enum Event<'a> {
     Closed {
         reason: Error,
     },
+}
+/// [`Event`] with every borrowed payload copied out, for hosts that retain
+/// rows, errors or notifications past the next mutable call. `as_event` lends
+/// it back in borrowed form, so one host handler can consume either.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnedEvent {
+    UpgradeTls,
+    ScramNeeded {
+        plus: bool,
+    },
+    Connected,
+    ParameterStatus {
+        name: String,
+        value: String,
+    },
+    Fields {
+        token: Token,
+        fields: OwnedFields,
+    },
+    Row {
+        token: Token,
+        row: OwnedRow,
+    },
+    CommandComplete {
+        token: Token,
+        tag: String,
+        row_count: Option<u64>,
+    },
+    Error {
+        token: Option<Token>,
+        error: OwnedServerError,
+    },
+    Notice(OwnedServerError),
+    Notification {
+        process_id: i32,
+        channel: String,
+        payload: String,
+    },
+    CopyIn {
+        token: Token,
+        binary: bool,
+        column_formats: Vec<u8>,
+    },
+    CopyOut {
+        token: Token,
+        binary: bool,
+        column_formats: Vec<u8>,
+    },
+    CopyData {
+        token: Token,
+        data: Vec<u8>,
+    },
+    CopyDone {
+        token: Token,
+    },
+    Completed {
+        token: Token,
+        outcome: Outcome,
+        transaction: TransactionStatus,
+    },
+    Closed {
+        reason: Error,
+    },
+}
+impl Event<'_> {
+    /// Copy the event out of the connection's buffer. Only borrowed payloads
+    /// allocate: each string, byte slice, row, field list or diagnostic once.
+    pub fn into_owned(self) -> OwnedEvent {
+        match self {
+            Self::UpgradeTls => OwnedEvent::UpgradeTls,
+            Self::ScramNeeded { plus } => OwnedEvent::ScramNeeded { plus },
+            Self::Connected => OwnedEvent::Connected,
+            Self::ParameterStatus { name, value } => OwnedEvent::ParameterStatus {
+                name: name.into(),
+                value: value.into(),
+            },
+            Self::Fields { token, fields } => OwnedEvent::Fields {
+                token,
+                fields: fields.into_owned(),
+            },
+            Self::Row { token, row } => OwnedEvent::Row {
+                token,
+                row: row.into_owned(),
+            },
+            Self::CommandComplete {
+                token,
+                tag,
+                row_count,
+            } => OwnedEvent::CommandComplete {
+                token,
+                tag: tag.into(),
+                row_count,
+            },
+            Self::Error { token, error } => OwnedEvent::Error {
+                token,
+                error: error.into_owned(),
+            },
+            Self::Notice(error) => OwnedEvent::Notice(error.into_owned()),
+            Self::Notification {
+                process_id,
+                channel,
+                payload,
+            } => OwnedEvent::Notification {
+                process_id,
+                channel: channel.into(),
+                payload: payload.into(),
+            },
+            Self::CopyIn {
+                token,
+                binary,
+                column_formats,
+            } => OwnedEvent::CopyIn {
+                token,
+                binary,
+                column_formats: column_formats.into(),
+            },
+            Self::CopyOut {
+                token,
+                binary,
+                column_formats,
+            } => OwnedEvent::CopyOut {
+                token,
+                binary,
+                column_formats: column_formats.into(),
+            },
+            Self::CopyData { token, data } => OwnedEvent::CopyData {
+                token,
+                data: data.into(),
+            },
+            Self::CopyDone { token } => OwnedEvent::CopyDone { token },
+            Self::Completed {
+                token,
+                outcome,
+                transaction,
+            } => OwnedEvent::Completed {
+                token,
+                outcome,
+                transaction,
+            },
+            Self::Closed { reason } => OwnedEvent::Closed { reason },
+        }
+    }
+}
+impl OwnedEvent {
+    /// Borrow the retained event in the form `next_event` produced it.
+    pub fn as_event(&self) -> Event<'_> {
+        match self {
+            Self::UpgradeTls => Event::UpgradeTls,
+            Self::ScramNeeded { plus } => Event::ScramNeeded { plus: *plus },
+            Self::Connected => Event::Connected,
+            Self::ParameterStatus { name, value } => Event::ParameterStatus { name, value },
+            Self::Fields { token, fields } => Event::Fields {
+                token: *token,
+                fields: fields.fields(),
+            },
+            Self::Row { token, row } => Event::Row {
+                token: *token,
+                row: row.row(),
+            },
+            Self::CommandComplete {
+                token,
+                tag,
+                row_count,
+            } => Event::CommandComplete {
+                token: *token,
+                tag,
+                row_count: *row_count,
+            },
+            Self::Error { token, error } => Event::Error {
+                token: *token,
+                error: error.server_error(),
+            },
+            Self::Notice(error) => Event::Notice(error.server_error()),
+            Self::Notification {
+                process_id,
+                channel,
+                payload,
+            } => Event::Notification {
+                process_id: *process_id,
+                channel,
+                payload,
+            },
+            Self::CopyIn {
+                token,
+                binary,
+                column_formats,
+            } => Event::CopyIn {
+                token: *token,
+                binary: *binary,
+                column_formats,
+            },
+            Self::CopyOut {
+                token,
+                binary,
+                column_formats,
+            } => Event::CopyOut {
+                token: *token,
+                binary: *binary,
+                column_formats,
+            },
+            Self::CopyData { token, data } => Event::CopyData {
+                token: *token,
+                data,
+            },
+            Self::CopyDone { token } => Event::CopyDone { token: *token },
+            Self::Completed {
+                token,
+                outcome,
+                transaction,
+            } => Event::Completed {
+                token: *token,
+                outcome: outcome.clone(),
+                transaction: *transaction,
+            },
+            Self::Closed { reason } => Event::Closed {
+                reason: reason.clone(),
+            },
+        }
+    }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -250,6 +527,19 @@ pub struct Connection {
     reason: Error,
 }
 impl Connection {
+    /// Validate `config` and queue the first message, so `output()` is already
+    /// non-empty on return: the StartupMessage, or with `SslMode::Prefer`/
+    /// `Require` the SSLRequest. Send it as soon as the transport connects;
+    /// nothing else will produce it.
+    ///
+    /// ```
+    /// use turnloop_postgres::{Config, Connection, SslMode};
+    /// let c = Connection::new(Config::default())?;
+    /// assert!(c.output().windows(5).any(|w| w == b"user\0"), "StartupMessage");
+    /// let tls = Connection::new(Config { ssl: SslMode::Require, ..Config::default() })?;
+    /// assert_eq!(tls.output(), [0, 0, 0, 8, 4, 210, 22, 47], "SSLRequest");
+    /// # Ok::<(), turnloop_postgres::Error>(())
+    /// ```
     pub fn new(config: Config) -> Result<Self> {
         if config.max_buffer < 1024
             || config.max_buffer > i32::MAX as usize
@@ -283,7 +573,7 @@ impl Connection {
             copy_in: false,
             transaction: TransactionStatus::Idle,
             key: None,
-            reason: Error::Transport,
+            reason: Error::Transport(None),
         };
         if this.config.ssl == SslMode::Disable {
             this.startup()?;
@@ -306,6 +596,11 @@ impl Connection {
         )?;
         self.state = State::Auth;
         Ok(())
+    }
+    /// The configuration this connection was built from. On `ScramNeeded`,
+    /// build `ScramSha256` from `config().password`; the host keeps no copy.
+    pub fn config(&self) -> &Config {
+        &self.config
     }
     pub fn output(&self) -> &[u8] {
         &self.output[self.output_at..]
@@ -626,6 +921,11 @@ impl Connection {
     /// `Error::ConnectionAborted` immediately and makes the session unusable.
     /// Continue pulling to drain one Aborted completion per pending token, then
     /// Closed; a later transport abort cannot replace the server diagnostic.
+    ///
+    /// After `ScramNeeded`, pulling again before `start_scram` returns
+    /// `Error::State` instead of `Ok(None)`: an unanswered SCRAM request is a
+    /// host error, not idleness. The connection is unchanged, so `start_scram`
+    /// (or `abort`) is still accepted afterwards.
     pub fn next_event(&mut self) -> Result<Option<Event<'_>>> {
         if self.state == State::Closing {
             if let Some(p) = self.pending.pop_front() {
@@ -643,7 +943,14 @@ impl Connection {
                 reason: self.reason.clone(),
             }));
         }
-        if matches!(self.state, State::Closed | State::Tls | State::Scram(_)) {
+        if let State::Scram(_) = self.state {
+            // Nothing can progress until the host answers ScramNeeded; an
+            // Ok(None) here would look like "no input yet" and stall silently.
+            return Err(Error::State(
+                "SCRAM authentication pending: answer ScramNeeded with start_scram",
+            ));
+        }
+        if matches!(self.state, State::Closed | State::Tls) {
             return Ok(None);
         }
         if self.state == State::Ssl {
