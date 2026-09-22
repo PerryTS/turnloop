@@ -140,9 +140,20 @@ pub enum Event<'a> {
         token: Token,
         row: Row<'a>,
     },
+    /// A genuine OK packet: a command or one statement of a multi-statement
+    /// query finished without a result set. `affected_rows`, `last_insert_id`
+    /// and `info` are meaningful.
     Ok {
         token: Token,
         packet: OkPacket<'a>,
+    },
+    /// The EOF packet ending one result set's rows. It carries no row counts,
+    /// only the warning count and status flags (`SERVER_MORE_RESULTS_EXISTS`
+    /// announces another result).
+    Eof {
+        token: Token,
+        warnings: u16,
+        status: StatusFlags,
     },
     Prepared {
         token: Token,
@@ -938,8 +949,9 @@ impl Connection {
             }
             State::Rows => {
                 if self.packet[0] == 0xfe && self.packet.len() < 9 {
-                    let ok = parse_eof(&self.packet, self.caps)?;
-                    self.status = ok.status_flags();
+                    let eof = parse_eof(&self.packet, self.caps)?;
+                    let warnings = eof.warnings();
+                    self.status = eof.status_flags();
                     if self
                         .status
                         .contains(StatusFlags::SERVER_MORE_RESULTS_EXISTS)
@@ -948,9 +960,10 @@ impl Connection {
                     } else {
                         self.complete(Outcome::Success);
                     }
-                    return Ok(Some(Event::Ok {
+                    return Ok(Some(Event::Eof {
                         token: self.token()?,
-                        packet: parse_eof(&self.packet, self.caps)?,
+                        warnings,
+                        status: self.status,
                     }));
                 }
                 return Ok(Some(Event::Row {

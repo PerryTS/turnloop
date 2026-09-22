@@ -61,7 +61,7 @@ Provide absolute deadlines; schedule `next_timeout` and call
 deadline; Config does not read a clock. On EOF/TLS failure or a parsing error,
 call `abort(error)` and drain events. A parsing error is terminal; never continue
 the byte stream after it. Each accepted command yields exactly one Completed;
-server Error and result Ok events are informational. Close emits one Closed.
+server Error, Ok and Eof events are informational. Close emits one Closed.
 Command rejection accepts no token. There are no callbacks from this core.
 
 MySQL permits one active command. Busy calls return backpressure;
@@ -70,7 +70,9 @@ methods call it themselves), so a host queue never copies the rule. The adapter
 queues commands in JS submission order. This prevents unsynchronized packet
 sequence resets. COM_QUERY supports multiple result sets (multiple statements
 are opt-in); EOF negotiation deliberately selects legacy EOF, which MySQL 9.6
-supports. Result Ok includes affected_rows, last_insert_id, warnings and status.
+supports. `Ok` is a real OK packet (affected_rows, last_insert_id, warnings,
+status); `Eof` ends a result set's rows and carries only warnings and status,
+so a host need not track whether a result set is open to read either one.
 
 Prepare emits parameter/column metadata and a Statement ID. Execute accepts
 mysql_common Value parameters and emits binary rows. Reset/close statements,

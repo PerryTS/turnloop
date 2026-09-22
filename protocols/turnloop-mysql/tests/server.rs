@@ -8,6 +8,7 @@ use turnloop_mysql::*;
 struct Results {
     rows: Vec<Vec<Value>>,
     oks: Vec<(u64, u64, u16)>,
+    eofs: Vec<u16>,
     errors: Vec<(u16, String, String)>,
     completed: Vec<Outcome>,
     statement: Option<Statement>,
@@ -111,6 +112,7 @@ impl Driver {
                     packet.last_insert_id().unwrap_or(0),
                     packet.warnings(),
                 )),
+                Event::Eof { warnings, .. } => r.eofs.push(warnings),
                 Event::Prepared { statement, .. } => r.statement = Some(statement),
                 Event::Error { error, .. } => r.errors.push((
                     error.errno,
@@ -191,6 +193,8 @@ fn auth_prepared_transactions_compression_and_infile() {
     let r=d.query("CREATE TEMPORARY TABLE items(id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY, name TEXT); INSERT INTO items(name) VALUES('one'),('two'); SELECT * FROM items ORDER BY id");
     assert_eq!(r.rows.len(), 2);
     assert!(r.oks.contains(&(2, 1, 0)));
+    assert_eq!(r.oks.len(), 2, "CREATE and INSERT end in OK packets");
+    assert_eq!(r.eofs, [0], "only the SELECT ends in a result-set EOF");
     assert_eq!(
         r.rows[0],
         vec![Value::Bytes(b"1".to_vec()), Value::Bytes(b"one".to_vec())]

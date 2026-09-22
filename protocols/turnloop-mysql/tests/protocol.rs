@@ -594,6 +594,67 @@ fn close_statement_forgets_the_statement_only_after_its_bytes_are_sent() {
         Err(Error::State("unknown prepared statement"))
     );
 }
+/// A statement's OK packet and a result set's terminating EOF are different
+/// events, so a host never reads an EOF's bytes as affected rows.
+#[test]
+fn ok_packets_and_result_set_eofs_are_distinct_events() {
+    let mut c = ready();
+    c.query(1, "INSERT INTO t VALUES (1),(2),(3); SELECT 42", None)
+        .expect("fixture operation must succeed");
+    flush(&mut c);
+    // OK: affected_rows 3, last_insert_id 9, SERVER_MORE_RESULTS_EXISTS | AUTOCOMMIT.
+    let insert = frame(1, &[0, 3, 9, 10, 0, 0, 0]);
+    // Legacy EOF: 0xfe, warnings = 3, status = AUTOCOMMIT.
+    let end = frame(6, &[0xfe, 3, 0, 2, 0]);
+    c.receive(
+        &[
+            insert,
+            frame(2, &[1]),
+            column(3, ColumnType::MYSQL_TYPE_LONG),
+            eof(4, 2),
+            frame(5, b"\x0242"),
+            end,
+        ]
+        .concat(),
+    )
+    .expect("fixture operation must succeed");
+    let mut seen = Vec::new();
+    while let Some(e) = c.next_event().expect("fixture operation must succeed") {
+        match e {
+            Event::Ok { token, packet } => seen.push(format!(
+                "ok {token} affected={} id={:?} more={}",
+                packet.affected_rows(),
+                packet.last_insert_id(),
+                packet
+                    .status_flags()
+                    .contains(StatusFlags::SERVER_MORE_RESULTS_EXISTS)
+            )),
+            Event::Eof {
+                token,
+                warnings,
+                status,
+            } => seen.push(format!(
+                "eof {token} warnings={warnings} more={}",
+                status.contains(StatusFlags::SERVER_MORE_RESULTS_EXISTS)
+            )),
+            Event::Row { .. } => seen.push("row".into()),
+            Event::Completed { token, outcome } => {
+                seen.push(format!("completed {token} {outcome:?}"))
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        seen,
+        [
+            "ok 1 affected=3 id=Some(9) more=true",
+            "row",
+            "eof 1 warnings=3 more=false",
+            "completed 1 Success",
+        ]
+    );
+    assert_eq!(c.status(), StatusFlags::SERVER_STATUS_AUTOCOMMIT);
+}
 /// `can_accept` is the admission rule itself: whenever it is false a command is
 /// rejected without side effects, and whenever it is true the next one is taken.
 #[test]
