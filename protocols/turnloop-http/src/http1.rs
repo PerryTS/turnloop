@@ -47,6 +47,16 @@ impl Head {
             .find(|h| h.name.eq_ignore_ascii_case(name))
             .map(|h| h.value.as_slice())
     }
+    /// Every value of a header that may repeat, in wire order. [`get`](Self::get)
+    /// returns only the first line; a list-valued field such as
+    /// `Content-Encoding` needs all of them, for example
+    /// `StreamingDecoder::from_codings(head.values("content-encoding"), limit)`.
+    pub fn values<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a [u8]> + 'a {
+        self.headers
+            .iter()
+            .filter(move |h| h.name.eq_ignore_ascii_case(name))
+            .map(|h| h.value.as_slice())
+    }
     pub fn token(&self, name: &str, token: &str) -> bool {
         self.headers
             .iter()
@@ -54,9 +64,19 @@ impl Head {
             .any(|h| tokens(&h.value).any(|t| t.eq_ignore_ascii_case(token.as_bytes())))
     }
 }
+/// Which side of the connection a [`Decoder`] reads.
+///
+/// The two modes raise the same [`Event`]s, [`Event::Upgrade`] included: a
+/// server decoding an upgrade or CONNECT request sees it just as a client
+/// decoding the `101` or `2xx` does. What differs is who decides. In
+/// [`Mode::Response`] the peer has already switched protocols, so the decoder
+/// is finished with the connection. In [`Mode::Request`] the peer has only
+/// asked, and the host answers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
+    /// Server side: decode requests.
     Request,
+    /// Client side: decode responses. Call [`Decoder::response_to`] first.
     Response,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,7 +99,30 @@ pub enum Event<'a> {
     Informational(Head),
     Body(&'a [u8]),
     Trailers(Vec<Header>),
+    /// The message is complete. Reads no input: see [`Step`].
     End,
+    /// The message is complete, and it leaves HTTP/1 or asks to. Raised
+    /// *instead of* [`Event::End`], with `consumed == 0`, as the last event of
+    /// the message. Every byte after it belongs to the next protocol, so the
+    /// host takes its retained input along.
+    ///
+    /// Both [`Mode`]s raise it:
+    ///
+    /// * [`Mode::Response`]: a `101 Switching Protocols`, or a `2xx` answer to a
+    ///   request passed to [`Decoder::response_to`] as `CONNECT`. The switch has
+    ///   happened, so the decoder is never [`reusable`](Decoder::reusable)
+    ///   afterwards.
+    /// * [`Mode::Request`]: an HTTP/1.1 request with an `Upgrade` header and
+    ///   the `upgrade` token in `Connection` (RFC 9110 section 7.8), or any
+    ///   `CONNECT` request. It follows the request body, if there is one. The
+    ///   switch has **not** happened: answering `101` (or `2xx` for CONNECT) is
+    ///   the host's decision. A host that accepts stops feeding this decoder.
+    ///   A host that declines sends an ordinary response and may carry on: the
+    ///   decoder is [`reusable`](Decoder::reusable) on the same terms as after
+    ///   [`Event::End`], and [`Decoder::reset`] resumes HTTP/1.
+    ///
+    /// An `Upgrade` header on an HTTP/1.0 request is ignored, as RFC 9110
+    /// section 7.8 requires, and that request ends with [`Event::End`].
     Upgrade,
 }
 /// One decode step: how much of `input` was consumed, and the event it
@@ -95,7 +138,37 @@ pub enum Event<'a> {
 /// | `0` | `Some` | an event that reads no input: [`Event::End`] and [`Event::Upgrade`] both arrive this way. |
 ///
 /// So the loop condition is `consumed > 0 || event.is_some()`, and a host that
-/// stops on either zero alone is wrong in one of the two directions.
+/// stops on either zero alone is wrong in one of the two directions:
+///
+/// ```
+/// # use turnloop_http::http1::{Decoder, Event, Mode};
+/// # let mut decoder = Decoder::new(Mode::Response, Default::default());
+/// # decoder.response_to("GET");
+/// # let mut input = b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nhi".to_vec();
+/// let mut ended = false;
+/// loop {
+///     let step = decoder.receive(&input)?;
+///     let consumed = step.consumed;
+///     let progressed = consumed > 0 || step.event.is_some();
+///     // Body borrows `input`, so handle the event before draining.
+///     ended |= matches!(step.event, Some(Event::End));
+///     input.drain(..consumed);
+///     if !progressed {
+///         break; // read more bytes from the transport, then continue
+///     }
+/// }
+/// // `End` came from a step after the last byte was consumed.
+/// assert!(ended && input.is_empty() && decoder.reusable());
+/// # Ok::<(), turnloop_http::Error>(())
+/// ```
+///
+/// **The zero-consumption event is the trap.** The step that consumes the last
+/// byte of a message does not carry `End`; the *next* call does, and it reads
+/// nothing. A host that loops while it has input - or stops when a step
+/// consumed nothing - never makes that call, and the finished message sits in
+/// the decoder until the peer's idle timeout closes the connection.
+/// [`Decoder::wants_step`] names the pending call for a host that keys its
+/// loop on input rather than on steps.
 #[derive(Debug)]
 pub struct Step<'a> {
     pub consumed: usize,
@@ -109,6 +182,8 @@ pub struct Decoder {
     head_request: bool,
     connect_request: bool,
     keep_alive: bool,
+    /// The request being read asks to leave HTTP/1, so it ends in `Upgrade`.
+    upgrade_request: bool,
 }
 fn invalid(message: &'static str) -> Error {
     Error::new("HPE_INVALID_HEADER_TOKEN", message)
@@ -202,6 +277,7 @@ impl Decoder {
             head_request: false,
             connect_request: false,
             keep_alive: false,
+            upgrade_request: false,
         }
     }
     /// Must precede response parsing. Pipelining is intentionally not provided.
@@ -211,6 +287,57 @@ impl Decoder {
     }
     pub fn reusable(&self) -> bool {
         self.state == State::Done && self.keep_alive
+    }
+    /// True when the decoder holds an event that reads no input, so the host
+    /// must call [`receive`](Self::receive) again even with nothing new to feed
+    /// it - an empty slice will do. That event is [`Event::End`] or
+    /// [`Event::Upgrade`]. It becomes pending when the last body byte, the
+    /// final chunk or the head of a bodiless message is consumed, and after
+    /// [`eof`](Self::eof) ends a close-delimited body.
+    ///
+    /// This is the signal a host that drives on "bytes to feed" is missing.
+    /// Such a host stops once its buffer is empty and never sees `End`: the
+    /// message sits finished inside the decoder, the connection is not
+    /// [`reusable`](Self::reusable), and only the peer's idle timeout ends the
+    /// exchange. Loop while `!input.is_empty() || decoder.wants_step()`, or use
+    /// the [`Step`] contract's condition, which covers the same case.
+    pub fn wants_step(&self) -> bool {
+        matches!(self.state, State::End | State::Upgrade)
+    }
+    /// True between a message's [`Event::Head`] and the point its end is
+    /// reached: the body, chunk framing or trailers are still being read. False
+    /// before the head (including after an [`Event::Informational`], which is
+    /// not the message), once `End` or `Upgrade` is owed or delivered, and after
+    /// a failure. Bytes of a head the host has buffered but not yet completed
+    /// are the host's to know; the decoder has not accepted them.
+    ///
+    /// A close-delimited body is mid-message too, though EOF is its legal end:
+    /// ask [`eof_is_clean`](Self::eof_is_clean) to tell the two apart.
+    pub fn is_mid_message(&self) -> bool {
+        matches!(
+            self.state,
+            State::Fixed(_)
+                | State::ChunkSize
+                | State::Chunk(_)
+                | State::ChunkEnd
+                | State::Trailers
+                | State::Eof
+        )
+    }
+    /// Whether the transport ending now would be a clean end rather than a
+    /// truncation: exactly the cases in which [`eof`](Self::eof) returns `Ok`,
+    /// answered without changing any state. True inside a close-delimited body
+    /// and once the message is complete; false inside a framed body, before a
+    /// head arrives and after a failure. So a host whose read returned zero can
+    /// choose what to do - retry, fail with its own diagnosis, log - before it
+    /// commits to `eof`.
+    ///
+    /// Before a head is always "not clean" here, because a client that sees EOF
+    /// there got no response. A server whose connection closes while idle
+    /// between requests (with no buffered head bytes) treats that as an
+    /// ordinary close on its own.
+    pub fn eof_is_clean(&self) -> bool {
+        matches!(self.state, State::Eof | State::End | State::Done)
     }
     pub fn reset(&mut self) -> Result<()> {
         if !self.reusable() {
@@ -288,6 +415,12 @@ impl Decoder {
                 head.keep_alive = !head.token("connection", "close")
                     && (head.version == 1 || head.token("connection", "keep-alive"));
                 self.keep_alive = head.keep_alive;
+                // RFC 9110 7.8: an Upgrade in an HTTP/1.0 request is ignored.
+                self.upgrade_request = self.mode == Mode::Request
+                    && (head.method == "CONNECT"
+                        || (head.version == 1
+                            && head.get("upgrade").is_some()
+                            && head.token("connection", "upgrade")));
                 step.consumed = end;
                 if self.mode == Mode::Response
                     && (100..200).contains(&head.status)
@@ -430,7 +563,11 @@ impl Decoder {
             }
             State::End => {
                 self.state = State::Done;
-                step.event = Some(Event::End);
+                step.event = Some(if self.upgrade_request {
+                    Event::Upgrade
+                } else {
+                    Event::End
+                });
             }
             State::Upgrade => {
                 self.state = State::Done;
@@ -441,23 +578,45 @@ impl Decoder {
         }
         Ok(step)
     }
+    /// Declare the end of input. Ends a close-delimited body (leaving
+    /// [`Event::End`] owed, see [`wants_step`](Self::wants_step)); anywhere
+    /// [`eof_is_clean`](Self::eof_is_clean) is false it fails the decoder.
     pub fn eof(&mut self) -> Result<()> {
+        if !self.eof_is_clean() {
+            self.state = State::Failed;
+            return Err(Error::new("UND_ERR_SOCKET", "unexpected EOF"));
+        }
         if self.state == State::Eof {
             self.state = State::End;
-            Ok(())
-        } else if matches!(self.state, State::End | State::Done) {
-            Ok(())
-        } else {
-            self.state = State::Failed;
-            Err(Error::new("UND_ERR_SOCKET", "unexpected EOF"))
         }
+        Ok(())
     }
 }
+/// How the body after an encoded head is framed.
 #[derive(Debug, Clone, Copy)]
 pub enum BodyLength {
+    /// No body. A `Content-Length` in the head, if any, must be `0`.
     Empty,
+    /// Exactly this many bytes, framed by `Content-Length`.
     Known(u64),
+    /// `Transfer-Encoding: chunked`; the only framing that carries trailers.
     Chunked,
+    /// Responses only: no framing, the body ends when the connection closes
+    /// (RFC 9112 section 6.3, rule 8). The head must carry neither
+    /// `Content-Length` nor `Transfer-Encoding`, and after
+    /// [`finish`](Encoder::finish) the host closes the connection - that close
+    /// *is* the end of the body. Adding `connection: close` is the host's
+    /// choice; the peer reads to EOF either way.
+    CloseDelimited,
+    /// Responses only: the head's framing headers are sent exactly as given,
+    /// and no body follows them. This is a response to HEAD, which advertises
+    /// the `Content-Length` (or chunked coding) it *would* have sent, and a
+    /// `304`, which may do the same. A `204` or `1xx` may not advertise a length
+    /// at all (RFC 9110 sections 8.6 and 15.2), so either header is refused
+    /// there. The encoder cannot see the request method, so a HEAD response is
+    /// the host's word. No framing header is added, and [`body`](Encoder::body)
+    /// accepts only empty slices.
+    Omitted,
 }
 /// Caller-owned wire buffer, reused across commands. No body buffering.
 pub struct Encoder {
@@ -465,22 +624,61 @@ pub struct Encoder {
     finished: bool,
 }
 impl Encoder {
+    /// Encode a head. A response's status line uses the canonical reason
+    /// phrase; [`start_with_reason`](Self::start_with_reason) sets another one.
     pub fn start(head: &Head, body: BodyLength, out: &mut Vec<u8>) -> Result<Self> {
+        Self::encode(head, None, body, out)
+    }
+    /// Encode a response head with a custom reason phrase, as Node's
+    /// `res.writeHead(404, "Nope")` puts `HTTP/1.1 404 Nope` on the wire. The
+    /// phrase may be empty, and may hold spaces, tabs, visible ASCII and
+    /// obs-text (RFC 9112 section 4); a request head or a control character is
+    /// refused before anything is written.
+    pub fn start_with_reason(
+        head: &Head,
+        reason: &str,
+        body: BodyLength,
+        out: &mut Vec<u8>,
+    ) -> Result<Self> {
+        if head.status == 0 {
+            return Err(invalid("reason phrase on a request"));
+        }
+        if reason.bytes().any(|b| (b < 32 && b != b'\t') || b == 127) {
+            return Err(invalid("invalid reason phrase"));
+        }
+        Self::encode(head, Some(reason), body, out)
+    }
+    fn encode(
+        head: &Head,
+        reason: Option<&str>,
+        body: BodyLength,
+        out: &mut Vec<u8>,
+    ) -> Result<Self> {
         // Validate everything before mutating the output.
         for h in &head.headers {
             validate_field(h)?;
         }
         let (cl, te) = lengths(head)?;
-        let expect_cl = match body {
-            BodyLength::Known(n) => Some(n),
-            BodyLength::Empty => Some(0),
-            BodyLength::Chunked => None,
+        let conflict = match body {
+            BodyLength::Known(n) => te || cl.is_some_and(|cl| cl != n),
+            BodyLength::Empty => te || cl.is_some_and(|cl| cl != 0),
+            BodyLength::Chunked => cl.is_some(),
+            BodyLength::CloseDelimited => te || cl.is_some(),
+            BodyLength::Omitted => {
+                (cl.is_some() || te) && (head.status < 200 || head.status == 204)
+            }
         };
-        if (cl.is_some() && cl != expect_cl)
-            || (te && !matches!(body, BodyLength::Chunked))
-            || (cl.is_some() && matches!(body, BodyLength::Chunked))
-        {
+        if conflict {
             return Err(invalid("body length conflicts with headers"));
+        }
+        let response_only = matches!(body, BodyLength::CloseDelimited | BodyLength::Omitted);
+        if response_only && head.status == 0 {
+            return Err(invalid("body length is only valid for a response"));
+        }
+        if matches!(body, BodyLength::CloseDelimited)
+            && (head.status < 200 || matches!(head.status, 204 | 304))
+        {
+            return Err(invalid("status forbids a body"));
         }
         if head.status == 0 {
             if !valid_token(head.method.as_bytes()) {
@@ -493,13 +691,8 @@ impl Encoder {
         } else {
             let status =
                 http::StatusCode::from_u16(head.status).map_err(|_| invalid("invalid status"))?;
-            write!(
-                out,
-                "HTTP/1.1 {} {}\r\n",
-                head.status,
-                status.canonical_reason().unwrap_or("")
-            )
-            .unwrap();
+            let reason = reason.unwrap_or(status.canonical_reason().unwrap_or(""));
+            write!(out, "HTTP/1.1 {} {reason}\r\n", head.status).unwrap();
         }
         for h in &head.headers {
             out.extend_from_slice(h.name.as_bytes());
@@ -511,7 +704,7 @@ impl Encoder {
             match body {
                 BodyLength::Known(n) => write!(out, "content-length: {n}\r\n").unwrap(),
                 BodyLength::Chunked => out.extend_from_slice(b"transfer-encoding: chunked\r\n"),
-                BodyLength::Empty => {}
+                BodyLength::Empty | BodyLength::CloseDelimited | BodyLength::Omitted => {}
             }
         }
         out.extend_from_slice(b"\r\n");
@@ -525,11 +718,12 @@ impl Encoder {
             return Err(invalid("body already finished"));
         }
         match self.left {
-            BodyLength::Empty => {
+            BodyLength::Empty | BodyLength::Omitted => {
                 if !bytes.is_empty() {
                     return Err(invalid("unexpected body"));
                 }
             }
+            BodyLength::CloseDelimited => out.extend_from_slice(bytes),
             BodyLength::Known(n) => {
                 if bytes.len() as u64 > n {
                     return Err(invalid("body exceeds content-length"));

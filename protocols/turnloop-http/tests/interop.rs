@@ -116,7 +116,7 @@ fn response(stream: &mut impl Read, decoder: &mut http1::Decoder) -> (Head, Vec<
     loop {
         let step = decoder.receive(&buffer).unwrap();
         let progressed = step.consumed > 0 || step.event.is_some();
-        let end = matches!(step.event, Some(http1::Event::End));
+        let end = matches!(step.event, Some(http1::Event::End | http1::Event::Upgrade));
         match step.event {
             Some(http1::Event::Head(h)) => head = Some(h),
             Some(http1::Event::Body(bytes)) => body.extend_from_slice(bytes),
