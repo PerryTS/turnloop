@@ -235,6 +235,10 @@ mod native {
         multishot_accept_respects_the_handle_ceiling::<B>();
     }
     #[test]
+    fn multishot_accept_parked_after_its_read_fired() {
+        super::multishot_accept_parked_after_its_read_fired::<B>();
+    }
+    #[test]
     fn cancellation_close() {
         cancel_close_ordering::<B>();
     }
@@ -1297,6 +1301,120 @@ pub fn multishot_accept_respects_the_handle_ceiling<B: Backend>() {
     while l.alive() {
         assert!(Instant::now() < deadline, "the loop never drained");
         l.turn(Timeout::After(Duration::from_millis(50)), &mut out)
+            .expect("drain");
+        for c in out.drain() {
+            assert!(
+                matches!(c.result, OpResult::Stopped | OpResult::Closed),
+                "unexpected {:?}",
+                c.result
+            );
+        }
+    }
+    drop(clients);
+}
+
+/// A multishot accept whose connection arrives once the budget is spent (#77).
+///
+/// Two listeners share the handle ceiling. Both accepts are started while the
+/// backlogs are empty, then the second listener's connections take every free
+/// slot, so the first listener's accept is already waiting on the backend when
+/// its connection arrives with nothing left to house it. That connection must
+/// wait without the loop spinning — on WASI 0.3 the fired waitable would
+/// otherwise stay in the wait-set — and must be delivered, not lost, as soon as
+/// a slot frees up.
+pub fn multishot_accept_parked_after_its_read_fired<B: Backend>() {
+    let mut l = Driver::<B>::new(Config {
+        max_handles: 4,
+        max_operations: 16,
+        ..Config::default()
+    })
+    .expect("loop");
+    let first = l
+        .tcp_listen(localhost(), &ListenOpts::default())
+        .expect("listen");
+    let second = l
+        .tcp_listen(localhost(), &ListenOpts::default())
+        .expect("listen");
+    let first_addr = l.local_addr(first).expect("addr");
+    let second_addr = l.local_addr(second).expect("addr");
+    let first_accept = l.accept_start(first, Token(1)).expect("accept");
+    let second_accept = l.accept_start(second, Token(2)).expect("accept");
+    let mut out = Completions::with_capacity(16);
+    // Both accepts start waiting on empty backlogs.
+    for _ in 0..3 {
+        l.turn(Timeout::After(Duration::from_millis(5)), &mut out)
+            .expect("turn");
+        assert!(out.is_empty(), "nothing has connected yet");
+    }
+    // The second listener's two connections take both free slots.
+    let mut clients: Vec<std::net::TcpStream> = (0..2)
+        .map(|_| std::net::TcpStream::connect(second_addr).expect("client"))
+        .collect();
+    let mut live = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while live.len() < 2 {
+        assert!(Instant::now() < deadline, "only {} accepted", live.len());
+        l.turn(Timeout::After(Duration::from_millis(20)), &mut out)
+            .expect("turn");
+        for c in out.drain() {
+            let OpResult::Accepted { conn, .. } = c.result else {
+                panic!("unexpected {:?}", c.result);
+            };
+            assert_eq!(c.op, Some(second_accept));
+            live.push(conn);
+        }
+    }
+    clients.push(std::net::TcpStream::connect(first_addr).expect("client"));
+    // At the ceiling the first listener's connection waits: turns deliver
+    // nothing, and each blocks for its timeout instead of spinning.
+    let quiet = Instant::now();
+    let mut turns = 0;
+    while quiet.elapsed() < Duration::from_millis(200) {
+        let info = l
+            .turn(Timeout::After(Duration::from_millis(20)), &mut out)
+            .expect("turn at the ceiling");
+        assert!(info.os_waits + info.discovery_polls <= 1);
+        assert!(
+            out.is_empty(),
+            "nothing past the ceiling: {:?}",
+            out[0].result
+        );
+        turns += 1;
+    }
+    assert!(
+        turns <= 20,
+        "{turns} turns in 200 ms at the ceiling: a spin"
+    );
+    // One freed slot delivers the waiting connection to the first listener.
+    l.close(live.pop().expect("a connection"), Token(3))
+        .expect("close");
+    let mut delivered = false;
+    while !delivered {
+        assert!(Instant::now() < deadline, "the waiting connection was lost");
+        l.turn(Timeout::After(Duration::from_millis(20)), &mut out)
+            .expect("turn");
+        for c in out.drain() {
+            match c.result {
+                OpResult::Closed => {}
+                OpResult::Accepted { conn, .. } => {
+                    assert_eq!(c.op, Some(first_accept));
+                    assert!(!delivered, "one connection, one delivery");
+                    live.push(conn);
+                    delivered = true;
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+    assert!(l.stop(first_accept));
+    assert!(l.stop(second_accept));
+    for h in live.drain(..).chain([first, second]) {
+        l.close(h, Token(4)).expect("close");
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while l.alive() {
+        assert!(Instant::now() < deadline, "the loop never drained");
+        l.turn(Timeout::After(Duration::from_millis(20)), &mut out)
             .expect("drain");
         for c in out.drain() {
             assert!(

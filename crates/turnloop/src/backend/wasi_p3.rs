@@ -266,6 +266,20 @@ impl WasiP3 {
         } else if held && !r.throttled {
             r.throttled = true;
             self.throttled.push_back(h);
+            // A parked accept whose read already fired keeps its outcome in
+            // `code`, which `execute` consumes once the budget resumes it; only
+            // `finish_wait` would otherwise take the waitable out of the set.
+            // Leave it there and every wait while the ceiling holds could return
+            // it again at once, a spin that produces nothing (rule 4a). Removing
+            // it runs no side effect and loses no connection; `finish_wait`
+            // removes it again harmlessly, since `join(_, 0)` is idempotent.
+            if let Some(p) = r.heads[0].and_then(|i| self.ops[i].as_ref())
+                && let Some((waitable, _)) = p.wait
+                && p.code.is_some()
+                && waitable != 0
+            {
+                self.wait_set.remove(waitable);
+            }
         }
     }
     /// Start a poll with `budget`: a positive one resumes every held listener.
