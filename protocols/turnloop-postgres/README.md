@@ -61,7 +61,9 @@ and RSA-PSS are supported; MD5/SHA-1 signatures use SHA-256. Unsupported algorit
    go into `receive`. Prefer mode can fall back after `N`; Require cannot.
 5. For `ScramNeeded`, construct the reexported upstream `ScramSha256` **in the
    host** (its constructor reads entropy) from `connection.config().password`,
-   then call `start_scram`. The host needs no second copy of the password. PLUS needs
+   then call `start_scram`. The host needs no second copy of the password. Until it
+   does, `next_event()` returns `Error::State` rather than `Ok(None)`, so an
+   ignored `ScramNeeded` fails visibly instead of stalling. PLUS needs
    `ChannelBinding::tls_server_end_point` containing the certificate digest
    defined in RFC 5929. For plain SCRAM use `ChannelBinding::unsupported()`.
    The core checks the mechanism/binding selection and

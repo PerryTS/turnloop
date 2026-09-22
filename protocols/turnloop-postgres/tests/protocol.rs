@@ -588,6 +588,15 @@ fn legacy_tls_acknowledgement_has_no_binding_and_uses_n_gs2_flag() {
         c.next_event().expect("selection"),
         Some(Event::ScramNeeded { plus: false })
     ));
+    // A host that ignores ScramNeeded must not see the Ok(None) of an idle
+    // connection; the error repeats and leaves the request answerable.
+    for _ in 0..2 {
+        assert_eq!(
+            c.next_event().expect_err("unanswered SCRAM request"),
+            Error::State("SCRAM authentication pending: answer ScramNeeded with start_scram")
+        );
+    }
+    assert!(c.output().is_empty());
     c.start_scram(ScramSha256::new(b"secret", ChannelBinding::unsupported()))
         .expect("plain SCRAM");
     let packet = flush(&mut c);

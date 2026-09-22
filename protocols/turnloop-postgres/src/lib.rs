@@ -908,6 +908,11 @@ impl Connection {
     /// `Error::ConnectionAborted` immediately and makes the session unusable.
     /// Continue pulling to drain one Aborted completion per pending token, then
     /// Closed; a later transport abort cannot replace the server diagnostic.
+    ///
+    /// After `ScramNeeded`, pulling again before `start_scram` returns
+    /// `Error::State` instead of `Ok(None)`: an unanswered SCRAM request is a
+    /// host error, not idleness. The connection is unchanged, so `start_scram`
+    /// (or `abort`) is still accepted afterwards.
     pub fn next_event(&mut self) -> Result<Option<Event<'_>>> {
         if self.state == State::Closing {
             if let Some(p) = self.pending.pop_front() {
@@ -925,7 +930,14 @@ impl Connection {
                 reason: self.reason.clone(),
             }));
         }
-        if matches!(self.state, State::Closed | State::Tls | State::Scram(_)) {
+        if let State::Scram(_) = self.state {
+            // Nothing can progress until the host answers ScramNeeded; an
+            // Ok(None) here would look like "no input yet" and stall silently.
+            return Err(Error::State(
+                "SCRAM authentication pending: answer ScramNeeded with start_scram",
+            ));
+        }
+        if matches!(self.state, State::Closed | State::Tls) {
             return Ok(None);
         }
         if self.state == State::Ssl {
