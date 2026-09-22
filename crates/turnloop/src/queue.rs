@@ -23,8 +23,9 @@ unsafe impl<T: Send> Send for Queue<T> {}
 /// `Slot`'s initial value **is** the all-zero bit pattern: `state` starts at 0,
 /// which is the empty state, and `value` is a `MaybeUninit` for which every
 /// pattern is valid. Building the slots with `map`/`collect` writes each one,
-/// which makes the entire ring resident at construction — 3.15 MiB for a
-/// 32 768-slot `WorkPort`, in a process that may never submit a blocking job.
+/// which makes the entire ring resident at construction — 3.15 MiB for the
+/// 32 768-slot `WorkPort` a large `max_operations` used to give a loop, in a
+/// process that may never submit a blocking job.
 ///
 /// Asking the allocator for zeroed memory instead gives a ready ring with no
 /// writes at all, and a zeroed allocation this large is fresh pages the OS
@@ -117,6 +118,10 @@ impl<T> Queue<T> {
     pub fn is_empty(&self) -> bool {
         self.occupied.load(Ordering::Acquire) == 0
     }
+    #[cfg(all(test, not(loom), not(target_arch = "wasm32")))]
+    pub fn capacity(&self) -> usize {
+        self.slots.len()
+    }
 }
 impl<T> Drop for Queue<T> {
     fn drop(&mut self) {
@@ -185,7 +190,7 @@ mod zeroed_ring {
     /// slots were constructed individually.
     ///
     /// The slots come from `alloc_zeroed` so that a large ring costs only the
-    /// pages it touches — `WorkPort` sizes its ring from `max_operations`, which
+    /// pages it touches — `WorkPort` sized its ring from `max_operations`, which
     /// a host legitimately sets to 32 768, and writing every slot made all
     /// 3.15 MiB of it resident in a process that may never submit a blocking
     /// job. That is only sound because `Slot`'s empty state IS the all-zero bit

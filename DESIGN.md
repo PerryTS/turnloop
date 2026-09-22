@@ -596,8 +596,16 @@ slab (`kernel`, and the `bridges` parallel to it) maps a completion packet's
 pointer back to an operation index by pointer arithmetic over one allocation;
 paging it needs a different reverse map, which is its own change. The cross-thread
 result rings are lock-free and index by a power-of-two mask, where the capacity is
-also the backpressure bound. `pooled_buffers` is a separate question, tracked in
-#43: it is the remaining per-loop cost that scales with configuration.
+also the backpressure bound. The post ring is sized by `post_capacity`; the
+result ring that pool workers and helper threads deliver into is sized by
+`PoolConfig::max_undelivered` (capped at `max_operations`), not by
+`max_operations` itself (#88). Every operation delivering through that ring —
+blocking jobs of both classes, pool lookups, typed file requests, external waits
+— holds one of its credits from acceptance until its result leaves the ring, and
+a submission past the ceiling is refused with `ResourceLimit`, so the ring can
+never be full when a worker pushes. `pooled_buffers` is the remaining per-loop
+cost that scales with configuration, the other half of #88.
+
 
 **Reaching the ceiling is backpressure.** An operation whose completion creates a
 handle — an accept, a handle receive — reserves its handle slot when it is

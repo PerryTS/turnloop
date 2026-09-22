@@ -279,6 +279,10 @@ mod native {
         long_jobs_settle_once_on_cancel_panic_and_shutdown::<B>();
     }
     #[test]
+    fn undelivered_pool_results_have_a_ceiling() {
+        undelivered_pool_results_are_bounded::<B>();
+    }
+    #[test]
     fn reuse_port_share_binds_twice() {
         reuse_port_share::<B>();
     }

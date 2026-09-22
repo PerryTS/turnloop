@@ -56,6 +56,9 @@ struct Op {
     /// backend accepted natively (such as WASI DNS). DESIGN §10 rule 3 keys
     /// queued-turn discovery on these operations.
     native: bool,
+    /// Delivers through the loop's result ring (`WorkPort`), and so holds one
+    /// of `PoolConfig::max_undelivered` credits until it retires.
+    port: bool,
     job_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     previous: Option<OpId>,
     next: Option<OpId>,
@@ -102,6 +105,10 @@ pub struct Driver<B: Backend> {
     /// for but not yet delivered. See [`Driver::submit`].
     reserved_handles: usize,
     native_pending: usize,
+    /// Operations delivering through `work_port` that have not retired: the
+    /// ring's occupancy can never exceed this, and admission keeps it at or
+    /// below `PoolConfig::max_undelivered`, which sizes the ring (issue #88).
+    undelivered: usize,
     config: Config,
     _local: PhantomData<Rc<()>>,
 }
@@ -115,6 +122,7 @@ impl<B: Backend> Driver<B> {
             || config.events_per_turn == 0
             || config.post_capacity == 0
             || config.pooled_buffer_size == 0
+            || config.blocking_pool.max_undelivered == 0
         {
             return Err(Error::new(ErrorKind::InvalidInput));
         }
@@ -129,7 +137,15 @@ impl<B: Backend> Driver<B> {
         let notifier = Notifier::new(backend.waker());
         backend.set_notifier(notifier.clone());
         let poster = Poster::new(config.post_capacity, notifier.clone());
-        let work_port = crate::blocking::WorkPort::new(config.max_operations, notifier.clone());
+        // Sized by the results that can be undelivered at once, not by every
+        // operation the loop may hold: see `PoolConfig::max_undelivered`.
+        let work_port = crate::blocking::WorkPort::new(
+            config
+                .blocking_pool
+                .max_undelivered
+                .min(config.max_operations),
+            notifier.clone(),
+        );
         let owner = loop {
             let current = NEXT_OWNER.load(Ordering::Relaxed);
             let next = current
@@ -171,6 +187,7 @@ impl<B: Backend> Driver<B> {
             outstanding: 0,
             reserved_handles: 0,
             native_pending: 0,
+            undelivered: 0,
             config,
             _local: PhantomData,
         })
@@ -260,6 +277,7 @@ impl<B: Backend> Driver<B> {
                 fs: false,
                 reserved_handles: 0,
                 native,
+                port: false,
                 previous,
                 next: None,
             })
@@ -291,12 +309,33 @@ impl<B: Backend> Driver<B> {
             key,
         })
     }
+    /// Refuse a submission whose result would have no room in the result ring.
+    ///
+    /// Checked before anything is created, like the pool's own queue limit, so
+    /// a refused submission owes no completion. See `PoolConfig::max_undelivered`.
+    fn admit_port(&self) -> Result<()> {
+        if self.undelivered >= self.config.blocking_pool.max_undelivered {
+            return Err(Error::new(ErrorKind::ResourceLimit));
+        }
+        Ok(())
+    }
+    /// Charge an admitted operation to the result ring until it retires.
+    fn charge_port(&mut self, op: OpId) {
+        let op = self.ops.get_mut(op.key).expect("admitted op");
+        debug_assert!(!op.port);
+        op.port = true;
+        self.undelivered += 1;
+        debug_assert!(self.undelivered <= self.config.blocking_pool.max_undelivered);
+    }
     fn retire(&mut self, id: OpId) -> Option<Op> {
         let op = self.ops.remove(id.key)?;
         self.connect_deadlines.cancel(id.key);
         self.reserved_handles -= op.reserved_handles;
         if op.native {
             self.native_pending -= 1;
+        }
+        if op.port {
+            self.undelivered -= 1;
         }
         if let Some(previous) = op.previous {
             self.ops.get_mut(previous.key).expect("previous").next = op.next;
@@ -1109,8 +1148,10 @@ impl<B: Backend> Driver<B> {
         deadline: Option<Instant>,
         token: Token,
     ) -> Result<OpId> {
+        self.admit_port()?;
         let op = self.new_op(None, token)?;
         self.ops.get_mut(op.key).expect("new wait").external_wait = true;
+        self.charge_port(op);
         if let Err(e) =
             crate::external_wait::submit(op, self.work_port.clone(), condition, expected, deadline)
         {
@@ -1135,6 +1176,9 @@ impl<B: Backend> Driver<B> {
         } else {
             Kind::Socket
         };
+        if B::FILESYSTEM == Filesystem::Pool {
+            self.admit_port()?;
+        }
         let target = request.handle();
         if let Some(h) = target {
             let r = self.resource(h)?;
@@ -1162,6 +1206,9 @@ impl<B: Backend> Driver<B> {
             }
         };
         self.ops.get_mut(op.key).expect("new request").fs = true;
+        if B::FILESYSTEM == Filesystem::Pool {
+            self.charge_port(op);
+        }
         let accepted = match B::FILESYSTEM {
             #[cfg(not(target_arch = "wasm32"))]
             Filesystem::Pool => self.files.submit(op, handle, request),
@@ -1356,7 +1403,9 @@ impl<B: Backend> Driver<B> {
             &std::sync::Arc<std::sync::atomic::AtomicBool>,
         ) -> Box<dyn FnOnce() -> Result<crate::blocking::WorkOutput> + Send>,
     {
+        self.admit_port()?;
         let op = self.new_op(None, token)?;
+        self.charge_port(op);
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.ops.get_mut(op.key).expect("new op").job_cancel = Some(cancel.clone());
         let f = make(&cancel);
@@ -2343,5 +2392,49 @@ impl Driver<crate::backend::web::Web> {
             return Err(e);
         }
         Ok(h)
+    }
+}
+
+#[cfg(all(test, not(loom), not(target_arch = "wasm32")))]
+mod result_ring {
+    use super::*;
+    /// The result ring holds every result that may be undelivered at once, and
+    /// no more: `max_undelivered`, capped by `max_operations` (issue #88).
+    #[test]
+    fn is_sized_by_undelivered_results_not_by_operations() {
+        let pool = PoolConfig {
+            max_undelivered: 100,
+            ..PoolConfig::default()
+        };
+        let l = Loop::new(Config {
+            max_operations: 32_768,
+            blocking_pool: pool,
+            ..Config::default()
+        })
+        .expect("loop");
+        assert_eq!(
+            l.work_port.capacity(),
+            128,
+            "a large I/O ceiling is not paid for"
+        );
+        let l = Loop::new(Config {
+            max_operations: 16,
+            ..Config::default()
+        })
+        .expect("loop");
+        assert_eq!(
+            l.work_port.capacity(),
+            16,
+            "never more than every operation"
+        );
+        let none = PoolConfig {
+            max_undelivered: 0,
+            ..PoolConfig::default()
+        };
+        let refused = Loop::new(Config {
+            blocking_pool: none,
+            ..Config::default()
+        });
+        assert_eq!(refused.err().map(|e| e.kind), Some(ErrorKind::InvalidInput));
     }
 }
