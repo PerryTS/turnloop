@@ -1,14 +1,36 @@
 //! RFC 5929 certificate binding. This reads only the outer certificate envelope
 //! and signature AlgorithmIdentifier; certificate verification belongs to rustls.
-use ring::digest::{self, Algorithm, Digest, SHA256, SHA384, SHA512};
+#[cfg(feature = "ring")]
+use ring::digest::{self, Digest};
+
+/// The hash RFC 5929 §4.1 selects for a certificate's tls-server-end-point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndPointHash {
+    Sha256,
+    Sha384,
+    Sha512,
+}
+use EndPointHash::{Sha256, Sha384, Sha512};
 
 /// Hash a verified server leaf's DER for RFC 5929 §4.1 tls-server-end-point.
 /// RSA/ECDSA SHA-256/384/512 and RSA-PSS parameters are supported. MD5/SHA-1
 /// signatures use SHA-256. Unknown algorithms (including Ed25519), malformed DER
 /// and undefined bindings return `None`. This helper does not verify certificates
 /// and performs no allocation; call it after successful TLS authentication.
+#[cfg(feature = "ring")]
 pub fn tls_server_end_point(certificate: &[u8]) -> Option<Digest> {
-    Some(digest::digest(signature_hash(certificate)?, certificate))
+    let algorithm = match tls_server_end_point_hash(certificate)? {
+        Sha256 => &digest::SHA256,
+        Sha384 => &digest::SHA384,
+        Sha512 => &digest::SHA512,
+    };
+    Some(digest::digest(algorithm, certificate))
+}
+
+/// The hash `tls_server_end_point` would apply to this leaf's DER, for hosts
+/// that hash with their own crypto provider. `None` in exactly the same cases.
+pub fn tls_server_end_point_hash(certificate: &[u8]) -> Option<EndPointHash> {
+    signature_hash(certificate)
 }
 
 const RSA: &[u8] = b"\x2a\x86\x48\x86\xf7\x0d\x01\x01";
@@ -68,7 +90,7 @@ impl<'a> Der<'a> {
     }
 }
 
-fn signature_hash(certificate: &[u8]) -> Option<&'static Algorithm> {
+fn signature_hash(certificate: &[u8]) -> Option<EndPointHash> {
     let mut der = Der(certificate);
     let mut cert = Der(der.value(0x30)?);
     der.end()?;
@@ -93,17 +115,17 @@ fn signature_hash(certificate: &[u8]) -> Option<&'static Algorithm> {
         }
         alg.null_or_absent()?;
         match suffix {
-            [4 | 5 | 11] => Some(&SHA256), // MD5, SHA-1, SHA-256
-            [12] => Some(&SHA384),
-            [13] => Some(&SHA512),
+            [4 | 5 | 11] => Some(Sha256), // MD5, SHA-1, SHA-256
+            [12] => Some(Sha384),
+            [13] => Some(Sha512),
             _ => None,
         }
     } else if let Some(suffix) = oid.strip_prefix(ECDSA) {
         alg.end()?; // ECDSA parameters MUST be absent.
         match suffix {
-            [2] => Some(&SHA256),
-            [3] => Some(&SHA384),
-            [4] => Some(&SHA512),
+            [2] => Some(Sha256),
+            [3] => Some(Sha384),
+            [4] => Some(Sha512),
             _ => None,
         }
     } else {
@@ -111,27 +133,27 @@ fn signature_hash(certificate: &[u8]) -> Option<&'static Algorithm> {
     }
 }
 
-fn hash_identifier(bytes: &[u8]) -> Option<&'static Algorithm> {
+fn hash_identifier(bytes: &[u8]) -> Option<EndPointHash> {
     let mut der = Der(bytes);
     let mut alg = Der(der.value(0x30)?);
     der.end()?;
     let oid = alg.value(6)?;
     alg.null_or_absent()?;
     if oid == SHA1 {
-        return Some(&SHA256);
+        return Some(Sha256);
     }
     match oid.strip_prefix(SHA2)? {
-        [1] => Some(&SHA256),
-        [2] => Some(&SHA384),
-        [3] => Some(&SHA512),
+        [1] => Some(Sha256),
+        [2] => Some(Sha384),
+        [3] => Some(Sha512),
         _ => None,
     }
 }
 
-fn pss_hash(parameters: &[u8]) -> Option<&'static Algorithm> {
+fn pss_hash(parameters: &[u8]) -> Option<EndPointHash> {
     // RFC 4055: absent hashAlgorithm defaults to SHA-1 (RFC 5929 -> SHA-256).
     // MGF1's hash is validated separately; it does not select the binding hash.
-    let mut hash = &SHA256;
+    let mut hash = Sha256;
     let mut params = Der(parameters);
     let mut previous = 0;
     while let Some(&tag) = params.0.first() {

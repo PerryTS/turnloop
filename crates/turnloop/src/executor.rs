@@ -44,6 +44,10 @@ use std::{
     time::Duration,
 };
 const TAG: u64 = 1 << 63;
+/// Token for executor-owned closes that no future awaits by token. It carries the
+/// executor's tag, so its completion is claimed rather than handed to the host,
+/// and generation zero is never issued, so it can never match a live slot.
+const INTERNAL: Token = Token(TAG);
 
 /// Fixed executor capacities, allocated at construction.
 #[derive(Clone, Copy, Debug)]
@@ -60,6 +64,28 @@ impl Default for ExecutorConfig {
         Self {
             tasks: 1024,
             operations: 1024,
+            buffer_size: 16 * 1024,
+        }
+    }
+}
+impl ExecutorConfig {
+    /// The executor half of [`Config::single_connection`]: one connection's
+    /// futures, one request at a time.
+    ///
+    /// Each pending executor future holds one slot, and an abandoned one keeps
+    /// it until its cancellation is acknowledged. The connection's resolve or
+    /// connect, then its read, write and shutdown, a request deadline's
+    /// [`Sleep`] and one [`Close`] need 6 at most, and the preset keeps 8, which
+    /// is 128 KiB of staging at the default 16 KiB `buffer_size`. Every slot
+    /// that submits I/O also holds one of the loop's operations, so 8 stays
+    /// within `Config::single_connection`'s 16 with room for the host's own.
+    /// Four tasks cover the request, a watchdog beside it and a background task
+    /// a protocol layer may spawn for its connection. A future or task past
+    /// either bound fails with `ResourceLimit`; nothing is dropped.
+    pub fn single_connection() -> Self {
+        Self {
+            tasks: 4,
+            operations: 8,
             buffer_size: 16 * 1024,
         }
     }
@@ -147,7 +173,7 @@ impl<B: Backend> Shared<B> {
             | OpResult::HandleReceived { handle: conn },
         ) = result
         {
-            let _ = self.driver.borrow_mut().close(conn, Token(0));
+            let _ = self.driver.borrow_mut().close(conn, INTERNAL);
         }
     }
     fn abandon(&self, key: Key) {
@@ -162,7 +188,7 @@ impl<B: Backend> Shared<B> {
             (slot.op, slot.timer.take(), slot.result.is_some())
         };
         if let Some(timer) = timer {
-            let _ = self.driver.borrow_mut().close(timer, Token(0));
+            let _ = self.driver.borrow_mut().close(timer, INTERNAL);
         } else if let Some(op) = op {
             self.driver.borrow_mut().cancel(op);
         }
@@ -178,7 +204,9 @@ impl<B: Backend> Shared<B> {
         }
         slot.result.take()
     }
-    fn dispatch(&self, completion: Completion) {
+    /// Whether this completion belongs to the executor. Every `Closed` is also
+    /// shown to the [`Close`] futures watching its handle, whoever closed it.
+    fn claims(&self, completion: &Completion) -> bool {
         if matches!(completion.result, OpResult::Closed) {
             for slot in self.slots.borrow_mut().iter_mut() {
                 if slot.used && slot.closing.is_some() && slot.closing == completion.handle {
@@ -189,9 +217,12 @@ impl<B: Backend> Shared<B> {
                 }
             }
         }
-        if completion.token.0 & TAG == 0 {
-            return;
-        }
+        completion.token.0 & TAG != 0
+    }
+    /// Route a claimed completion to its slot. A stale generation (an abandoned
+    /// operation's late result, or an [`INTERNAL`] close) is dropped here.
+    fn dispatch(&self, completion: Completion) {
+        debug_assert!(completion.token.0 & TAG != 0, "unclaimed completion");
         let key = Key {
             index: completion.token.0 as u32 as usize,
             generation: ((completion.token.0 & !TAG) >> 32) as u32,
@@ -209,7 +240,7 @@ impl<B: Backend> Shared<B> {
             (slot.waker.take(), slot.abandoned, timer)
         };
         if let Some(timer) = timer {
-            let _ = self.driver.borrow_mut().close(timer, Token(0));
+            let _ = self.driver.borrow_mut().close(timer, INTERNAL);
         }
         if abandoned {
             self.free(key);
@@ -220,6 +251,13 @@ impl<B: Backend> Shared<B> {
 }
 
 /// A `!Send` executor whose owning host explicitly drives every turn.
+///
+/// The host may share the loop with the executor: operations it submits itself
+/// through [`LocalExecutor::driver`], with a token whose top bit is clear, are
+/// never consumed by the executor. [`LocalExecutor::turn_into`] hands their
+/// completions back in the host's own buffer, so a host with a dispatch table
+/// keyed on the token routes them exactly as it would from [`Driver::turn`];
+/// [`LocalExecutor::turn`] keeps them in [`LocalExecutor::unclaimed`].
 pub struct LocalExecutor<B: Backend> {
     shared: Rc<Shared<B>>,
     out: Completions,
@@ -271,10 +309,22 @@ impl<B: Backend> LocalExecutor<B> {
             shared: self.shared.clone(),
         }
     }
-    /// Borrow the loop for synchronous resource creation/configuration. Tokens
-    /// with their top bit set are reserved; executor turn consumes completions.
+    /// Borrow the loop for synchronous resource creation/configuration, and for
+    /// the host's own operations. Tokens with their top bit set are reserved for
+    /// the executor; every other token's completion is handed back by
+    /// [`LocalExecutor::turn_into`] or kept in [`LocalExecutor::unclaimed`].
     pub fn driver(&self) -> RefMut<'_, Driver<B>> {
         self.shared.driver.borrow_mut()
+    }
+    /// Completions from the most recent [`LocalExecutor::turn`] that the executor
+    /// did not issue: the host's own operations (any token with its top bit
+    /// clear) and posts, in delivery order.
+    ///
+    /// Like the output of [`Driver::turn`], the next turn clears this buffer, so
+    /// drain it after every turn; whatever is left, pooled-read leases included,
+    /// is dropped then. Executor-owned closes are claimed and never listed here.
+    pub fn unclaimed(&mut self) -> &mut Completions {
+        &mut self.out
     }
     /// Spawn a local future. Dropping its JoinHandle requests cancellation.
     pub fn spawn_local<F: Future + 'static>(&self, future: F) -> Result<JoinHandle<F::Output>> {
@@ -318,7 +368,34 @@ impl<B: Backend> LocalExecutor<B> {
     /// Drive one bounded loop turn and then one pass of runnable futures. Pending
     /// tasks that woke themselves keep this turn nonblocking, without being repolled
     /// repeatedly inside the same call.
+    ///
+    /// Completions for executor operations wake their futures; every other
+    /// completion stays in [`LocalExecutor::unclaimed`] for the host. The returned
+    /// [`TurnInfo::completions`] counts both. A host with its own dispatch table
+    /// uses [`LocalExecutor::turn_into`] instead.
     pub fn turn(&mut self, timeout: crate::Timeout) -> Result<TurnInfo> {
+        // An empty Vec does not allocate; the retained buffer is put back below.
+        let mut out = std::mem::replace(
+            &mut self.out,
+            Completions {
+                entries: Vec::new(),
+            },
+        );
+        let result = self.turn_into(timeout, &mut out);
+        self.out = out;
+        result
+    }
+    /// [`LocalExecutor::turn`] for a host that also submits its own operations:
+    /// like [`Driver::turn`], it clears `out` and fills it up to its capacity, and
+    /// then claims the executor's completions from it. What is left in `out`, in
+    /// delivery order, is every completion the executor did not issue (the
+    /// host's own tokens and posts), for the host to route while it is free to
+    /// submit more work through [`LocalExecutor::driver`].
+    pub fn turn_into(
+        &mut self,
+        timeout: crate::Timeout,
+        out: &mut Completions,
+    ) -> Result<TurnInfo> {
         self.run_ready();
         let ready = self
             .shared
@@ -334,10 +411,11 @@ impl<B: Backend> LocalExecutor<B> {
             } else {
                 timeout
             },
-            &mut self.out,
+            out,
         )?;
-        for completion in self.out.drain() {
-            self.shared.dispatch(completion);
+        let shared = &self.shared;
+        for completion in out.entries.extract_if(.., |c| shared.claims(c)) {
+            shared.dispatch(completion);
         }
         self.run_ready();
         Ok(info)
@@ -371,7 +449,8 @@ impl<B: Backend> Clone for ExecutorHandle<B> {
 }
 impl<B: Backend> ExecutorHandle<B> {
     /// Borrow the driver for resource configuration. Release before awaiting.
-    /// Tokens with the top bit set belong to the executor.
+    /// Tokens with the top bit set belong to the executor; completions for any
+    /// other token are handed back to the host by [`LocalExecutor::turn_into`].
     pub fn driver(&self) -> RefMut<'_, Driver<B>> {
         self.shared.driver.borrow_mut()
     }
@@ -895,7 +974,7 @@ impl<B: Backend> AsyncWrite for AsyncIo<B> {
             this.shared
                 .driver
                 .borrow_mut()
-                .close(this.handle, Token(0))
+                .close(this.handle, INTERNAL)
                 .map_err(io_error)?;
             this.closed = true;
         }
@@ -914,7 +993,7 @@ impl<B: Backend> Drop for AsyncIo<B> {
             self.shared.abandon(key);
         }
         if !self.closed {
-            let _ = self.shared.driver.borrow_mut().close(self.handle, Token(0));
+            let _ = self.shared.driver.borrow_mut().close(self.handle, INTERNAL);
         }
     }
 }
@@ -1099,7 +1178,7 @@ impl<B: Backend> Future for Close<B> {
                 if driver.is_closing(handle) {
                     Ok(())
                 } else {
-                    driver.close(handle, Token(0))
+                    driver.close(handle, INTERNAL)
                 }
             };
             if let Err(e) = result {
@@ -1240,7 +1319,7 @@ impl<B: Backend> Drop for Connect<B> {
                 .shared
                 .driver
                 .borrow_mut()
-                .close(handle, Token(0));
+                .close(handle, INTERNAL);
         }
         if let Some(key) = self.key.take() {
             // Connect has no borrowed buffer. Generation tags reject its later
@@ -1381,7 +1460,7 @@ impl Drop for Fetch {
             self.executor.shared.abandon(key);
         }
         if let Some(handle) = self.handle.take() {
-            let _ = self.executor.driver().close(handle, Token(0));
+            let _ = self.executor.driver().close(handle, INTERNAL);
         }
     }
 }

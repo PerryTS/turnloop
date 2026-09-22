@@ -5,6 +5,9 @@ use crate::{
     http1::{Head, Header},
 };
 use std::{
+    cmp::{Ordering, Reverse},
+    collections::{BinaryHeap, HashMap},
+    hash::Hash,
     net::IpAddr,
     time::{Duration, Instant},
 };
@@ -264,8 +267,129 @@ impl PoolKey {
         }
     }
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Issued by [`Pool::acquire`]. Ids are never reused, so a stale id can never
+/// name a newer connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ConnectionId(pub u64);
+/// A host-chosen key for one in-flight request's deadline in [`Pool`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RequestId(pub u64);
+
+/// A deadline heap keyed by `K`, holding at most one deadline per key.
+///
+/// [`next_timeout`](Self::next_timeout) is O(1) and
+/// [`set`](Self::set)/[`pop_expired`](Self::pop_expired) are O(log n), so a host
+/// with many connections or requests never rescans them to arm its timer.
+/// Replaced deadlines stay in the heap until they surface and are discarded;
+/// the heap is rebuilt whenever they outnumber the live ones, so its size stays
+/// within a constant factor of [`len`](Self::len).
+pub struct Deadlines<K> {
+    heap: BinaryHeap<Reverse<Entry<K>>>,
+    live: HashMap<K, (Instant, u64)>,
+    sequence: u64,
+}
+struct Entry<K> {
+    at: Instant,
+    sequence: u64,
+    key: K,
+}
+impl<K> PartialEq for Entry<K> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+impl<K> Eq for Entry<K> {}
+impl<K> PartialOrd for Entry<K> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl<K> Ord for Entry<K> {
+    // Sequence numbers are unique, so equal deadlines fire in the order set.
+    fn cmp(&self, other: &Self) -> Ordering {
+        (self.at, self.sequence).cmp(&(other.at, other.sequence))
+    }
+}
+impl<K: Copy + Eq + Hash> Default for Deadlines<K> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl<K: Copy + Eq + Hash> Deadlines<K> {
+    pub fn new() -> Self {
+        Self {
+            heap: BinaryHeap::new(),
+            live: HashMap::new(),
+            sequence: 0,
+        }
+    }
+    /// Replace `key`'s deadline; `None` removes it.
+    pub fn set(&mut self, key: K, deadline: Option<Instant>) {
+        match deadline {
+            Some(at) if self.live.get(&key).is_some_and(|&(d, _)| d == at) => return,
+            Some(at) => {
+                self.sequence += 1;
+                self.live.insert(key, (at, self.sequence));
+                self.heap.push(Reverse(Entry {
+                    at,
+                    sequence: self.sequence,
+                    key,
+                }));
+            }
+            None => {
+                if self.live.remove(&key).is_none() {
+                    return;
+                }
+            }
+        }
+        self.settle();
+    }
+    pub fn get(&self, key: K) -> Option<Instant> {
+        self.live.get(&key).map(|&(at, _)| at)
+    }
+    /// The earliest live deadline.
+    pub fn next_timeout(&self) -> Option<Instant> {
+        self.heap.peek().map(|Reverse(entry)| entry.at)
+    }
+    /// Remove and return one key whose deadline is at or before `now`, earliest
+    /// first. Call repeatedly until `None`.
+    pub fn pop_expired(&mut self, now: Instant) -> Option<K> {
+        if self.next_timeout()? > now {
+            return None;
+        }
+        let Reverse(entry) = self.heap.pop()?;
+        self.live.remove(&entry.key);
+        self.settle();
+        Some(entry.key)
+    }
+    pub fn len(&self) -> usize {
+        self.live.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.live.is_empty()
+    }
+    /// Keep the top of the heap live, so `next_timeout` can simply peek.
+    fn settle(&mut self) {
+        if self.heap.len() > 2 * self.live.len() + 16 {
+            self.heap = self
+                .live
+                .iter()
+                .map(|(&key, &(at, sequence))| Reverse(Entry { at, sequence, key }))
+                .collect();
+            return;
+        }
+        while let Some(Reverse(top)) = self.heap.peek() {
+            if self.live.get(&top.key) == Some(&(top.at, top.sequence)) {
+                break;
+            }
+            self.heap.pop();
+        }
+    }
+    #[cfg(test)]
+    fn heap_len(&self) -> usize {
+        self.heap.len()
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Acquire {
     Connect(ConnectionId),
@@ -281,11 +405,18 @@ struct Slot {
     deadline: Option<Instant>,
     closed: bool,
 }
+/// Connection reuse plus every client-wide deadline: idle connections and, when
+/// the host registers them, in-flight requests. One [`next_timeout`] covers all
+/// of them without visiting each connection or request.
+///
+/// [`next_timeout`]: Pool::next_timeout
 pub struct Pool {
     slots: Vec<Slot>,
     max_per_host: usize,
     idle: Duration,
     next: u64,
+    idle_deadlines: Deadlines<ConnectionId>,
+    request_deadlines: Deadlines<RequestId>,
 }
 impl Pool {
     pub fn new(max_per_host: usize, idle: Duration) -> Self {
@@ -294,6 +425,8 @@ impl Pool {
             max_per_host,
             idle,
             next: 1,
+            idle_deadlines: Deadlines::new(),
+            request_deadlines: Deadlines::new(),
         }
     }
     /// A Connect reservation counts immediately, so concurrent callers cannot overbook.
@@ -307,7 +440,9 @@ impl Pool {
         }) {
             s.active += 1;
             s.deadline = None;
-            return Acquire::Reuse(s.id);
+            let id = s.id;
+            self.idle_deadlines.set(id, None);
+            return Acquire::Reuse(id);
         }
         if self
             .slots
@@ -368,29 +503,63 @@ impl Pool {
             s.capacity = 0;
         }
         if s.active == 0 {
-            s.deadline = Some(if s.capacity == 0 { now } else { now + idle });
+            let deadline = if s.capacity == 0 { now } else { now + idle };
+            s.deadline = Some(deadline);
+            self.idle_deadlines.set(id, Some(deadline));
         }
         Ok(())
     }
     pub fn closed(&mut self, id: ConnectionId) -> Result<()> {
         self.slot(id)?.closed = true;
+        self.idle_deadlines.set(id, None);
         Ok(())
     }
+    /// Whether `id` still names a live connection: acquired and neither closed,
+    /// forgotten nor expired by [`handle_timeout`](Self::handle_timeout).
+    pub fn contains(&self, id: ConnectionId) -> bool {
+        self.slots.iter().any(|s| s.id == id && !s.closed)
+    }
+    /// Drop `id` whatever its state, for a host whose own socket table no longer
+    /// has it (closed without telling the pool, or never found). Outstanding
+    /// acquisitions go with it, so its per-host place is free for the next
+    /// `acquire`. Returns whether `id` was live; a stale id is not an error.
+    pub fn forget(&mut self, id: ConnectionId) -> bool {
+        let live = self.slot(id).map(|s| s.closed = true).is_ok();
+        self.idle_deadlines.set(id, None);
+        live
+    }
+    /// The earliest idle-connection or registered request deadline, in O(1).
     pub fn next_timeout(&self) -> Option<Instant> {
-        self.slots
-            .iter()
-            .filter(|s| !s.closed)
-            .filter_map(|s| s.deadline)
+        self.idle_deadlines
+            .next_timeout()
+            .into_iter()
+            .chain(self.request_deadlines.next_timeout())
             .min()
     }
     /// Repeatedly call to obtain all Close requests at this time. No clock or timer is owned.
     pub fn handle_timeout(&mut self, now: Instant) -> Option<ConnectionId> {
-        let s = self
-            .slots
-            .iter_mut()
-            .find(|s| !s.closed && s.deadline.is_some_and(|d| d <= now))?;
-        s.closed = true;
-        Some(s.id)
+        while let Some(id) = self.idle_deadlines.pop_expired(now) {
+            if let Ok(s) = self.slot(id) {
+                s.closed = true;
+                return Some(id);
+            }
+        }
+        None
+    }
+    /// Register (or with `None` clear) a request's next deadline, typically the
+    /// `next_timeout()` of its [`Lifecycle`] or [`Http1Connection`] after each
+    /// call that may move it. The pool never inspects the request itself.
+    pub fn set_request_deadline(&mut self, id: RequestId, deadline: Option<Instant>) {
+        self.request_deadlines.set(id, deadline);
+    }
+    pub fn request_deadline(&self, id: RequestId) -> Option<Instant> {
+        self.request_deadlines.get(id)
+    }
+    /// Repeatedly call to obtain every request whose registered deadline is at or
+    /// before `now`. Its registration is removed: call that request's
+    /// `handle_timeout(now)` and register its new `next_timeout()`, if any.
+    pub fn handle_request_timeout(&mut self, now: Instant) -> Option<RequestId> {
+        self.request_deadlines.pop_expired(now)
     }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -777,4 +946,36 @@ fn proxy_authorization(proxy: &Url) -> Option<String> {
         "Basic {}",
         base64::engine::general_purpose::STANDARD.encode(credential)
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replaced_deadlines_do_not_accumulate() {
+        let now = Instant::now();
+        let mut deadlines = Deadlines::new();
+        for key in 0..100u32 {
+            deadlines.set(key, Some(now + Duration::from_secs(1000)));
+        }
+        // A request refreshing its body deadline on every chunk, far from the top.
+        for step in 0..100_000u64 {
+            deadlines.set(7, Some(now + Duration::from_secs(2000 + step)));
+            assert!(deadlines.heap_len() <= 2 * deadlines.len() + 17);
+        }
+        assert_eq!(deadlines.len(), 100);
+        assert_eq!(
+            deadlines.next_timeout(),
+            Some(now + Duration::from_secs(1000))
+        );
+        let late = now + Duration::from_secs(1_000_000);
+        let mut popped = 0;
+        while let Some(key) = deadlines.pop_expired(late) {
+            assert_eq!(key == 7, popped == 99, "the refreshed key fires last");
+            popped += 1;
+        }
+        assert_eq!(popped, 100);
+        assert_eq!(deadlines.heap_len(), 0);
+    }
 }

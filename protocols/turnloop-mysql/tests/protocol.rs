@@ -468,3 +468,242 @@ fn local_infile_enabled_is_an_explicit_borrowed_request() {
         })
     ));
 }
+/// Prepare `id` with no parameters or columns; the server's reply completes it.
+fn prepare_statement(c: &mut Connection, token: Token, id: u32) -> Statement {
+    c.prepare(token, "DO 1", None)
+        .expect("fixture operation must succeed");
+    flush(c);
+    let mut prepare = vec![0];
+    prepare.extend_from_slice(&id.to_le_bytes());
+    prepare.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0]);
+    c.receive(&frame(1, &prepare))
+        .expect("fixture operation must succeed");
+    let Some(Event::Prepared { statement, .. }) =
+        c.next_event().expect("fixture operation must succeed")
+    else {
+        panic!("expected Prepared")
+    };
+    assert!(matches!(
+        c.next_event().expect("fixture operation must succeed"),
+        Some(Event::Completed { .. })
+    ));
+    statement
+}
+/// A completion-driven host only calls into the connection when a write or a
+/// read completes. COM_STMT_CLOSE and COM_QUIT get no reply, so the write
+/// acknowledgement alone must say "call next_event() now"; no timer is used.
+#[test]
+fn no_reply_commands_complete_from_the_write_acknowledgement() {
+    let mut c = ready();
+    let stmt = prepare_statement(&mut c, 1, 17);
+    c.close_statement(2, stmt.id)
+        .expect("fixture operation must succeed");
+    let close = c.output().to_vec();
+    assert_eq!(close, frame(0, &[0x19, 17, 0, 0, 0]));
+    assert!(c.next_event().expect("unwritten close").is_none());
+    // Partial write completion: nothing to deliver yet.
+    assert!(!c.consume_output(3).expect("fixture operation must succeed"));
+    assert!(c.next_event().expect("half-written close").is_none());
+    // Final write completion: the only wakeup this command will ever get.
+    assert!(
+        c.consume_output(close.len() - 3)
+            .expect("fixture operation must succeed"),
+        "acknowledging COM_STMT_CLOSE must ask for next_event()"
+    );
+    assert!(matches!(
+        c.next_event().expect("fixture operation must succeed"),
+        Some(Event::Completed {
+            token: 2,
+            outcome: Outcome::Success
+        })
+    ));
+    assert!(c.next_event().expect("drained").is_none());
+    assert!(c.can_accept());
+
+    // A command that does get a reply is not reported early.
+    c.ping(3).expect("fixture operation must succeed");
+    let n = c.output().len();
+    assert!(!c.consume_output(n).expect("fixture operation must succeed"));
+    assert!(c.next_event().expect("awaiting reply").is_none());
+    c.receive(&ok(1, 0, 2))
+        .expect("fixture operation must succeed");
+    while c.next_event().expect("ping reply").is_some() {}
+
+    c.quit().expect("fixture operation must succeed");
+    assert_eq!(c.output(), frame(0, &[1]));
+    assert!(c.next_event().expect("unwritten quit").is_none());
+    let n = c.output().len();
+    assert!(
+        c.consume_output(n).expect("fixture operation must succeed"),
+        "acknowledging COM_QUIT must ask for next_event()"
+    );
+    assert!(matches!(
+        c.next_event().expect("fixture operation must succeed"),
+        Some(Event::Closed {
+            reason: Error::Cancelled
+        })
+    ));
+    assert!(c.next_event().expect("closed").is_none());
+}
+/// The statement stays registered until the COM_STMT_CLOSE bytes are
+/// acknowledged, so a failed flush cannot leave the core believing the server
+/// dropped a statement it never heard about.
+#[test]
+fn close_statement_forgets_the_statement_only_after_its_bytes_are_sent() {
+    let mut c = ready();
+    let stmt = prepare_statement(&mut c, 1, 17);
+    assert_eq!(c.statements(), [stmt]);
+    c.close_statement(2, stmt.id)
+        .expect("fixture operation must succeed");
+    assert_eq!(c.statements(), [stmt], "close not yet written");
+    let n = c.output().len();
+    assert!(!c.consume_output(n - 1).expect("partial write"));
+    assert_eq!(c.statements(), [stmt], "close only partly written");
+    // The flush carrying the last byte fails: the host aborts.
+    c.abort(Error::Transport);
+    assert_eq!(c.statements(), [stmt], "the server still holds it");
+    assert!(matches!(
+        c.next_event().expect("fixture operation must succeed"),
+        Some(Event::Completed {
+            token: 2,
+            outcome: Outcome::Aborted(Error::Transport)
+        })
+    ));
+
+    let mut c = ready();
+    let stmt = prepare_statement(&mut c, 1, 17);
+    c.close_statement(2, stmt.id)
+        .expect("fixture operation must succeed");
+    let n = c.output().len();
+    assert!(c.consume_output(n).expect("full write"));
+    assert_eq!(c.statements(), []);
+    assert_eq!(
+        c.execute(3, stmt.id, &[], None),
+        Err(Error::State("connection busy or closed")),
+        "Completed not yet delivered"
+    );
+    assert!(matches!(
+        c.next_event().expect("fixture operation must succeed"),
+        Some(Event::Completed {
+            token: 2,
+            outcome: Outcome::Success
+        })
+    ));
+    assert_eq!(
+        c.execute(3, stmt.id, &[], None),
+        Err(Error::State("unknown prepared statement"))
+    );
+}
+/// A statement's OK packet and a result set's terminating EOF are different
+/// events, so a host never reads an EOF's bytes as affected rows.
+#[test]
+fn ok_packets_and_result_set_eofs_are_distinct_events() {
+    let mut c = ready();
+    c.query(1, "INSERT INTO t VALUES (1),(2),(3); SELECT 42", None)
+        .expect("fixture operation must succeed");
+    flush(&mut c);
+    // OK: affected_rows 3, last_insert_id 9, SERVER_MORE_RESULTS_EXISTS | AUTOCOMMIT.
+    let insert = frame(1, &[0, 3, 9, 10, 0, 0, 0]);
+    // Legacy EOF: 0xfe, warnings = 3, status = AUTOCOMMIT.
+    let end = frame(6, &[0xfe, 3, 0, 2, 0]);
+    c.receive(
+        &[
+            insert,
+            frame(2, &[1]),
+            column(3, ColumnType::MYSQL_TYPE_LONG),
+            eof(4, 2),
+            frame(5, b"\x0242"),
+            end,
+        ]
+        .concat(),
+    )
+    .expect("fixture operation must succeed");
+    let mut seen = Vec::new();
+    while let Some(e) = c.next_event().expect("fixture operation must succeed") {
+        match e {
+            Event::Ok { token, packet } => seen.push(format!(
+                "ok {token} affected={} id={:?} more={}",
+                packet.affected_rows(),
+                packet.last_insert_id(),
+                packet
+                    .status_flags()
+                    .contains(StatusFlags::SERVER_MORE_RESULTS_EXISTS)
+            )),
+            Event::Eof {
+                token,
+                warnings,
+                status,
+            } => seen.push(format!(
+                "eof {token} warnings={warnings} more={}",
+                status.contains(StatusFlags::SERVER_MORE_RESULTS_EXISTS)
+            )),
+            Event::Row { .. } => seen.push("row".into()),
+            Event::Completed { token, outcome } => {
+                seen.push(format!("completed {token} {outcome:?}"))
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        seen,
+        [
+            "ok 1 affected=3 id=Some(9) more=true",
+            "row",
+            "eof 1 warnings=3 more=false",
+            "completed 1 Success",
+        ]
+    );
+    assert_eq!(c.status(), StatusFlags::SERVER_STATUS_AUTOCOMMIT);
+}
+/// `can_accept` is the admission rule itself: whenever it is false a command is
+/// rejected without side effects, and whenever it is true the next one is taken.
+#[test]
+fn can_accept_reports_the_exact_admission_decision() {
+    let mut c = Connection::new(Config::default()).expect("fixture operation must succeed");
+    assert!(!c.can_accept());
+    assert_eq!(
+        c.ping(1),
+        Err(Error::State("connection busy or closed")),
+        "handshake in progress"
+    );
+    let mut c = ready();
+    assert!(c.can_accept());
+    c.query(1, "SELECT 1", None)
+        .expect("admitted when can_accept is true");
+    let request = c.output().len();
+    assert!(!c.can_accept());
+    assert!(c.ping(2).is_err());
+    assert_eq!(
+        c.output().len(),
+        request,
+        "a rejected command adds no bytes"
+    );
+    c.consume_output(request - 1)
+        .expect("fixture operation must succeed");
+    assert!(!c.can_accept(), "unacknowledged output");
+    assert!(c.ping(2).is_err());
+    c.consume_output(1).expect("fixture operation must succeed");
+    assert!(!c.can_accept(), "command still pending");
+    assert!(c.ping(2).is_err());
+    c.receive(&ok(1, 0, 2))
+        .expect("fixture operation must succeed");
+    assert!(matches!(
+        c.next_event().expect("fixture operation must succeed"),
+        Some(Event::Ok { token: 1, .. })
+    ));
+    assert!(!c.can_accept(), "Completed not yet delivered");
+    assert!(c.ping(2).is_err());
+    assert!(matches!(
+        c.next_event().expect("fixture operation must succeed"),
+        Some(Event::Completed {
+            token: 1,
+            outcome: Outcome::Success
+        })
+    ));
+    assert!(c.can_accept());
+    c.ping(2).expect("admitted when can_accept is true");
+    assert_eq!(flush(&mut c), frame(0, &[0x0e]));
+    c.abort(Error::Transport);
+    assert!(!c.can_accept());
+    assert!(c.quit().is_err());
+}
