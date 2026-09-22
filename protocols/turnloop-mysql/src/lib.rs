@@ -193,6 +193,8 @@ enum CommandKind {
     Execute,
     Reset,
     ChangeUser,
+    /// COM_STMT_CLOSE for this statement ID; forgotten once its bytes are sent.
+    CloseStatement(u32),
     Other,
 }
 struct Pending {
@@ -286,6 +288,16 @@ impl Connection {
             self.output.clear();
             self.output_at = 0;
             if self.state == State::NoResponse {
+                // The server holds the statement until these bytes reach it, so
+                // it is dropped from the bookkeeping only now; a failed flush
+                // aborts instead and leaves it listed.
+                if let Some(Pending {
+                    kind: CommandKind::CloseStatement(id),
+                    ..
+                }) = self.pending
+                {
+                    self.statements.retain(|s| s.id != id);
+                }
                 self.complete(Outcome::Success);
             }
         }
@@ -555,9 +567,18 @@ impl Connection {
         self.simple(token, 0x1a, Some(id), CommandKind::Other, State::Header)
     }
     pub fn close_statement(&mut self, token: Token, id: u32) -> Result<()> {
-        self.simple(token, 0x19, Some(id), CommandKind::Other, State::NoResponse)?;
-        self.statements.retain(|s| s.id != id);
-        Ok(())
+        self.simple(
+            token,
+            0x19,
+            Some(id),
+            CommandKind::CloseStatement(id),
+            State::NoResponse,
+        )
+    }
+    /// Prepared statements the server still holds for this session. A statement
+    /// being closed stays listed until its COM_STMT_CLOSE bytes are acknowledged.
+    pub fn statements(&self) -> &[Statement] {
+        &self.statements
     }
     pub fn change_user(
         &mut self,

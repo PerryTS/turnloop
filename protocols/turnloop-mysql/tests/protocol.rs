@@ -545,6 +545,55 @@ fn no_reply_commands_complete_from_the_write_acknowledgement() {
     ));
     assert!(c.next_event().expect("closed").is_none());
 }
+/// The statement stays registered until the COM_STMT_CLOSE bytes are
+/// acknowledged, so a failed flush cannot leave the core believing the server
+/// dropped a statement it never heard about.
+#[test]
+fn close_statement_forgets_the_statement_only_after_its_bytes_are_sent() {
+    let mut c = ready();
+    let stmt = prepare_statement(&mut c, 1, 17);
+    assert_eq!(c.statements(), [stmt]);
+    c.close_statement(2, stmt.id)
+        .expect("fixture operation must succeed");
+    assert_eq!(c.statements(), [stmt], "close not yet written");
+    let n = c.output().len();
+    assert!(!c.consume_output(n - 1).expect("partial write"));
+    assert_eq!(c.statements(), [stmt], "close only partly written");
+    // The flush carrying the last byte fails: the host aborts.
+    c.abort(Error::Transport);
+    assert_eq!(c.statements(), [stmt], "the server still holds it");
+    assert!(matches!(
+        c.next_event().expect("fixture operation must succeed"),
+        Some(Event::Completed {
+            token: 2,
+            outcome: Outcome::Aborted(Error::Transport)
+        })
+    ));
+
+    let mut c = ready();
+    let stmt = prepare_statement(&mut c, 1, 17);
+    c.close_statement(2, stmt.id)
+        .expect("fixture operation must succeed");
+    let n = c.output().len();
+    assert!(c.consume_output(n).expect("full write"));
+    assert_eq!(c.statements(), []);
+    assert_eq!(
+        c.execute(3, stmt.id, &[], None),
+        Err(Error::State("connection busy or closed")),
+        "Completed not yet delivered"
+    );
+    assert!(matches!(
+        c.next_event().expect("fixture operation must succeed"),
+        Some(Event::Completed {
+            token: 2,
+            outcome: Outcome::Success
+        })
+    ));
+    assert_eq!(
+        c.execute(3, stmt.id, &[], None),
+        Err(Error::State("unknown prepared statement"))
+    );
+}
 /// `can_accept` is the admission rule itself: whenever it is false a command is
 /// rejected without side effects, and whenever it is true the next one is taken.
 #[test]
