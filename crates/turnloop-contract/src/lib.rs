@@ -231,6 +231,10 @@ mod native {
         an_armed_accept_keeps_its_slot::<B>();
     }
     #[test]
+    fn multishot_accept_waits_at_the_handle_ceiling() {
+        multishot_accept_respects_the_handle_ceiling::<B>();
+    }
+    #[test]
     fn cancellation_close() {
         cancel_close_ordering::<B>();
     }
@@ -1187,6 +1191,118 @@ pub fn an_armed_accept_keeps_its_slot<B: Backend>() {
     );
     l.close(conn, Token(5)).expect("close");
     l.close(spare, Token(6)).expect("close");
+}
+
+/// A multishot accept never outruns the handle ceiling within one turn (#77).
+///
+/// One poll can bring a multishot accept many connections, up to the event
+/// budget. With fewer free handle slots than that, every connection past the
+/// ceiling used to be taken from the kernel and then destroyed, surfacing as an
+/// accept that completed with `ResourceLimit`. The core now tells the backend
+/// how many connections it can house, so the rest wait in the listener's
+/// backlog, a turn at the ceiling blocks instead of spinning, and each waiting
+/// connection is accepted as soon as a slot is free.
+pub fn multishot_accept_respects_the_handle_ceiling<B: Backend>() {
+    // Room for the listener and three connections, far below the event budget.
+    const ROOM: usize = 3;
+    const CLIENTS: usize = 12;
+    assert!(ROOM < Config::default().events_per_turn);
+    let mut l = Driver::<B>::new(Config {
+        max_handles: 1 + ROOM,
+        max_operations: 64,
+        ..Config::default()
+    })
+    .expect("loop");
+    let listener = l
+        .tcp_listen(localhost(), &ListenOpts::default())
+        .expect("listen");
+    let addr = l.local_addr(listener).expect("addr");
+    let accept = l
+        .accept_start(listener, Token(1))
+        .expect("multishot accept");
+    // Flood the listener before the loop turns, so connections are waiting in
+    // the backlog together and one poll can find all of them at once.
+    let clients: Vec<std::net::TcpStream> = (0..CLIENTS)
+        .map(|_| std::net::TcpStream::connect(addr).expect("client"))
+        .collect();
+    let mut out = Completions::with_capacity(4 * CLIENTS);
+    let mut live = Vec::new();
+    let mut accepted = 0;
+    let collect = |out: &mut Completions, live: &mut Vec<Handle>, accepted: &mut usize| {
+        for c in out.drain() {
+            match c.result {
+                OpResult::Accepted { conn, .. } => {
+                    assert_eq!(c.op, Some(accept));
+                    assert!(!c.terminal, "the multishot accept stays armed");
+                    live.push(conn);
+                    *accepted += 1;
+                }
+                OpResult::Closed => {}
+                OpResult::Err(e) => panic!("an accepted connection was destroyed: {e:?}"),
+                other => panic!("unexpected {other:?}"),
+            }
+            assert!(live.len() <= ROOM, "more connections than handle slots");
+        }
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while live.len() < ROOM {
+        assert!(Instant::now() < deadline, "only {} accepted", live.len());
+        l.turn(Timeout::After(Duration::from_millis(50)), &mut out)
+            .expect("turn");
+        collect(&mut out, &mut live, &mut accepted);
+    }
+    // At the ceiling the remaining connections wait in the backlog: turns
+    // deliver nothing, and each blocks for its timeout instead of spinning.
+    let quiet = Instant::now();
+    let mut turns = 0;
+    while quiet.elapsed() < Duration::from_millis(100) {
+        let info = l
+            .turn(Timeout::After(Duration::from_millis(20)), &mut out)
+            .expect("turn at the ceiling");
+        assert!(info.os_waits + info.discovery_polls <= 1);
+        collect(&mut out, &mut live, &mut accepted);
+        assert_eq!(accepted, ROOM, "nothing past the ceiling was delivered");
+        turns += 1;
+    }
+    assert!(
+        turns <= 10,
+        "{turns} turns in 100 ms at the ceiling: a spin"
+    );
+    // Every slot that frees up admits the next waiting connection, until each
+    // client has been accepted exactly once: none was lost along the way.
+    while accepted < CLIENTS {
+        assert!(
+            Instant::now() < deadline,
+            "only {accepted} of {CLIENTS} accepted"
+        );
+        if live.len() == ROOM {
+            let conn = live.pop().expect("a connection");
+            l.close(conn, Token(2)).expect("close");
+        }
+        l.turn(Timeout::After(Duration::from_millis(50)), &mut out)
+            .expect("turn");
+        collect(&mut out, &mut live, &mut accepted);
+    }
+    assert_eq!(accepted, CLIENTS);
+    assert!(l.stop(accept));
+    for conn in live.drain(..) {
+        l.close(conn, Token(2)).expect("close");
+    }
+    l.close(listener, Token(3)).expect("close listener");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while l.alive() {
+        assert!(Instant::now() < deadline, "the loop never drained");
+        l.turn(Timeout::After(Duration::from_millis(50)), &mut out)
+            .expect("drain");
+        for c in out.drain() {
+            assert!(
+                matches!(c.result, OpResult::Stopped | OpResult::Closed),
+                "unexpected {:?}",
+                c.result
+            );
+        }
+    }
+    drop(clients);
 }
 
 pub fn pooled_lease_backpressure<B: Backend>() {

@@ -1,5 +1,5 @@
 use crate::{
-    backend::{Backend, Event, Filesystem, Operation, Outcome, Request},
+    backend::{Backend, Budget, Event, Filesystem, Operation, Outcome, Request},
     fs::FsOutput,
     table::Table,
     timer::DriverTimerQueue as TimerQueue,
@@ -50,8 +50,12 @@ struct Op {
     /// A typed filesystem request (pool service or backend, per `B::FILESYSTEM`).
     fs: bool,
     /// Handle slots this operation holds against the ceiling, released when it
-    /// retires. Non-zero only for operations whose completion creates a handle.
+    /// retires. Non-zero only for single-shot operations whose completion
+    /// creates a handle; a multishot accept draws on `multishot_reserved`.
     reserved_handles: usize,
+    /// A multishot accept, counted in `multishot_armed`, whose connections the
+    /// backend delivers against the poll's `Budget` (turnloop#77).
+    multishot: bool,
     /// Counted in `native_pending`: a socket-handle operation or a request the
     /// backend accepted natively (such as WASI DNS). DESIGN §10 rule 3 keys
     /// queued-turn discovery on these operations.
@@ -104,6 +108,12 @@ pub struct Driver<B: Backend> {
     /// Handle slots promised to accepts and handle receives that have been asked
     /// for but not yet delivered. See [`Driver::submit`].
     reserved_handles: usize,
+    /// Armed multishot accepts, and the part of `reserved_handles` promised to
+    /// them: one each, as far as the ceiling allows. The promises are pooled
+    /// rather than owned per operation, because the poll budget is shared by
+    /// every multishot accept, and any of them may spend any of these slots.
+    multishot_armed: usize,
+    multishot_reserved: usize,
     native_pending: usize,
     /// Operations delivering through `work_port` that have not retired: the
     /// ring's occupancy can never exceed this, and admission keeps it at or
@@ -186,6 +196,8 @@ impl<B: Backend> Driver<B> {
             refs: 0,
             outstanding: 0,
             reserved_handles: 0,
+            multishot_armed: 0,
+            multishot_reserved: 0,
             native_pending: 0,
             undelivered: 0,
             config,
@@ -276,6 +288,7 @@ impl<B: Backend> Driver<B> {
                 external_wait: false,
                 fs: false,
                 reserved_handles: 0,
+                multishot: false,
                 native,
                 port: false,
                 previous,
@@ -331,6 +344,13 @@ impl<B: Backend> Driver<B> {
         let op = self.ops.remove(id.key)?;
         self.connect_deadlines.cancel(id.key);
         self.reserved_handles -= op.reserved_handles;
+        if op.multishot {
+            self.multishot_armed -= 1;
+            if self.multishot_reserved > self.multishot_armed {
+                self.multishot_reserved -= 1;
+                self.reserved_handles -= 1;
+            }
+        }
         if op.native {
             self.native_pending -= 1;
         }
@@ -882,6 +902,7 @@ impl<B: Backend> Driver<B> {
             operation,
             Operation::Accept { .. } | Operation::RecvHandle
         ));
+        let multishot = matches!(operation, Operation::Accept { multishot: true });
         // Only a reserving operation is gated: reads, writes and everything else
         // on an existing handle must still work at the ceiling.
         if reserve != 0 && self.handles.remaining() < self.reserved_handles + reserve {
@@ -889,7 +910,14 @@ impl<B: Backend> Driver<B> {
         }
         let op = self.new_op(Some(h), token)?;
         self.reserved_handles += reserve;
-        self.ops.get_mut(op.key).expect("new op").reserved_handles = reserve;
+        let new = self.ops.get_mut(op.key).expect("new op");
+        if multishot {
+            new.multishot = true;
+            self.multishot_armed += 1;
+            self.multishot_reserved += 1;
+        } else {
+            new.reserved_handles = reserve;
+        }
         self.assert_reservations();
         if let Err(e) = self.backend.submit(Request {
             op,
@@ -1098,33 +1126,52 @@ impl<B: Backend> Driver<B> {
     ///
     /// Releasing the reservation before creating the handle is what makes it
     /// real: `new_handle` refuses slots that are still promised, so the only
-    /// thing that can spend this one is the accept that reserved it. A multishot
-    /// accept stays armed and reserves again for its next connection; if the
-    /// loop is at its ceiling it holds nothing, and its next connection is
-    /// refused the way a fresh submission would be.
+    /// thing that can spend this one is the accept that reserved it.
+    ///
+    /// A multishot accept spends one of the slots pooled for every multishot
+    /// accept, if any is left, and the pool is then refilled as far as the
+    /// ceiling allows. The backend delivered this connection within the poll's
+    /// [`Budget`], which counts exactly the free slots not promised to
+    /// single-shot operations, so there is room for it either way.
     fn attach_reserved(
         &mut self,
         transport: B::Detached,
         id: OpId,
         token: Token,
-        terminal: bool,
     ) -> Result<Handle> {
-        let held = self
-            .ops
-            .get_mut(id.key)
-            .map_or(0, |op| std::mem::take(&mut op.reserved_handles));
-        self.reserved_handles -= held;
-        let attached = self.attach(transport, token);
-        if !terminal && held != 0 && self.handles.remaining() > self.reserved_handles {
-            self.reserved_handles += held;
-            if let Some(op) = self.ops.get_mut(id.key) {
-                op.reserved_handles = held;
-            } else {
-                self.reserved_handles -= held;
+        let multishot = self.ops.get(id.key).is_some_and(|op| op.multishot);
+        let attached = if multishot {
+            if self.multishot_reserved != 0 {
+                self.multishot_reserved -= 1;
+                self.reserved_handles -= 1;
             }
-        }
+            let attached = self.attach(transport, token);
+            while self.multishot_reserved < self.multishot_armed
+                && self.handles.remaining() > self.reserved_handles
+            {
+                self.multishot_reserved += 1;
+                self.reserved_handles += 1;
+            }
+            attached
+        } else {
+            let held = self
+                .ops
+                .get_mut(id.key)
+                .map_or(0, |op| std::mem::take(&mut op.reserved_handles));
+            self.reserved_handles -= held;
+            self.attach(transport, token)
+        };
         self.assert_reservations();
         attached
+    }
+    /// What the backend may deliver in the next poll (turnloop#77): every free
+    /// handle slot that no single-shot accept or handle receive is holding. A
+    /// multishot accept's connections are counted against it, so a batch can
+    /// never outrun the ceiling; nothing else is.
+    fn budget(&self) -> Budget {
+        Budget {
+            accepts: self.handles.remaining() - (self.reserved_handles - self.multishot_reserved),
+        }
     }
     /// Register an owning transport on this loop; failure drops the rejected transport.
     ///
@@ -1518,23 +1565,19 @@ impl<B: Backend> Driver<B> {
                 Ok(Outcome::Resolved(addresses)) => OpResult::Resolved(addresses),
                 Ok(Outcome::Exited(status)) => OpResult::Exited(status),
                 Ok(Outcome::Signal(signal)) => OpResult::Signal(signal),
-                Ok(Outcome::PipeAccepted(d)) => {
-                    match self.attach_reserved(d, e.op, op.token, e.terminal) {
-                        Ok(conn) => OpResult::PipeAccepted { conn },
-                        Err(e) => OpResult::Err(e),
-                    }
-                }
-                Ok(Outcome::HandleReceived(d)) => {
-                    match self.attach_reserved(d, e.op, op.token, e.terminal) {
-                        Ok(handle) => OpResult::HandleReceived { handle },
-                        Err(e) => OpResult::Err(e),
-                    }
-                }
+                Ok(Outcome::PipeAccepted(d)) => match self.attach_reserved(d, e.op, op.token) {
+                    Ok(conn) => OpResult::PipeAccepted { conn },
+                    Err(e) => OpResult::Err(e),
+                },
+                Ok(Outcome::HandleReceived(d)) => match self.attach_reserved(d, e.op, op.token) {
+                    Ok(handle) => OpResult::HandleReceived { handle },
+                    Err(e) => OpResult::Err(e),
+                },
                 Ok(Outcome::HandleSent) => OpResult::HandleSent,
                 Err(e) => OpResult::Err(e),
                 Ok(Outcome::Connected) => OpResult::Connected,
                 Ok(Outcome::Accepted { transport, peer }) => {
-                    match self.attach_reserved(transport, e.op, op.token, e.terminal) {
+                    match self.attach_reserved(transport, e.op, op.token) {
                         Ok(conn) => OpResult::Accepted { conn, peer },
                         Err(e) => OpResult::Err(e),
                     }
@@ -1593,7 +1636,7 @@ impl<B: Backend> Driver<B> {
             if timeout == Some(Duration::ZERO) || queued || notified || !self.notifier.park() {
                 timeout = Some(Duration::ZERO);
             }
-            let poll = self.backend.poll(timeout, &mut self.events);
+            let poll = self.backend.poll(timeout, self.budget(), &mut self.events);
             self.notifier.running();
             let poll = poll?;
             waits = poll.waits;
@@ -1989,6 +2032,7 @@ mod clock_contract {
         fn poll(
             &mut self,
             timeout: Option<Duration>,
+            _budget: Budget,
             events: &mut Vec<Event<()>>,
         ) -> Result<PollInfo> {
             assert_eq!(timeout, Some(Duration::ZERO));

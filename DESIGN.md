@@ -615,9 +615,16 @@ with `ResourceLimit` instead, before the kernel is asked. The pending connection
 stays in the listener's backlog, which is the queue meant to absorb it. This
 replaces accepting a connection and then destroying it for want of a slot, which
 is what a host at its ceiling did before, and is why it surfaced as a connection
-refusal rather than a delay. A multishot accept holds one such reservation, so it
-is protected for one connection at a time; bounding a whole batch needs a per-turn
-native event budget on `Backend::poll`, which is a separate change.
+refusal rather than a delay. A multishot accept holds one such reservation (the
+reservations of all armed multishot accepts are pooled), so it is protected for
+one connection at a time; a whole batch is bounded by the `Budget` the core
+passes to `Backend::poll` (#77): the free slots no single-shot accept or handle
+receive holds. Each connection a multishot accept delivers spends one; a
+multishot accept out of budget takes nothing more from the kernel, so the
+connection stays in the backlog, and it is not runnable work either, so a turn at
+the ceiling still blocks for its timeout (rule 4a). The budget throttles only
+multishot accepts: every other source, in the same poll, fills the output exactly
+as before, which is what rule 3's fairness contract depends on.
 
 **Rule 3 rationale (tl-i01b, spec-owner decision, 2026-09-15).** The original rule 3 ("none when completions are already queued") forbade even a zero-timeout poll. Backend revision 2 has no separate no-wait discovery primitive: `poll(Duration::ZERO)` is the only way to learn about fresh readiness or completions, and on Unix, after cached readiness reaches `EAGAIN`, only the poller marks a resource ready again. libuv and Node make the same trade: `uv_run` computes `uv_backend_timeout()`, which is zero while pending, idle or closing work exists, and still calls `uv__io_poll` with that zero timeout (see the libuv [loop API](https://docs.libuv.org/en/v1.x/loop.html) and [`src/unix/core.c`](https://github.com/libuv/libuv/blob/v1.x/src/unix/core.c)). The [tl-i01 probes](docs/lanes/tl-i01.md#evidence--specification-decision) showed that skipping discovery breaks the unchanged fairness contract: skipping the native step whenever work was queued failed the timer/I/O/post fairness test after two seconds, and a guard that only drained cached work delivered 64 posts with zero reads and failed the same fairness test. A separate no-wait collection API on all six backends is not justified before measurement. Rule 4a and its raw zero-event accounting are unchanged: an empty discovery poll still counts toward the same no-spin bound.
 

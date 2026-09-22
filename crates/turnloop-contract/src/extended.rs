@@ -835,10 +835,9 @@ pub fn handoff_accept_exactly_once<B: Backend>() {
         }));
     }
     let clients = mt_clients(addr, MT_CONNECTIONS);
-    // Single-shot accept, re-armed per connection. turnloop#77 is open: a
-    // multishot accept can outrun the handle ceiling within one turn, and this
-    // loop deliberately runs at a low ceiling, so depending on multishot here
-    // would be testing that open issue rather than the handoff.
+    // Single-shot accept, re-armed per connection, so this tests the handoff
+    // alone. A multishot accept at a low ceiling is covered separately, by
+    // `multishot_accept_respects_the_handle_ceiling` (turnloop#77).
     acceptor.accept(listener, Token(0)).expect("accept");
     let mut handed = 0;
     let mut out = Completions::default();

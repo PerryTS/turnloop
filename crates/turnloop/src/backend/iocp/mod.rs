@@ -16,7 +16,7 @@ mod timer;
 mod watch;
 
 use crate::{
-    backend::{Backend, Event, Operation, Outcome, PollInfo, Request},
+    backend::{Backend, Budget, Event, Operation, Outcome, PollInfo, Request},
     *,
 };
 use integration::EventIntegration;
@@ -239,6 +239,9 @@ struct Pending {
     queued: bool,
     pool_wait: bool,
     listener_wait: bool,
+    /// Listed in `throttled`: a multishot accept held back by the budget. It
+    /// is not re-armed, and a connection it already completed stays here.
+    throttled: bool,
     cancelled: bool,
     completion: Option<Result<u32>>,
     offset: usize,
@@ -280,6 +283,11 @@ pub struct Iocp {
     /// `OVERLAPPED` pointer back to an operation index needs `kernel` contiguous.
     bridges: Vec<Option<bridge::Bridge>>,
     ready: VecDeque<usize>,
+    /// Multishot accepts out of budget: not runnable, so they neither count
+    /// as work nor shorten a wait, until a poll with a positive budget (#77).
+    throttled: VecDeque<usize>,
+    /// Connections multishot accepts may still deliver in the current poll.
+    accepts: usize,
     pool_waiting: VecDeque<OpId>,
     pool: BufferPool,
     port: Arc<Port>,
@@ -403,6 +411,7 @@ impl Iocp {
             && !p.queued
             && !p.waiting
             && !p.listener_wait
+            && (!p.throttled || p.cancelled)
         {
             p.queued = true;
             self.ready.push_back(i);
@@ -455,6 +464,17 @@ impl Iocp {
                 continue;
             };
             p.queued = false;
+            if !p.cancelled && self.accepts == 0 && Budget::throttles(&p.request.operation) {
+                // Out of budget: take nothing more from the kernel, and keep a
+                // connection that has already completed in `p` until a poll can
+                // house it.
+                if !p.throttled {
+                    p.throttled = true;
+                    self.throttled.push_back(i);
+                }
+                self.ops[i] = Some(p);
+                continue;
+            }
             let result = if p.cancelled {
                 Ok(Some((Outcome::Cancelled, true)))
             } else {
@@ -476,11 +496,15 @@ impl Iocp {
                 if terminal {
                     self.unlink(i, &p);
                 }
-                events.push(Event {
+                let event = Event {
                     op: p.request.op,
                     terminal,
                     result: Ok(result),
-                });
+                };
+                if Budget::spends(&event) {
+                    self.accepts -= 1;
+                }
+                events.push(event);
                 if terminal {
                     continue;
                 }
@@ -1122,6 +1146,8 @@ unsafe impl Backend for Iocp {
             kernel,
             bridges,
             ready: VecDeque::with_capacity(page_reserve(config.max_operations)),
+            throttled: VecDeque::with_capacity(page_reserve(config.max_operations)),
+            accepts: usize::MAX,
             pool_waiting: VecDeque::with_capacity(page_reserve(config.max_operations)),
             pool,
             wake: Arc::new(IocpWake {
@@ -1483,6 +1509,7 @@ unsafe impl Backend for Iocp {
             queued: false,
             pool_wait: false,
             listener_wait: false,
+            throttled: false,
             cancelled: false,
             completion: None,
             offset: 0,
@@ -1540,8 +1567,18 @@ unsafe impl Backend for Iocp {
     fn poll(
         &mut self,
         timeout: Option<Duration>,
+        budget: Budget,
         events: &mut Vec<Event<Detached>>,
     ) -> Result<PollInfo> {
+        self.accepts = budget.accepts;
+        if self.accepts != 0 {
+            while let Some(i) = self.throttled.pop_front() {
+                if let Some(p) = self.ops[i].as_mut().filter(|p| p.throttled) {
+                    p.throttled = false;
+                    self.schedule(i);
+                }
+            }
+        }
         if let Some(event) = &self.event {
             event.check()?;
         }
@@ -1698,7 +1735,7 @@ impl Drop for Iocp {
         self.watches.shutdown();
         let mut events = Vec::with_capacity(64);
         while self.ops.iter().any(Option::is_some) || self.watches.pending() {
-            if self.poll(None, &mut events).is_err() {
+            if self.poll(None, Budget::UNLIMITED, &mut events).is_err() {
                 std::process::abort();
             }
             events.clear();
@@ -1775,7 +1812,7 @@ mod tests {
                 backend.port.post(WAKE, 0).expect("wake");
             }
             let info = backend
-                .poll(Some(Duration::ZERO), &mut events)
+                .poll(Some(Duration::ZERO), Budget::UNLIMITED, &mut events)
                 .expect("discovery");
             assert_eq!(
                 (info.waits, info.discovery_polls, info.zero_event_waits),
@@ -1791,7 +1828,7 @@ mod tests {
         let result = unsafe { WaitForSingleObject(event as _, 2000) };
         assert_eq!(result, WAIT_OBJECT_0, "helper must forward a real packet");
         let info = backend
-            .poll(Some(Duration::ZERO), &mut events)
+            .poll(Some(Duration::ZERO), Budget::UNLIMITED, &mut events)
             .expect("helper drain");
         assert_eq!(
             (info.waits, info.discovery_polls, info.zero_event_waits),
@@ -1857,7 +1894,7 @@ mod tests {
             for (i, op) in self.ops.into_iter().enumerate() {
                 let info = self
                     .backend
-                    .poll(Some(Duration::ZERO), &mut out)
+                    .poll(Some(Duration::ZERO), Budget::UNLIMITED, &mut out)
                     .expect("drain valid packet");
                 assert_eq!((info.waits, info.discovery_polls), (0, 0));
                 assert_eq!(out.len(), 1);

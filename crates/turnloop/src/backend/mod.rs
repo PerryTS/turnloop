@@ -44,6 +44,18 @@
 //!   queued work, whatever `has_work` reports (web, whose poll never
 //!   enters the OS, keeps draining cached host work). `None` means an unbounded
 //!   wait. Durations must retain sub-millisecond precision.
+//! * `Budget::accepts` bounds the connections multishot accepts deliver in one
+//!   poll: nonterminal `Accepted`/`PipeAccepted` events (turnloop#77). It is the
+//!   number of handles the core can still house for them, so each one past it
+//!   would be accepted from the kernel and then destroyed. It throttles only
+//!   those operations: every other source, single-shot accepts included, fills
+//!   the vector exactly as before (DESIGN §10 rule 3 fairness). A multishot
+//!   accept held back by it takes nothing further from the kernel (a readiness
+//!   backend leaves the connection in the listener's backlog; a completion
+//!   backend does not re-arm, and keeps an already completed one in its
+//!   operation storage), and is neither runnable work for `has_work` nor a
+//!   reason to end the wait early (rule 4a): the operation is resumed by the
+//!   first poll whose budget is positive again.
 //! * Readiness backends execute I/O in poll, cache readiness until EAGAIN, and
 //!   requeue partially processed work fairly. Completion backends drain native
 //!   completions. WASI 0.2 polls pollables; 0.3 drives a waitable set; web drains
@@ -267,6 +279,31 @@ pub enum Filesystem {
     /// No filesystem: `Loop::fs` returns Unsupported.
     Unsupported,
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// What the core can house from one `poll` (see the module documentation).
+pub struct Budget {
+    /// Connections multishot accepts may deliver in this poll: the handle
+    /// slots the core holds for them, which each such event spends.
+    pub accepts: usize,
+}
+impl Budget {
+    /// No limit on any source. For backend-level tests that bypass the core.
+    pub const UNLIMITED: Self = Self {
+        accepts: usize::MAX,
+    };
+    /// Whether this operation's deliveries are counted against `accepts`.
+    pub fn throttles(operation: &Operation) -> bool {
+        matches!(operation, Operation::Accept { multishot: true })
+    }
+    /// Whether this event spent one of `accepts`.
+    pub fn spends<D>(event: &Event<D>) -> bool {
+        !event.terminal
+            && matches!(
+                event.result,
+                Ok(Outcome::Accepted { .. } | Outcome::PipeAccepted(_))
+            )
+    }
+}
 #[derive(Clone, Copy, Debug, Default)]
 /// Instrumentation for the single bounded backend wait.
 pub struct PollInfo {
@@ -436,10 +473,13 @@ pub unsafe trait Backend: Sized + 'static {
     fn cancel(&mut self, op: OpId) -> Result<()>;
     /// Whether completions or immediately runnable cached operations are available.
     fn has_work(&self) -> bool;
-    /// Append bounded completions, performing at most one OS wait with the supplied exact timeout.
+    /// Append bounded completions, performing at most one OS wait with the
+    /// supplied exact timeout, and delivering no more multishot connections
+    /// than `budget` allows.
     fn poll(
         &mut self,
         timeout: Option<Duration>,
+        budget: Budget,
         events: &mut Vec<Event<Self::Detached>>,
     ) -> Result<PollInfo>;
     /// Release a quiescent resource after Closed was appended to host output.

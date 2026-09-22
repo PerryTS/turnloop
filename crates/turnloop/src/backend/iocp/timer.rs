@@ -268,7 +268,11 @@ mod tests {
         assert!(
             fixture
                 .backend
-                .poll(Some(Duration::from_secs(30)), &mut out)
+                .poll(
+                    Some(Duration::from_secs(30)),
+                    crate::backend::Budget::UNLIMITED,
+                    &mut out
+                )
                 .is_err()
         );
         assert_eq!(
@@ -288,7 +292,11 @@ mod tests {
         backend.port.post(WAKE, 0).expect("wake first wait");
         let mut out = Vec::with_capacity(1);
         let info = backend
-            .poll(Some(Duration::from_secs(30)), &mut out)
+            .poll(
+                Some(Duration::from_secs(30)),
+                crate::backend::Budget::UNLIMITED,
+                &mut out,
+            )
             .expect("first wait");
         assert_eq!(
             (info.waits, info.discovery_polls, info.zero_event_waits),
@@ -316,7 +324,11 @@ mod tests {
             },
         );
         let info = backend
-            .poll(Some(Duration::from_secs(30)), &mut out)
+            .poll(
+                Some(Duration::from_secs(30)),
+                crate::backend::Budget::UNLIMITED,
+                &mut out,
+            )
             .expect("drain pending timer");
         assert_eq!(
             (info.waits, info.discovery_polls, info.zero_event_waits),
@@ -332,7 +344,11 @@ mod tests {
         // Reuse is allowed after acknowledgement, and the next generation runs.
         backend.port.post(WAKE, 0).expect("wake rearmed wait");
         backend
-            .poll(Some(Duration::from_secs(30)), &mut out)
+            .poll(
+                Some(Duration::from_secs(30)),
+                crate::backend::Budget::UNLIMITED,
+                &mut out,
+            )
             .expect("reuse timer");
         assert_eq!(backend.timer.generation, generation + 1);
         assert_eq!(CANCELS.with(Cell::get), 2);
