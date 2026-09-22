@@ -209,17 +209,17 @@ impl Connection {
         }
         Ok(())
     }
+    /// Whether `receive` would accept bytes now: a handshake, authentication or
+    /// command reply is outstanding. This is the exact check `receive` makes, so
+    /// a host need not shadow the state machine to decide when to read. It is
+    /// false before `connected`, during a TLS upgrade, when idle, while an
+    /// unacknowledged write drains, while a reply is unreleased and after close.
+    pub fn accepts_receive(&self) -> bool {
+        matches!(self.state, State::Handshake | State::Auth | State::Command)
+    }
     /// Feed may consume only a frame prefix; retain and feed the remaining bytes.
     pub fn receive(&mut self, input: &[u8]) -> Result<usize> {
-        if matches!(
-            self.state,
-            State::New
-                | State::Tls
-                | State::Ready
-                | State::UnackSending
-                | State::Reply
-                | State::Closed
-        ) {
+        if !self.accepts_receive() {
             return Err(Error::protocol("Connection is not expecting a reply"));
         }
         let result = self.receive_inner(input);

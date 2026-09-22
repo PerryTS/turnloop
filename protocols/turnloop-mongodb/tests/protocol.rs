@@ -867,3 +867,85 @@ fn compressed_commands_are_independent_zlib_streams() {
     assert_eq!(decoded_rounds, 64, "every round must be decoded");
     assert_eq!(shrank, 64, "every round must actually compress");
 }
+
+/// Writes the pending request and returns a server reply to it.
+fn answer(c: &mut Connection, body: &Document) -> Vec<u8> {
+    let req = wire::i32_at(c.transmit(), 4).unwrap();
+    let n = c.transmit().len();
+    c.consume_transmit(n).unwrap();
+    let mut reply = Vec::new();
+    wire::encode(&mut reply, 1, req, 0, &raw(body), &[], 1000).unwrap();
+    reply
+}
+
+/// `accepts_receive` must be the check `receive` makes: a refused `receive`
+/// changes nothing, and an accepted empty one consumes nothing.
+fn accepts(c: &mut Connection) -> bool {
+    let accepts = c.accepts_receive();
+    assert_eq!(c.receive(&[]).is_ok(), accepts);
+    accepts
+}
+
+#[test]
+fn accepts_receive_tracks_every_connection_state() {
+    let body = raw(&doc! {"ping":1,"$db":"admin"});
+    // New, then a requested TLS upgrade, then the handshake it releases.
+    let mut c = Connection::new(Options::parse("mongodb://a/?tls=true").unwrap());
+    assert!(!accepts(&mut c));
+    c.connected(clock::now(), "").unwrap();
+    assert!(matches!(c.poll_event(), Some(ConnectionEvent::UpgradeTls)));
+    assert!(!accepts(&mut c));
+    c.tls_established().unwrap();
+    assert!(accepts(&mut c));
+
+    // Authentication continues to expect replies after the handshake.
+    let mut c = Connection::new(Options::parse("mongodb://user:pencil@a/").unwrap());
+    c.connected(clock::now(), "fyko+d2lbbFgONRv9qkxdawL")
+        .unwrap();
+    assert!(accepts(&mut c));
+    let hello = answer(&mut c, &doc! {"ok":1,"maxWireVersion":27});
+    feed(&mut c, &hello);
+    assert!(c.poll_event().is_none(), "saslStart, not Ready, follows");
+    assert!(!c.transmit().is_empty());
+    assert!(accepts(&mut c));
+
+    // Ready, an outstanding command, then its unreleased reply.
+    let mut c = ready();
+    assert!(!accepts(&mut c));
+    c.command(1, &body, &[], clock::now()).unwrap();
+    assert!(accepts(&mut c));
+    let reply = answer(&mut c, &doc! {"ok":1});
+    feed(&mut c, &reply);
+    assert!(matches!(
+        c.poll_event(),
+        Some(ConnectionEvent::Reply { token: 1 })
+    ));
+    assert!(!accepts(&mut c));
+    c.release_reply().unwrap();
+    assert!(!accepts(&mut c));
+    assert!(c.is_ready());
+
+    // An unacknowledged write expects no reply while or after it drains.
+    let unack = raw(&doc! {"insert":"x","writeConcern":{"w":0},"$db":"test"});
+    c.command(2, &unack, &[], clock::now()).unwrap();
+    assert!(!accepts(&mut c));
+    let n = c.transmit().len();
+    c.consume_transmit(n).unwrap();
+    assert!(matches!(
+        c.poll_event(),
+        Some(ConnectionEvent::Unacknowledged { token: 2 })
+    ));
+    assert!(!accepts(&mut c));
+
+    // Closed, including when a command was outstanding.
+    c.command(3, &body, &[], clock::now()).unwrap();
+    assert!(accepts(&mut c));
+    c.close();
+    assert!(!accepts(&mut c));
+    assert!(matches!(
+        c.poll_event(),
+        Some(ConnectionEvent::Failed { token: Some(3), .. })
+    ));
+    assert!(matches!(c.poll_event(), Some(ConnectionEvent::Closed)));
+    assert!(c.poll_event().is_none());
+}

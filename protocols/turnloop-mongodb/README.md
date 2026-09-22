@@ -57,6 +57,8 @@ has no SRV/TXT capability, so use explicit resolved seed URIs there.
 4. Feed plaintext bytes through `receive()`. It returns the consumed prefix: loop on
    the remainder. It deliberately stops at a frame boundary. Drain events and release
    a complete reply before feeding another frame. Partial reads and writes are normal.
+   `accepts_receive()` is the same check `receive()` makes, so a host can ask whether
+   to read instead of tracking an `expecting_reply` flag of its own.
 5. On `Ready`, submit one command. An accepted token receives one `Reply`, `Failed` or
    `Unacknowledged`; rejected submissions receive no completion. `Reply` is a borrowed
    view obtained with `reply()`. Consume or copy it, then `release_reply()`.
