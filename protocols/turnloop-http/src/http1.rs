@@ -294,6 +294,41 @@ impl Decoder {
     pub fn wants_step(&self) -> bool {
         matches!(self.state, State::End | State::Upgrade)
     }
+    /// True between a message's [`Event::Head`] and the point its end is
+    /// reached: the body, chunk framing or trailers are still being read. False
+    /// before the head (including after an [`Event::Informational`], which is
+    /// not the message), once `End` or `Upgrade` is owed or delivered, and after
+    /// a failure. Bytes of a head the host has buffered but not yet completed
+    /// are the host's to know; the decoder has not accepted them.
+    ///
+    /// A close-delimited body is mid-message too, though EOF is its legal end:
+    /// ask [`eof_is_clean`](Self::eof_is_clean) to tell the two apart.
+    pub fn is_mid_message(&self) -> bool {
+        matches!(
+            self.state,
+            State::Fixed(_)
+                | State::ChunkSize
+                | State::Chunk(_)
+                | State::ChunkEnd
+                | State::Trailers
+                | State::Eof
+        )
+    }
+    /// Whether the transport ending now would be a clean end rather than a
+    /// truncation: exactly the cases in which [`eof`](Self::eof) returns `Ok`,
+    /// answered without changing any state. True inside a close-delimited body
+    /// and once the message is complete; false inside a framed body, before a
+    /// head arrives and after a failure. So a host whose read returned zero can
+    /// choose what to do - retry, fail with its own diagnosis, log - before it
+    /// commits to `eof`.
+    ///
+    /// Before a head is always "not clean" here, because a client that sees EOF
+    /// there got no response. A server whose connection closes while idle
+    /// between requests (with no buffered head bytes) treats that as an
+    /// ordinary close on its own.
+    pub fn eof_is_clean(&self) -> bool {
+        matches!(self.state, State::Eof | State::End | State::Done)
+    }
     pub fn reset(&mut self) -> Result<()> {
         if !self.reusable() {
             return Err(invalid("connection is not reusable"));
@@ -533,16 +568,18 @@ impl Decoder {
         }
         Ok(step)
     }
+    /// Declare the end of input. Ends a close-delimited body (leaving
+    /// [`Event::End`] owed, see [`wants_step`](Self::wants_step)); anywhere
+    /// [`eof_is_clean`](Self::eof_is_clean) is false it fails the decoder.
     pub fn eof(&mut self) -> Result<()> {
+        if !self.eof_is_clean() {
+            self.state = State::Failed;
+            return Err(Error::new("UND_ERR_SOCKET", "unexpected EOF"));
+        }
         if self.state == State::Eof {
             self.state = State::End;
-            Ok(())
-        } else if matches!(self.state, State::End | State::Done) {
-            Ok(())
-        } else {
-            self.state = State::Failed;
-            Err(Error::new("UND_ERR_SOCKET", "unexpected EOF"))
         }
+        Ok(())
     }
 }
 /// How the body after an encoded head is framed.

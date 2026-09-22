@@ -1467,6 +1467,72 @@ fn http1_end_needs_a_step_after_the_last_byte() {
     assert!(!decoder.wants_step());
 }
 
+/// PerryTS/turnloop#80: when a read returns zero, P11 must decide between a
+/// legal end of body and a truncated response before calling `eof`, which
+/// commits (and fails the decoder) either way. The queries answer from state.
+#[test]
+fn http1_mid_message_is_queryable_without_feeding_eof() {
+    let position = |d: &Decoder| (d.is_mid_message(), d.eof_is_clean());
+    // Content-Length: mid-body, and EOF here would be a truncation.
+    let mut decoder = Decoder::new(Mode::Response, Limits::default());
+    decoder.response_to("GET");
+    assert_eq!(position(&decoder), (false, false), "no response yet");
+    let head = b"HTTP/1.1 200 OK\r\ncontent-length: 6\r\n\r\n";
+    decoder.receive(head).unwrap();
+    assert_eq!(position(&decoder), (true, false));
+    decoder.receive(b"par").unwrap();
+    assert_eq!(position(&decoder), (true, false));
+    // Asking changed nothing: the rest of the body still decodes.
+    assert!(matches!(
+        decoder.receive(b"tial").unwrap().event,
+        Some(Event::Body(b"tia"))
+    ));
+    assert_eq!(position(&decoder), (false, true), "complete, End owed");
+    decoder.receive(&[]).unwrap();
+    assert_eq!(position(&decoder), (false, true));
+    decoder.eof().unwrap();
+
+    // Close-delimited: mid-body, and EOF is its legal end.
+    let mut decoder = Decoder::new(Mode::Response, Limits::default());
+    decoder.response_to("GET");
+    decoder.receive(b"HTTP/1.0 200 OK\r\n\r\n").unwrap();
+    decoder.receive(b"abc").unwrap();
+    assert_eq!(position(&decoder), (true, true));
+    decoder.eof().unwrap();
+    assert_eq!(position(&decoder), (false, true));
+
+    // Chunked framing and trailers are mid-message too.
+    let mut decoder = Decoder::new(Mode::Response, Limits::default());
+    decoder.response_to("GET");
+    let mut wire =
+        b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n2\r\nab\r\n0\r\n".to_vec();
+    let mut seen = Vec::new();
+    loop {
+        let step = decoder.receive(&wire).unwrap();
+        let (consumed, progressed) = (step.consumed, step.consumed > 0 || step.event.is_some());
+        wire.drain(..consumed);
+        seen.push(position(&decoder));
+        if !progressed {
+            break;
+        }
+    }
+    assert!(seen.iter().all(|p| *p == (true, false)), "{seen:?}");
+
+    // An informational response is not the message.
+    let mut decoder = Decoder::new(Mode::Response, Limits::default());
+    decoder.response_to("GET");
+    decoder.receive(b"HTTP/1.1 100 Continue\r\n\r\n").unwrap();
+    assert_eq!(position(&decoder), (false, false));
+
+    // The answers agree with what `eof` then does.
+    let mut decoder = Decoder::new(Mode::Response, Limits::default());
+    decoder.response_to("GET");
+    decoder.receive(head).unwrap();
+    assert!(!decoder.eof_is_clean());
+    assert!(decoder.eof().is_err());
+    assert_eq!(position(&decoder), (false, false), "failed");
+}
+
 /// PerryTS/turnloop#47, part 1: Node's `res.writeHead(404, "Nope")`.
 #[test]
 fn http1_encoder_writes_a_custom_reason_phrase() {
