@@ -47,10 +47,18 @@ pub enum Error {
     State(&'static str),
     Limit,
     Timeout,
-    Transport,
+    /// The transport failed. The host may attach its own diagnostic (for
+    /// example `ECONNREFUSED`); it reaches every `Outcome::Aborted` and `Closed`.
+    Transport(Option<TransportFailure>),
     /// The server terminated the session; preserves SQLSTATE and every field.
     ConnectionAborted(ConnectionFailure),
     Cancelled,
+}
+impl Error {
+    /// A transport failure carrying the host's I/O error kind, OS code and text.
+    pub fn transport(error: &std::io::Error) -> Self {
+        Self::Transport(Some(error.into()))
+    }
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -58,7 +66,10 @@ impl fmt::Display for Error {
             Self::Protocol(s) | Self::State(s) => f.write_str(s),
             Self::Limit => f.write_str("protocol buffer limit exceeded"),
             Self::Timeout => f.write_str("Connection terminated due to timeout"),
-            Self::Transport => f.write_str("Connection terminated unexpectedly"),
+            Self::Transport(None) => f.write_str("Connection terminated unexpectedly"),
+            Self::Transport(Some(failure)) => {
+                write!(f, "Connection terminated unexpectedly: {failure}")
+            }
             Self::ConnectionAborted(error) => write!(f, "Connection aborted: {error}"),
             Self::Cancelled => f.write_str("Connection terminated"),
         }
@@ -67,12 +78,56 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 impl From<Error> for std::io::Error {
     fn from(error: Error) -> Self {
-        let kind = match error {
-            Error::ConnectionAborted(_) | Error::Transport => std::io::ErrorKind::ConnectionAborted,
+        let kind = match &error {
+            Error::Transport(Some(failure)) => failure.kind(),
+            Error::ConnectionAborted(_) | Error::Transport(None) => {
+                std::io::ErrorKind::ConnectionAborted
+            }
             Error::Timeout => std::io::ErrorKind::TimedOut,
             _ => std::io::ErrorKind::Other,
         };
         Self::new(kind, error)
+    }
+}
+/// Host-supplied transport diagnostic. Clones share one copy of the message,
+/// so aborting a pipeline of tokens allocates nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransportFailure {
+    kind: std::io::ErrorKind,
+    code: Option<i32>,
+    message: std::sync::Arc<str>,
+}
+impl TransportFailure {
+    /// `code` is whatever error number the host reports (OS errno, libuv code).
+    pub fn new(
+        kind: std::io::ErrorKind,
+        code: Option<i32>,
+        message: impl Into<std::sync::Arc<str>>,
+    ) -> Self {
+        Self {
+            kind,
+            code,
+            message: message.into(),
+        }
+    }
+    pub fn kind(&self) -> std::io::ErrorKind {
+        self.kind
+    }
+    pub fn code(&self) -> Option<i32> {
+        self.code
+    }
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+impl From<&std::io::Error> for TransportFailure {
+    fn from(error: &std::io::Error) -> Self {
+        Self::new(error.kind(), error.raw_os_error(), error.to_string())
+    }
+}
+impl fmt::Display for TransportFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
     }
 }
 impl From<std::io::Error> for Error {
@@ -505,7 +560,7 @@ impl Connection {
             copy_in: false,
             transaction: TransactionStatus::Idle,
             key: None,
-            reason: Error::Transport,
+            reason: Error::Transport(None),
         };
         if this.config.ssl == SslMode::Disable {
             this.startup()?;

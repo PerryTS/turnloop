@@ -69,7 +69,11 @@ and RSA-PSS are supported; MD5/SHA-1 signatures use SHA-256. Unsupported algorit
 6. Schedule `next_timeout()` in the host. Call `handle_timeout(now)` with supplied
    monotonic time. No method obtains time implicitly.
 7. On transport EOF, TLS failure, or an error from `receive`/`next_event`, call
-   `abort(error)` and drain events. Do not resume parsing after a protocol error.
+   `abort(error)` and drain events. For a transport failure pass
+   `Error::transport(&io_error)` (or `Error::Transport(Some(TransportFailure::new(kind,
+   code, message)))`): the host's kind, error code and text (for example
+   `connect ECONNREFUSED`) reach every `Outcome::Aborted` and the `Closed` reason.
+   `Error::Transport(None)` keeps pg's generic message. Do not resume parsing after a protocol error.
    Each accepted token yields one terminal `Completed`; `Error` and command tags
    are informational and must not separately settle a promise. Aborting drains
    all tokens, then emits one `Closed`. Rejected command calls accept no token.

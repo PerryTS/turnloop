@@ -636,7 +636,7 @@ fn fatal_errors_abort_every_pending_token_and_preserve_diagnostics_after_eof() {
             assert!(!c.is_ready());
             assert!(c.output().is_empty(), "discard unsent pipeline output");
             assert!(c.query(99, "SELECT 1", None).is_err());
-            c.abort(Error::Transport); // Scripted peer closes immediately after FATAL.
+            c.abort(Error::Transport(None)); // Scripted peer closes immediately after FATAL.
             for token in 1..=pending {
                 match c.next_event().expect("terminal completion") {
                     Some(Event::Completed {
@@ -822,4 +822,76 @@ fn owned_events_survive_later_input_and_lend_back_the_borrowed_form() {
         Event::Notice(error) if error.code() == "00000"
     ));
     assert_eq!(retained[1].as_event().into_owned(), retained[1]);
+}
+
+#[test]
+fn host_transport_diagnostic_reaches_every_aborted_completion_and_close() {
+    let refused = std::io::Error::new(
+        std::io::ErrorKind::ConnectionRefused,
+        "connect ECONNREFUSED 127.0.0.1:5432",
+    );
+    let from_io = Error::transport(&refused);
+    let with_code = Error::Transport(Some(TransportFailure::new(
+        std::io::ErrorKind::ConnectionReset,
+        Some(-104),
+        "read ECONNRESET",
+    )));
+    for (reason, kind, code, message) in [
+        (
+            from_io,
+            std::io::ErrorKind::ConnectionRefused,
+            None,
+            "connect ECONNREFUSED 127.0.0.1:5432",
+        ),
+        (
+            with_code,
+            std::io::ErrorKind::ConnectionReset,
+            Some(-104),
+            "read ECONNRESET",
+        ),
+    ] {
+        let mut c = ready();
+        for token in 1..=3 {
+            c.query(token, "SELECT 1", None).expect("queue query");
+        }
+        c.abort(reason.clone());
+        for token in 1..=3 {
+            match c.next_event().expect("terminal completion") {
+                Some(Event::Completed {
+                    token: actual,
+                    outcome: Outcome::Aborted(Error::Transport(Some(failure))),
+                    ..
+                }) => {
+                    assert_eq!(actual, token);
+                    assert_eq!(failure.kind(), kind);
+                    assert_eq!(failure.code(), code);
+                    assert_eq!(failure.message(), message);
+                }
+                event => panic!("lost transport diagnostic: {event:?}"),
+            }
+        }
+        let Some(Event::Closed { reason: closed }) = c.next_event().expect("close") else {
+            panic!("missing close");
+        };
+        assert_eq!(closed, reason);
+        assert_eq!(
+            closed.to_string(),
+            format!("Connection terminated unexpectedly: {message}")
+        );
+        let io = std::io::Error::from(closed);
+        assert_eq!(io.kind(), kind);
+        assert!(io.to_string().ends_with(message));
+    }
+    // An OS error keeps its raw code.
+    let os = std::io::Error::from_raw_os_error(2);
+    let Error::Transport(Some(failure)) = Error::transport(&os) else {
+        panic!("transport");
+    };
+    assert_eq!(failure.code(), Some(2));
+    assert_eq!(failure.message(), os.to_string());
+    // Without a diagnostic the generic pg message is unchanged.
+    assert_eq!(
+        Error::Transport(None).to_string(),
+        "Connection terminated unexpectedly"
+    );
 }
