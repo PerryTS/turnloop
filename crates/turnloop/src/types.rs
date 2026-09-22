@@ -204,13 +204,93 @@ impl Default for Config {
         }
     }
 }
+impl Config {
+    /// Capacities for a short-lived loop that drives one outbound connection,
+    /// one request at a time: a client that resolves a name, connects, writes a
+    /// request, reads the response and drops the loop.
+    ///
+    /// [`Config::default`] sizes every table for a server. This preset keeps the
+    /// defaults only where they are not per-loop: the pooled buffer size (one
+    /// read still takes a full TLS record) and [`Config::blocking_pool`], which is
+    /// process-wide and must match every other loop's, so shrinking it here would
+    /// make the first DNS lookup fail with `InvalidInput` in a process that also
+    /// runs default loops.
+    ///
+    /// # The floor, and what it covers
+    ///
+    /// A handle's slot is held from creation until its `Closed` completion is
+    /// delivered, and an operation's until its terminal completion is. The worst
+    /// moment for this caller is a reconnect (a redirect or a retry) that starts
+    /// before the previous attempt's completions have been turned out:
+    ///
+    /// | Holding a slot at that moment | handles | operations |
+    /// |---|---|---|
+    /// | the old socket, closing, and its cancelled read, write and shutdown | 1 | 3 |
+    /// | the new socket: its connect, then read, write and shutdown | 1 | 3 |
+    /// | a request deadline timer, and the one it replaces | 2 | 2 |
+    /// | a DNS lookup, and one other blocking-pool job | 0 | 2 |
+    /// | **needed** | **4** | **10** |
+    /// | **this preset** | **8** | **16** |
+    ///
+    /// `max_handles` and `max_operations` are the only fields a caller can size
+    /// too small by guessing, and they fail loudly: a creation or submission past
+    /// either ceiling is refused with `ResourceLimit`, nothing is dropped. The
+    /// other fields only pace the loop: `events_per_turn` bounds how many native
+    /// events one turn collects, `pooled_buffers` how many
+    /// [`ReadBuf::Pooled`](crate::ReadBuf::Pooled) reads can hold data at once
+    /// (a read waits for a free buffer rather than failing; two let the next read
+    /// fill while the host still holds the last one), and `post_capacity` how
+    /// many cross-thread posts can queue before `Poster::post` refuses one.
+    ///
+    /// Anything beyond the table, such as a second concurrent connection, a
+    /// listener, child processes, signal subscriptions or filesystem requests,
+    /// needs its own handles and operations on top. With the `executor`
+    /// feature's `LocalExecutor`, pair this with
+    /// `ExecutorConfig::single_connection`, whose operations fit inside these.
+    pub fn single_connection() -> Self {
+        Self {
+            max_handles: 8,
+            max_operations: 16,
+            events_per_turn: 16,
+            pooled_buffers: 2,
+            pooled_buffer_size: 16 * 1024,
+            post_capacity: 16,
+            blocking_pool: crate::PoolConfig::default(),
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, Default)]
-/// TCP connection options applied when creating the socket. Anything a host
-/// needs to change later goes through `Loop::set_option` and
-/// [`SocketOption`] instead.
+/// Connect-time options for [`Loop::tcp_connect`].
+///
+/// This struct holds what must be decided before the connection attempt starts
+/// and what the loop itself enforces. Every socket option that can be changed
+/// on a live socket goes through [`Loop::set_option`] and [`SocketOption`]
+/// instead, and can be applied to the handle `tcp_connect` returns, before the
+/// `Connected` completion arrives, wherever the backend supports that option:
+/// keep-alive, linger, TTL and buffer sizes. A
+/// receive buffer set that way is applied after the handshake has started, so it
+/// cannot change the window scale the peers negotiate.
+///
+/// Not offered at all, on any backend: binding the connecting socket to a
+/// chosen local address or port before it connects. `IPV6_V6ONLY` is not needed
+/// here: a connecting socket's family is the destination's.
+///
+/// [`Loop::tcp_connect`]: crate::Driver::tcp_connect
+/// [`Loop::set_option`]: crate::Driver::set_option
 pub struct TcpOpts {
     /// Disable the TCP Nagle algorithm for latency-sensitive small writes.
     pub nodelay: bool,
+    /// Give up on the connection attempt after this long.
+    ///
+    /// Enforced by the loop on its own clock, identically on every backend: when
+    /// the deadline passes, the pending connect is cancelled and completes once,
+    /// with `Err` of kind `TimedOut`, only after the backend acknowledges the
+    /// cancellation. It covers the attempt only, never later stream I/O, and it
+    /// cannot outlast the operating system's own connect timeout, which still
+    /// applies. The handle stays open after a timeout; close it as after any
+    /// other failed connect. `None` (the default) leaves the attempt to the OS.
+    /// A zero duration is `InvalidInput`.
+    pub connect_timeout: Option<Duration>,
 }
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 /// What a second bind of the same address is allowed to do.

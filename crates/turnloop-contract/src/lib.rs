@@ -239,6 +239,14 @@ mod native {
         refused_connect_once::<B>();
     }
     #[test]
+    fn connect_timeout() {
+        tcp_connect_timeout::<B>();
+    }
+    #[test]
+    fn single_connection_preset() {
+        single_connection_config::<B>();
+    }
+    #[test]
     fn liveness() {
         ref_unref::<B>();
     }
@@ -432,6 +440,226 @@ pub fn refused_connect_once<B: Backend>() {
     }
     l.close(conn, Token(8)).expect("close");
     assert_eq!(count, 1);
+}
+/// `TcpOpts::connect_timeout` is enforced by the loop: an attempt still pending
+/// at its deadline completes once with `TimedOut`, an attempt that connects in
+/// time is unaffected and leaves no deadline behind, and a zero budget is
+/// refused before any socket exists.
+pub fn tcp_connect_timeout<B: Backend>() {
+    let mut l = Driver::<B>::new(Config::default()).expect("loop");
+    let zero = TcpOpts {
+        connect_timeout: Some(Duration::ZERO),
+        ..TcpOpts::default()
+    };
+    assert_eq!(
+        l.tcp_connect(localhost(), &zero, Token(1))
+            .expect_err("zero budget")
+            .kind,
+        ErrorKind::InvalidInput
+    );
+    assert!(!l.alive(), "a refused connect retains nothing");
+
+    let server = l
+        .tcp_listen(localhost(), &ListenOpts::default())
+        .expect("listen");
+    let addr = l.local_addr(server).expect("addr");
+    let mut out = Completions::default();
+
+    // In time: Connected, and the deadline is retired with the operation.
+    let generous = TcpOpts {
+        connect_timeout: Some(Duration::from_secs(5)),
+        ..TcpOpts::default()
+    };
+    let on_time = l.tcp_connect(addr, &generous, Token(2)).expect("connect");
+    assert!(l.next_deadline().is_some(), "the budget is armed");
+    let until = l.now() + Duration::from_secs(3);
+    let mut results = Vec::new();
+    while results.is_empty() {
+        assert!(l.now() < until, "connect in time");
+        l.turn(Timeout::Until(until), &mut out).expect("turn");
+        results.extend(out.drain().map(|c| (c.token, c.terminal, c.result)));
+    }
+    assert!(
+        matches!(results[..], [(Token(2), true, OpResult::Connected)]),
+        "{results:?}"
+    );
+    assert_eq!(l.next_deadline(), None, "no deadline outlives its connect");
+
+    // Expired before the loop ever looked: exactly one TimedOut, then a clean close.
+    let tight = TcpOpts {
+        connect_timeout: Some(Duration::from_millis(1)),
+        ..TcpOpts::default()
+    };
+    let late = l.tcp_connect(addr, &tight, Token(3)).expect("connect");
+    thread::sleep(Duration::from_millis(20));
+    results.clear();
+    while results.is_empty() {
+        assert!(l.now() < until, "timeout delivered");
+        l.turn(Timeout::Until(until), &mut out).expect("turn");
+        results.extend(out.drain().map(|c| (c.token, c.terminal, c.result)));
+    }
+    assert!(
+        matches!(
+            results[..],
+            [(
+                Token(3),
+                true,
+                OpResult::Err(Error {
+                    kind: ErrorKind::TimedOut,
+                    ..
+                })
+            )]
+        ),
+        "{results:?}"
+    );
+    for _ in 0..3 {
+        l.turn(Timeout::Now, &mut out).expect("no duplicate");
+        assert!(out.is_empty(), "the timeout is reported once");
+    }
+    for (h, token) in [(late, 4), (on_time, 5), (server, 6)] {
+        l.close(h, Token(token)).expect("close");
+    }
+    let mut closed = 0;
+    while l.alive() {
+        assert!(l.now() < until, "closes");
+        l.turn(Timeout::Until(until), &mut out).expect("turn");
+        for c in out.drain() {
+            assert!(matches!(c.result, OpResult::Closed), "{c:?}");
+            closed += 1;
+        }
+    }
+    assert_eq!(closed, 3);
+}
+/// A peer that reads each of `connections` requests to EOF and echoes it back.
+/// Echo failures are ignored: a client may close without reading its reply.
+pub(crate) fn echo_peer(connections: usize) -> (SocketAddr, thread::JoinHandle<Vec<Vec<u8>>>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind(localhost()).expect("peer listen");
+    let addr = listener.local_addr().expect("peer addr");
+    let peer = thread::spawn(move || {
+        (0..connections)
+            .map(|_| {
+                let (mut stream, _) = listener.accept().expect("peer accept");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .expect("peer timeout");
+                let mut request = Vec::new();
+                stream.read_to_end(&mut request).expect("peer read");
+                let _ = stream.write_all(&request);
+                request
+            })
+            .collect()
+    });
+    (addr, peer)
+}
+/// Turn until every token in `wanted` has a completion, recording each result.
+fn turn_for<B: Backend>(
+    l: &mut Driver<B>,
+    out: &mut Completions,
+    until: turnloop::Instant,
+    wanted: &[u64],
+    seen: &mut Vec<(u64, String)>,
+) {
+    while !wanted.iter().all(|w| seen.iter().any(|(t, _)| t == w)) {
+        assert!(l.now() < until, "waiting for {wanted:?}, saw {seen:?}");
+        l.turn(Timeout::Until(until), out).expect("turn");
+        seen.extend(out.drain().map(|c| (c.token.0, format!("{:?}", c.result))));
+    }
+}
+/// `Config::single_connection` carries a client through its worst moment: a
+/// redirect started while the first attempt's socket, its cancelled read, write
+/// and shutdown and its request timer are still closing, with a second DNS
+/// lookup and connect deadlines armed. Every creation and submission succeeds and the second
+/// exchange completes byte for byte.
+pub fn single_connection_config<B: Backend>() {
+    let mut l = Driver::<B>::new(Config::single_connection()).expect("loop");
+    let (peer_addr, peer) = echo_peer(2);
+    let mut out = Completions::default();
+    let mut seen = Vec::new();
+    let until = l.now() + Duration::from_secs(10);
+    let opts = TcpOpts {
+        connect_timeout: Some(Duration::from_secs(5)),
+        ..TcpOpts::default()
+    };
+
+    let first_timer = l
+        .timer(l.now() + Duration::from_secs(30), None, Token(1))
+        .expect("request timer");
+    l.resolve(
+        DnsRequest {
+            host: "localhost".into(),
+            port: peer_addr.port(),
+        },
+        Token(2),
+    )
+    .expect("resolve");
+    turn_for(&mut l, &mut out, until, &[2], &mut seen);
+    assert!(seen[0].1.starts_with("Resolved("), "{seen:?}");
+
+    let first = l.tcp_connect(peer_addr, &opts, Token(3)).expect("connect");
+    turn_for(&mut l, &mut out, until, &[3], &mut seen);
+    l.read(first, ReadBuf::Pooled, Token(4)).expect("read");
+    l.write(first, WriteBuf::Owned(b"first".to_vec()), Token(5))
+        .expect("write");
+    l.shutdown(first, Token(6)).expect("shutdown");
+
+    // A redirect, before the first attempt's read, write and shutdown have been
+    // turned out: abandon it, replace the timer, look up the new name and connect.
+    l.close(first, Token(7)).expect("close first socket");
+    l.close(first_timer, Token(8)).expect("close first timer");
+    let second_timer = l
+        .timer(l.now() + Duration::from_secs(30), None, Token(9))
+        .expect("replacement timer");
+    l.resolve(
+        DnsRequest {
+            host: "localhost".into(),
+            port: peer_addr.port(),
+        },
+        Token(16),
+    )
+    .expect("second lookup");
+    let second = l
+        .tcp_connect(peer_addr, &opts, Token(10))
+        .expect("reconnect");
+    turn_for(&mut l, &mut out, until, &[4, 5, 6, 7, 8, 10, 16], &mut seen);
+    l.read(second, ReadBuf::Pooled, Token(11)).expect("read");
+    l.write(second, WriteBuf::Owned(b"second".to_vec()), Token(12))
+        .expect("write");
+    l.shutdown(second, Token(13)).expect("shutdown");
+    let mut reply = Vec::new();
+    let mut eof = false;
+    while !eof {
+        assert!(l.now() < until, "reply stalled at {reply:?}");
+        l.turn(Timeout::Until(until), &mut out).expect("turn");
+        for c in out.drain() {
+            match c.result {
+                OpResult::Read { lease: Some(b), .. } if c.token == Token(11) => {
+                    reply.extend_from_slice(b.as_slice());
+                    drop(b);
+                    l.read(second, ReadBuf::Pooled, Token(11)).expect("read on");
+                }
+                OpResult::Eof => eof = true,
+                ref result => seen.push((c.token.0, format!("{result:?}"))),
+            }
+        }
+    }
+    assert_eq!(reply, b"second");
+    l.close(second, Token(14)).expect("close");
+    l.close(second_timer, Token(15)).expect("close");
+    while l.alive() {
+        assert!(l.now() < until, "teardown");
+        l.turn(Timeout::Until(until), &mut out).expect("turn");
+        seen.extend(out.drain().map(|c| (c.token.0, format!("{:?}", c.result))));
+    }
+    assert!(
+        !seen.iter().any(|(_, r)| r.contains("ResourceLimit")),
+        "{seen:?}"
+    );
+    // The abandoned request may have reached the peer in full, in part or not
+    // at all; only the second one's bytes are specified.
+    let requests = peer.join().expect("peer");
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1], b"second");
 }
 pub fn ref_unref<B: Backend>() {
     let mut l = Driver::<B>::new(Config::default()).expect("loop");
