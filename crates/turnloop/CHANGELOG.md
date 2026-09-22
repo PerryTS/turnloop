@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0-alpha.7](https://github.com/PerryTS/turnloop/compare/turnloop-v0.1.0-alpha.6...turnloop-v0.1.0-alpha.7) - 2026-09-22
+
+### Other
+
+- pool-result ceiling ([#88](https://github.com/PerryTS/turnloop/pull/88)), multishot accept budget ([#77](https://github.com/PerryTS/turnloop/pull/77)), safe loop rebuild ([#43](https://github.com/PerryTS/turnloop/pull/43)) ([#106](https://github.com/PerryTS/turnloop/pull/106))
+- Core host API: hand back host completions, TCP connect timeout, single-connection presets ([#105](https://github.com/PerryTS/turnloop/pull/105))
+
 ## [0.1.0-alpha.6](https://github.com/PerryTS/turnloop/compare/turnloop-v0.1.0-alpha.5...turnloop-v0.1.0-alpha.6) - 2026-09-17
 
 ### Other

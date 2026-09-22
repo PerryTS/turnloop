@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0-alpha.7](https://github.com/PerryTS/turnloop/compare/turnloop-tls-v0.1.0-alpha.6...turnloop-tls-v0.1.0-alpha.7) - 2026-09-22
+
+### Other
+
+- HTTP client pool deadlines and stale ids, multipart encoder, host-built rustls configs and provider choice ([#101](https://github.com/PerryTS/turnloop/pull/101))
+
 ## [0.1.0-alpha.4](https://github.com/PerryTS/turnloop/compare/turnloop-tls-v0.1.0-alpha.3...turnloop-tls-v0.1.0-alpha.4) - 2026-09-15
 
 ### Other
