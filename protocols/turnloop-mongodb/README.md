@@ -59,12 +59,15 @@ has no SRV/TXT capability, so use explicit resolved seed URIs there.
    a complete reply before feeding another frame. Partial reads and writes are normal.
    `accepts_receive()` is the same check `receive()` makes, so a host can ask whether
    to read instead of tracking an `expecting_reply` flag of its own.
-5. On `Ready`, submit one command. An accepted token receives one `Reply`, `Failed` or
-   `Unacknowledged`; rejected submissions receive no completion. `Reply` is a borrowed
-   view obtained with `reply()`. Consume or copy it, then `release_reply()`.
+5. On `Ready`, submit one command. An accepted token is settled exactly once: by
+   `Failed`, by `Unacknowledged`, or by `release_reply()` after its `Reply` event;
+   rejected submissions receive no completion. `Reply` is a borrowed view obtained with
+   `reply()`. Consume or copy it, then `release_reply()`.
 6. Pass transport errors to `fail()`. Drive `handle_timeout(now)` at `next_timeout()`.
-   A timed-out connection must be physically closed by the adapter. Closing cancels an
-   outstanding command once, followed by `Closed`. A reply already received remains
+   A timed-out connection must be physically closed by the adapter. `fail()` settles an
+   outstanding command, or a reply not yet released, with `Failed`: the reply is revoked
+   and a still-queued `Reply` event for it is withdrawn. `close()` cancels an
+   outstanding command once, followed by `Closed`, but a reply already received remains
    readable after close until released.
 
 `Instant` is std::time::Instant on native/WASI. Browser Wasm uses `HostInstant`, created

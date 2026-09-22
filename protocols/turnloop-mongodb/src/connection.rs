@@ -1,6 +1,9 @@
 //! mongodb-handshake/handshake.md §§ Connection Handshake, Speculative Authentication.
 //! Events are pull-based. A token is accepted only on successful `command`, and
-//! yields exactly one Reply, Failed, or Unacknowledged event before reuse.
+//! is settled exactly once before reuse: by a Failed or Unacknowledged event, or
+//! by `release_reply()` after its Reply event. `fail()` before that release
+//! revokes the reply and settles the token with Failed instead; `close()` keeps
+//! a received reply readable until it is released.
 use crate::Instant;
 use crate::{
     Error, ErrorKind, Result,
@@ -524,16 +527,23 @@ impl Connection {
             ));
         }
     }
+    /// Closes the connection after a transport or protocol failure. An
+    /// outstanding command, or a reply not yet released, settles with `Failed`.
+    /// Such a reply is revoked: `reply()` and `release_reply()` then fail, and
+    /// its `Reply` event is withdrawn if the host has not yet polled it.
     pub fn fail(&mut self, error: Error) {
         if self.state == State::Closed {
             return;
         }
-        if self.state != State::Reply {
-            self.events.push_back(ConnectionEvent::Failed {
-                token: self.token.take(),
-                error,
-            });
+        let token = self.token.take();
+        if self.state == State::Reply {
+            self.decoder.clear();
+            self.expanded.clear();
+            self.events
+                .retain(|e| !matches!(e, ConnectionEvent::Reply { token: t } if Some(*t) == token));
         }
+        self.events
+            .push_back(ConnectionEvent::Failed { token, error });
         self.state = State::Closed;
         self.deadline = None;
         self.tx.clear();

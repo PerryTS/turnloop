@@ -1008,3 +1008,81 @@ fn write_result_verdict_fails_on_write_errors_despite_ok() {
     assert_eq!(bulk.write_errors[0].get_i32("index").unwrap(), 5);
     assert_eq!(bulk.write_concern_errors[0].get_i32("code").unwrap(), 64);
 }
+
+/// Drains the queue and returns the settlement of `token` plus whether the
+/// terminal `Closed` came last, asserting no event for it appears twice.
+fn settlements(c: &mut Connection, token: u64) -> (Vec<&'static str>, bool) {
+    let mut seen = Vec::new();
+    let mut closed_last = false;
+    while let Some(event) = c.poll_event() {
+        closed_last = matches!(event, ConnectionEvent::Closed);
+        match event {
+            ConnectionEvent::Reply { token: t } if t == token => seen.push("reply"),
+            ConnectionEvent::Failed {
+                token: Some(t),
+                error,
+            } if t == token => {
+                assert_eq!(error.kind, ErrorKind::Network);
+                seen.push("failed");
+            }
+            ConnectionEvent::Closed => {}
+            e => panic!("unexpected event {e:?}"),
+        }
+    }
+    (seen, closed_last)
+}
+
+#[test]
+fn fail_settles_an_unreleased_reply_exactly_once() {
+    let body = raw(&doc! {"ping":1,"$db":"admin"});
+    let reset = || Error::new(ErrorKind::Network, "connection reset");
+
+    // The reply arrived but its event was never polled: the queued Reply is
+    // withdrawn so the token's only settlement is Failed.
+    let mut c = ready();
+    c.command(90, &body, &[], clock::now()).unwrap();
+    let reply = answer(&mut c, &doc! {"ok":1});
+    feed(&mut c, &reply);
+    c.fail(reset());
+    assert_eq!(settlements(&mut c, 90), (vec!["failed"], true));
+    assert!(c.reply().is_err());
+    assert!(c.release_reply().is_err());
+
+    // The host took the Reply but had not released it: Failed settles it.
+    let mut c = ready();
+    c.command(91, &body, &[], clock::now()).unwrap();
+    let reply = answer(&mut c, &doc! {"ok":1});
+    feed(&mut c, &reply);
+    assert!(matches!(
+        c.poll_event(),
+        Some(ConnectionEvent::Reply { token: 91 })
+    ));
+    assert_eq!(c.reply().unwrap().get_i32("ok").unwrap(), 1);
+    c.fail(reset());
+    assert_eq!(settlements(&mut c, 91), (vec!["failed"], true));
+    assert!(c.reply().is_err());
+    assert!(c.release_reply().is_err());
+    // Nothing further is settled by a second failure or a close.
+    c.fail(reset());
+    c.close();
+    assert!(c.poll_event().is_none());
+
+    // A released reply was settled by the release; failing afterwards reports
+    // only the connection failure, for no token.
+    let mut c = ready();
+    c.command(92, &body, &[], clock::now()).unwrap();
+    let reply = answer(&mut c, &doc! {"ok":1});
+    feed(&mut c, &reply);
+    assert!(matches!(
+        c.poll_event(),
+        Some(ConnectionEvent::Reply { token: 92 })
+    ));
+    c.release_reply().unwrap();
+    c.fail(reset());
+    assert!(matches!(
+        c.poll_event(),
+        Some(ConnectionEvent::Failed { token: None, .. })
+    ));
+    assert!(matches!(c.poll_event(), Some(ConnectionEvent::Closed)));
+    assert!(c.poll_event().is_none());
+}
