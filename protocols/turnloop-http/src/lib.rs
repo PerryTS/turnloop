@@ -23,7 +23,7 @@
 //! so neither is optional:
 //!
 //! * **`consumed > 0` with no event** is progress with nothing to hand up: the
-//!   HTTP/2 client preface, a SETTINGS acknowledgement, a PRIORITY frame, an
+//!   HTTP/2 client preface, a PRIORITY frame, an
 //!   unknown frame type, or a frame the peer had in flight for a stream that is
 //!   already gone; an HTTP/1 chunk-size line, chunk CRLF or empty trailer
 //!   block. A loop that continues only while an event came back stalls here, and

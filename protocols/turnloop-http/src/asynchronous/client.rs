@@ -445,7 +445,9 @@ impl<B: Backend> Client<B> {
                             http2::Event::Reset { stream, .. } if stream == id => {
                                 return Err(io::Error::other("HTTP/2 stream reset"));
                             }
-                            http2::Event::Goaway { last_stream, code } => {
+                            http2::Event::Goaway {
+                                last_stream, code, ..
+                            } => {
                                 peer_draining = true;
                                 if code != 0 || last_stream < id {
                                     return Err(io::Error::other("HTTP/2 GOAWAY rejected request"));
@@ -540,7 +542,9 @@ impl<B: Backend> Client<B> {
                                     http2::Event::Reset { stream, .. } if stream == id => {
                                         return Err(io::Error::other("HTTP/2 stream reset"));
                                     }
-                                    http2::Event::Goaway { last_stream, code } => {
+                                    http2::Event::Goaway {
+                                        last_stream, code, ..
+                                    } => {
                                         peer_draining = true;
                                         if code != 0 || last_stream < id {
                                             return Err(io::Error::other(

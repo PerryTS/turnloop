@@ -743,7 +743,8 @@ fn drive(to: &mut http2::Connection, input: &mut Vec<u8>) -> Result<Vec<String>,
         let progressed = consumed > 0 || step.event.is_some();
         if let Some(event) = step.event {
             seen.push(match event {
-                http2::Event::Settings => "Settings".to_string(),
+                http2::Event::Settings(_) => "Settings".to_string(),
+                http2::Event::SettingsAck(_) => "SettingsAck".to_string(),
                 http2::Event::Headers { stream, .. } => format!("Headers s={stream}"),
                 http2::Event::Data { stream, bytes, .. } => {
                     format!("Data s={stream} n={}", bytes.len())
@@ -1149,7 +1150,7 @@ fn h2_step_has_two_independent_zero_cases() {
         vec![
             (24, false), // consumed > 0, event == None: the preface. KEEP GOING.
             (9, true),   // SETTINGS
-            (9, false),  // consumed > 0, event == None: the SETTINGS ack.
+            (9, true),   // SettingsAck: the ack of our initial SETTINGS.
             (14, false), // consumed > 0, event == None: PRIORITY.
             (0, false),  // consumed == 0, event == None: exhausted. STOP.
         ]

@@ -1,7 +1,7 @@
 //! RFC 9113 connection/stream framing. Caller retains partial frames and acknowledges
 //! writes. DATA is borrowed, flow-control credit is returned explicitly by the host.
 use crate::{Error, Result, hpack, http1::Header};
-use std::time::Instant;
+use std::{collections::VecDeque, time::Instant};
 pub const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -25,6 +25,127 @@ impl Default for Limits {
             continuations: 16,
             streams: 100,
         }
+    }
+}
+/// SETTINGS parameters this endpoint sends: at most one value per identifier,
+/// kept and serialised in ascending identifier order (the order Node writes
+/// them in). An empty `Settings` is a valid, empty SETTINGS frame.
+///
+/// Identifiers this crate does not know are sent as given, so a host can
+/// advertise extension settings; the named constants are the ones RFC 9113
+/// section 6.5.2 and RFC 8441 define.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Settings {
+    entries: Vec<(u16, u32)>,
+}
+impl Settings {
+    pub const HEADER_TABLE_SIZE: u16 = 1;
+    pub const ENABLE_PUSH: u16 = 2;
+    pub const MAX_CONCURRENT_STREAMS: u16 = 3;
+    pub const INITIAL_WINDOW_SIZE: u16 = 4;
+    pub const MAX_FRAME_SIZE: u16 = 5;
+    pub const MAX_HEADER_LIST_SIZE: u16 = 6;
+    pub const ENABLE_CONNECT_PROTOCOL: u16 = 8;
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// The three limits [`Connection::new`] advertises.
+    pub fn from_limits(limits: &Limits) -> Self {
+        let mut settings = Self::new();
+        settings
+            .set(Self::MAX_CONCURRENT_STREAMS, limits.streams as u32)
+            .set(Self::MAX_FRAME_SIZE, limits.frame_size as u32)
+            .set(Self::MAX_HEADER_LIST_SIZE, limits.header_list as u32);
+        settings
+    }
+    /// Set `id` to `value`, replacing any earlier value for it.
+    pub fn set(&mut self, id: u16, value: u32) -> &mut Self {
+        match self.entries.binary_search_by_key(&id, |e| e.0) {
+            Ok(i) => self.entries[i].1 = value,
+            Err(i) => self.entries.insert(i, (id, value)),
+        }
+        self
+    }
+    pub fn remove(&mut self, id: u16) -> Option<u32> {
+        let i = self.entries.binary_search_by_key(&id, |e| e.0).ok()?;
+        Some(self.entries.remove(i).1)
+    }
+    pub fn get(&self, id: u16) -> Option<u32> {
+        let i = self.entries.binary_search_by_key(&id, |e| e.0).ok()?;
+        Some(self.entries[i].1)
+    }
+    /// `(identifier, value)` pairs in ascending identifier order.
+    pub fn iter(&self) -> impl Iterator<Item = (u16, u32)> + '_ {
+        self.entries.iter().copied()
+    }
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+    fn merge(&mut self, from: impl Iterator<Item = (u16, u32)>) {
+        for (id, value) in from {
+            self.set(id, value);
+        }
+    }
+    fn encode(&self) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(self.entries.len() * 6);
+        for (id, value) in self.iter() {
+            payload.extend_from_slice(&id.to_be_bytes());
+            payload.extend_from_slice(&value.to_be_bytes());
+        }
+        payload
+    }
+    /// Refuse what this endpoint cannot honour once the peer acts on it.
+    fn validate(&self) -> Result<()> {
+        for (id, value) in self.iter() {
+            let valid = match id {
+                // The HPACK decoder's dynamic table is fixed at 4096 octets;
+                // advertising more would let the peer's encoder outgrow it.
+                Self::HEADER_TABLE_SIZE => value <= 4096,
+                // Server push is not implemented: PUSH_PROMISE is always a
+                // connection error, so neither side may invite one.
+                Self::ENABLE_PUSH => value == 0,
+                Self::INITIAL_WINDOW_SIZE => value <= 0x7fffffff,
+                Self::MAX_FRAME_SIZE => (16384..=0xffffff).contains(&value),
+                Self::ENABLE_CONNECT_PROTOCOL => value <= 1,
+                _ => true,
+            };
+            if !valid {
+                return Err(protocol("invalid SETTINGS value"));
+            }
+        }
+        Ok(())
+    }
+}
+/// The parameters of one SETTINGS frame the peer sent, borrowed from the input
+/// exactly as they were on the wire: in frame order, duplicates and unknown
+/// identifiers included. RFC 9113 section 6.5.3 processes them in that order,
+/// so for a repeated identifier the last value is the one in force.
+#[derive(Debug, Clone, Copy)]
+pub struct SettingsFrame<'a> {
+    payload: &'a [u8],
+}
+impl<'a> SettingsFrame<'a> {
+    pub fn iter(&self) -> impl Iterator<Item = (u16, u32)> + 'a {
+        self.payload
+            .as_chunks::<6>()
+            .0
+            .iter()
+            .map(|s| (u16::from_be_bytes([s[0], s[1]]), u32be(&s[2..])))
+    }
+    /// The value in force for `id` after this frame, if the frame carried it.
+    pub fn get(&self, id: u16) -> Option<u32> {
+        self.iter().filter(|e| e.0 == id).last().map(|e| e.1)
+    }
+    pub fn is_empty(&self) -> bool {
+        self.payload.is_empty()
+    }
+    pub fn to_settings(&self) -> Settings {
+        let mut settings = Settings::new();
+        settings.merge(self.iter());
+        settings
     }
 }
 #[derive(Debug, Clone, Copy)]
@@ -96,7 +217,16 @@ pub enum HeadersKind {
 }
 #[derive(Debug)]
 pub enum Event<'a> {
-    Settings,
+    /// The peer's SETTINGS, already applied and acknowledged.
+    Settings(SettingsFrame<'a>),
+    /// The peer acknowledged the oldest SETTINGS frame this endpoint still had
+    /// outstanding; its parameters are returned here and are now in force.
+    /// Acknowledgements arrive in the order the frames were sent (RFC 9113
+    /// section 6.5.3), and the first is always for the frame the constructor
+    /// queued, so a host that timestamps construction and each
+    /// [`Connection::settings`] call can pair them in FIFO order to measure a
+    /// round trip. No clock is read here.
+    SettingsAck(Settings),
     Headers {
         stream: u32,
         headers: Vec<Header>,
@@ -136,6 +266,11 @@ pub enum Event<'a> {
     Goaway {
         last_stream: u32,
         code: u32,
+        /// The opaque debug data (RFC 9113 section 6.8). `None` when the frame
+        /// carried none - Node reports `undefined` there, not an empty buffer.
+        /// The wire cannot express "present but empty", so this is never
+        /// `Some` of an empty slice.
+        debug: Option<&'a [u8]>,
     },
     Ping {
         ack: bool,
@@ -153,7 +288,7 @@ pub enum Event<'a> {
 /// | `consumed` | `event` | meaning |
 /// |---|---|---|
 /// | `0` | `None` | **stop.** A partial preface or a partial frame; read more input before calling again. |
-/// | `> 0` | `None` | **keep going.** Progress with nothing for the host: the client preface, a SETTINGS acknowledgement, PRIORITY, an unknown frame type, or a frame the peer had in flight for a stream that is already gone. |
+/// | `> 0` | `None` | **keep going.** Progress with nothing for the host: the client preface, PRIORITY, an unknown frame type, or a frame the peer had in flight for a stream that is already gone. |
 /// | `> 0` | `Some` | an event. In HTTP/2 an event always consumes; `consumed == 0` is only ever the stop case. |
 ///
 /// So the loop condition is `consumed > 0 || event.is_some()`:
@@ -249,7 +384,21 @@ pub struct Connection {
     peer_streams: usize,
     preface: bool,
     settings_received: bool,
-    settings_awaiting_ack: bool,
+    /// SETTINGS frames sent and not yet acknowledged, oldest first. RFC 9113
+    /// section 6.5.3 acknowledges them in order, so this is a queue: a second
+    /// frame sent while one is outstanding is ordinary, not an error.
+    settings_pending: VecDeque<Settings>,
+    /// Every local parameter the peer has acknowledged, merged in order.
+    local_settings: Settings,
+    /// Every parameter the peer has sent, merged in order.
+    remote_settings: Settings,
+    /// The limits the acknowledged frames establish. `limits`, the ones
+    /// enforced, is this relaxed by every outstanding frame: see
+    /// `enforce_settings`.
+    acked_limits: Limits,
+    /// Our SETTINGS_INITIAL_WINDOW_SIZE as acknowledged, and as enforced.
+    acked_recv_initial: i64,
+    recv_initial: i64,
     decoder: hpack::Decoder,
     encoder: hpack::Encoder,
     block: Vec<u8>,
@@ -266,13 +415,35 @@ pub struct Connection {
     settings_deadline: Option<Instant>,
 }
 impl Connection {
+    /// A connection whose initial SETTINGS advertises `limits`: the
+    /// concurrent-stream, frame-size and header-list limits, in that
+    /// (ascending) identifier order, plus ENABLE_PUSH = 0 for a client.
     pub fn new(role: Role, limits: Limits) -> Result<Self> {
+        Self::with_settings(role, limits, &Settings::from_limits(&limits))
+    }
+    /// A connection whose initial SETTINGS frame carries exactly `settings`,
+    /// serialised in ascending identifier order. `Settings::new()` sends an
+    /// empty frame, which is what Node's server sends.
+    ///
+    /// `limits` is what this endpoint enforces on its own. A parameter in
+    /// `settings` that corresponds to a limit replaces it once the peer
+    /// acknowledges the frame (and at once, if that relaxes it: the peer may
+    /// act on the new value before its ack reaches us). One parameter is
+    /// added: a client that does not name ENABLE_PUSH sends ENABLE_PUSH = 0,
+    /// because push defaults to enabled and this crate treats PUSH_PROMISE
+    /// as a connection error.
+    pub fn with_settings(role: Role, limits: Limits, settings: &Settings) -> Result<Self> {
         if !(16384..=0xffffff).contains(&limits.frame_size)
             || limits.streams == 0
             || limits.streams > u32::MAX as usize
         {
             return Err(protocol("invalid limits"));
         }
+        let mut settings = settings.clone();
+        if role == Role::Client && settings.get(Settings::ENABLE_PUSH).is_none() {
+            settings.set(Settings::ENABLE_PUSH, 0);
+        }
+        settings.validate()?;
         let mut result = Self {
             role,
             limits,
@@ -287,7 +458,12 @@ impl Connection {
             peer_streams: usize::MAX,
             preface: role == Role::Client,
             settings_received: false,
-            settings_awaiting_ack: true,
+            settings_pending: VecDeque::new(),
+            local_settings: Settings::new(),
+            remote_settings: Settings::new(),
+            acked_limits: limits,
+            acked_recv_initial: 65535,
+            recv_initial: 65535,
             decoder: hpack::Decoder::new(4096, limits.header_list),
             encoder: hpack::Encoder::new(4096),
             block: Vec::new(),
@@ -303,27 +479,100 @@ impl Connection {
         if role == Role::Client {
             result.output.extend_from_slice(PREFACE);
         }
-        let mut settings = Vec::new();
-        for (id, value) in [
-            (3, limits.streams as u32),
-            (5, limits.frame_size as u32),
-            (6, limits.header_list as u32),
-        ] {
-            settings.extend_from_slice(&(id as u16).to_be_bytes());
-            settings.extend_from_slice(&value.to_be_bytes());
-        }
-        if role == Role::Client {
-            settings.extend_from_slice(&[0, 2, 0, 0, 0, 0]);
-        }
-        result.frame(4, 0, 0, &settings)?;
+        result.send_settings(settings)?;
         Ok(result)
     }
-    /// Host-supplied SETTINGS acknowledgement deadline; no clock is sampled.
+    /// Send a SETTINGS frame carrying `settings` to a live connection -
+    /// Node's `session.settings()`. It may be called while earlier frames
+    /// are still unacknowledged; each is acknowledged in turn with
+    /// [`Event::SettingsAck`].
+    ///
+    /// A parameter that loosens what this endpoint enforces - a larger
+    /// MAX_FRAME_SIZE, INITIAL_WINDOW_SIZE, MAX_HEADER_LIST_SIZE or
+    /// MAX_CONCURRENT_STREAMS - applies at once, because the peer may act on
+    /// it before its acknowledgement arrives. One that tightens applies when
+    /// the peer acknowledges the frame (RFC 9113 section 6.5.3), so frames the
+    /// peer sent under the old value are never treated as errors.
+    ///
+    /// Values this endpoint could not honour are refused before anything is
+    /// sent: ENABLE_PUSH other than 0, HEADER_TABLE_SIZE above 4096, and the
+    /// out-of-range values RFC 9113 section 6.5.2 forbids.
+    pub fn settings(&mut self, settings: &Settings) -> Result<()> {
+        if self.failed {
+            return Err(protocol("failed connection"));
+        }
+        settings.validate()?;
+        self.send_settings(settings.clone())
+    }
+    fn send_settings(&mut self, settings: Settings) -> Result<()> {
+        let payload = settings.encode();
+        if payload.len() > self.peer_frame {
+            return Err(frame_error());
+        }
+        self.frame(4, 0, 0, &payload)?;
+        self.settings_pending.push_back(settings);
+        self.enforce_settings();
+        Ok(())
+    }
+    /// Recompute the enforced limits: the acknowledged ones, loosened by every
+    /// frame still outstanding. The peer may already be acting on any of them.
+    fn enforce_settings(&mut self) {
+        let mut limits = self.acked_limits;
+        let mut recv_initial = self.acked_recv_initial;
+        for settings in &self.settings_pending {
+            for (id, value) in settings.iter() {
+                let value = value as usize;
+                match id {
+                    Settings::MAX_CONCURRENT_STREAMS => limits.streams = limits.streams.max(value),
+                    Settings::INITIAL_WINDOW_SIZE => recv_initial = recv_initial.max(value as i64),
+                    Settings::MAX_FRAME_SIZE => limits.frame_size = limits.frame_size.max(value),
+                    Settings::MAX_HEADER_LIST_SIZE => {
+                        limits.header_list = limits.header_list.max(value)
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // RFC 9113 section 6.9.2: a change to the initial window adjusts every
+        // open stream's window by the difference.
+        let delta = recv_initial - self.recv_initial;
+        if delta != 0 {
+            for s in &mut self.streams {
+                s.recv_window += delta;
+            }
+            self.recv_initial = recv_initial;
+        }
+        self.decoder.max_list_size = limits.header_list;
+        self.limits = limits;
+    }
+    /// What this endpoint enforces now, including the effect of SETTINGS it
+    /// has sent (see [`settings`](Self::settings)).
+    pub fn limits(&self) -> Limits {
+        self.limits
+    }
+    /// Every parameter this endpoint has sent and the peer has acknowledged -
+    /// Node's `session.localSettings`, less the defaults nobody sent.
+    pub fn local_settings(&self) -> &Settings {
+        &self.local_settings
+    }
+    /// Every parameter the peer has sent - Node's `session.remoteSettings`,
+    /// less the defaults the peer did not send.
+    pub fn remote_settings(&self) -> &Settings {
+        &self.remote_settings
+    }
+    /// SETTINGS frames sent and not yet acknowledged.
+    pub fn pending_settings(&self) -> usize {
+        self.settings_pending.len()
+    }
+    /// Host-supplied deadline for the oldest outstanding SETTINGS frame's
+    /// acknowledgement; no clock is sampled. Each acknowledgement clears it, so
+    /// a host with further frames outstanding sets the next one after each
+    /// [`Event::SettingsAck`].
     pub fn set_settings_deadline(&mut self, deadline: Option<Instant>) {
         self.settings_deadline = deadline;
     }
     pub fn next_timeout(&self) -> Option<Instant> {
-        if self.settings_awaiting_ack && !self.failed {
+        if !self.settings_pending.is_empty() && !self.failed {
             self.settings_deadline
         } else {
             None
@@ -441,7 +690,7 @@ impl Connection {
         let stream = Stream {
             id,
             send_window: self.initial_send,
-            recv_window: 65535,
+            recv_window: self.recv_initial,
             unreleased: 0,
             credited: false,
             local_end: false,
@@ -914,10 +1163,29 @@ impl Connection {
                     if !f.payload.is_empty() {
                         return Err(frame_error());
                     }
-                    if !self.settings_awaiting_ack {
+                    let Some(acked) = self.settings_pending.pop_front() else {
                         return Err(protocol("unsolicited SETTINGS ack"));
+                    };
+                    for (id, value) in acked.iter() {
+                        match id {
+                            Settings::MAX_CONCURRENT_STREAMS => {
+                                self.acked_limits.streams = value as usize
+                            }
+                            Settings::INITIAL_WINDOW_SIZE => self.acked_recv_initial = value as i64,
+                            Settings::MAX_FRAME_SIZE => {
+                                self.acked_limits.frame_size = value as usize
+                            }
+                            Settings::MAX_HEADER_LIST_SIZE => {
+                                self.acked_limits.header_list = value as usize
+                            }
+                            _ => {}
+                        }
                     }
-                    self.settings_awaiting_ack = false;
+                    self.local_settings.merge(acked.iter());
+                    self.enforce_settings();
+                    // The deadline was for this frame; the host arms the next.
+                    self.settings_deadline = None;
+                    step.event = Some(Event::SettingsAck(acked));
                 } else {
                     if f.payload.len() % 6 != 0 {
                         return Err(frame_error());
@@ -959,8 +1227,10 @@ impl Connection {
                         }
                     }
                     self.settings_received = true;
+                    let settings = SettingsFrame { payload: f.payload };
+                    self.remote_settings.merge(settings.iter());
                     self.frame(4, 1, 0, &[])?;
-                    step.event = Some(Event::Settings);
+                    step.event = Some(Event::Settings(settings));
                 }
             }
             5 => return Err(protocol("server push disabled")),
@@ -989,6 +1259,7 @@ impl Connection {
                 step.event = Some(Event::Goaway {
                     last_stream: u32be(f.payload) & 0x7fffffff,
                     code: u32be(&f.payload[4..]),
+                    debug: Some(&f.payload[8..]).filter(|d| !d.is_empty()),
                 });
             }
             8 => {
