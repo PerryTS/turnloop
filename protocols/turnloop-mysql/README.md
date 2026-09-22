@@ -101,6 +101,9 @@ Zstd and MariaDB extensions are out of scope.
 ## mysql2 conversions and hooks
 
 Row iterators return borrowed bytes or mysql_common numeric/calendar scalars.
+Each value is validated and decoded once, as the iterator reaches it (the last
+one also rejects trailing bytes); the first error ends the row. Such an error
+is a parsing error: abort the connection.
 `types::decode` implements a default conversion policy. `Column` retains names,
 original names/table/schema, flags, charset, length, decimals and wire type.
 

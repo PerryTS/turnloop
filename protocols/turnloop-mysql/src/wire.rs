@@ -112,6 +112,14 @@ pub enum RawValue<'a> {
     Bytes(&'a [u8]),
     Scalar(Value),
 }
+/// One row packet, decoded lazily and validated as it is iterated.
+///
+/// `Row::parse` checks the header (binary marker and NULL bitmap) eagerly; each
+/// value is bounds-checked and decoded exactly once as the iterator reaches it,
+/// and the final value also rejects trailing packet bytes. The first `Err` ends
+/// the iteration (every later `next` is `None`), so nothing past a malformed
+/// value is ever yielded. A row error means the server sent a malformed packet:
+/// treat it like any other parsing error and `abort` the connection.
 #[derive(Debug, Clone)]
 pub struct Row<'a> {
     cursor: Cursor<'a>,
@@ -135,19 +143,13 @@ impl<'a> Row<'a> {
         } else {
             &[]
         };
-        let row = Self {
+        Ok(Self {
             cursor,
             columns,
             bitmap,
             binary,
             at: 0,
-        };
-        let mut check = row.clone();
-        for v in &mut check {
-            v?;
-        }
-        check.cursor.end()?;
-        Ok(row)
+        })
     }
     fn value(&mut self, index: usize) -> Result<RawValue<'a>> {
         if !self.binary {
@@ -190,7 +192,17 @@ impl<'a> Iterator for Row<'a> {
         }
         let i = self.at;
         self.at += 1;
-        Some(self.value(i))
+        let value = self.value(i).and_then(|value| {
+            if self.at == self.columns.len() {
+                self.cursor.end()?;
+            }
+            Ok(value)
+        });
+        if value.is_err() {
+            // Fuse: never decode past a malformed value.
+            self.at = self.columns.len();
+        }
+        Some(value)
     }
     fn size_hint(&self) -> (usize, Option<usize>) {
         let n = self.columns.len() - self.at;
@@ -263,4 +275,74 @@ pub fn error_code(errno: u16) -> Option<&'static str> {
         1859 => "ER_DUP_UNKNOWN_IN_INDEX",
         _ => return None,
     })
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn info(column_type: ColumnType) -> ColumnTypeInfo {
+        ColumnTypeInfo {
+            column_type,
+            flags: ColumnFlags::empty(),
+            character_set: 45,
+        }
+    }
+    fn text() -> [ColumnTypeInfo; 2] {
+        [info(ColumnType::MYSQL_TYPE_VAR_STRING); 2]
+    }
+    #[test]
+    fn a_valid_row_is_decoded_in_one_pass() {
+        let columns = text();
+        let mut row = Row::parse(b"\x02ab\xfb", &columns, false).expect("valid header");
+        assert_eq!(row.len(), 2);
+        assert_eq!(row.next(), Some(Ok(RawValue::Bytes(b"ab"))));
+        assert_eq!(row.len(), 1);
+        assert_eq!(row.next(), Some(Ok(RawValue::Null)));
+        assert_eq!(row.next(), None);
+    }
+    /// Values are validated as they are reached; nothing after the first error
+    /// is decoded or yielded.
+    #[test]
+    fn a_malformed_value_ends_the_row() {
+        let columns = text();
+        // Second value claims 9 bytes but only 2 remain.
+        let mut row = Row::parse(b"\x02ab\x09cd", &columns, false)
+            .expect("parse no longer decodes values ahead of the host");
+        assert_eq!(row.next(), Some(Ok(RawValue::Bytes(b"ab"))));
+        assert_eq!(row.next(), Some(Err(Error::Protocol("truncated packet"))));
+        assert_eq!(row.len(), 0);
+        assert_eq!(row.next(), None);
+    }
+    #[test]
+    fn trailing_bytes_fail_the_last_value() {
+        let columns = text();
+        let mut row = Row::parse(b"\x02ab\x01c!", &columns, false).expect("valid header");
+        assert_eq!(row.next(), Some(Ok(RawValue::Bytes(b"ab"))));
+        assert_eq!(
+            row.next(),
+            Some(Err(Error::Protocol("trailing packet bytes")))
+        );
+        assert_eq!(row.next(), None);
+    }
+    #[test]
+    fn binary_rows_validate_the_header_eagerly_and_scalars_lazily() {
+        let long = [info(ColumnType::MYSQL_TYPE_LONG)];
+        assert_eq!(
+            Row::parse(&[1, 0, 42, 0, 0, 0], &long, true).err(),
+            Some(Error::Protocol("invalid binary row marker"))
+        );
+        assert_eq!(
+            Row::parse(&[0], &long, true).err(),
+            Some(Error::Protocol("truncated packet"))
+        );
+        let mut row = Row::parse(&[0, 0, 42, 0, 0, 0], &long, true).expect("valid row");
+        assert_eq!(row.next(), Some(Ok(RawValue::Scalar(Value::Int(42)))));
+        assert_eq!(row.next(), None);
+        // A LONG needs four bytes; two are present.
+        let mut row = Row::parse(&[0, 0, 42, 0], &long, true).expect("valid header");
+        assert_eq!(
+            row.next(),
+            Some(Err(Error::Protocol("invalid binary scalar")))
+        );
+        assert_eq!(row.next(), None);
+    }
 }
