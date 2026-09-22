@@ -170,6 +170,11 @@ pub enum Event {
         token: u64,
         info: SendInfo,
     },
+    /// A streamed message's DATA was accepted (354): write its content with
+    /// [`Connection::send_chunk`] and end it with [`Connection::finish_body`].
+    BodyReady {
+        token: u64,
+    },
     Failed {
         token: Option<u64>,
         error: Error,
@@ -216,6 +221,9 @@ pub struct Connection {
     auth_raw: Vec<u8>,
     auth_encoded: String,
     body: Vec<u8>,
+    streaming: Option<StreamBody>,
+    encoder: DataEncoder,
+    body_open: bool,
     events: VecDeque<Event>,
     deadline: Option<Instant>,
     token: Option<u64>,
@@ -246,6 +254,9 @@ impl Connection {
             auth_raw: Vec::with_capacity(256),
             auth_encoded: String::with_capacity(512),
             body: Vec::with_capacity(8192),
+            streaming: None,
+            encoder: DataEncoder::new(),
+            body_open: false,
             events: VecDeque::with_capacity(16),
             deadline: None,
             token: None,
@@ -504,10 +515,17 @@ impl Connection {
                 }
             }
             State::Data if code == 354 => {
-                self.tx.extend_from_slice(&self.body);
                 self.state = State::Body;
+                if self.streaming.is_some() {
+                    self.encoder = DataEncoder::new();
+                    self.body_open = true;
+                    let token = self.token.unwrap();
+                    self.events.push_back(Event::BodyReady { token });
+                } else {
+                    self.tx.extend_from_slice(&self.body);
+                }
             }
-            State::Body if code == 250 => {
+            State::Body if code == 250 && !self.body_open => {
                 let token = self.token.take().unwrap();
                 let info = SendInfo {
                     response: response.into(),
@@ -620,6 +638,7 @@ impl Connection {
     }
     /// Move the result's inherent envelope/ID ownership into the core. `content`
     /// may be lettre's formatted MIME bytes or another already-built message.
+    /// For a message too large to hold twice in memory, use [`Self::start_send`].
     pub fn send(
         &mut self,
         token: u64,
@@ -628,6 +647,90 @@ impl Connection {
         content: &[u8],
         now: Instant,
     ) -> Result<(), Error> {
+        let eight_bit = !content.is_ascii();
+        self.check_send(&envelope, eight_bit)?;
+        self.body.clear();
+        let size = encode_data(content, &mut self.body);
+        self.begin(
+            token,
+            envelope,
+            message_id,
+            Some(size as u64),
+            eight_bit,
+            now,
+        )?;
+        self.streaming = None;
+        Ok(())
+    }
+    /// Starts a message whose content is streamed instead of passed whole.
+    /// MAIL/RCPT/DATA proceed as for [`Self::send`]; once the server accepts
+    /// DATA the core emits [`Event::BodyReady`], after which the host passes the
+    /// content in any number of [`Self::send_chunk`] calls and then calls
+    /// [`Self::finish_body`]. Line-ending normalization and dot-stuffing carry
+    /// across chunk boundaries, so any split yields the bytes `send` would.
+    /// The result is the same single `Sent`/`Failed` for `token`.
+    pub fn start_send(
+        &mut self,
+        token: u64,
+        envelope: Envelope,
+        message_id: String,
+        body: StreamBody,
+        now: Instant,
+    ) -> Result<(), Error> {
+        self.check_send(&envelope, body.eight_bit)?;
+        self.begin(token, envelope, message_id, body.size, body.eight_bit, now)?;
+        self.streaming = Some(body);
+        Ok(())
+    }
+    /// True between [`Event::BodyReady`] and [`Self::finish_body`].
+    pub fn can_send_body(&self) -> bool {
+        self.body_open && self.state == State::Body
+    }
+    /// Encodes one piece of a streamed message into `output()`. Drain `output()`
+    /// between chunks to keep memory bounded by the chunk size. 8-bit bytes in
+    /// a body not declared `eight_bit` cannot be retracted mid-DATA, so they
+    /// fail the transaction and close the transport.
+    pub fn send_chunk(&mut self, chunk: &[u8], now: Instant) -> Result<(), Error> {
+        self.check_body()?;
+        if !chunk.is_ascii() && !self.streaming.is_some_and(|b| b.eight_bit) {
+            let e = error(
+                "EMESSAGE",
+                "DATA",
+                "8-bit content in a body not declared eight_bit",
+                None,
+                "",
+            );
+            self.fail(e.clone());
+            self.close_transport();
+            return Err(e);
+        }
+        self.encoder.encode(chunk, &mut self.tx);
+        self.arm(now);
+        Ok(())
+    }
+    /// Ends a streamed message: terminates its last line if needed and writes
+    /// the `.` terminator. The server's reply settles the token.
+    pub fn finish_body(&mut self, now: Instant) -> Result<(), Error> {
+        self.check_body()?;
+        self.encoder.finish(&mut self.tx);
+        self.body_open = false;
+        self.arm(now);
+        Ok(())
+    }
+    fn check_body(&self) -> Result<(), Error> {
+        if self.can_send_body() {
+            Ok(())
+        } else {
+            Err(error(
+                "ESTATE",
+                "DATA",
+                "No streamed SMTP message body is open",
+                None,
+                "",
+            ))
+        }
+    }
+    fn check_send(&self, envelope: &Envelope, eight_bit: bool) -> Result<(), Error> {
         if self.state != State::Ready {
             return Err(error(
                 "ESTATE",
@@ -656,9 +759,7 @@ impl Connection {
                 "",
             ));
         }
-        let utf8 = !envelope.from.is_ascii() || envelope.to.iter().any(|s| !s.is_ascii());
-        let eight_bit = !content.is_ascii();
-        if utf8 && !self.capabilities.smtp_utf8 {
+        if utf8(envelope) && !self.capabilities.smtp_utf8 {
             return Err(error(
                 "EENVELOPE",
                 "MAIL FROM",
@@ -676,13 +777,23 @@ impl Connection {
                 "",
             ));
         }
-        self.body.clear();
-        let size = encode_data(content, &mut self.body);
-        if self
-            .capabilities
-            .size
-            .is_some_and(|limit| limit != 0 && size as u64 > limit)
-        {
+        Ok(())
+    }
+    /// Emits MAIL FROM (and pipelined RCPT TO) once `check_send` has passed.
+    fn begin(
+        &mut self,
+        token: u64,
+        envelope: Envelope,
+        message_id: String,
+        size: Option<u64>,
+        eight_bit: bool,
+        now: Instant,
+    ) -> Result<(), Error> {
+        if size.is_some_and(|size| {
+            self.capabilities
+                .size
+                .is_some_and(|limit| limit != 0 && size > limit)
+        }) {
             return Err(error(
                 "EMESSAGE",
                 "MAIL FROM",
@@ -695,14 +806,17 @@ impl Connection {
         self.rejected.clear();
         self.mail_error = None;
         self.recipient_index = 0;
+        self.body_open = false;
         write!(self.tx, "MAIL FROM:<{}>", envelope.from).unwrap();
-        if self.capabilities.size_supported {
+        if let Some(size) = size
+            && self.capabilities.size_supported
+        {
             write!(self.tx, " SIZE={size}").unwrap();
         }
         if eight_bit {
             self.tx.extend_from_slice(b" BODY=8BITMIME");
         }
-        if utf8 {
+        if utf8(&envelope) {
             self.tx.extend_from_slice(b" SMTPUTF8");
         }
         self.tx.extend_from_slice(b"\r\n");
@@ -759,7 +873,8 @@ impl Connection {
             Some(code),
             response,
         );
-        if matches!(self.state, State::Data | State::Body) {
+        // RSET cannot follow a DATA body that was never terminated.
+        if matches!(self.state, State::Data | State::Body) && !self.body_open {
             self.fail_and_reset(e);
         } else {
             self.fail(e);
@@ -881,6 +996,7 @@ impl Connection {
             return;
         }
         self.state = State::Closed;
+        self.body_open = false;
         self.deadline = None;
         self.tx.clear();
         self.tx_pos = 0;
@@ -888,39 +1004,86 @@ impl Connection {
         self.events.push_back(Event::Closed);
     }
 }
+fn utf8(envelope: &Envelope) -> bool {
+    !envelope.from.is_ascii() || envelope.to.iter().any(|s| !s.is_ascii())
+}
+/// How a streamed message body will be sent; see [`Connection::start_send`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StreamBody {
+    /// Expected normalized content octets, sent as the SIZE parameter when the
+    /// server supports it and checked against the server's advertised limit.
+    /// `None` omits the parameter. The server, not this core, enforces it.
+    pub size: Option<u64>,
+    /// The body may contain 8-bit bytes: sends BODY=8BITMIME, which the server
+    /// must support. Without it, a non-ASCII chunk fails the transaction.
+    pub eight_bit: bool,
+}
+/// Incremental SMTP DATA encoding: normalizes LF, CRLF and bare CR to CRLF and
+/// dot-stuffs each line. State carries across [`DataEncoder::encode`] calls, so
+/// a CR/LF pair or a line-leading `.` split between chunks encodes exactly as
+/// it would in one piece.
+#[derive(Debug, Clone)]
+pub struct DataEncoder {
+    at_line_start: bool,
+    after_cr: bool,
+    size: usize,
+}
+impl Default for DataEncoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl DataEncoder {
+    pub fn new() -> Self {
+        Self {
+            at_line_start: true,
+            after_cr: false,
+            size: 0,
+        }
+    }
+    pub fn encode(&mut self, content: &[u8], out: &mut Vec<u8>) {
+        for &byte in content {
+            match byte {
+                // The LF of a CRLF whose CR already produced the line break.
+                b'\n' if self.after_cr => self.after_cr = false,
+                b'\r' | b'\n' => {
+                    out.extend_from_slice(b"\r\n");
+                    self.size += 2;
+                    self.at_line_start = true;
+                    self.after_cr = byte == b'\r';
+                }
+                byte => {
+                    if self.at_line_start && byte == b'.' {
+                        out.push(b'.');
+                    }
+                    out.push(byte);
+                    self.size += 1;
+                    self.at_line_start = false;
+                    self.after_cr = false;
+                }
+            }
+        }
+    }
+    /// Terminates an unfinished last line and appends the DATA terminator.
+    /// Returns SIZE octets (normalized content, excluding transparency dots)
+    /// and resets the encoder for the next message.
+    pub fn finish(&mut self, out: &mut Vec<u8>) -> usize {
+        if !self.at_line_start {
+            out.extend_from_slice(b"\r\n");
+            self.size += 2;
+        }
+        out.extend_from_slice(b".\r\n");
+        let size = self.size;
+        *self = Self::new();
+        size
+    }
+}
 /// Normalize LF, CRLF and bare CR, dot-stuff each line, append the SMTP DATA
 /// terminator. Returns SIZE octets (normalized content, excluding transparency).
 pub fn encode_data(content: &[u8], out: &mut Vec<u8>) -> usize {
-    let mut start = true;
-    let mut i = 0;
-    let mut size = 0;
-    while i < content.len() {
-        match content[i] {
-            b'\r' | b'\n' => {
-                if content[i] == b'\r' && content.get(i + 1) == Some(&b'\n') {
-                    i += 1;
-                }
-                out.extend_from_slice(b"\r\n");
-                size += 2;
-                start = true;
-            }
-            byte => {
-                if start && byte == b'.' {
-                    out.push(b'.');
-                }
-                out.push(byte);
-                size += 1;
-                start = false;
-            }
-        }
-        i += 1;
-    }
-    if !start {
-        out.extend_from_slice(b"\r\n");
-        size += 2;
-    }
-    out.extend_from_slice(b".\r\n");
-    size
+    let mut encoder = DataEncoder::new();
+    encoder.encode(content, out);
+    encoder.finish(out)
 }
 
 #[cfg(feature = "turnloop")]

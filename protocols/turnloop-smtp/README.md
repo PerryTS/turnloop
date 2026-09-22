@@ -44,8 +44,21 @@ are rejected. MIME building materializes owned representations; this is separate
 from the transport hot path. The transport reuses TX/RX, response, SASL and DATA
 buffers; warmed success allocates only the returned accepted-vector, recipient
 string and response string (verified by counting allocator). Maximum response
-buffer defaults to 64 KiB. Message size is limited by server SIZE when supplied;
-there is no streaming body API yet, so hosts must bound their MIME inputs.
+buffer defaults to 64 KiB. Message size is limited by server SIZE when supplied.
+
+`send` is the one-shot convenience: it copies the whole message into DATA storage.
+For large messages, `start_send(token, envelope, message_id, StreamBody { size,
+eight_bit }, now)` runs the same MAIL/RCPT/DATA exchange, then emits `BodyReady`
+once the server answers 354. Pass the content in any number of `send_chunk(bytes,
+now)` calls and end it with `finish_body(now)`; the single `Sent`/`Failed` follows
+as for `send`. Draining `output()` between chunks keeps memory bounded by one
+chunk. `DataEncoder` normalizes line endings and dot-stuffs incrementally, so a
+CRLF pair or a CRLF.CRLF split across chunks encodes exactly as in one piece.
+`size` is the declared SIZE parameter (omitted when `None`) and `eight_bit`
+declares BODY=8BITMIME up front, since both are sent before any content. Content
+cannot be retracted mid-DATA, so undeclared 8-bit bytes or a server reply while
+the body is open fail the message and close the transport instead of sending a
+terminator.
 
 Error fields follow nodemailer response/responseCode/command/code conventions.
 AUTH failures include mechanism and server response in the message. Full exact
