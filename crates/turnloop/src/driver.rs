@@ -204,6 +204,49 @@ impl<B: Backend> Driver<B> {
             _local: PhantomData,
         })
     }
+    /// Rebuild this loop from a new `config`, in place (issue #43).
+    ///
+    /// A loop's configuration is fixed when it is built, so raising a profile —
+    /// a process that starts doing network I/O, say — means building a new loop.
+    /// Dropping the old one to do that is a cancellation nobody asked for: a pool
+    /// job it accepted still runs, and its result is discarded because its loop
+    /// is gone, so the job's completion never arrives. This is the checked way
+    /// to replace a loop, which refuses instead of losing anything.
+    ///
+    /// The loop is rebuilt only when it owns nothing a new loop could not
+    /// deliver: no handle, no operation in flight (pool jobs, pool lookups,
+    /// typed file requests and external waits included), no completion awaiting
+    /// delivery and no queued post. Otherwise this is `WouldBlock` and nothing
+    /// changes: turn the loop until that work has been delivered, then retry —
+    /// the same contract as [`detach`](Self::detach). A `config` that
+    /// [`Driver::new`] would reject fails the same way, also without changing
+    /// anything.
+    ///
+    /// On success this is a new loop. Handles, operation ids, [`Notifier`]s,
+    /// [`Poster`]s and an [`integration`](Self::integration) primitive obtained
+    /// before belong to the old one and no longer reach it: fetch new ones.
+    /// Quiesce other threads' posters first: a post that lands between the
+    /// check and the rebuild goes down with the old loop, exactly as it would if
+    /// the loop were dropped, and later ones are refused with `NotFound`.
+    ///
+    /// Growing the old loop in place instead is not offered: its capacities size
+    /// structures that cannot grow under live use — the lock-free post and
+    /// result rings that other threads are writing into, and the Windows
+    /// `OVERLAPPED` slab whose addresses the kernel holds.
+    pub fn rebuild(&mut self, config: Config) -> Result<()> {
+        self.assert_owner();
+        if self.outstanding != 0
+            || self.handles.remaining() != self.config.max_handles
+            || !self.queued.is_empty()
+            || !self.poster.is_empty()
+            || !self.work_port.is_empty()
+        {
+            return Err(Error::new(ErrorKind::WouldBlock));
+        }
+        debug_assert_eq!(self.undelivered, 0, "every pool operation is outstanding");
+        *self = Self::new(config)?;
+        Ok(())
+    }
     /// Reserved slots are a subset of free ones.
     ///
     /// Every path that moves either side keeps this: a reserving submission

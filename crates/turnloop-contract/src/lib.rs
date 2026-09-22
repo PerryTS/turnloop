@@ -287,6 +287,10 @@ mod native {
         undelivered_pool_results_are_bounded::<B>();
     }
     #[test]
+    fn rebuild_keeps_in_flight_pool_completions() {
+        rebuild_never_drops_pool_completions::<B>();
+    }
+    #[test]
     fn reuse_port_share_binds_twice() {
         reuse_port_share::<B>();
     }

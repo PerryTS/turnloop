@@ -606,6 +606,12 @@ a submission past the ceiling is refused with `ResourceLimit`, so the ring can
 never be full when a worker pushes. `pooled_buffers` is the remaining per-loop
 cost that scales with configuration, the other half of #88.
 
+A loop's configuration cannot grow in place: the rings above are written by
+other threads and the `OVERLAPPED` slab is held by the kernel. `Loop::rebuild`
+replaces a loop with one built from a new configuration, and refuses with
+`WouldBlock` while the old one still owes anything — a handle, an operation
+(pool jobs included), a queued completion or post — so a profile upgrade can
+never discard an in-flight pool completion (#43).
 
 **Reaching the ceiling is backpressure.** An operation whose completion creates a
 handle — an accept, a handle receive — reserves its handle slot when it is

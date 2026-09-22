@@ -34,6 +34,7 @@ contract!(
     an_armed_accept_keeps_its_slot,
     multishot_accept_respects_the_handle_ceiling,
     undelivered_pool_results_are_bounded,
+    rebuild_never_drops_pool_completions,
     ready_timer_liveness,
     pooled_lease_backpressure,
     io_and_posts_progress_with_repeating_timers
