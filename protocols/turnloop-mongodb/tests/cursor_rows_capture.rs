@@ -15,6 +15,11 @@ use turnloop_mongodb::{
 
 /// The tail-position pattern from the issue: the scrutinee borrows `batch`,
 /// a local dropped at the end of the block, while the row escapes it.
+#[allow(
+    clippy::manual_map,
+    clippy::needless_match,
+    reason = "the issue's tail-position match, spelled out"
+)]
 fn first_row(reply: &RawDocument) -> Option<Result<&RawDocument>> {
     let batch = CursorBatch::parse(reply).ok()?;
     match batch.rows().next() {
