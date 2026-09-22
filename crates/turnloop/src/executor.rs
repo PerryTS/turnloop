@@ -68,6 +68,28 @@ impl Default for ExecutorConfig {
         }
     }
 }
+impl ExecutorConfig {
+    /// The executor half of [`Config::single_connection`]: one connection's
+    /// futures, one request at a time.
+    ///
+    /// Each pending executor future holds one slot, and an abandoned one keeps
+    /// it until its cancellation is acknowledged. The connection's resolve or
+    /// connect, then its read, write and shutdown, a request deadline's
+    /// [`Sleep`] and one [`Close`] need 6 at most, and the preset keeps 8, which
+    /// is 128 KiB of staging at the default 16 KiB `buffer_size`. Every slot
+    /// that submits I/O also holds one of the loop's operations, so 8 stays
+    /// within `Config::single_connection`'s 16 with room for the host's own.
+    /// Four tasks cover the request, a watchdog beside it and a background task
+    /// a protocol layer may spawn for its connection. A future or task past
+    /// either bound fails with `ResourceLimit`; nothing is dropped.
+    pub fn single_connection() -> Self {
+        Self {
+            tasks: 4,
+            operations: 8,
+            buffer_size: 16 * 1024,
+        }
+    }
+}
 struct IoSlot {
     generation: u32,
     used: bool,

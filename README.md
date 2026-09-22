@@ -40,6 +40,10 @@ driver.turn(Timeout::Until(deadline), &mut completions)?;
 # Ok::<(), turnloop::Error>(())
 ```
 
+A short-lived loop that drives one outbound connection at a time can start
+from `Config::single_connection()` (and `ExecutorConfig::single_connection()`)
+instead of trimming the server-sized defaults by hand.
+
 Use the pinned nightly for dependency resolution under the seven-day publication
 soak. The workspace also builds with stable Rust 1.97.1.
 

@@ -204,6 +204,61 @@ impl Default for Config {
         }
     }
 }
+impl Config {
+    /// Capacities for a short-lived loop that drives one outbound connection,
+    /// one request at a time: a client that resolves a name, connects, writes a
+    /// request, reads the response and drops the loop.
+    ///
+    /// [`Config::default`] sizes every table for a server. This preset keeps the
+    /// defaults only where they are not per-loop: the pooled buffer size (one
+    /// read still takes a full TLS record) and [`Config::blocking_pool`], which is
+    /// process-wide and must match every other loop's, so shrinking it here would
+    /// make the first DNS lookup fail with `InvalidInput` in a process that also
+    /// runs default loops.
+    ///
+    /// # The floor, and what it covers
+    ///
+    /// A handle's slot is held from creation until its `Closed` completion is
+    /// delivered, and an operation's until its terminal completion is. The worst
+    /// moment for this caller is a reconnect (a redirect or a retry) that starts
+    /// before the previous attempt's completions have been turned out:
+    ///
+    /// | Holding a slot at that moment | handles | operations |
+    /// |---|---|---|
+    /// | the old socket, closing, and its cancelled read, write and shutdown | 1 | 3 |
+    /// | the new socket: its connect, then read, write and shutdown | 1 | 3 |
+    /// | a request deadline timer, and the one it replaces | 2 | 2 |
+    /// | a DNS lookup, and one other blocking-pool job | 0 | 2 |
+    /// | **needed** | **4** | **10** |
+    /// | **this preset** | **8** | **16** |
+    ///
+    /// `max_handles` and `max_operations` are the only fields a caller can size
+    /// too small by guessing, and they fail loudly: a creation or submission past
+    /// either ceiling is refused with `ResourceLimit`, nothing is dropped. The
+    /// other fields only pace the loop: `events_per_turn` bounds how many native
+    /// events one turn collects, `pooled_buffers` how many
+    /// [`ReadBuf::Pooled`](crate::ReadBuf::Pooled) reads can hold data at once
+    /// (a read waits for a free buffer rather than failing; two let the next read
+    /// fill while the host still holds the last one), and `post_capacity` how
+    /// many cross-thread posts can queue before `Poster::post` refuses one.
+    ///
+    /// Anything beyond the table, such as a second concurrent connection, a
+    /// listener, child processes, signal subscriptions or filesystem requests,
+    /// needs its own handles and operations on top. With the `executor`
+    /// feature's `LocalExecutor`, pair this with
+    /// `ExecutorConfig::single_connection`, whose operations fit inside these.
+    pub fn single_connection() -> Self {
+        Self {
+            max_handles: 8,
+            max_operations: 16,
+            events_per_turn: 16,
+            pooled_buffers: 2,
+            pooled_buffer_size: 16 * 1024,
+            post_capacity: 16,
+            blocking_pool: crate::PoolConfig::default(),
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, Default)]
 /// Connect-time options for [`Loop::tcp_connect`].
 ///

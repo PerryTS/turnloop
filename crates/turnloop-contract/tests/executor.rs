@@ -51,3 +51,9 @@ fn host_operations_complete_beside_executor_futures() {
         turnloop::backend::Platform,
     >();
 }
+
+#[test]
+fn single_connection_presets_carry_a_request() {
+    turnloop_contract::executor_contract::single_connection_presets::<turnloop::backend::Platform>(
+    );
+}

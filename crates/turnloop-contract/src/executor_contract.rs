@@ -497,3 +497,83 @@ pub fn host_operations_share_the_loop<B: backend::Backend>() {
     assert_eq!(closed, 4, "every host close is handed back exactly once");
     assert!(unexpected.is_empty(), "foreign completions: {unexpected:?}");
 }
+
+/// The executor presets carry one request end to end: a lookup, a connect with
+/// its deadline, a write, a half-close and a read to EOF, all under a request
+/// timeout, then a second request on a fresh connection after the first
+/// adapter was dropped mid-read.
+pub fn single_connection_presets<B: backend::Backend>() {
+    let mut ex = LocalExecutor::<B>::with_config(
+        Config::single_connection(),
+        turnloop::ExecutorConfig::single_connection(),
+    )
+    .expect("executor");
+    let (addr, peer) = crate::echo_peer(2);
+    let h = ex.handle();
+    let task = ex
+        .spawn_local(async move {
+            let opts = TcpOpts {
+                connect_timeout: Some(Duration::from_secs(5)),
+                ..TcpOpts::default()
+            };
+            let lookup = DnsRequest {
+                host: "localhost".into(),
+                port: addr.port(),
+            };
+            assert!(!h.resolve(lookup).await.expect("resolve").is_empty());
+            // Abandoned with a read pending: its slots return on cancellation.
+            let mut first = h.connect(addr, opts).await.expect("connect");
+            let mut bytes = [0; 16];
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(
+                Pin::new(&mut first)
+                    .poll_read(&mut cx, &mut bytes)
+                    .is_pending()
+            );
+            drop(first);
+            let request = async {
+                let mut stream = h.connect(addr, opts).await.expect("reconnect");
+                let sent = b"one request";
+                let mut wrote = 0;
+                while wrote < sent.len() {
+                    wrote += poll_fn(|cx| Pin::new(&mut stream).poll_write(cx, &sent[wrote..]))
+                        .await
+                        .expect("write");
+                }
+                poll_fn(|cx| stream.poll_shutdown(cx))
+                    .await
+                    .expect("shutdown");
+                let mut reply = Vec::new();
+                loop {
+                    let n = poll_fn(|cx| Pin::new(&mut stream).poll_read(cx, &mut bytes))
+                        .await
+                        .expect("read");
+                    if n == 0 {
+                        break reply;
+                    }
+                    reply.extend_from_slice(&bytes[..n]);
+                }
+            };
+            h.timeout(Duration::from_secs(5), request)
+                .await
+                .expect("request deadline")
+        })
+        .expect("spawn");
+    let until = ex.driver().now() + Duration::from_secs(10);
+    while !task.is_finished() {
+        assert!(ex.driver().now() < until, "request stalled");
+        ex.turn(Timeout::Until(until)).expect("turn");
+    }
+    let mut task = task;
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    let std::task::Poll::Ready(reply) = Pin::new(&mut task).poll(&mut cx) else {
+        panic!("finished task must be ready")
+    };
+    assert_eq!(reply.expect("task"), b"one request");
+    let requests = peer.join().expect("peer");
+    assert_eq!(requests[1], b"one request");
+    while ex.alive() {
+        assert!(ex.driver().now() < until, "teardown");
+        ex.turn(Timeout::Until(until)).expect("turn");
+    }
+}

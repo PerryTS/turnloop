@@ -16,6 +16,7 @@ contract!(
     cancel_close_ordering,
     refused_connect_once,
     tcp_connect_timeout,
+    single_connection_config,
     ref_unref,
     no_spin,
     quiet_deadline_accounting,
