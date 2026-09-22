@@ -253,6 +253,7 @@ pub struct Response {
     output: Vec<u8>,
     finished: bool,
     keep_alive: bool,
+    status: u16,
 }
 impl Default for Response {
     fn default() -> Self {
@@ -261,6 +262,7 @@ impl Default for Response {
             output: Vec::with_capacity(65536),
             finished: false,
             keep_alive: true,
+            status: 0,
         }
     }
 }
@@ -275,6 +277,7 @@ impl Response {
         }
         self.encoder = Some(super::encode_head(head, length, &mut self.output)?);
         self.keep_alive = head.keep_alive && !head.token("connection", "close");
+        self.status = head.status;
         Ok(())
     }
     pub fn body(&mut self, bytes: &[u8]) -> io::Result<()> {
@@ -299,6 +302,12 @@ impl Response {
 /// A connection that ends after a response (shutdown, `connection: close` or a
 /// non-reusable request) and an idle connection at shutdown close with a lingering
 /// close bounded by [`Options::linger_timeout`] and [`Shutdown::stop_by`].
+///
+/// A request asking to upgrade (or a CONNECT) ends with
+/// [`Event::Upgrade`](crate::http1::Event::Upgrade) in place of `End`. A service
+/// that declines answers normally and the connection stays HTTP/1. This driver
+/// cannot hand the transport over, so a `101` (or a `2xx` to CONNECT) closes the
+/// connection after the response. Serve upgrades from [`super::Http1`] directly.
 pub async fn http1<S: HalfClose>(
     stream: S,
     shutdown: Shutdown,
@@ -326,6 +335,7 @@ pub async fn http1<S: HalfClose>(
             return Ok(());
         };
         let head = head?;
+        let connect = head.method == "CONNECT";
         service(crate::http1::Event::Head(head), &mut response)?;
         turnloop_io::write_all(
             conn.stream.as_mut().ok_or_else(super::closed)?,
@@ -333,11 +343,15 @@ pub async fn http1<S: HalfClose>(
         )
         .await?;
         response.output.clear();
+        let mut upgrade = false;
         loop {
             let mut ended = false;
             let received = conn
                 .event(|event| {
-                    ended = matches!(event, crate::http1::Event::End);
+                    // An upgrade request ends like any other; the service
+                    // decides whether to switch by the status it answers.
+                    upgrade = matches!(event, crate::http1::Event::Upgrade);
+                    ended = upgrade || matches!(event, crate::http1::Event::End);
                     service(event, &mut response)
                 })
                 .await?;
@@ -357,7 +371,11 @@ pub async fn http1<S: HalfClose>(
         if !response.finished {
             return Err(io::Error::other("service did not finish response"));
         }
-        if shutdown.is_stopped() || !conn.reusable() || !response.keep_alive {
+        // This driver has no handoff, so an accepted upgrade ends the connection
+        // rather than parsing the next protocol's bytes as HTTP/1.
+        let switched =
+            upgrade && (response.status == 101 || connect && (200..300).contains(&response.status));
+        if shutdown.is_stopped() || switched || !conn.reusable() || !response.keep_alive {
             linger(&mut conn.stream, &mut conn.input, &shutdown).await;
             return Ok(());
         }

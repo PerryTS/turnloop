@@ -28,8 +28,10 @@ impl<S: Stream> Http1<S> {
             upgraded: false,
         }
     }
+    /// A request that asked to upgrade ends the message too, and a server that
+    /// declined it may reuse the connection. A response upgrade never can.
     pub fn reusable(&self) -> bool {
-        self.stream.is_some() && self.ended && self.decoder.reusable()
+        self.stream.is_some() && (self.ended || self.upgraded) && self.decoder.reusable()
     }
     pub fn abort(&mut self) {
         self.stream.take();
@@ -37,6 +39,7 @@ impl<S: Stream> Http1<S> {
     pub fn reset(&mut self) -> io::Result<()> {
         self.decoder.reset().map_err(io::Error::other)?;
         self.ended = false;
+        self.upgraded = false;
         Ok(())
     }
     pub fn response_to(&mut self, method: &str) {

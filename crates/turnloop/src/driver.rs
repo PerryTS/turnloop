@@ -750,21 +750,34 @@ impl<B: Backend> Driver<B> {
     pub fn udp_bind(&mut self, addr: SocketAddr, opts: &UdpOpts) -> Result<Handle> {
         self.open(Open::Udp { addr, opts: *opts })
     }
-    /// Create a TCP socket and submit its connection operation with the supplied token.
+    /// Create a TCP socket and submit its connection operation with the supplied
+    /// token. [`TcpOpts::connect_timeout`] is enforced exactly like the deadline
+    /// of [`Driver::pipe_connect_until`].
     pub fn tcp_connect(
         &mut self,
         addr: SocketAddr,
         opts: &TcpOpts,
         token: Token,
     ) -> Result<Handle> {
-        let h = self.open(Open::Tcp { addr, opts: *opts })?;
-        if let Err(e) = self.submit(h, Operation::Connect, token) {
-            self.backend.release(h);
-            self.handles.remove(h.key);
-            self.refs -= 1;
-            return Err(e);
+        if opts.connect_timeout == Some(Duration::ZERO) {
+            return Err(Error::new(ErrorKind::InvalidInput));
         }
-        Ok(h)
+        let h = self.open(Open::Tcp { addr, opts: *opts })?;
+        match self.submit(h, Operation::Connect, token) {
+            Ok(op) => {
+                if let Some(at) = opts.connect_timeout.and_then(|t| self.now().checked_add(t)) {
+                    self.connect_deadlines.insert(op.key, at);
+                    self.backend.deadline_changed(self.next_deadline());
+                }
+                Ok(h)
+            }
+            Err(e) => {
+                self.backend.release(h);
+                self.handles.remove(h.key);
+                self.refs -= 1;
+                Err(e)
+            }
+        }
     }
     /// Return the local IP endpoint of a bound socket.
     pub fn local_addr(&self, h: Handle) -> Result<SocketAddr> {

@@ -140,9 +140,20 @@ pub enum Event<'a> {
         token: Token,
         row: Row<'a>,
     },
+    /// A genuine OK packet: a command or one statement of a multi-statement
+    /// query finished without a result set. `affected_rows`, `last_insert_id`
+    /// and `info` are meaningful.
     Ok {
         token: Token,
         packet: OkPacket<'a>,
+    },
+    /// The EOF packet ending one result set's rows. It carries no row counts,
+    /// only the warning count and status flags (`SERVER_MORE_RESULTS_EXISTS`
+    /// announces another result).
+    Eof {
+        token: Token,
+        warnings: u16,
+        status: StatusFlags,
     },
     Prepared {
         token: Token,
@@ -193,6 +204,8 @@ enum CommandKind {
     Execute,
     Reset,
     ChangeUser,
+    /// COM_STMT_CLOSE for this statement ID; forgotten once its bytes are sent.
+    CloseStatement(u32),
     Other,
 }
 struct Pending {
@@ -270,7 +283,14 @@ impl Connection {
     pub fn output(&self) -> &[u8] {
         &self.output[self.output_at..]
     }
-    pub fn consume_output(&mut self, n: usize) -> Result<()> {
+    /// Acknowledge `n` written bytes of `output()`.
+    ///
+    /// Returns `true` when an event is now deliverable without further input,
+    /// in which case the host must call `next_event()` right away. This matters
+    /// for COM_STMT_CLOSE and COM_QUIT: the server never answers them, so their
+    /// `Completed` / `Closed` is produced by this acknowledgement itself and no
+    /// read completion or timer would otherwise wake a completion-driven host.
+    pub fn consume_output(&mut self, n: usize) -> Result<bool> {
         if n > self.output().len() {
             return Err(Error::State("invalid output acknowledgement"));
         }
@@ -278,8 +298,21 @@ impl Connection {
         if self.output_at == self.output.len() {
             self.output.clear();
             self.output_at = 0;
+            if self.state == State::NoResponse {
+                // The server holds the statement until these bytes reach it, so
+                // it is dropped from the bookkeeping only now; a failed flush
+                // aborts instead and leaves it listed.
+                if let Some(Pending {
+                    kind: CommandKind::CloseStatement(id),
+                    ..
+                }) = self.pending
+                {
+                    self.statements.retain(|s| s.id != id);
+                }
+                self.complete(Outcome::Success);
+            }
         }
-        Ok(())
+        Ok(self.completion.is_some() || (self.state == State::Closing && self.output.is_empty()))
     }
     pub fn receive(&mut self, b: &[u8]) -> Result<()> {
         if matches!(
@@ -403,8 +436,16 @@ impl Connection {
         self.state = State::Auth;
         Ok(())
     }
+    /// Whether a command submitted now would be admitted. This is the exact rule
+    /// every command method applies: the session is authenticated and idle, the
+    /// previous command's `Completed` has been delivered and all output has been
+    /// acknowledged. A host queue can gate submission on it instead of copying
+    /// the preconditions. Unlike `is_ready`, it also requires flushed output.
+    pub fn can_accept(&self) -> bool {
+        self.state == State::Ready && self.pending.is_none() && self.output().is_empty()
+    }
     fn accept(&self) -> Result<()> {
-        if self.state != State::Ready || self.pending.is_some() || !self.output().is_empty() {
+        if !self.can_accept() {
             Err(Error::State("connection busy or closed"))
         } else {
             Ok(())
@@ -537,9 +578,18 @@ impl Connection {
         self.simple(token, 0x1a, Some(id), CommandKind::Other, State::Header)
     }
     pub fn close_statement(&mut self, token: Token, id: u32) -> Result<()> {
-        self.simple(token, 0x19, Some(id), CommandKind::Other, State::NoResponse)?;
-        self.statements.retain(|s| s.id != id);
-        Ok(())
+        self.simple(
+            token,
+            0x19,
+            Some(id),
+            CommandKind::CloseStatement(id),
+            State::NoResponse,
+        )
+    }
+    /// Prepared statements the server still holds for this session. A statement
+    /// being closed stays listed until its COM_STMT_CLOSE bytes are acknowledged.
+    pub fn statements(&self) -> &[Statement] {
+        &self.statements
     }
     pub fn change_user(
         &mut self,
@@ -642,9 +692,6 @@ impl Connection {
         self.state = State::Ready;
     }
     pub fn next_event(&mut self) -> Result<Option<Event<'_>>> {
-        if self.state == State::NoResponse && self.output().is_empty() {
-            self.complete(Outcome::Success);
-        }
         if let Some(outcome) = self.completion.take() {
             let p = self
                 .pending
@@ -902,8 +949,9 @@ impl Connection {
             }
             State::Rows => {
                 if self.packet[0] == 0xfe && self.packet.len() < 9 {
-                    let ok = parse_eof(&self.packet, self.caps)?;
-                    self.status = ok.status_flags();
+                    let eof = parse_eof(&self.packet, self.caps)?;
+                    let warnings = eof.warnings();
+                    self.status = eof.status_flags();
                     if self
                         .status
                         .contains(StatusFlags::SERVER_MORE_RESULTS_EXISTS)
@@ -912,9 +960,10 @@ impl Connection {
                     } else {
                         self.complete(Outcome::Success);
                     }
-                    return Ok(Some(Event::Ok {
+                    return Ok(Some(Event::Eof {
                         token: self.token()?,
-                        packet: parse_eof(&self.packet, self.caps)?,
+                        warnings,
+                        status: self.status,
                     }));
                 }
                 return Ok(Some(Event::Row {

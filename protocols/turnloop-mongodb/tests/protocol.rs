@@ -867,3 +867,222 @@ fn compressed_commands_are_independent_zlib_streams() {
     assert_eq!(decoded_rounds, 64, "every round must be decoded");
     assert_eq!(shrank, 64, "every round must actually compress");
 }
+
+/// Writes the pending request and returns a server reply to it.
+fn answer(c: &mut Connection, body: &Document) -> Vec<u8> {
+    let req = wire::i32_at(c.transmit(), 4).unwrap();
+    let n = c.transmit().len();
+    c.consume_transmit(n).unwrap();
+    let mut reply = Vec::new();
+    wire::encode(&mut reply, 1, req, 0, &raw(body), &[], 1000).unwrap();
+    reply
+}
+
+/// `accepts_receive` must be the check `receive` makes: a refused `receive`
+/// changes nothing, and an accepted empty one consumes nothing.
+fn accepts(c: &mut Connection) -> bool {
+    let accepts = c.accepts_receive();
+    assert_eq!(c.receive(&[]).is_ok(), accepts);
+    accepts
+}
+
+#[test]
+fn accepts_receive_tracks_every_connection_state() {
+    let body = raw(&doc! {"ping":1,"$db":"admin"});
+    // New, then a requested TLS upgrade, then the handshake it releases.
+    let mut c = Connection::new(Options::parse("mongodb://a/?tls=true").unwrap());
+    assert!(!accepts(&mut c));
+    c.connected(clock::now(), "").unwrap();
+    assert!(matches!(c.poll_event(), Some(ConnectionEvent::UpgradeTls)));
+    assert!(!accepts(&mut c));
+    c.tls_established().unwrap();
+    assert!(accepts(&mut c));
+
+    // Authentication continues to expect replies after the handshake.
+    let mut c = Connection::new(Options::parse("mongodb://user:pencil@a/").unwrap());
+    c.connected(clock::now(), "fyko+d2lbbFgONRv9qkxdawL")
+        .unwrap();
+    assert!(accepts(&mut c));
+    let hello = answer(&mut c, &doc! {"ok":1,"maxWireVersion":27});
+    feed(&mut c, &hello);
+    assert!(c.poll_event().is_none(), "saslStart, not Ready, follows");
+    assert!(!c.transmit().is_empty());
+    assert!(accepts(&mut c));
+
+    // Ready, an outstanding command, then its unreleased reply.
+    let mut c = ready();
+    assert!(!accepts(&mut c));
+    c.command(1, &body, &[], clock::now()).unwrap();
+    assert!(accepts(&mut c));
+    let reply = answer(&mut c, &doc! {"ok":1});
+    feed(&mut c, &reply);
+    assert!(matches!(
+        c.poll_event(),
+        Some(ConnectionEvent::Reply { token: 1 })
+    ));
+    assert!(!accepts(&mut c));
+    c.release_reply().unwrap();
+    assert!(!accepts(&mut c));
+    assert!(c.is_ready());
+
+    // An unacknowledged write expects no reply while or after it drains.
+    let unack = raw(&doc! {"insert":"x","writeConcern":{"w":0},"$db":"test"});
+    c.command(2, &unack, &[], clock::now()).unwrap();
+    assert!(!accepts(&mut c));
+    let n = c.transmit().len();
+    c.consume_transmit(n).unwrap();
+    assert!(matches!(
+        c.poll_event(),
+        Some(ConnectionEvent::Unacknowledged { token: 2 })
+    ));
+    assert!(!accepts(&mut c));
+
+    // Closed, including when a command was outstanding.
+    c.command(3, &body, &[], clock::now()).unwrap();
+    assert!(accepts(&mut c));
+    c.close();
+    assert!(!accepts(&mut c));
+    assert!(matches!(
+        c.poll_event(),
+        Some(ConnectionEvent::Failed { token: Some(3), .. })
+    ));
+    assert!(matches!(c.poll_event(), Some(ConnectionEvent::Closed)));
+    assert!(c.poll_event().is_none());
+}
+
+#[test]
+fn write_result_verdict_fails_on_write_errors_despite_ok() {
+    use turnloop_mongodb::command::{BulkResult, WriteResult};
+    // A duplicate key is `ok: 1` with the failure in writeErrors.
+    let duplicate = raw(&doc! {"ok":1,"n":0,"writeErrors":[
+        {"index":0,"code":11000,"codeName":"DuplicateKey","errmsg":"E11000 duplicate key"}
+    ]});
+    let e = WriteResult::parse(&duplicate).unwrap_err();
+    assert_eq!(e.kind, ErrorKind::BulkWrite);
+    assert_eq!(e.code, Some(11000));
+    assert_eq!(e.message, "E11000 duplicate key");
+    assert!(
+        e.response
+            .as_ref()
+            .unwrap()
+            .get_array("writeErrors")
+            .is_ok()
+    );
+    let decoded = WriteResult::decode(&duplicate).unwrap();
+    assert!(!decoded.succeeded());
+    assert_eq!(decoded.count, 0);
+    assert_eq!(decoded.write_errors.unwrap().into_iter().count(), 1);
+
+    // The write applied, but the requested durability was not confirmed.
+    let concern = raw(&doc! {"ok":1,"n":1,"writeConcernError":
+        {"code":64,"codeName":"WriteConcernFailed","errmsg":"waiting for replication timed out"}
+    });
+    let e = WriteResult::parse(&concern).unwrap_err();
+    assert_eq!(e.kind, ErrorKind::Server);
+    assert_eq!(e.code, Some(64));
+    let decoded = WriteResult::decode(&concern).unwrap();
+    assert!(!decoded.succeeded());
+    assert_eq!(decoded.count, 1);
+
+    // Clean writes, including an explicitly empty writeErrors, succeed.
+    for clean in [
+        raw(&doc! {"ok":1,"n":2,"nModified":1}),
+        raw(&doc! {"ok":1.0,"n":2,"nModified":1,"writeErrors":[]}),
+    ] {
+        let parsed = WriteResult::parse(&clean).unwrap();
+        assert!(parsed.succeeded());
+        assert_eq!((parsed.count, parsed.modified_count), (2, 1));
+        assert!(WriteResult::decode(&clean).unwrap().succeeded());
+    }
+
+    // A failed command is an error either way.
+    let failed = raw(&doc! {"ok":0,"code":13,"errmsg":"unauthorized"});
+    assert_eq!(WriteResult::parse(&failed).unwrap_err().code, Some(13));
+    assert_eq!(WriteResult::decode(&failed).unwrap_err().code, Some(13));
+
+    // Aggregation still sees per-document errors instead of an early return.
+    let mut bulk = BulkResult::default();
+    assert!(!bulk.accept(&duplicate, 5, true).unwrap());
+    assert!(bulk.accept(&concern, 6, false).unwrap());
+    assert_eq!(bulk.count, 1);
+    assert_eq!(bulk.write_errors[0].get_i32("index").unwrap(), 5);
+    assert_eq!(bulk.write_concern_errors[0].get_i32("code").unwrap(), 64);
+}
+
+/// Drains the queue and returns the settlement of `token` plus whether the
+/// terminal `Closed` came last, asserting no event for it appears twice.
+fn settlements(c: &mut Connection, token: u64) -> (Vec<&'static str>, bool) {
+    let mut seen = Vec::new();
+    let mut closed_last = false;
+    while let Some(event) = c.poll_event() {
+        closed_last = matches!(event, ConnectionEvent::Closed);
+        match event {
+            ConnectionEvent::Reply { token: t } if t == token => seen.push("reply"),
+            ConnectionEvent::Failed {
+                token: Some(t),
+                error,
+            } if t == token => {
+                assert_eq!(error.kind, ErrorKind::Network);
+                seen.push("failed");
+            }
+            ConnectionEvent::Closed => {}
+            e => panic!("unexpected event {e:?}"),
+        }
+    }
+    (seen, closed_last)
+}
+
+#[test]
+fn fail_settles_an_unreleased_reply_exactly_once() {
+    let body = raw(&doc! {"ping":1,"$db":"admin"});
+    let reset = || Error::new(ErrorKind::Network, "connection reset");
+
+    // The reply arrived but its event was never polled: the queued Reply is
+    // withdrawn so the token's only settlement is Failed.
+    let mut c = ready();
+    c.command(90, &body, &[], clock::now()).unwrap();
+    let reply = answer(&mut c, &doc! {"ok":1});
+    feed(&mut c, &reply);
+    c.fail(reset());
+    assert_eq!(settlements(&mut c, 90), (vec!["failed"], true));
+    assert!(c.reply().is_err());
+    assert!(c.release_reply().is_err());
+
+    // The host took the Reply but had not released it: Failed settles it.
+    let mut c = ready();
+    c.command(91, &body, &[], clock::now()).unwrap();
+    let reply = answer(&mut c, &doc! {"ok":1});
+    feed(&mut c, &reply);
+    assert!(matches!(
+        c.poll_event(),
+        Some(ConnectionEvent::Reply { token: 91 })
+    ));
+    assert_eq!(c.reply().unwrap().get_i32("ok").unwrap(), 1);
+    c.fail(reset());
+    assert_eq!(settlements(&mut c, 91), (vec!["failed"], true));
+    assert!(c.reply().is_err());
+    assert!(c.release_reply().is_err());
+    // Nothing further is settled by a second failure or a close.
+    c.fail(reset());
+    c.close();
+    assert!(c.poll_event().is_none());
+
+    // A released reply was settled by the release; failing afterwards reports
+    // only the connection failure, for no token.
+    let mut c = ready();
+    c.command(92, &body, &[], clock::now()).unwrap();
+    let reply = answer(&mut c, &doc! {"ok":1});
+    feed(&mut c, &reply);
+    assert!(matches!(
+        c.poll_event(),
+        Some(ConnectionEvent::Reply { token: 92 })
+    ));
+    c.release_reply().unwrap();
+    c.fail(reset());
+    assert!(matches!(
+        c.poll_event(),
+        Some(ConnectionEvent::Failed { token: None, .. })
+    ));
+    assert!(matches!(c.poll_event(), Some(ConnectionEvent::Closed)));
+    assert!(c.poll_event().is_none());
+}

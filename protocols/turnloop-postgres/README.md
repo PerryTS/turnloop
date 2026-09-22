@@ -48,7 +48,10 @@ and RSA-PSS are supported; MD5/SHA-1 signatures use SHA-256. Unsupported algorit
 
 1. Construct `Connection::new(Config { .. })`. The host resolves the address,
    connects TCP/Unix transport and supplies any absolute connection deadline.
-2. Transmit `output()`. Acknowledge **only actually written bytes** with
+   **Construction already queues output**: `output()` holds the StartupMessage
+   (or the SSLRequest when `ssl` is `Prefer`/`Require`) before any transport
+   exists. Do not assume it starts empty; step 2 must run first once connected.
+2. Transmit `output()`, starting with those bytes. Acknowledge **only actually written bytes** with
    `consume_output(n)`. Retain the borrow until write completion, or copy into a
    reusable host write buffer; never hold a raw pointer while mutating the core.
 3. Feed plaintext with `receive(bytes)`, then repeatedly pull `next_event()` until
@@ -60,7 +63,10 @@ and RSA-PSS are supported; MD5/SHA-1 signatures use SHA-256. Unsupported algorit
    `tls_established()` acknowledges TLS without binding data. TLS records never
    go into `receive`. Prefer mode can fall back after `N`; Require cannot.
 5. For `ScramNeeded`, construct the reexported upstream `ScramSha256` **in the
-   host** (its constructor reads entropy), then call `start_scram`. PLUS needs
+   host** (its constructor reads entropy) from `connection.config().password`,
+   then call `start_scram`. The host needs no second copy of the password. Until it
+   does, `next_event()` returns `Error::State` rather than `Ok(None)`, so an
+   ignored `ScramNeeded` fails visibly instead of stalling. PLUS needs
    `ChannelBinding::tls_server_end_point` containing the certificate digest
    defined in RFC 5929. For plain SCRAM use `ChannelBinding::unsupported()`.
    The core checks the mechanism/binding selection and
@@ -68,13 +74,21 @@ and RSA-PSS are supported; MD5/SHA-1 signatures use SHA-256. Unsupported algorit
 6. Schedule `next_timeout()` in the host. Call `handle_timeout(now)` with supplied
    monotonic time. No method obtains time implicitly.
 7. On transport EOF, TLS failure, or an error from `receive`/`next_event`, call
-   `abort(error)` and drain events. Do not resume parsing after a protocol error.
+   `abort(error)` and drain events. For a transport failure pass
+   `Error::transport(&io_error)` (or `Error::Transport(Some(TransportFailure::new(kind,
+   code, message)))`): the host's kind, error code and text (for example
+   `connect ECONNREFUSED`) reach every `Outcome::Aborted` and the `Closed` reason.
+   `Error::Transport(None)` keeps pg's generic message. Do not resume parsing after a protocol error.
    Each accepted token yields one terminal `Completed`; `Error` and command tags
    are informational and must not separately settle a promise. Aborting drains
    all tokens, then emits one `Closed`. Rejected command calls accept no token.
 
 Every event borrows storage until the next mutable call. Materialize JS rows,
-errors, notifications and fields before advancing. ParameterStatus events allow
+errors, notifications and fields before advancing, or retain them with
+`Event::into_owned()`: the resulting `OwnedEvent` holds `OwnedRow`, `OwnedFields`
+and `OwnedServerError` (also available from `Row`/`Fields`/`ServerError::into_owned`),
+each one copy of its wire bytes. `OwnedEvent::as_event()` lends it back as the
+borrowed `Event`, so one handler serves both forms. ParameterStatus events allow
 hosts to retain whatever session parameters they need; the core does not copy
 an unbounded parameter dictionary. No event calls a host callback itself.
 
@@ -118,7 +132,7 @@ The core has no JavaScript objects; the adapter applies these policies.
 | json/jsonb | JSON text (jsonb version removed) | host JSON.parse |
 | uuid | UUID text (binary formatted canonically) | string |
 | arrays of these | nested Array; NULL preserved | nested JS arrays |
-| unknown OID | text string or tagged binary Raw | custom parser or string fallback |
+| unknown OID | `Unknown { oid, text }` (never `Text`) or tagged binary `Raw` | custom parser or string fallback |
 
 JS Date milliseconds discard microseconds; the host must handle timezone,
 BC dates and infinity. Binary temporal values retain PostgreSQL's 2000 epoch and

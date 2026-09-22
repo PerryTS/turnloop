@@ -3,6 +3,7 @@ mod support;
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
+    sync::Arc,
     thread,
     time::{Duration, Instant},
 };
@@ -179,7 +180,6 @@ fn certificate_name_expiry_and_not_yet_valid_codes() {
 }
 #[test]
 fn ca_chain_and_sni_enabled_or_disabled() {
-    use std::sync::Arc;
     let mut root_params = rcgen::CertificateParams::new(vec!["Test Root".into()]).unwrap();
     root_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     let root_key = rcgen::KeyPair::generate().unwrap();
@@ -242,4 +242,172 @@ fn ca_chain_and_sni_enabled_or_disabled() {
         assert_eq!(&reply, b"okay");
         task.join().unwrap();
     }
+}
+
+fn provider_with(suite: rustls::SupportedCipherSuite) -> Arc<rustls::crypto::CryptoProvider> {
+    Arc::new(rustls::crypto::CryptoProvider {
+        cipher_suites: vec![suite],
+        ..rustls::crypto::ring::default_provider()
+    })
+}
+
+/// Handshake over loopback and exchange one byte each way. The server's `Ok`
+/// carries the client chain it saw; each `Err` is that side's error text.
+type Outcome = (Result<Vec<Vec<u8>>, String>, Result<(), String>);
+fn handshake(client: ClientConfig, server: turnloop_tls::ServerConfig) -> Outcome {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = thread::spawn(move || {
+        let mut stream = Stream::new(server.accept().unwrap(), listener.accept().unwrap().0);
+        let mut byte = [0];
+        stream.read_exact(&mut byte).map_err(|e| e.to_string())?;
+        assert_eq!(byte, [42]);
+        let peer = stream
+            .engine
+            .peer_certificates()
+            .unwrap_or_default()
+            .iter()
+            .map(|c| c.to_vec())
+            .collect();
+        stream.write_all(&[43]).map_err(|e| e.to_string())?;
+        Ok(peer)
+    });
+    let mut stream = Stream::new(
+        client
+            .connect(ServerName::try_from("localhost").unwrap())
+            .unwrap(),
+        TcpStream::connect(address).unwrap(),
+    );
+    let mut reply = [0];
+    let client = stream
+        .write_all(&[42])
+        .and_then(|()| stream.read_exact(&mut reply))
+        .map(|()| assert_eq!(reply, [43]))
+        .map_err(|e| e.to_string());
+    drop(stream);
+    (task.join().unwrap(), client)
+}
+
+#[test]
+fn host_selected_crypto_provider_is_the_one_negotiating() {
+    use rustls::crypto::ring::cipher_suite::{
+        TLS13_AES_128_GCM_SHA256, TLS13_CHACHA20_POLY1305_SHA256,
+    };
+    let cert = certificate();
+    let server = |suite| {
+        turnloop_tls::ServerConfig::with_provider(
+            provider_with(suite),
+            vec![cert.cert.der().clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()).into(),
+            vec![b"http/1.1".to_vec()],
+            NOW,
+        )
+        .unwrap()
+    };
+    let client = |suite| {
+        ClientConfig::new(
+            ClientOptions {
+                ca: Some(vec![cert.cert.der().clone()]),
+                provider: Some(provider_with(suite)),
+                ..Default::default()
+            },
+            NOW,
+        )
+        .unwrap()
+    };
+    // Each side offers only its provider's one suite. Had either side kept the
+    // full ring provider, the two would have found a common suite.
+    let (server_result, client_result) = handshake(
+        client(TLS13_AES_128_GCM_SHA256),
+        server(TLS13_CHACHA20_POLY1305_SHA256),
+    );
+    let server_error = server_result.unwrap_err();
+    assert!(
+        server_error.contains("NoCipherSuitesInCommon"),
+        "{server_error}"
+    );
+    // The test adapter drops the failed server connection without an alert.
+    assert!(client_result.is_err());
+    let (server_result, client_result) = handshake(
+        client(TLS13_CHACHA20_POLY1305_SHA256),
+        server(TLS13_CHACHA20_POLY1305_SHA256),
+    );
+    assert!(server_result.unwrap().is_empty());
+    client_result.unwrap();
+}
+
+#[test]
+fn from_rustls_carries_client_certificate_authentication() {
+    use turnloop_tls::HostTime;
+    let server_cert = certificate();
+    let client_cert = rcgen::generate_simple_self_signed(vec!["client.test".into()]).unwrap();
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let server = || {
+        let time = HostTime::new(NOW);
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(client_cert.cert.der().clone()).unwrap();
+        let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+            roots.into(),
+            provider.clone(),
+        )
+        .build()
+        .unwrap();
+        let config =
+            rustls::ServerConfig::builder_with_details(provider.clone(), time.time_provider())
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_client_cert_verifier(verifier)
+                .with_single_cert(
+                    vec![server_cert.cert.der().clone()],
+                    rustls::pki_types::PrivatePkcs8KeyDer::from(
+                        server_cert.key_pair.serialize_der(),
+                    )
+                    .into(),
+                )
+                .unwrap();
+        turnloop_tls::ServerConfig::from_rustls(Arc::new(config), time)
+    };
+    // Deliberately wrong until `process` supplies the host's time.
+    let time = HostTime::new(0);
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(server_cert.cert.der().clone()).unwrap();
+    let config = Arc::new(
+        rustls::ClientConfig::builder_with_details(provider.clone(), time.time_provider())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_client_auth_cert(
+                vec![client_cert.cert.der().clone()],
+                rustls::pki_types::PrivatePkcs8KeyDer::from(client_cert.key_pair.serialize_der())
+                    .into(),
+            )
+            .unwrap(),
+    );
+    let client = ClientConfig::from_rustls(config.clone(), time.clone());
+    assert!(Arc::ptr_eq(client.rustls_config(), &config));
+    let (server_result, client_result) = handshake(client, server());
+    client_result.unwrap();
+    assert_eq!(
+        server_result.unwrap(),
+        vec![client_cert.cert.der().to_vec()]
+    );
+    // The wrapped config validated the server certificate against the clock
+    // that `process` fed, not the 1970 value it started with.
+    assert_eq!(time.unix_seconds(), NOW);
+
+    // The same server refuses a client that has no certificate to present.
+    let plain = ClientConfig::new(
+        ClientOptions {
+            ca: Some(vec![server_cert.cert.der().clone()]),
+            ..Default::default()
+        },
+        NOW,
+    )
+    .unwrap();
+    let (server_result, _) = handshake(plain, server());
+    let server_error = server_result.unwrap_err();
+    assert!(
+        server_error.contains("peer sent no certificates"),
+        "{server_error}"
+    );
 }

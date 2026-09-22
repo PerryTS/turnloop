@@ -44,25 +44,49 @@ the core. WASI 0.2 supports A/AAAA through ip-name-lookup; its standard interfac
 has no SRV/TXT capability, so use explicit resolved seed URIs there.
 
 
+## Host entropy
+
+The sans-I/O core reads no OS entropy and no clock, so every random or unique value
+comes from the host. Two are easy to miss because nothing fails locally: a weak SCRAM
+nonce authenticates anyway, and an insert without `_id` succeeds against a server.
+
+| Obligation | Where it goes | What to supply |
+|---|---|---|
+| SCRAM client nonce | `Connection::connected(now, nonce)` | For a connection with credentials, a fresh CSPRNG nonce per connection: at least 16 printable ASCII bytes and no `,` (base64 of 18 random bytes works). `Scram::new` rejects a short or unprintable nonce; it cannot detect a reused or predictable one. Pass `""` without credentials. |
+| Document `_id` | each inserted document, before encoding | Every document sent by `insert` (or through `BulkBatcher`) must already carry `_id`. The server otherwise creates one the host never learns, where the Node driver would have generated it locally and returned it as the inserted id. Create one `ObjectIdGenerator::new(random, counter)` per process with 5 random bytes and a random 24-bit counter start, then call `generate(unix_seconds)` for each document. |
+| Session identity | `Session::new(id)`, `RetrySession { id, .. }` | A random RFC 4122 UUID per server session. `SessionPool::checkout` returns `None` when a new one is needed. |
+| Server selection | `Topology::choose` / `select_reusing` | Two random `u64`s per selection, for an unbiased pick within the latency window. |
+
+The `turnloop` feature's `asynchronous` client fills the nonce, session identity and
+selection entropy from rustls' ring `SecureRandom`. Adding `_id` remains the caller's job
+in every mode.
+
+
 ## Driving a connection
 
 1. Parse `Options`. For `mongodb+srv`, execute both `resolution_requests()` and provide
    the answers to `resolve()`. The host opens the resulting address using its transport.
 2. Construct `Connection`, call `connected(now, nonce)`. A nonce must be supplied by a
-   host CSPRNG for authenticated connections. `UpgradeTls` means finish certificate-
-   validated TLS on the transport and call `tls_established()` before sending Mongo bytes.
+   host CSPRNG for authenticated connections (see [Host entropy](#host-entropy)).
+   `UpgradeTls` means finish certificate-validated TLS on the transport and call
+   `tls_established()` before sending Mongo bytes.
 3. Write `transmit()` and acknowledge only bytes actually written with
    `consume_transmit(n)`. The slice must not be retained across mutating calls; an
    adapter using completion I/O keeps the connection immobile until write completion.
 4. Feed plaintext bytes through `receive()`. It returns the consumed prefix: loop on
    the remainder. It deliberately stops at a frame boundary. Drain events and release
    a complete reply before feeding another frame. Partial reads and writes are normal.
-5. On `Ready`, submit one command. An accepted token receives one `Reply`, `Failed` or
-   `Unacknowledged`; rejected submissions receive no completion. `Reply` is a borrowed
-   view obtained with `reply()`. Consume or copy it, then `release_reply()`.
+   `accepts_receive()` is the same check `receive()` makes, so a host can ask whether
+   to read instead of tracking an `expecting_reply` flag of its own.
+5. On `Ready`, submit one command. An accepted token is settled exactly once: by
+   `Failed`, by `Unacknowledged`, or by `release_reply()` after its `Reply` event;
+   rejected submissions receive no completion. `Reply` is a borrowed view obtained with
+   `reply()`. Consume or copy it, then `release_reply()`.
 6. Pass transport errors to `fail()`. Drive `handle_timeout(now)` at `next_timeout()`.
-   A timed-out connection must be physically closed by the adapter. Closing cancels an
-   outstanding command once, followed by `Closed`. A reply already received remains
+   A timed-out connection must be physically closed by the adapter. `fail()` settles an
+   outstanding command, or a reply not yet released, with `Failed`: the reply is revoked
+   and a still-queued `Reply` event for it is withdrawn. `close()` cancels an
+   outstanding command once, followed by `Closed`, but a reply already received remains
    readable after close until released.
 
 `Instant` is std::time::Instant on native/WASI. Browser Wasm uses `HostInstant`, created
@@ -87,11 +111,15 @@ assert_eq!(command.raw().get_str("find").unwrap(), "tasks");
 
 Insert/update/delete use OP_MSG document sequences named documents/updates/deletes.
 `BulkBatcher` splits borrowed models by negotiated count, BSON and wire size limits;
-pass the **final decorated body** when calculating overhead. `BulkResult` preserves
-original error indices across batches. It exposes aggregate wire counts; the caller
+pass the **final decorated body** when calculating overhead. A failed write can arrive
+inside `ok: 1`: a duplicate key is reported in `writeErrors` and an unmet write concern
+in `writeConcernError`. `WriteResult::parse` is the verdict — it runs
+`Error::from_response` first and fails on either, so no separate check is needed.
+`WriteResult::decode` keeps both as data; check `succeeded()` on its result. `BulkResult`
+uses `decode` and preserves original error indices across batches. It exposes aggregate wire counts; the caller
 maps them and inserted/upserted IDs to the desired JS result structure. Missing `_id`
-values must be added before sending; `ObjectIdGenerator` accepts host entropy and Unix
-seconds and never reads a clock or OS entropy itself.
+values must be added before sending with `ObjectIdGenerator`; see
+[Host entropy](#host-entropy).
 
 `CursorBatch::rows()` yields borrowed RawDocuments without per-row allocation. `Cursor`
 tracks namespace, server affinity and client limit. `needs_kill()` means issue

@@ -1,5 +1,6 @@
 //! auth/auth.md §§ SCRAM-SHA-1, SCRAM-SHA-256 and mongodb-handshake/handshake.md
-//! § Speculative Authentication. Entropy is provided by the host, never acquired here.
+//! § Speculative Authentication. Entropy is provided by the host, never acquired here;
+//! see the crate's [host entropy](crate#host-entropy) obligations.
 use crate::{Error, ErrorKind, Result, uri::Credential};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use bson::{Binary, Document, doc, spec::BinarySubtype};

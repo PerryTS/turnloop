@@ -31,8 +31,10 @@
 //!   starts at all.
 //! * **`consumed == 0` with an event** is an event that reads no input.
 //!   HTTP/1's [`http1::Event::End`] and [`http1::Event::Upgrade`] both arrive
-//!   this way. A loop that continues only while input was consumed drops the end
-//!   of every message. HTTP/2 has no step of this shape: there an event always
+//!   this way. A loop that continues only while input was consumed - or only
+//!   while it has input to feed - drops the end of every message;
+//!   [`http1::Decoder::wants_step`] says when such an event is pending. HTTP/2
+//!   has no step of this shape: there an event always
 //!   consumes, and `consumed == 0` is always the stop case.
 //! * **`consumed == 0` with no event** is the only stop condition, and it is
 //!   returned whether the decoder needs more bytes or is finished for good. The
@@ -55,6 +57,7 @@ pub mod compression;
 pub mod hpack;
 pub mod http1;
 pub mod http2;
+pub mod multipart;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Error {

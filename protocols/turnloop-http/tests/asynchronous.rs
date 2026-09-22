@@ -1832,3 +1832,104 @@ fn http1_idle_keepalive_lingers_at_shutdown() {
     assert_eq!(gate.discarded.get(), PIPELINED.len());
     assert!(gate.released.get());
 }
+
+/// PerryTS/turnloop#46: an upgrade request reaches the service as
+/// `Event::Upgrade`, and the service decides. Declined, the connection stays
+/// HTTP/1 and serves the next request. Accepted, the driver closes rather than
+/// parse the next protocol's bytes as a request.
+#[test]
+fn http1_server_upgrade_request_is_the_services_decision() {
+    let mut executor = LocalExecutor::<Platform>::new(Config::default()).expect("executor");
+    let h = executor.handle();
+    let listener = Listener::bind(&h, "127.0.0.1:0".parse().expect("address")).expect("listen");
+    let address = listener.local_addr().expect("address");
+    let mut server = executor
+        .spawn_local(async move {
+            let mut events = Vec::new();
+            for _ in 0..2 {
+                let stream = listener.accept().await.expect("accept");
+                server::http1(stream, server::Shutdown::default(), |event, out| {
+                    match event {
+                        Event::Head(head) => {
+                            events.push(format!("head {}", head.target));
+                            if head.target == "/accept" {
+                                let head = Head {
+                                    status: 101,
+                                    headers: vec![
+                                        Header::new("connection", "upgrade"),
+                                        Header::new("upgrade", "test"),
+                                    ],
+                                    ..response()
+                                };
+                                out.start(&head, BodyLength::Empty)?;
+                            } else {
+                                let body = head.target.as_bytes();
+                                out.start(&response(), BodyLength::Known(body.len() as u64))?;
+                                out.body(body)?;
+                            }
+                        }
+                        Event::Upgrade => {
+                            events.push("upgrade".into());
+                            out.finish(&[])?;
+                        }
+                        Event::End => {
+                            events.push("end".into());
+                            out.finish(&[])?;
+                        }
+                        _ => {}
+                    }
+                    Ok(())
+                })
+                .await
+                .expect("the connection ends cleanly");
+            }
+            events
+        })
+        .expect("spawn");
+    let mut client = executor
+        .spawn_local(async move {
+            let mut responses = Vec::new();
+            for wire in [
+                b"GET /decline HTTP/1.1\r\nhost: l\r\nconnection: upgrade\r\nupgrade: test\r\n\r\n\
+                  GET /next HTTP/1.1\r\nhost: l\r\nconnection: close\r\n\r\n"
+                    .as_slice(),
+                b"GET /accept HTTP/1.1\r\nhost: l\r\nconnection: upgrade\r\nupgrade: test\r\n\r\n\
+                  not HTTP at all\r\n\r\n",
+            ] {
+                let mut stream = h
+                    .connect(address, Default::default())
+                    .await
+                    .expect("connect");
+                write_all(&mut stream, wire).await.expect("request");
+                responses.push(read_until_eof(&mut stream).await);
+                close(&mut stream).await.expect("close");
+            }
+            responses
+        })
+        .expect("spawn");
+    run_until(&mut executor, &mut server, &mut client);
+    let responses = finish(&mut client);
+    assert_eq!(
+        finish(&mut server),
+        [
+            "head /decline",
+            "upgrade",
+            "head /next",
+            "end",
+            "head /accept",
+            "upgrade"
+        ]
+    );
+    let declined = String::from_utf8(responses[0].clone()).expect("ASCII");
+    assert!(declined.starts_with("HTTP/1.1 200"), "{declined}");
+    assert!(
+        declined.contains("\r\n\r\n/declineHTTP/1.1 200") && declined.ends_with("\r\n\r\n/next"),
+        "{declined}"
+    );
+    let accepted = String::from_utf8(responses[1].clone()).expect("ASCII");
+    assert!(accepted.starts_with("HTTP/1.1 101"), "{accepted}");
+    assert!(
+        accepted.ends_with("\r\n\r\n"),
+        "nothing after the switch: {accepted}"
+    );
+}

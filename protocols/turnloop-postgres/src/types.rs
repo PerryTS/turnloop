@@ -34,6 +34,13 @@ pub enum Value<'a> {
         oid: u32,
         bytes: Cow<'a, [u8]>,
     },
+    /// Text-format value of an OID with no codec here (time, interval, inet,
+    /// oid, xml, enums, ...). Distinct from `Text`, which only text, varchar,
+    /// bpchar and name produce, so a host can apply its own parser.
+    Unknown {
+        oid: u32,
+        text: Cow<'a, str>,
+    },
 }
 impl Value<'_> {
     pub fn into_owned(self) -> Value<'static> {
@@ -64,6 +71,10 @@ impl Value<'_> {
             Self::Raw { oid, bytes } => Value::Raw {
                 oid,
                 bytes: Cow::Owned(bytes.into_owned()),
+            },
+            Self::Unknown { oid, text } => Value::Unknown {
+                oid,
+                text: Cow::Owned(text.into_owned()),
             },
         }
     }
@@ -132,7 +143,12 @@ pub fn decode(oid: u32, format: i16, bytes: Option<&[u8]>) -> Result<Value<'_>> 
                 oid,
                 text: s.into(),
             },
-            _ => Value::Text(s.into()),
+            // The same text OIDs the binary codec accepts.
+            19 | 25 | 1042 | 1043 => Value::Text(s.into()),
+            _ => Value::Unknown {
+                oid,
+                text: s.into(),
+            },
         });
     }
     let mut c = Cursor(b);
@@ -487,5 +503,45 @@ mod tests {
             decode(1007, 1, Some(&array)).unwrap(),
             Value::Array(vec![Value::Int(42), Value::Null])
         );
+    }
+    #[test]
+    fn unknown_text_oids_are_not_reported_as_text() {
+        for oid in [19, 25, 1042, 1043] {
+            assert_eq!(
+                decode(oid, 0, Some(b"hello")).unwrap(),
+                Value::Text("hello".into()),
+                "OID {oid}"
+            );
+        }
+        // time, interval, inet, oid and an arbitrary enum/extension OID.
+        for (oid, text) in [
+            (1083, "12:34:56"),
+            (1186, "1 day"),
+            (869, "127.0.0.1"),
+            (26, "16384"),
+            (91_234, "happy"),
+        ] {
+            let value = decode(oid, 0, Some(text.as_bytes())).unwrap();
+            assert_eq!(
+                value,
+                Value::Unknown {
+                    oid,
+                    text: text.into()
+                }
+            );
+            assert!(matches!(
+                value.into_owned(),
+                Value::Unknown { oid: o, text: Cow::Owned(t) } if o == oid && t == text
+            ));
+        }
+        // Binary unknowns stay uninterpreted bytes.
+        assert_eq!(
+            decode(1083, 1, Some(&[0; 8])).unwrap(),
+            Value::Raw {
+                oid: 1083,
+                bytes: Cow::Borrowed(&[0; 8])
+            }
+        );
+        assert!(decode(1083, 0, Some(&[0xff])).is_err());
     }
 }
