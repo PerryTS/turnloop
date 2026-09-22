@@ -47,7 +47,7 @@ loom-filters = ["models"]
 miri-filters = ["timer::tests", "table::tests", "slots::tests"]
 
 [target.'cfg(all(target_os = "wasi", target_env = "p2"))'.dependencies]
-wasip2 = "1.0.3"
+wasip2 = "2.0.0"
 
 [target.'cfg(all(target_os = "wasi", target_env = "p3"))'.dependencies]
 wasip3 = { version = "0.8.0", optional = true }
