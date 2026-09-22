@@ -140,7 +140,7 @@ fn terminal_diagnostic_allocates_once_and_pipeline_abort_clones_allocate_zero() 
     let diagnostic = diagnostic.expect("owned error");
     assert_eq!(
         allocation::allocations(|| {
-            c.abort(Error::Transport);
+            c.abort(Error::Transport(None));
             for token in 0..64 {
                 match c.next_event().expect("completion") {
                     Some(Event::Completed {
@@ -162,4 +162,44 @@ fn terminal_diagnostic_allocates_once_and_pipeline_abort_clones_allocate_zero() 
         0
     );
     assert_eq!(c.pending_count(), 0);
+
+    // A host transport diagnostic is built once; fanning it out to every
+    // pending token and the close shares that copy.
+    let mut c = Connection::new(Config::default()).expect("core");
+    c.consume_output(c.output().len()).expect("startup sent");
+    c.receive(b"R\0\0\0\x08\0\0\0\0Z\0\0\0\x05I").expect("auth");
+    assert!(matches!(
+        c.next_event().expect("connected"),
+        Some(Event::Connected)
+    ));
+    for token in 0..64 {
+        c.query(token, "SELECT 1", None).expect("pipeline");
+    }
+    let reason = Error::Transport(Some(TransportFailure::new(
+        std::io::ErrorKind::ConnectionReset,
+        Some(-104),
+        "read ECONNRESET",
+    )));
+    assert_eq!(
+        allocation::allocations(|| {
+            c.abort(reason.clone());
+            for token in 0..64 {
+                match c.next_event().expect("completion") {
+                    Some(Event::Completed {
+                        token: actual,
+                        outcome: Outcome::Aborted(error),
+                        ..
+                    }) => {
+                        assert_eq!(actual, token);
+                        assert_eq!(error, reason);
+                    }
+                    event => panic!("missing pipeline abort: {event:?}"),
+                }
+            }
+            assert!(
+                matches!(c.next_event().expect("close"), Some(Event::Closed { reason: r }) if r == reason)
+            );
+        }),
+        0
+    );
 }
