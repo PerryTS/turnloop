@@ -205,12 +205,37 @@ impl Default for Config {
     }
 }
 #[derive(Clone, Copy, Debug, Default)]
-/// TCP connection options applied when creating the socket. Anything a host
-/// needs to change later goes through `Loop::set_option` and
-/// [`SocketOption`] instead.
+/// Connect-time options for [`Loop::tcp_connect`].
+///
+/// This struct holds what must be decided before the connection attempt starts
+/// and what the loop itself enforces. Every socket option that can be changed
+/// on a live socket goes through [`Loop::set_option`] and [`SocketOption`]
+/// instead, and can be applied to the handle `tcp_connect` returns, before the
+/// `Connected` completion arrives, wherever the backend supports that option:
+/// keep-alive, linger, TTL and buffer sizes. A
+/// receive buffer set that way is applied after the handshake has started, so it
+/// cannot change the window scale the peers negotiate.
+///
+/// Not offered at all, on any backend: binding the connecting socket to a
+/// chosen local address or port before it connects. `IPV6_V6ONLY` is not needed
+/// here: a connecting socket's family is the destination's.
+///
+/// [`Loop::tcp_connect`]: crate::Driver::tcp_connect
+/// [`Loop::set_option`]: crate::Driver::set_option
 pub struct TcpOpts {
     /// Disable the TCP Nagle algorithm for latency-sensitive small writes.
     pub nodelay: bool,
+    /// Give up on the connection attempt after this long.
+    ///
+    /// Enforced by the loop on its own clock, identically on every backend: when
+    /// the deadline passes, the pending connect is cancelled and completes once,
+    /// with `Err` of kind `TimedOut`, only after the backend acknowledges the
+    /// cancellation. It covers the attempt only, never later stream I/O, and it
+    /// cannot outlast the operating system's own connect timeout, which still
+    /// applies. The handle stays open after a timeout; close it as after any
+    /// other failed connect. `None` (the default) leaves the attempt to the OS.
+    /// A zero duration is `InvalidInput`.
+    pub connect_timeout: Option<Duration>,
 }
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 /// What a second bind of the same address is allowed to do.

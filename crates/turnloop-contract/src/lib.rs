@@ -239,6 +239,10 @@ mod native {
         refused_connect_once::<B>();
     }
     #[test]
+    fn connect_timeout() {
+        tcp_connect_timeout::<B>();
+    }
+    #[test]
     fn liveness() {
         ref_unref::<B>();
     }
@@ -432,6 +436,95 @@ pub fn refused_connect_once<B: Backend>() {
     }
     l.close(conn, Token(8)).expect("close");
     assert_eq!(count, 1);
+}
+/// `TcpOpts::connect_timeout` is enforced by the loop: an attempt still pending
+/// at its deadline completes once with `TimedOut`, an attempt that connects in
+/// time is unaffected and leaves no deadline behind, and a zero budget is
+/// refused before any socket exists.
+pub fn tcp_connect_timeout<B: Backend>() {
+    let mut l = Driver::<B>::new(Config::default()).expect("loop");
+    let zero = TcpOpts {
+        connect_timeout: Some(Duration::ZERO),
+        ..TcpOpts::default()
+    };
+    assert_eq!(
+        l.tcp_connect(localhost(), &zero, Token(1))
+            .expect_err("zero budget")
+            .kind,
+        ErrorKind::InvalidInput
+    );
+    assert!(!l.alive(), "a refused connect retains nothing");
+
+    let server = l
+        .tcp_listen(localhost(), &ListenOpts::default())
+        .expect("listen");
+    let addr = l.local_addr(server).expect("addr");
+    let mut out = Completions::default();
+
+    // In time: Connected, and the deadline is retired with the operation.
+    let generous = TcpOpts {
+        connect_timeout: Some(Duration::from_secs(5)),
+        ..TcpOpts::default()
+    };
+    let on_time = l.tcp_connect(addr, &generous, Token(2)).expect("connect");
+    assert!(l.next_deadline().is_some(), "the budget is armed");
+    let until = l.now() + Duration::from_secs(3);
+    let mut results = Vec::new();
+    while results.is_empty() {
+        assert!(l.now() < until, "connect in time");
+        l.turn(Timeout::Until(until), &mut out).expect("turn");
+        results.extend(out.drain().map(|c| (c.token, c.terminal, c.result)));
+    }
+    assert!(
+        matches!(results[..], [(Token(2), true, OpResult::Connected)]),
+        "{results:?}"
+    );
+    assert_eq!(l.next_deadline(), None, "no deadline outlives its connect");
+
+    // Expired before the loop ever looked: exactly one TimedOut, then a clean close.
+    let tight = TcpOpts {
+        connect_timeout: Some(Duration::from_millis(1)),
+        ..TcpOpts::default()
+    };
+    let late = l.tcp_connect(addr, &tight, Token(3)).expect("connect");
+    thread::sleep(Duration::from_millis(20));
+    results.clear();
+    while results.is_empty() {
+        assert!(l.now() < until, "timeout delivered");
+        l.turn(Timeout::Until(until), &mut out).expect("turn");
+        results.extend(out.drain().map(|c| (c.token, c.terminal, c.result)));
+    }
+    assert!(
+        matches!(
+            results[..],
+            [(
+                Token(3),
+                true,
+                OpResult::Err(Error {
+                    kind: ErrorKind::TimedOut,
+                    ..
+                })
+            )]
+        ),
+        "{results:?}"
+    );
+    for _ in 0..3 {
+        l.turn(Timeout::Now, &mut out).expect("no duplicate");
+        assert!(out.is_empty(), "the timeout is reported once");
+    }
+    for (h, token) in [(late, 4), (on_time, 5), (server, 6)] {
+        l.close(h, Token(token)).expect("close");
+    }
+    let mut closed = 0;
+    while l.alive() {
+        assert!(l.now() < until, "closes");
+        l.turn(Timeout::Until(until), &mut out).expect("turn");
+        for c in out.drain() {
+            assert!(matches!(c.result, OpResult::Closed), "{c:?}");
+            closed += 1;
+        }
+    }
+    assert_eq!(closed, 3);
 }
 pub fn ref_unref<B: Backend>() {
     let mut l = Driver::<B>::new(Config::default()).expect("loop");

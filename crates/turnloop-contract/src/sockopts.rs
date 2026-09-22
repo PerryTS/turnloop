@@ -426,7 +426,10 @@ pub fn nodelay_round_trip_and_accept_default<B: Backend>() {
     let eager = l
         .tcp_connect(
             (std::net::Ipv4Addr::LOCALHOST, 9).into(),
-            &TcpOpts { nodelay: true },
+            &TcpOpts {
+                nodelay: true,
+                ..TcpOpts::default()
+            },
             Token(30),
         )
         .expect("connecting socket");
@@ -634,7 +637,10 @@ pub fn unsupported_connect_nodelay_is_rejected<B: Backend>() {
     assert_eq!(
         l.tcp_connect(
             (std::net::Ipv4Addr::LOCALHOST, 9).into(),
-            &TcpOpts { nodelay: true },
+            &TcpOpts {
+                nodelay: true,
+                ..TcpOpts::default()
+            },
             Token(1),
         )
         .expect_err("no Nagle control here")

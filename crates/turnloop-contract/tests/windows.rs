@@ -15,6 +15,7 @@ contract!(
     sustained_posts_idle_io,
     cancel_close_ordering,
     refused_connect_once,
+    tcp_connect_timeout,
     ref_unref,
     no_spin,
     quiet_deadline_accounting,
