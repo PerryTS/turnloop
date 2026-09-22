@@ -394,3 +394,106 @@ pub fn pending_writes_may_replace_the_caller_slice<B: backend::Backend>() {
     assert_eq!(&actual[..32], [7; 32]);
     assert_eq!(&actual[32..], b"new");
 }
+
+/// A host that owns the loop submits its own read alongside an executor-driven
+/// one, and both complete: the executor wakes its future and hands the host's
+/// completions back through `unclaimed` instead of dropping them. Executor-owned
+/// closes are claimed, so the host sees only the tokens it issued.
+pub fn host_operations_share_the_loop<B: backend::Backend>() {
+    let mut ex = LocalExecutor::<B>::new(Config::default()).expect("executor");
+    let (host_server, host_client, host_conn) = crate::pair(&mut ex.driver());
+    let (exec_server, exec_client, exec_conn) = crate::pair(&mut ex.driver());
+    let h = ex.handle();
+    let task = ex
+        .spawn_local(async move {
+            let mut writer = h.io(exec_client);
+            let mut reader = h.io(exec_conn);
+            let sent = b"executor bytes";
+            let mut wrote = 0;
+            while wrote < sent.len() {
+                wrote += poll_fn(|cx| Pin::new(&mut writer).poll_write(cx, &sent[wrote..]))
+                    .await
+                    .expect("executor write");
+            }
+            poll_fn(|cx| Pin::new(&mut writer).poll_flush(cx))
+                .await
+                .expect("executor flush");
+            let mut bytes = [0; 32];
+            let mut read = 0;
+            while read < sent.len() {
+                let n = poll_fn(|cx| Pin::new(&mut reader).poll_read(cx, &mut bytes[read..]))
+                    .await
+                    .expect("executor read");
+                assert!(n > 0, "early EOF");
+                read += n;
+            }
+            bytes[..read].to_vec()
+            // Both adapters drop here and close their handles internally.
+        })
+        .expect("spawn executor task");
+    ex.driver()
+        .read(host_conn, ReadBuf::Pooled, Token(10))
+        .expect("host read");
+    ex.driver()
+        .write(
+            host_client,
+            WriteBuf::Owned(b"host bytes".to_vec()),
+            Token(11),
+        )
+        .expect("host write");
+    let mut host_read = Vec::new();
+    let mut host_wrote = None;
+    let mut unexpected = Vec::new();
+    let mut out = Completions::default();
+    let until = ex.driver().now() + Duration::from_secs(5);
+    while !task.is_finished() || host_wrote.is_none() || host_read.len() < 10 {
+        assert!(
+            ex.driver().now() < until,
+            "host read {:?}, host write {host_wrote:?}, task finished {}",
+            host_read,
+            task.is_finished()
+        );
+        ex.turn_into(Timeout::Until(until), &mut out)
+            .expect("executor turn");
+        for c in out.drain() {
+            match (c.token, c.result) {
+                (Token(10), OpResult::Read { lease: Some(b), .. }) => {
+                    host_read.extend_from_slice(b.as_slice());
+                    if host_read.len() < 10 {
+                        ex.driver()
+                            .read(host_conn, ReadBuf::Pooled, Token(10))
+                            .expect("continue host read");
+                    }
+                }
+                (Token(11), OpResult::Wrote(n)) => host_wrote = Some(n),
+                (token, result) => unexpected.push(format!("{token:?} {result:?}")),
+            }
+        }
+    }
+    assert_eq!(host_read, b"host bytes");
+    assert_eq!(host_wrote, Some(10));
+    let mut task = task;
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    let std::task::Poll::Ready(value) = Pin::new(&mut task).poll(&mut cx) else {
+        panic!("finished task must be ready")
+    };
+    assert_eq!(value.expect("executor task"), b"executor bytes");
+    // The adapters' own closes are the executor's; the host's closes, collected
+    // here through plain `turn`, are the only ones handed back.
+    for handle in [host_client, host_conn, host_server, exec_server] {
+        ex.driver().close(handle, Token(20)).expect("host close");
+    }
+    let mut closed = 0;
+    while ex.alive() {
+        assert!(ex.driver().now() < until, "drain closes");
+        ex.turn(Timeout::Until(until)).expect("close turn");
+        for c in ex.unclaimed().drain() {
+            match (c.token, c.result) {
+                (Token(20), OpResult::Closed) => closed += 1,
+                (token, result) => unexpected.push(format!("{token:?} {result:?}")),
+            }
+        }
+    }
+    assert_eq!(closed, 4, "every host close is handed back exactly once");
+    assert!(unexpected.is_empty(), "foreign completions: {unexpected:?}");
+}
