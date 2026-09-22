@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0-alpha.7](https://github.com/PerryTS/turnloop/compare/turnloop-http-v0.1.0-alpha.6...turnloop-http-v0.1.0-alpha.7) - 2026-09-22
+
+### Other
+
+- HTTP/2 SETTINGS as a live negotiation; websocket Received step contract (#87, #86) ([#100](https://github.com/PerryTS/turnloop/pull/100))
+- HTTP/1 step and encoder gaps, and Content-Encoding lists and step reasons in compression ([#104](https://github.com/PerryTS/turnloop/pull/104))
+- HTTP client pool deadlines and stale ids, multipart encoder, host-built rustls configs and provider choice ([#101](https://github.com/PerryTS/turnloop/pull/101))
+
 ## [0.1.0-alpha.6](https://github.com/PerryTS/turnloop/compare/turnloop-http-v0.1.0-alpha.5...turnloop-http-v0.1.0-alpha.6) - 2026-09-17
 
 ### Other
