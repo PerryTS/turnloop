@@ -89,8 +89,12 @@ assert_eq!(command.raw().get_str("find").unwrap(), "tasks");
 
 Insert/update/delete use OP_MSG document sequences named documents/updates/deletes.
 `BulkBatcher` splits borrowed models by negotiated count, BSON and wire size limits;
-pass the **final decorated body** when calculating overhead. `BulkResult` preserves
-original error indices across batches. It exposes aggregate wire counts; the caller
+pass the **final decorated body** when calculating overhead. A failed write can arrive
+inside `ok: 1`: a duplicate key is reported in `writeErrors` and an unmet write concern
+in `writeConcernError`. `WriteResult::parse` is the verdict — it runs
+`Error::from_response` first and fails on either, so no separate check is needed.
+`WriteResult::decode` keeps both as data; check `succeeded()` on its result. `BulkResult`
+uses `decode` and preserves original error indices across batches. It exposes aggregate wire counts; the caller
 maps them and inserted/upserted IDs to the desired JS result structure. Missing `_id`
 values must be added before sending; `ObjectIdGenerator` accepts host entropy and Unix
 seconds and never reads a clock or OS entropy itself.

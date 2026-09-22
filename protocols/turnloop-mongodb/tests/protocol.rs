@@ -949,3 +949,62 @@ fn accepts_receive_tracks_every_connection_state() {
     assert!(matches!(c.poll_event(), Some(ConnectionEvent::Closed)));
     assert!(c.poll_event().is_none());
 }
+
+#[test]
+fn write_result_verdict_fails_on_write_errors_despite_ok() {
+    use turnloop_mongodb::command::{BulkResult, WriteResult};
+    // A duplicate key is `ok: 1` with the failure in writeErrors.
+    let duplicate = raw(&doc! {"ok":1,"n":0,"writeErrors":[
+        {"index":0,"code":11000,"codeName":"DuplicateKey","errmsg":"E11000 duplicate key"}
+    ]});
+    let e = WriteResult::parse(&duplicate).unwrap_err();
+    assert_eq!(e.kind, ErrorKind::BulkWrite);
+    assert_eq!(e.code, Some(11000));
+    assert_eq!(e.message, "E11000 duplicate key");
+    assert!(
+        e.response
+            .as_ref()
+            .unwrap()
+            .get_array("writeErrors")
+            .is_ok()
+    );
+    let decoded = WriteResult::decode(&duplicate).unwrap();
+    assert!(!decoded.succeeded());
+    assert_eq!(decoded.count, 0);
+    assert_eq!(decoded.write_errors.unwrap().into_iter().count(), 1);
+
+    // The write applied, but the requested durability was not confirmed.
+    let concern = raw(&doc! {"ok":1,"n":1,"writeConcernError":
+        {"code":64,"codeName":"WriteConcernFailed","errmsg":"waiting for replication timed out"}
+    });
+    let e = WriteResult::parse(&concern).unwrap_err();
+    assert_eq!(e.kind, ErrorKind::Server);
+    assert_eq!(e.code, Some(64));
+    let decoded = WriteResult::decode(&concern).unwrap();
+    assert!(!decoded.succeeded());
+    assert_eq!(decoded.count, 1);
+
+    // Clean writes, including an explicitly empty writeErrors, succeed.
+    for clean in [
+        raw(&doc! {"ok":1,"n":2,"nModified":1}),
+        raw(&doc! {"ok":1.0,"n":2,"nModified":1,"writeErrors":[]}),
+    ] {
+        let parsed = WriteResult::parse(&clean).unwrap();
+        assert!(parsed.succeeded());
+        assert_eq!((parsed.count, parsed.modified_count), (2, 1));
+        assert!(WriteResult::decode(&clean).unwrap().succeeded());
+    }
+
+    // A failed command is an error either way.
+    let failed = raw(&doc! {"ok":0,"code":13,"errmsg":"unauthorized"});
+    assert_eq!(WriteResult::parse(&failed).unwrap_err().code, Some(13));
+    assert_eq!(WriteResult::decode(&failed).unwrap_err().code, Some(13));
+
+    // Aggregation still sees per-document errors instead of an early return.
+    let mut bulk = BulkResult::default();
+    assert!(!bulk.accept(&duplicate, 5, true).unwrap());
+    assert!(bulk.accept(&concern, 6, false).unwrap());
+    assert_eq!(bulk.count, 1);
+    assert_eq!(bulk.write_errors[0].get_i32("index").unwrap(), 5);
+    assert_eq!(bulk.write_concern_errors[0].get_i32("code").unwrap(), 64);
+}
