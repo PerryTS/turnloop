@@ -108,8 +108,25 @@ impl Detached {
     /// Adopt an owned Unix descriptor, classifying stream/file/TTY or socket.
     /// The descriptor must have no concurrent I/O users. Status flags and terminal
     /// settings are restored when this transport is closed or dropped.
+    ///
+    /// On kqueue platforms (macOS, the BSDs) a *listening* socket cannot be told
+    /// apart from a connected one here, and is adopted as a stream; adopt a
+    /// listener with [`from_listener_fd`](Self::from_listener_fd) instead.
     pub fn from_fd(fd: OwnedFd) -> Result<Self> {
         super::ipc::classify(fd)
+    }
+    /// Adopt an owned, already listening TCP or Unix stream socket, so the loop
+    /// can `accept` on it - a listener a host bound itself or received from
+    /// another process.
+    ///
+    /// This works on every Unix backend. [`from_fd`](Self::from_fd) recognises a
+    /// listener only where the kernel reports `SO_ACCEPTCONN`, which macOS and
+    /// the BSDs do not. A descriptor that is not a stream socket, or that has a
+    /// peer, is refused with `InvalidInput` and closed. On kqueue platforms a
+    /// socket that was bound but never `listen`ed cannot be detected; its first
+    /// `accept` fails instead.
+    pub fn from_listener_fd(fd: OwnedFd) -> Result<Self> {
+        super::ipc::classify_listener(fd)
     }
 }
 impl Drop for Detached {
