@@ -101,6 +101,28 @@ pub(super) fn stdio(raw: RawFd) -> Result<Detached> {
 pub(super) fn classify(fd: OwnedFd) -> Result<Detached> {
     classify_hint(fd, false)
 }
+/// Adopt a descriptor the caller says is a listening stream socket, and refuse
+/// anything that is provably not one.
+///
+/// epoll asks the kernel with `SO_ACCEPTCONN`. kqueue platforms do not support
+/// that option (macOS answers `ENOPROTOOPT`), so there the caller's word is
+/// taken - except that a socket with a peer is connected, and a listener never
+/// has one, so that case is still refused.
+pub(super) fn classify_listener(fd: OwnedFd) -> Result<Detached> {
+    #[cfg(turnloop_backend = "kqueue")]
+    {
+        let mut peer = Addr::empty();
+        // SAFETY: initialized sockaddr output storage and length on a live fd.
+        if unsafe { libc::getpeername(fd.as_raw_fd(), peer.mut_ptr(), &mut peer.len) } == 0 {
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
+    }
+    let transport = classify_hint(fd, true)?;
+    if !matches!(transport.kind, Kind::Listener | Kind::PipeListener) {
+        return Err(Error::new(ErrorKind::InvalidInput));
+    }
+    Ok(transport)
+}
 fn classify_hint(fd: OwnedFd, listener: bool) -> Result<Detached> {
     // SAFETY: stat is plain output storage and all-zero is a valid initial value.
     let mut stat: libc::stat = unsafe { zeroed() };
