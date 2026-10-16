@@ -44,7 +44,7 @@ turnloop-zstd-decoder = { path = "protocols/turnloop-zstd-decoder", version = "0
 http = "1"
 url = "2"
 httparse = "1"
-brotli = "8"
+brotli = "9"
 percent-encoding = "2"
 webpki-roots = "1"
 ring = "0.17"
