@@ -483,9 +483,14 @@ fn stat_fd(fd: RawFd) -> Result<FileMetadata> {
 fn set_errno(value: c_int) {
     // SAFETY: the thread-local errno location is valid for this thread.
     unsafe {
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[cfg(target_os = "linux")]
         {
             *libc::__errno_location() = value;
+        }
+        #[cfg(target_os = "android")]
+        {
+            // Bionic has no `__errno_location`; its errno accessor is `__errno`.
+            *libc::__errno() = value;
         }
         #[cfg(any(target_vendor = "apple", target_os = "freebsd"))]
         {

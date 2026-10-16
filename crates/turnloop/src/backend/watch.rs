@@ -469,8 +469,10 @@ impl Watches {
                     && !shared
                     && let Some(inotify) = &self.inotify
                 {
+                    // Bionic declares the watch descriptor `u32`, glibc/musl `c_int`;
+                    // `wd >= 0` was checked above, so the conversion is lossless.
                     // SAFETY: live inotify descriptor and a watch owned by this loop.
-                    unsafe { libc::inotify_rm_watch(inotify.fd.as_raw_fd(), wd) };
+                    unsafe { libc::inotify_rm_watch(inotify.fd.as_raw_fd(), wd as _) };
                 }
             }
             #[cfg(not(any(target_os = "linux", target_os = "android")))]
