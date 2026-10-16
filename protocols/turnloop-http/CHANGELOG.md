@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0-alpha.9](https://github.com/PerryTS/turnloop/compare/turnloop-http-v0.1.0-alpha.8...turnloop-http-v0.1.0-alpha.9) - 2026-10-16
+
+### Other
+
+- release v0.1.0-alpha.9
+
 ## [0.1.0-alpha.7](https://github.com/PerryTS/turnloop/compare/turnloop-http-v0.1.0-alpha.6...turnloop-http-v0.1.0-alpha.7) - 2026-09-22
 
 ### Other
