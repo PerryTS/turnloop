@@ -351,7 +351,7 @@ jobs:
         run: scripts/test-servers.py logs
       - name: Preserve private server diagnostics
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: protocol-server-logs
           path: .tools/protocol-logs/
@@ -498,7 +498,7 @@ jobs:
           fi
       - name: Upload measured baseline candidates, including missing-baseline failures
         if: ${{ !cancelled() && hashFiles('.tools/instruction-baselines/measurements.json') != '' }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: instruction-baselines
           path: .tools/instruction-baselines/
