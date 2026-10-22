@@ -13,13 +13,3 @@ banned = [
   "async-executor", "async-global-executor", "futures-executor", "futures-runtime",
   "http-body", "http-body-util",
 ]
-
-# Owner-approved (2026-10-16) one-time soak exception: rustls 0.23.46 fixes
-# RUSTSEC-2026-0346/0347/0348/0349 against 0.23.45. Expires when the release
-# completes its 7-day soak (published 2026-10-14).
-[[security-exceptions]]
-crate = "rustls"
-version = "0.23.46"
-advisory = "RUSTSEC-2026-0346"
-reason = "rustls 0.23.46 fixes RUSTSEC-2026-0346, -0347, -0348 and -0349 in 0.23.45 (TLS secrets in Debug, ECH rejection data leak, brotli cert decompression DoS, ServerHello KX downgrade)"
-expires = 2026-10-21
