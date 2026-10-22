@@ -51,30 +51,31 @@ mod platform {
         if bind {
             // SAFETY: zeroed C address storage has no invalid bit patterns.
             let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-            let len;
-            if v6 {
+            let len = if v6 {
                 // SAFETY: sockaddr_storage is large/aligned enough for sockaddr_in6.
                 let a =
                     unsafe { &mut *std::ptr::from_mut(&mut storage).cast::<libc::sockaddr_in6>() };
                 a.sin6_family = libc::AF_INET6 as _;
                 a.sin6_addr.s6_addr[15] = 1;
-                len = size_of::<libc::sockaddr_in6>();
+                let len = size_of::<libc::sockaddr_in6>();
                 #[cfg(any(target_vendor = "apple", target_os = "freebsd"))]
                 {
                     a.sin6_len = len as _;
                 }
+                len
             } else {
                 // SAFETY: sockaddr_storage is large/aligned enough for sockaddr_in.
                 let a =
                     unsafe { &mut *std::ptr::from_mut(&mut storage).cast::<libc::sockaddr_in>() };
                 a.sin_family = libc::AF_INET as _;
                 a.sin_addr.s_addr = u32::from_ne_bytes([127, 0, 0, 1]);
-                len = size_of::<libc::sockaddr_in>();
+                let len = size_of::<libc::sockaddr_in>();
                 #[cfg(any(target_vendor = "apple", target_os = "freebsd"))]
                 {
                     a.sin_len = len as _;
                 }
-            }
+                len
+            };
             assert_eq!(
                 // SAFETY: initialized sockaddr matches length and family; fd is owned.
                 unsafe { libc::bind(raw, std::ptr::from_ref(&storage).cast(), len as _) },
@@ -146,20 +147,19 @@ mod platform {
         if bind_socket {
             // SAFETY: zeroed C address storage has no invalid bit patterns.
             let mut storage: SOCKADDR_STORAGE = unsafe { std::mem::zeroed() };
-            let len;
-            if v6 {
+            let len = if v6 {
                 // SAFETY: sockaddr storage is large/aligned enough for SOCKADDR_IN6.
                 let a = unsafe { &mut *std::ptr::from_mut(&mut storage).cast::<SOCKADDR_IN6>() };
                 a.sin6_family = AF_INET6;
                 a.sin6_addr.u.Byte = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
-                len = size_of::<SOCKADDR_IN6>();
+                size_of::<SOCKADDR_IN6>()
             } else {
                 // SAFETY: sockaddr storage is large/aligned enough for SOCKADDR_IN.
                 let a = unsafe { &mut *std::ptr::from_mut(&mut storage).cast::<SOCKADDR_IN>() };
                 a.sin_family = AF_INET;
                 a.sin_addr.S_un.S_addr = u32::from_ne_bytes([127, 0, 0, 1]);
-                len = size_of::<SOCKADDR_IN>();
-            }
+                size_of::<SOCKADDR_IN>()
+            };
             assert_eq!(
                 // SAFETY: initialized address matches family/length; owned live socket.
                 unsafe { bind(raw, std::ptr::from_ref(&storage).cast(), len as _) },
