@@ -491,6 +491,26 @@ impl<B: Backend> ExecutorHandle<B> {
             opts,
             key: None,
             handle: None,
+            transport: None,
+        }
+    }
+    /// Connect an already-bound native TCP transport without replacing its
+    /// socket, local endpoint or pre-handshake options. Dropping the future
+    /// before polling drops the transport; dropping a pending attempt closes
+    /// it through the driver. See [`Driver::tcp_connect_bound`].
+    pub fn connect_bound(
+        &self,
+        transport: B::Detached,
+        addr: SocketAddr,
+        opts: TcpOpts,
+    ) -> Connect<B> {
+        Connect {
+            executor: self.clone(),
+            address: addr,
+            opts,
+            key: None,
+            handle: None,
+            transport: Some(transport),
         }
     }
     /// Apply an absolute deadline without resetting it between I/O operations.
@@ -1094,6 +1114,7 @@ pub struct Connect<B: Backend> {
     opts: TcpOpts,
     key: Option<Key>,
     handle: Option<Handle>,
+    transport: Option<B::Detached>,
 }
 
 /// A cancellable asynchronous name lookup.
@@ -1279,11 +1300,19 @@ impl<B: Backend> Future for Connect<B> {
             Some(key) => key,
             None => {
                 let key = shared.reserve(cx)?;
-                let result =
-                    shared
-                        .driver
-                        .borrow_mut()
-                        .tcp_connect(this.address, &this.opts, key.token());
+                let result = match this.transport.take() {
+                    Some(transport) => shared.driver.borrow_mut().tcp_connect_bound(
+                        transport,
+                        this.address,
+                        &this.opts,
+                        key.token(),
+                    ),
+                    None => shared.driver.borrow_mut().tcp_connect(
+                        this.address,
+                        &this.opts,
+                        key.token(),
+                    ),
+                };
                 match result {
                     Ok(handle) => {
                         this.handle = Some(handle);

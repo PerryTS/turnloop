@@ -271,9 +271,10 @@ impl Config {
 /// receive buffer set that way is applied after the handshake has started, so it
 /// cannot change the window scale the peers negotiate.
 ///
-/// Not offered at all, on any backend: binding the connecting socket to a
-/// chosen local address or port before it connects. `IPV6_V6ONLY` is not needed
-/// here: a connecting socket's family is the destination's.
+/// To preserve a local address/port or pre-handshake options set by the host,
+/// use [`crate::Driver::tcp_connect_bound`] with a bound native transport.
+/// `IPV6_V6ONLY` is not needed for fresh connections here: their socket family
+/// is the destination's.
 ///
 /// [`Loop::tcp_connect`]: crate::Driver::tcp_connect
 /// [`Loop::set_option`]: crate::Driver::set_option

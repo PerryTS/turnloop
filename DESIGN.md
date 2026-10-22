@@ -341,6 +341,7 @@ impl Loop {
 
     // sockets and pipes
     pub fn tcp_connect(&mut self, addr: SocketAddr, o: &TcpOpts, tok: Token) -> io::Result<Handle>;
+    pub fn tcp_connect_bound(&mut self, transport: B::Detached, addr: SocketAddr, o: &TcpOpts, tok: Token) -> io::Result<Handle>;
     pub fn tcp_listen(&mut self, addr: SocketAddr, o: &ListenOpts) -> io::Result<Handle>;
     pub fn udp_bind(&mut self, addr: SocketAddr, o: &UdpOpts) -> io::Result<Handle>;
     pub fn pipe_connect(&mut self, name: &PipeName, tok: Token) -> io::Result<Handle>; // AF_UNIX / named pipe
@@ -393,6 +394,18 @@ pub enum ChildFdSource { Null, Pipe, Duplex, Handle(Handle) }       // Duplex is
 ```
 
 ## 7. Platform design
+
+Native hosts can reserve a TCP local endpoint and configure handshake-sensitive
+options before connecting. `tcp_connect_bound` consumes an exclusively owned,
+bound but unconnected `Detached` transport, retaining its native identity,
+local endpoint and options. The optional executor exposes `connect_bound` with
+the same ownership. Unix and Windows implement this through their existing
+Connect operation, cancellation acknowledgement and deadline machinery. Failed
+setup releases the transport and all core reservations; dropping an unpolled
+future releases its transport, and dropping a pending future closes through the
+driver. An unsupported backend reports `Unsupported`, never creates a replacement
+socket. Existing connected sockets/listeners and mixed address families are
+rejected; IPv6-mapped peers use an IPv6 peer address with an IPv6 socket.
 
 ### 7.1 Linux
 

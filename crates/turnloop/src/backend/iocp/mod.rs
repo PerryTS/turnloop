@@ -1451,6 +1451,37 @@ unsafe impl Backend for Iocp {
     fn set_option(&mut self, h: Handle, option: SocketOption) -> Result<()> {
         sockopt::set(self.socket_of(h)?, option)
     }
+    fn open_bound_tcp(
+        &mut self,
+        h: Handle,
+        transport: Detached,
+        peer: SocketAddr,
+        opts: TcpOpts,
+    ) -> Result<()> {
+        if transport.kind != Kind::Tcp {
+            return Err(invalid());
+        }
+        let Native::Socket(socket) = &transport.native else {
+            return Err(invalid());
+        };
+        let raw = socket.as_raw_socket() as usize;
+        let local = socket::address(raw, false)?;
+        if local.port() == 0 || local.is_ipv4() != peer.is_ipv4() {
+            return Err(invalid());
+        }
+        match socket::address(raw, true) {
+            Ok(_) => return Err(invalid()),
+            Err(error) if error.os == Some(WSAENOTCONN) => {}
+            Err(error) => return Err(error),
+        }
+        if opts.nodelay {
+            sockopt::set(raw, SocketOption::NoDelay(true))?;
+        }
+        if peer.ip().is_loopback() {
+            socket::loopback_connect(raw);
+        }
+        self.install(h, transport, Some(peer), None)
+    }
     fn get_option(&self, h: Handle, kind: SocketOptionKind) -> Result<SocketOption> {
         sockopt::get(self.socket_of(h)?, kind)
     }

@@ -726,6 +726,35 @@ unsafe impl Backend for Unix {
     fn local_addr(&self, h: Handle) -> Result<SocketAddr> {
         socket::local_addr(self.get(h)?.transport.fd.as_raw_fd())
     }
+    fn open_bound_tcp(
+        &mut self,
+        h: Handle,
+        transport: Detached,
+        peer: SocketAddr,
+        opts: TcpOpts,
+    ) -> Result<()> {
+        if transport.kind != Kind::Tcp {
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
+        let fd = transport.fd.as_raw_fd();
+        let local = socket::local_addr(fd)?;
+        if local.port() == 0 || local.is_ipv4() != peer.is_ipv4() {
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
+        let mut address = Addr::empty();
+        // SAFETY: exclusively owned socket and initialized writable address storage.
+        if unsafe { libc::getpeername(fd, address.mut_ptr(), &mut address.len) } == 0 {
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
+        let error = last_error();
+        if error.os != Some(libc::ENOTCONN) {
+            return Err(error);
+        }
+        if opts.nodelay {
+            socket::option(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, 1)?;
+        }
+        self.install(h, transport, Some(Addr::new(peer)))
+    }
     fn set_option(&mut self, h: Handle, option: SocketOption) -> Result<()> {
         super::sockopt::set(self.socket_fd(h)?, option)
     }
