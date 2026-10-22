@@ -76,3 +76,24 @@ fn receive_shutdown_unsupported_udp_retains_read() {
         turnloop::backend::Platform,
     >();
 }
+
+#[test]
+fn datagram_addresses_empty_and_full_packets() {
+    turnloop_contract::executor_contract::datagram::addresses_empty_and_full_packets::<
+        turnloop::backend::Platform,
+    >();
+}
+
+#[test]
+fn datagram_receive_cancellation_and_truncation() {
+    turnloop_contract::executor_contract::datagram::receive_cancellation_and_truncation::<
+        turnloop::backend::Platform,
+    >();
+}
+
+#[test]
+fn datagram_oversized_and_pending_send_are_atomic() {
+    turnloop_contract::executor_contract::datagram::oversized_and_pending_send_are_atomic::<
+        turnloop::backend::Platform,
+    >();
+}

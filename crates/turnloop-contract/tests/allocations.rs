@@ -2869,3 +2869,7 @@ fn windows_duplex_fifos_make_independent_progress_without_allocating() {
     }
     assert_eq!(verified, 512);
 }
+
+#[cfg(feature = "executor")]
+#[path = "allocations/datagram.rs"]
+mod datagram;
