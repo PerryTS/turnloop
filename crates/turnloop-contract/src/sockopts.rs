@@ -9,6 +9,10 @@
 //! `multicast_membership_is_tracked` shows the kernel refusing to leave a group it
 //! was never asked to join.
 use super::*;
+mod controls;
+pub use controls::{
+    keep_alive_controls_are_independent, listener_backlog_preserves_pending_accept,
+};
 use turnloop::{KeepAlive, MulticastGroup, SocketOption, SocketOptionKind};
 
 /// A connected triple whose client keeps the platform's own Nagle setting, so a

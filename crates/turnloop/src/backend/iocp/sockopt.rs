@@ -115,18 +115,29 @@ fn set_keep_alive(socket: usize, value: Option<KeepAlive>) -> Result<()> {
     let Some(schedule) = value else {
         return set_int(socket, SOL_SOCKET, SO_KEEPALIVE, 0);
     };
-    let idle = schedule.idle.map(positive_seconds).transpose()?;
-    let interval = schedule.interval.map(positive_seconds).transpose()?;
+    set_keep_alive_settings(socket, schedule, true)
+}
+fn set_keep_alive_settings(socket: usize, schedule: KeepAlive, enable: bool) -> Result<()> {
+    let idle = schedule
+        .idle
+        .map(|v| bounded(positive_seconds(v)?))
+        .transpose()?;
+    let interval = schedule
+        .interval
+        .map(|v| bounded(positive_seconds(v)?))
+        .transpose()?;
     let count = schedule.count.map(bounded).transpose()?;
     if count == Some(0) {
         return Err(invalid());
     }
-    set_int(socket, SOL_SOCKET, SO_KEEPALIVE, 1)?;
+    if enable {
+        set_int(socket, SOL_SOCKET, SO_KEEPALIVE, 1)?;
+    }
     if let Some(idle) = idle {
-        set_int(socket, IPPROTO_TCP, TCP_KEEPIDLE, bounded(idle)?)?;
+        set_int(socket, IPPROTO_TCP, TCP_KEEPIDLE, idle)?;
     }
     if let Some(interval) = interval {
-        set_int(socket, IPPROTO_TCP, TCP_KEEPINTVL, bounded(interval)?)?;
+        set_int(socket, IPPROTO_TCP, TCP_KEEPINTVL, interval)?;
     }
     if let Some(count) = count {
         set_int(socket, IPPROTO_TCP, TCP_KEEPCNT, count)?;
@@ -137,7 +148,10 @@ fn get_keep_alive(socket: usize) -> Result<Option<KeepAlive>> {
     if get_int(socket, SOL_SOCKET, SO_KEEPALIVE)? == 0 {
         return Ok(None);
     }
-    Ok(Some(KeepAlive {
+    get_keep_alive_settings(socket).map(Some)
+}
+fn get_keep_alive_settings(socket: usize) -> Result<KeepAlive> {
+    Ok(KeepAlive {
         idle: Some(Duration::from_secs(
             get_int(socket, IPPROTO_TCP, TCP_KEEPIDLE)?.max(0) as u64,
         )),
@@ -145,7 +159,7 @@ fn get_keep_alive(socket: usize) -> Result<Option<KeepAlive>> {
             get_int(socket, IPPROTO_TCP, TCP_KEEPINTVL)?.max(0) as u64,
         )),
         count: Some(get_int(socket, IPPROTO_TCP, TCP_KEEPCNT)?.max(0) as u32),
-    }))
+    })
 }
 fn membership(socket: usize, group: MulticastGroup, join: bool) -> Result<()> {
     match (group.group, ipv6(socket)?) {
@@ -201,6 +215,20 @@ pub(super) fn set(socket: usize, option: SocketOption) -> Result<()> {
     match option {
         SocketOption::NoDelay(on) => set_int(socket, IPPROTO_TCP, TCP_NODELAY, i32::from(on)),
         SocketOption::KeepAlive(schedule) => set_keep_alive(socket, schedule),
+        SocketOption::KeepAliveEnabled(on) => {
+            set_int(socket, SOL_SOCKET, SO_KEEPALIVE, i32::from(on))
+        }
+        SocketOption::KeepAliveSettings(schedule) => {
+            set_keep_alive_settings(socket, schedule, false)
+        }
+        SocketOption::ListenBacklog(value) => {
+            let value = bounded(value)?;
+            if value == 0 {
+                return Err(invalid());
+            }
+            // SAFETY: the backend verified this is a live TCP listener; no ownership transfer.
+            super::socket::check(unsafe { listen(socket, value) })
+        }
         SocketOption::Linger(value) => set_linger(socket, value),
         SocketOption::RecvBufferSize(bytes) => {
             set_int(socket, SOL_SOCKET, SO_RCVBUF, bounded(bytes)?)
@@ -233,6 +261,12 @@ pub(super) fn get(socket: usize, kind: SocketOptionKind) -> Result<SocketOption>
             SocketOption::NoDelay(get_int(socket, IPPROTO_TCP, TCP_NODELAY)? != 0)
         }
         SocketOptionKind::KeepAlive => SocketOption::KeepAlive(get_keep_alive(socket)?),
+        SocketOptionKind::KeepAliveEnabled => {
+            SocketOption::KeepAliveEnabled(get_int(socket, SOL_SOCKET, SO_KEEPALIVE)? != 0)
+        }
+        SocketOptionKind::KeepAliveSettings => {
+            SocketOption::KeepAliveSettings(get_keep_alive_settings(socket)?)
+        }
         SocketOptionKind::Linger => SocketOption::Linger(get_linger(socket)?),
         SocketOptionKind::RecvBufferSize => {
             SocketOption::RecvBufferSize(get_int(socket, SOL_SOCKET, SO_RCVBUF)?.max(0) as u32)

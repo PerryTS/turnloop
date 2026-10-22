@@ -25,6 +25,8 @@ macro_rules! contract {
 }
 contract!(
     keep_alive_round_trip,
+    keep_alive_controls_are_independent,
+    listener_backlog_preserves_pending_accept,
     buffer_sizes_round_trip,
     ttl_round_trip,
     accept_defaults_keep_alive,
@@ -234,6 +236,43 @@ fn adopted_socket_options_reach_the_shared_socket() {
         bytes >= requested,
         "the OS reports {bytes} bytes for a {requested}-byte request"
     );
+    l.set_option(
+        h,
+        SocketOption::KeepAliveSettings(KeepAlive {
+            idle: Some(std::time::Duration::from_secs(17)),
+            interval: Some(std::time::Duration::from_secs(5)),
+            count: Some(6),
+        }),
+    )
+    .expect("schedule while disabled");
+    assert_eq!(keep_controls_of(raw), [0, 17, 5, 6]);
+    l.set_option(h, SocketOption::KeepAliveEnabled(true))
+        .expect("enable only");
+    assert_eq!(keep_controls_of(raw), [1, 17, 5, 6]);
+    l.set_option(h, SocketOption::KeepAliveEnabled(false))
+        .expect("disable only");
+    assert_eq!(keep_controls_of(raw), [0, 17, 5, 6]);
+    let too_large = KeepAlive {
+        idle: Some(std::time::Duration::from_secs(11)),
+        interval: Some(std::time::Duration::from_secs(i32::MAX as u64 + 1)),
+        count: None,
+    };
+    for option in [
+        SocketOption::KeepAlive(Some(too_large)),
+        SocketOption::KeepAliveSettings(too_large),
+    ] {
+        assert_eq!(
+            l.set_option(h, option)
+                .expect_err("oversized native schedule")
+                .kind,
+            ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            keep_controls_of(raw),
+            [0, 17, 5, 6],
+            "validation changed native settings"
+        );
+    }
     contract::close_all(&mut l, &[h]);
     drop(client);
     close_raw(raw);
@@ -393,4 +432,62 @@ fn ipv4_membership_by_interface_index() {
         );
     }
     contract::close_all(&mut l, &[udp]);
+}
+
+#[cfg(unix)]
+fn keep_controls_of(raw: std::os::fd::RawFd) -> [i32; 4] {
+    [
+        i32::from(probe::int(raw, libc::SOL_SOCKET, libc::SO_KEEPALIVE) != 0),
+        probe::int(raw, libc::IPPROTO_TCP, KEEPIDLE),
+        probe::int(raw, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL),
+        probe::int(raw, libc::IPPROTO_TCP, libc::TCP_KEEPCNT),
+    ]
+}
+#[cfg(windows)]
+fn keep_controls_of(raw: std::os::windows::io::RawSocket) -> [i32; 4] {
+    use windows_sys::Win32::Networking::WinSock::*;
+    [
+        i32::from(windows_probe::int(raw, SOL_SOCKET, SO_KEEPALIVE) != 0),
+        windows_probe::int(raw, IPPROTO_TCP, TCP_KEEPIDLE),
+        windows_probe::int(raw, IPPROTO_TCP, TCP_KEEPINTVL),
+        windows_probe::int(raw, IPPROTO_TCP, TCP_KEEPCNT),
+    ]
+}
+
+/// Linux exposes a listener's actual maximum backlog in TCP_INFO.tcpi_sacked:
+/// https://github.com/torvalds/linux/blob/master/net/ipv4/tcp.c (tcp_get_info).
+/// This independent kernel query rejects a successful no-op implementation.
+#[cfg(target_os = "linux")]
+#[test]
+fn listener_backlog_reaches_the_kernel() {
+    let mut l = Loop::new(Config::default()).expect("loop");
+    let listener = l
+        .tcp_listen((Ipv4Addr::LOCALHOST, 0).into(), &ListenOpts::default())
+        .expect("listen");
+    let RawTransport::Fd(fd) = l.raw_transport(listener).expect("native fd") else {
+        panic!("Unix listener has no fd");
+    };
+    for size in [9, 17, 4] {
+        l.set_option(listener, SocketOption::ListenBacklog(size))
+            .expect("change backlog");
+        // SAFETY: tcp_info consists of C integer fields; zero is valid.
+        let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::tcp_info>() as libc::socklen_t;
+        // SAFETY: live borrowed listener, writable tcp_info and exact capacity.
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_INFO,
+                std::ptr::from_mut(&mut info).cast(),
+                &mut len,
+            )
+        };
+        assert_eq!(rc, 0);
+        assert_eq!(
+            info.tcpi_sacked, size,
+            "kernel backlog differs from requested size"
+        );
+    }
+    contract::close_all(&mut l, &[listener]);
 }

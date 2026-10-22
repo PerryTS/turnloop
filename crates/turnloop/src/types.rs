@@ -422,7 +422,7 @@ impl AcceptDefaults {
     }
 }
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-/// TCP keep-alive probe schedule. Each `None` keeps the platform default.
+/// TCP keep-alive probe schedule. Each `None` leaves that kernel setting unchanged.
 ///
 /// Native platforms express the schedule in whole seconds, so a duration is
 /// rounded **up** to the next whole second and a zero duration is rejected as
@@ -470,6 +470,16 @@ pub enum SocketOption {
     /// whatever the OS left: read it back rather than assuming a rollback.
     /// Disabling clears the switch and leaves the schedule alone, as the OS does.
     KeepAlive(Option<KeepAlive>),
+    /// Change only the keep-alive switch, preserving the kernel's probe schedule.
+    KeepAliveEnabled(bool),
+    /// Change the provided schedule fields without enabling/disabling probing.
+    /// Omitted fields remain unchanged; getters return all three native values,
+    /// including while probing is disabled. Validation precedes every write.
+    KeepAliveSettings(KeepAlive),
+    /// Update an existing TCP listener's backlog without replacing its socket.
+    /// Zero, values above i32::MAX, and non-listener handles are InvalidInput.
+    /// This option has no getter: kernels do not expose a portable backlog query.
+    ListenBacklog(u32),
     /// `SO_LINGER`: `Some(d)` blocks the close until queued data is delivered or
     /// `d` elapses, and `Some(Duration::ZERO)` discards it and resets the
     /// connection. `None` restores the platform default (a graceful background
@@ -522,6 +532,10 @@ pub enum SocketOptionKind {
     NoDelay,
     /// Read [`SocketOption::KeepAlive`], including the schedule the OS holds.
     KeepAlive,
+    /// Read only the keep-alive switch.
+    KeepAliveEnabled,
+    /// Read the probe schedule, even when keep-alive is disabled.
+    KeepAliveSettings,
     /// Read [`SocketOption::Linger`].
     Linger,
     /// Read [`SocketOption::RecvBufferSize`] as the OS actually kept it.
