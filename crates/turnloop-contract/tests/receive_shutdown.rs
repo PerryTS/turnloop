@@ -36,10 +36,7 @@ fn native_receive_shutdown_is_observable_after_detach() {
         #[cfg(windows)]
         Err(error)
             if error.raw_os_error()
-                == Some(windows_sys::Win32::Networking::WinSock::WSAESHUTDOWN) =>
-        {
-            ()
-        }
+                == Some(windows_sys::Win32::Networking::WinSock::WSAESHUTDOWN) => {}
         other => panic!("native receive direction remained open with peer still live: {other:?}"),
     }
     owned
