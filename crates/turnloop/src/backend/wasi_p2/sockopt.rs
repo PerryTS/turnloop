@@ -138,7 +138,7 @@ pub(super) fn get(socket: &Socket, kind: SocketOptionKind) -> Result<SocketOptio
     Ok(match kind {
         SocketOptionKind::KeepAlive => SocketOption::KeepAlive(get_keep_alive(tcp(socket)?)?),
         SocketOptionKind::KeepAliveEnabled => {
-            SocketOption::KeepAliveEnabled(tcp(socket)?.get_keep_alive_enabled().map_err(error)?)
+            SocketOption::KeepAliveEnabled(tcp(socket)?.keep_alive_enabled().map_err(error)?)
         }
         SocketOptionKind::KeepAliveSettings => {
             SocketOption::KeepAliveSettings(get_keep_alive_settings(tcp(socket)?)?)
