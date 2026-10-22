@@ -37,6 +37,7 @@ pub struct Detached {
     pub(super) kind: Kind,
     pub(super) original_flags: Option<i32>,
     original_mode: Option<libc::termios>,
+    stdio_lease: Option<super::stdio::Lease>,
     /// A listener's per-connection defaults, applied to each socket it accepts.
     /// It travels with the listener across detach/attach, so a listener handed to
     /// another loop keeps configuring its connections there.
@@ -63,21 +64,29 @@ impl Detached {
     /// settings captured when the descriptor was adopted are restored first,
     /// exactly as they would be on close, and then the close is *not* performed.
     ///
+    /// For standard I/O, restoration waits until the last managed standard-I/O
+    /// transport is released, including duplicates held by other loops. A handed
+    /// off duplicate shares those flags and must not reconfigure them meanwhile.
+    ///
     /// A descriptor turnloop created itself was created non-blocking with
     /// `FD_CLOEXEC`, and it is handed over that way: nothing is restored,
     /// because nothing was changed. Call `fcntl(F_SETFL)` (or
     /// `TcpStream::set_nonblocking(false)`) if the receiving code wants blocking
     /// I/O, which is what a synchronous TLS handshake on the descriptor needs.
-    pub fn into_fd(self) -> OwnedFd {
+    pub fn into_fd(mut self) -> OwnedFd {
         self.restore();
+        drop(self.stdio_lease.take());
         let this = std::mem::ManuallyDrop::new(self);
         // SAFETY: `this` is never dropped, so this move of the single owning
-        // field cannot be observed twice; the remaining fields are Copy/plain
-        // data whose Drop is a no-op. `restore` already ran, and it is the only
-        // thing this type's Drop does besides releasing `fd`.
+        // field cannot be observed twice; the lease was released above and
+        // all other remaining fields are Copy/plain data whose Drop is a no-op.
+        // Restoration and lease release have already run.
         unsafe { std::ptr::read(&this.fd) }
     }
     fn restore(&self) {
+        if self.stdio_lease.is_some() {
+            return;
+        }
         if let Some(mode) = &self.original_mode {
             // SAFETY: descriptor is still owned; restore before OwnedFd drops.
             unsafe {
@@ -102,8 +111,14 @@ impl Detached {
             kind,
             original_flags: None,
             original_mode,
+            stdio_lease: None,
             accept_defaults: AcceptDefaults::EMPTY,
         }
+    }
+    pub(super) fn share_stdio(&mut self, lease: super::stdio::Lease, mode: Option<libc::termios>) {
+        self.original_flags = None;
+        self.original_mode = mode;
+        self.stdio_lease = Some(lease);
     }
     /// Adopt an owned Unix descriptor, classifying stream/file/TTY or socket.
     /// The descriptor must have no concurrent I/O users. Status flags and terminal
