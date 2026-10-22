@@ -529,6 +529,7 @@ impl<B: Backend> ExecutorHandle<B> {
             read: None,
             write: None,
             shutdown: None,
+            read_shut: false,
             write_shut: false,
             closed: false,
         }
@@ -707,6 +708,7 @@ pub struct AsyncIo<B: Backend> {
     read: Option<Key>,
     write: Option<Key>,
     shutdown: Option<Key>,
+    read_shut: bool,
     write_shut: bool,
     closed: bool,
 }
@@ -727,6 +729,41 @@ impl<B: Backend> AsyncIo<B> {
     /// `BrokenPipe`, while reads continue until the peer's EOF.
     pub fn is_write_shut(&self) -> bool {
         self.write_shut
+    }
+    /// Whether receive shutdown completed for this adapter.
+    pub fn is_read_shut(&self) -> bool {
+        self.read_shut
+    }
+    /// Stop receiving, discard this adapter's buffered input, and preserve sends.
+    ///
+    /// Calls native receive shutdown first; an unsupported transport leaves the
+    /// adapter unchanged. After success all reads return EOF, including when a
+    /// previous read was Pending or retained a partially consumed completion.
+    /// Pending native access is cancelled, but its internal buffer remains owned
+    /// by the executor until terminal acknowledgement. Repeated calls succeed.
+    /// Supports TCP on Unix, Windows and WASI 0.2 and Unix-domain streams. WASI
+    /// 0.3 and web currently return Unsupported; they require asynchronous stream
+    /// cancellation before dropping the receive endpoint.
+    pub fn shutdown_receive(&mut self) -> io::Result<()> {
+        if self.read_shut {
+            return Ok(());
+        }
+        if self.closed {
+            return Err(io::ErrorKind::NotConnected.into());
+        }
+        if self.peer.is_some() {
+            return Err(io::ErrorKind::Unsupported.into());
+        }
+        self.shared
+            .driver
+            .borrow_mut()
+            .shutdown_receive(self.handle)
+            .map_err(shutdown_error)?;
+        self.read_shut = true;
+        if let Some(key) = self.read.take() {
+            self.shared.abandon(key);
+        }
+        Ok(())
     }
     /// Gracefully end the write direction without closing the handle.
     ///
@@ -852,7 +889,7 @@ impl<B: Backend> AsyncRead for AsyncIo<B> {
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
-        if buf.is_empty() {
+        if this.read_shut || buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
         let key = match this.read {

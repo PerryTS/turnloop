@@ -356,6 +356,7 @@ impl Loop {
     pub fn writev(&mut self, h: Handle, b: &mut [WriteBuf], tok: Token) -> io::Result<OpId>;
     pub fn send_to(&mut self, h: Handle, b: WriteBuf, to: SocketAddr, tok: Token) -> io::Result<OpId>;
     pub fn shutdown(&mut self, h: Handle, tok: Token) -> io::Result<OpId>;
+    pub fn shutdown_receive(&mut self, h: Handle) -> io::Result<()>; // immediate native receive control; outstanding reads still require acknowledgement
     pub fn cancel(&mut self, op: OpId) -> bool;
     pub fn stop(&mut self, op: OpId) -> bool;                                        // end a multishot
     pub fn close(&mut self, h: Handle, tok: Token);

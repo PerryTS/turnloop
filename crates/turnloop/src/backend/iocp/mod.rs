@@ -1490,6 +1490,15 @@ unsafe impl Backend for Iocp {
     fn get_option(&self, h: Handle, kind: SocketOptionKind) -> Result<SocketOption> {
         sockopt::get(self.socket_of(h)?, kind)
     }
+    fn shutdown_receive(&mut self, h: Handle) -> Result<()> {
+        let transport = &self.get(h)?.transport;
+        if transport.kind != Kind::Tcp {
+            return Err(unsupported());
+        }
+        // SAFETY: live owned TCP socket. SD_RECEIVE preserves sends and does
+        // not release OVERLAPPED storage; outstanding receives still complete.
+        socket::check(unsafe { shutdown(transport.native.raw() as usize, SD_RECEIVE) })
+    }
     fn submit(&mut self, request: Request) -> Result<()> {
         if self.services.contains(request.handle) {
             return self.services.submit(request);

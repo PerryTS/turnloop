@@ -766,6 +766,18 @@ unsafe impl Backend for Unix {
     fn get_option(&self, h: Handle, kind: SocketOptionKind) -> Result<SocketOption> {
         super::sockopt::get(self.socket_fd(h)?, kind)
     }
+    fn shutdown_receive(&mut self, h: Handle) -> Result<()> {
+        let transport = &self.get(h)?.transport;
+        if !matches!(transport.kind, Kind::Tcp | Kind::Pipe) {
+            return Err(Error::new(ErrorKind::Unsupported));
+        }
+        // SAFETY: live owned TCP/Unix stream socket; receive shutdown does not
+        // close it or release any buffer held by accepted native requests.
+        if unsafe { libc::shutdown(transport.fd.as_raw_fd(), libc::SHUT_RD) } < 0 {
+            return Err(last_error());
+        }
+        Ok(())
+    }
     fn submit(&mut self, request: Request) -> Result<()> {
         let h = request.handle;
         if self.services.contains(h) {
