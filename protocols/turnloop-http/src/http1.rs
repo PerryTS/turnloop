@@ -30,6 +30,14 @@ impl Header {
             value: value.as_ref().to_vec(),
         }
     }
+    /// Preserve an HTTP/1 field's original spelling. Lookups remain case-insensitive.
+    /// HTTP/2 callers must continue to supply lowercase names.
+    pub fn new_preserving_case(name: &str, value: impl AsRef<[u8]>) -> Self {
+        Self {
+            name: name.to_owned(),
+            value: value.as_ref().to_vec(),
+        }
+    }
 }
 #[derive(Debug, Clone)]
 pub struct Head {
@@ -224,7 +232,10 @@ fn headers(raw: &[httparse::Header<'_>], limits: Limits) -> Result<Vec<Header>> 
     if raw.len() > limits.headers {
         return Err(Error::new("HPE_HEADER_OVERFLOW", "header count limit"));
     }
-    Ok(raw.iter().map(|h| Header::new(h.name, h.value)).collect())
+    Ok(raw
+        .iter()
+        .map(|h| Header::new_preserving_case(h.name, h.value))
+        .collect())
 }
 fn lengths(head: &Head) -> Result<(Option<u64>, bool)> {
     let mut cl = None;
@@ -397,7 +408,12 @@ impl Decoder {
                 };
                 if self.mode == Mode::Request
                     && head.version == 1
-                    && (head.headers.iter().filter(|h| h.name == "host").count() != 1
+                    && (head
+                        .headers
+                        .iter()
+                        .filter(|h| h.name.eq_ignore_ascii_case("host"))
+                        .count()
+                        != 1
                         || head.get("host").is_none_or(|v| v.is_empty()))
                 {
                     return Err(invalid("HTTP/1.1 requires exactly one Host"));
@@ -538,17 +554,7 @@ impl Decoder {
                     return Err(invalid("incomplete trailers"));
                 };
                 let trailers = headers(raw, self.limits)?;
-                if trailers.iter().any(|h| {
-                    matches!(
-                        h.name.as_str(),
-                        "content-length"
-                            | "transfer-encoding"
-                            | "host"
-                            | "connection"
-                            | "trailer"
-                            | "upgrade"
-                    )
-                }) {
+                if trailers.iter().any(|h| forbidden_trailer(&h.name)) {
                     return Err(invalid("forbidden trailer"));
                 }
                 step.consumed = n;
@@ -749,15 +755,7 @@ impl Encoder {
             return Err(invalid("trailers require chunked body"));
         }
         for h in trailers {
-            if matches!(
-                h.name.as_str(),
-                "content-length"
-                    | "transfer-encoding"
-                    | "host"
-                    | "connection"
-                    | "trailer"
-                    | "upgrade"
-            ) {
+            if forbidden_trailer(&h.name) {
                 return Err(invalid("forbidden trailer"));
             }
             validate_field(h)?;
@@ -775,6 +773,19 @@ impl Encoder {
         self.finished = true;
         Ok(())
     }
+}
+
+fn forbidden_trailer(name: &str) -> bool {
+    [
+        "content-length",
+        "transfer-encoding",
+        "host",
+        "connection",
+        "trailer",
+        "upgrade",
+    ]
+    .iter()
+    .any(|forbidden| name.eq_ignore_ascii_case(forbidden))
 }
 
 /// RFC token grammar, shared with HPACK field validation without temporary types.
