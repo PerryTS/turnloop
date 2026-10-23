@@ -664,6 +664,12 @@ impl<B: Backend> Driver<B> {
         Ok(())
     }
     /// Duplicate standard input, output or error, classifying pipe/file/terminal.
+    ///
+    /// Unix duplicates share nonblocking flags and terminal settings. Overlapping
+    /// managed standard-I/O transports, even on different loops, keep those
+    /// settings until the last transport is released; then the original settings
+    /// are restored. Do not replace or reconfigure process standard descriptors
+    /// (or their aliases) while any managed standard-I/O transport is live.
     pub fn open_stdio(&mut self, which: Stdio) -> Result<Handle> {
         self.open(Open::Stdio(which))
     }

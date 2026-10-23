@@ -261,7 +261,10 @@ jobs:
         if: '!cancelled()'
         run: python3 scripts/ci/run-tests.py node
   protocol:
-    runs-on: ubuntu-24.04
+    # MongoDB rejects the 24.04 image's affected 7.0 Azure kernel (SERVER-121912).
+    # Keep real-server coverage on 22.04's 6.8 kernel until the hosted image is fixed:
+    # https://github.com/actions/runner-images/issues/15005
+    runs-on: ubuntu-22.04
     permissions:
       contents: read
     timeout-minutes: 45
@@ -311,7 +314,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .tools/redis-build
-          key: redis-tls-ubuntu-24.04-${{ runner.arch }}-${{ hashFiles('scripts/ci/install-redis.py') }}
+          key: redis-tls-ubuntu-22.04-${{ runner.arch }}-${{ hashFiles('scripts/ci/install-redis.py') }}
       - name: Install and verify Redis 8.4.0 with TLS
         run: python3 scripts/ci/install-redis.py
       - name: Pull MongoDB before the bounded fixture startup wait

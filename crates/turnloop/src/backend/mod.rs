@@ -535,6 +535,8 @@ pub use wasi_p3::WasiP3 as Platform;
 mod ipc;
 #[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
 mod process;
+#[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
+mod stdio;
 
 #[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
 mod services;
