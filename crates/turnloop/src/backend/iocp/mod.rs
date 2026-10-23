@@ -1449,6 +1449,11 @@ unsafe impl Backend for Iocp {
         socket::address(r.transport.native.raw() as usize, false)
     }
     fn set_option(&mut self, h: Handle, option: SocketOption) -> Result<()> {
+        if matches!(option, SocketOption::ListenBacklog(_))
+            && self.get(h)?.transport.kind != Kind::Listener
+        {
+            return Err(invalid());
+        }
         sockopt::set(self.socket_of(h)?, option)
     }
     fn open_bound_tcp(

@@ -537,6 +537,11 @@ unsafe impl Backend for WasiP3 {
         self.install(h, transport, (kind == Kind::Tcp).then_some(addr))
     }
     fn set_option(&mut self, h: Handle, option: SocketOption) -> Result<()> {
+        if matches!(option, SocketOption::ListenBacklog(_))
+            && self.get(h)?.transport.kind != Kind::Listener
+        {
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
         sockopt::set(&self.get(h)?.transport.socket, option)
     }
     fn get_option(&self, h: Handle, kind: SocketOptionKind) -> Result<SocketOption> {

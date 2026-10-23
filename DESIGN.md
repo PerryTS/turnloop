@@ -531,6 +531,15 @@ and work on any live socket handle, including one produced by `accept`.
   default rejects the *listener* when it is created, and an OS failure while
   applying one fails that accept rather than handing up a half-configured socket.
 
+WASI hosts also need independent keep-alive controls: `KeepAliveEnabled` changes
+only the switch, and `KeepAliveSettings` changes only the supplied timing/count
+fields. Its getter reads all three kernel values even while probing is disabled.
+The existing `KeepAlive(Some(...))` still enables probing and applies a schedule.
+All supplied numeric fields are validated before any setting is written.
+`ListenBacklog` updates an existing TCP listener without replacing its transport
+or pending accepts. It rejects zero/oversized values and non-listeners; no
+portable backlog getter is claimed.
+
 ## 8. Loop liveness and ref/unref
 
 - A handle, pending operation or timer is **referenced** by default. `set_ref(h, false)` excludes it from `alive()`, but it still produces completions while something else keeps the loop running.

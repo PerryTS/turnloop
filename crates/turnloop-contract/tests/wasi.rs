@@ -573,3 +573,12 @@ mod filesystem {
         contract::capability_scope::<Platform>(root());
     }
 }
+
+#[test]
+fn independent_keep_alive_controls() {
+    contract::sockopts::keep_alive_controls_are_independent::<Platform>();
+}
+#[test]
+fn backlog_update_preserves_pending_accept() {
+    contract::sockopts::listener_backlog_preserves_pending_accept::<Platform>();
+}

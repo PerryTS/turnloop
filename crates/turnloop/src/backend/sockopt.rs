@@ -176,13 +176,18 @@ fn set_keep_alive(fd: RawFd, value: Option<KeepAlive>) -> Result<()> {
     let Some(schedule) = value else {
         return set_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, 0);
     };
+    set_keep_alive_settings(fd, schedule, true)
+}
+fn set_keep_alive_settings(fd: RawFd, schedule: KeepAlive, enable: bool) -> Result<()> {
     let idle = schedule.idle.map(positive_seconds).transpose()?;
     let interval = schedule.interval.map(positive_seconds).transpose()?;
     let count = schedule.count.map(bounded).transpose()?;
     if count == Some(0) {
         return Err(invalid());
     }
-    set_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1)?;
+    if enable {
+        set_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1)?;
+    }
     if let Some(idle) = idle {
         set_int(fd, libc::IPPROTO_TCP, KEEPIDLE, idle)?;
     }
@@ -204,7 +209,10 @@ fn get_keep_alive(fd: RawFd) -> Result<Option<KeepAlive>> {
     if get_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE)? == 0 {
         return Ok(None);
     }
-    Ok(Some(KeepAlive {
+    get_keep_alive_settings(fd).map(Some)
+}
+fn get_keep_alive_settings(fd: RawFd) -> Result<KeepAlive> {
+    Ok(KeepAlive {
         idle: Some(Duration::from_secs(
             get_int(fd, libc::IPPROTO_TCP, KEEPIDLE)?.max(0) as u64,
         )),
@@ -212,7 +220,7 @@ fn get_keep_alive(fd: RawFd) -> Result<Option<KeepAlive>> {
             get_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL)?.max(0) as u64,
         )),
         count: Some(get_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT)?.max(0) as u32),
-    }))
+    })
 }
 fn membership(fd: RawFd, group: MulticastGroup, join: bool) -> Result<()> {
     match (group.group, ipv6(fd)?) {
@@ -301,6 +309,18 @@ pub(super) fn set(fd: RawFd, option: SocketOption) -> Result<()> {
             set_int(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, i32::from(on))
         }
         SocketOption::KeepAlive(schedule) => set_keep_alive(fd, schedule),
+        SocketOption::KeepAliveEnabled(on) => {
+            set_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, i32::from(on))
+        }
+        SocketOption::KeepAliveSettings(schedule) => set_keep_alive_settings(fd, schedule, false),
+        SocketOption::ListenBacklog(value) => {
+            let value = bounded(value)?;
+            if value == 0 {
+                return Err(invalid());
+            }
+            // SAFETY: the backend verified this is a live TCP listener; no ownership transfer.
+            check(unsafe { libc::listen(fd, value) })
+        }
         SocketOption::Linger(value) => set_linger(fd, value),
         SocketOption::RecvBufferSize(bytes) => {
             set_int(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, bounded(bytes)?)
@@ -353,6 +373,12 @@ pub(super) fn get(fd: RawFd, kind: SocketOptionKind) -> Result<SocketOption> {
             SocketOption::NoDelay(get_int(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY)? != 0)
         }
         SocketOptionKind::KeepAlive => SocketOption::KeepAlive(get_keep_alive(fd)?),
+        SocketOptionKind::KeepAliveEnabled => {
+            SocketOption::KeepAliveEnabled(get_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE)? != 0)
+        }
+        SocketOptionKind::KeepAliveSettings => {
+            SocketOption::KeepAliveSettings(get_keep_alive_settings(fd)?)
+        }
         SocketOptionKind::Linger => SocketOption::Linger(get_linger(fd)?),
         SocketOptionKind::RecvBufferSize => SocketOption::RecvBufferSize(
             get_int(fd, libc::SOL_SOCKET, libc::SO_RCVBUF)?.max(0) as u32,

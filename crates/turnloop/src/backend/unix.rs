@@ -756,6 +756,11 @@ unsafe impl Backend for Unix {
         self.install(h, transport, Some(Addr::new(peer)))
     }
     fn set_option(&mut self, h: Handle, option: SocketOption) -> Result<()> {
+        if matches!(option, SocketOption::ListenBacklog(_))
+            && self.get(h)?.transport.kind != Kind::Listener
+        {
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
         super::sockopt::set(self.socket_fd(h)?, option)
     }
     fn get_option(&self, h: Handle, kind: SocketOptionKind) -> Result<SocketOption> {
