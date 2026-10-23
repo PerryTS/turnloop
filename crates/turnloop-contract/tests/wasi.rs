@@ -599,3 +599,21 @@ fn receive_shutdown_udp_retains_read() {
     contract::executor_contract::receive_shutdown::unsupported_udp_preserves_pending_read::<Platform>(
     );
 }
+
+#[cfg(feature = "executor")]
+#[test]
+fn datagram_addresses_empty_and_full_packets() {
+    contract::executor_contract::datagram::addresses_empty_and_full_packets::<Platform>();
+}
+
+#[cfg(feature = "executor")]
+#[test]
+fn datagram_receive_cancellation_and_truncation() {
+    contract::executor_contract::datagram::receive_cancellation_and_truncation::<Platform>();
+}
+
+#[cfg(feature = "executor")]
+#[test]
+fn datagram_oversized_and_pending_send_are_atomic() {
+    contract::executor_contract::datagram::oversized_and_pending_send_are_atomic::<Platform>();
+}
