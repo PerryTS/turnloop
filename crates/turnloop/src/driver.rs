@@ -871,6 +871,39 @@ impl<B: Backend> Driver<B> {
             return Err(Error::new(ErrorKind::InvalidInput));
         }
         let h = self.open(Open::Tcp { addr, opts: *opts })?;
+        self.start_tcp_connect(h, opts, token)
+    }
+    /// Connect an exclusively owned, already-bound native TCP socket.
+    ///
+    /// The binding (including an OS-assigned ephemeral port) and socket options
+    /// survive adoption. This supports options which affect the handshake,
+    /// such as the receive buffer size, and hosts which reserve a local port
+    /// before choosing a peer. `nodelay: true` enables TCP_NODELAY; otherwise
+    /// the existing setting is preserved. The peer must have the same address
+    /// family. Connected sockets, listeners and unbound sockets are rejected.
+    ///
+    /// Unix and Windows native backends support this operation. Others report
+    /// Unsupported. Ownership is consumed even on setup failure. Once accepted,
+    /// completion, timeout and close/cancellation follow [`Self::tcp_connect`].
+    pub fn tcp_connect_bound(
+        &mut self,
+        transport: B::Detached,
+        addr: SocketAddr,
+        opts: &TcpOpts,
+        token: Token,
+    ) -> Result<Handle> {
+        if opts.connect_timeout == Some(Duration::ZERO) {
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
+        let h = self.new_handle(Kind::Socket)?;
+        if let Err(error) = self.backend.open_bound_tcp(h, transport, addr, *opts) {
+            self.handles.remove(h.key);
+            self.refs -= 1;
+            return Err(error);
+        }
+        self.start_tcp_connect(h, opts, token)
+    }
+    fn start_tcp_connect(&mut self, h: Handle, opts: &TcpOpts, token: Token) -> Result<Handle> {
         match self.submit(h, Operation::Connect, token) {
             Ok(op) => {
                 if let Some(at) = opts.connect_timeout.and_then(|t| self.now().checked_add(t)) {
@@ -2051,7 +2084,14 @@ mod clock_contract {
             self.changes += 1;
         }
         fn open(&mut self, _: Handle, spec: Open) -> Result<()> {
-            if self.accept_connect && matches!(spec, Open::Pipe(_)) {
+            if self.accept_connect && matches!(spec, Open::Pipe(_) | Open::Tcp { .. }) {
+                Ok(())
+            } else {
+                Err(Error::new(ErrorKind::Unsupported))
+            }
+        }
+        fn open_bound_tcp(&mut self, _: Handle, _: (), _: SocketAddr, _: TcpOpts) -> Result<()> {
+            if self.accept_connect {
                 Ok(())
             } else {
                 Err(Error::new(ErrorKind::Unsupported))
@@ -2267,76 +2307,86 @@ mod clock_contract {
 
     #[test]
     fn connection_deadline_waits_for_acknowledgement_and_retains_cancellation_errors() {
-        let mut driver = Driver::<Host>::new(Config::default()).expect("host loop");
-        driver.backend.accept_connect = true;
-        let at = driver.now() + Duration::from_millis(10);
-        let h = driver
-            .pipe_connect_until(&PipeName("synthetic".into()), at, Token(1))
+        for kind in 0..3 {
+            let mut driver = Driver::<Host>::new(Config::default()).expect("host loop");
+            driver.backend.accept_connect = true;
+            let at = driver.now() + Duration::from_millis(10);
+            let opts = TcpOpts {
+                connect_timeout: Some(Duration::from_millis(10)),
+                ..TcpOpts::default()
+            };
+            let peer = "127.0.0.1:9".parse().unwrap();
+            let h = match kind {
+                0 => driver.pipe_connect_until(&PipeName("synthetic".into()), at, Token(1)),
+                1 => driver.tcp_connect(peer, &opts, Token(1)),
+                _ => driver.tcp_connect_bound((), peer, &opts, Token(1)),
+            }
             .expect("connect");
-        let op = driver
-            .backend
-            .pending
-            .as_ref()
-            .expect("submitted connect")
-            .op;
-        let mut out = Completions::with_capacity(1);
-        driver
-            .turn(Timeout::Now, &mut out)
-            .expect("before deadline");
-        assert!(out.is_empty());
-        assert_eq!(driver.backend.cancel_calls, 0);
-        assert_eq!(driver.next_deadline(), Some(at));
-        let failure = Error {
-            kind: ErrorKind::Other,
-            os: Some(12345),
-        };
-        driver.backend.cancel_error = Some(failure);
-        driver.backend.now = at;
-        assert_eq!(
+            let op = driver
+                .backend
+                .pending
+                .as_ref()
+                .expect("submitted connect")
+                .op;
+            let mut out = Completions::with_capacity(1);
             driver
                 .turn(Timeout::Now, &mut out)
-                .expect_err("injected cancellation error"),
-            failure
-        );
-        assert_eq!(driver.backend.cancel_calls, 1);
-        assert_eq!(driver.next_deadline(), Some(at));
-        assert!(out.is_empty() && driver.backend.pending.is_some());
-        driver.backend.cancel_error = None;
-        driver
-            .turn(Timeout::Now, &mut out)
-            .expect("retry cancellation");
-        assert_eq!(driver.backend.cancel_calls, 2);
-        assert_eq!(driver.next_deadline(), None);
-        assert!(
-            out.is_empty() && driver.backend.pending.is_some(),
-            "timeout cannot retire before native acknowledgement"
-        );
-        driver.backend.acknowledge = true;
-        driver
-            .turn(Timeout::Now, &mut out)
-            .expect("acknowledge timeout");
-        assert_eq!(out.len(), 1);
-        assert_eq!(
-            (out[0].handle, out[0].op, out[0].token, out[0].terminal),
-            (Some(h), Some(op), Token(1), true)
-        );
-        assert!(matches!(
-            out[0].result,
-            OpResult::Err(Error {
-                kind: ErrorKind::TimedOut,
-                ..
-            })
-        ));
-        assert!(driver.backend.pending.is_none());
-        assert_eq!(driver.backend.cancel_calls, 2);
-        driver.close(h, Token(2)).expect("close timed-out stream");
-        driver.turn(Timeout::Now, &mut out).expect("closed");
-        assert_eq!(out.len(), 1);
-        assert!(matches!(out[0].result, OpResult::Closed));
-        driver
-            .turn(Timeout::Now, &mut out)
-            .expect("no duplicate timeout");
-        assert!(out.is_empty() && !driver.alive());
+                .expect("before deadline");
+            assert!(out.is_empty());
+            assert_eq!(driver.backend.cancel_calls, 0);
+            assert_eq!(driver.next_deadline(), Some(at));
+            let failure = Error {
+                kind: ErrorKind::Other,
+                os: Some(12345),
+            };
+            driver.backend.cancel_error = Some(failure);
+            driver.backend.now = at;
+            assert_eq!(
+                driver
+                    .turn(Timeout::Now, &mut out)
+                    .expect_err("injected cancellation error"),
+                failure
+            );
+            assert_eq!(driver.backend.cancel_calls, 1);
+            assert_eq!(driver.next_deadline(), Some(at));
+            assert!(out.is_empty() && driver.backend.pending.is_some());
+            driver.backend.cancel_error = None;
+            driver
+                .turn(Timeout::Now, &mut out)
+                .expect("retry cancellation");
+            assert_eq!(driver.backend.cancel_calls, 2);
+            assert_eq!(driver.next_deadline(), None);
+            assert!(
+                out.is_empty() && driver.backend.pending.is_some(),
+                "timeout cannot retire before native acknowledgement"
+            );
+            driver.backend.acknowledge = true;
+            driver
+                .turn(Timeout::Now, &mut out)
+                .expect("acknowledge timeout");
+            assert_eq!(out.len(), 1);
+            assert_eq!(
+                (out[0].handle, out[0].op, out[0].token, out[0].terminal),
+                (Some(h), Some(op), Token(1), true)
+            );
+            assert!(matches!(
+                out[0].result,
+                OpResult::Err(Error {
+                    kind: ErrorKind::TimedOut,
+                    ..
+                })
+            ));
+            assert!(driver.backend.pending.is_none());
+            assert_eq!(driver.backend.cancel_calls, 2);
+            driver.close(h, Token(2)).expect("close timed-out stream");
+            driver.turn(Timeout::Now, &mut out).expect("closed");
+            assert_eq!(out.len(), 1);
+            assert!(matches!(out[0].result, OpResult::Closed));
+            driver
+                .turn(Timeout::Now, &mut out)
+                .expect("no duplicate timeout");
+            assert!(out.is_empty() && !driver.alive());
+        }
     }
     #[test]
     fn optional_native_capabilities_reject_without_leaking_core_reservations() {

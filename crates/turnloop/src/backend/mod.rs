@@ -357,6 +357,20 @@ pub unsafe trait Backend: Sized + 'static {
     };
     /// Construct backend storage and native wait resources with the supplied shared read pool.
     fn new(config: &Config, pool: BufferPool) -> Result<Self>;
+    /// Adopt an exclusively owned, bound but unconnected TCP transport and
+    /// configure its peer before a Connect request. Preserve the local binding
+    /// and existing socket options; apply nodelay when requested. On error,
+    /// retain no resource or native registration. Backends without native
+    /// transport adoption return Unsupported.
+    fn open_bound_tcp(
+        &mut self,
+        _handle: Handle,
+        _transport: Self::Detached,
+        _peer: SocketAddr,
+        _opts: crate::TcpOpts,
+    ) -> Result<()> {
+        Err(Error::new(crate::ErrorKind::Unsupported))
+    }
     /// Accept a typed filesystem request (only with `Filesystem::Backend`). `handle`
     /// is the request's file handle, or the new handle for an open.
     fn fs(&mut self, _op: OpId, _handle: Option<Handle>, _request: crate::FsRequest) -> Result<()> {
