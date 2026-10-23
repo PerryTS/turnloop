@@ -428,6 +428,13 @@ pub unsafe trait Backend: Sized + 'static {
     fn set_option(&mut self, _handle: Handle, _option: crate::SocketOption) -> Result<()> {
         Err(Error::new(crate::ErrorKind::Unsupported))
     }
+    /// Synchronously request native receive-side shutdown without closing the
+    /// send direction. Existing accepted requests retain their normal buffer
+    /// ownership and terminal acknowledgement requirements. Unsupported transports
+    /// must fail without changing either direction.
+    fn shutdown_receive(&mut self, _handle: Handle) -> Result<()> {
+        Err(Error::new(crate::ErrorKind::Unsupported))
+    }
     /// Read one socket option from the OS. Backends never answer from a cache of
     /// what was set: the kernel may round, clamp or double a request, and the
     /// caller is entitled to the value the kernel actually holds.

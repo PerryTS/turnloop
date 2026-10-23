@@ -582,3 +582,20 @@ fn independent_keep_alive_controls() {
 fn backlog_update_preserves_pending_accept() {
     contract::sockopts::listener_backlog_preserves_pending_accept::<Platform>();
 }
+
+#[cfg(all(feature = "executor", target_env = "p2"))]
+#[test]
+fn receive_shutdown_pending_read_and_live_write() {
+    contract::executor_contract::receive_shutdown::pending_read_and_live_write::<Platform>();
+}
+#[cfg(all(feature = "executor", target_env = "p2"))]
+#[test]
+fn receive_shutdown_discards_buffered_tail() {
+    contract::executor_contract::receive_shutdown::buffered_read_is_discarded::<Platform>();
+}
+#[cfg(all(feature = "executor", target_env = "p2"))]
+#[test]
+fn receive_shutdown_udp_retains_read() {
+    contract::executor_contract::receive_shutdown::unsupported_udp_preserves_pending_read::<Platform>(
+    );
+}

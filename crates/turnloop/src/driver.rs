@@ -1089,6 +1089,22 @@ impl<B: Backend> Driver<B> {
     pub fn shutdown(&mut self, h: Handle, token: Token) -> Result<OpId> {
         self.submit(h, Operation::Shutdown, token)
     }
+    /// Request native receive-side shutdown while preserving the send direction.
+    ///
+    /// This synchronous control supports TCP on Unix, Windows and WASI 0.2,
+    /// and Unix-domain stream sockets. Other transports/backends return
+    /// Unsupported. No completion is generated for the control itself.
+    /// Outstanding reads still require terminal acknowledgement before their
+    /// buffers can be reused; queued or already-completed data is not revoked.
+    /// Use the executor adapter's `shutdown_receive` to also discard its pending
+    /// read and buffered bytes and make all subsequent adapter reads return EOF.
+    pub fn shutdown_receive(&mut self, h: Handle) -> Result<()> {
+        let resource = self.resource(h)?;
+        if resource.closing.is_some() {
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
+        self.backend.shutdown_receive(h)
+    }
     /// Request cancellation; terminal acknowledgement must precede memory reuse.
     pub fn cancel(&mut self, id: OpId) -> bool {
         self.cancel_inner(id, false)

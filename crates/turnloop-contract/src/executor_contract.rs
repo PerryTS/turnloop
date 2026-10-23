@@ -577,3 +577,5 @@ pub fn single_connection_presets<B: backend::Backend>() {
         ex.turn(Timeout::Until(until)).expect("turn");
     }
 }
+
+pub mod receive_shutdown;

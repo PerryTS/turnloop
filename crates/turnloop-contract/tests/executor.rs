@@ -57,3 +57,22 @@ fn single_connection_presets_carry_a_request() {
     turnloop_contract::executor_contract::single_connection_presets::<turnloop::backend::Platform>(
     );
 }
+
+#[test]
+fn receive_shutdown_cancels_pending_read_and_preserves_write() {
+    turnloop_contract::executor_contract::receive_shutdown::pending_read_and_live_write::<
+        turnloop::backend::Platform,
+    >();
+}
+#[test]
+fn receive_shutdown_discards_buffered_tail() {
+    turnloop_contract::executor_contract::receive_shutdown::buffered_read_is_discarded::<
+        turnloop::backend::Platform,
+    >();
+}
+#[test]
+fn receive_shutdown_unsupported_udp_retains_read() {
+    turnloop_contract::executor_contract::receive_shutdown::unsupported_udp_preserves_pending_read::<
+        turnloop::backend::Platform,
+    >();
+}
