@@ -1884,3 +1884,77 @@ fn streaming_decoder_applies_a_content_encoding_list_innermost_last() {
     decode(" , identity", b"plain", &mut out, 100).unwrap();
     assert_eq!(out, b"plain");
 }
+
+#[test]
+fn http1_preserves_header_and_trailer_spelling_without_weakening_validation() {
+    let input = b"POST / HTTP/1.1\r\nHoSt: example.com\r\nX-First: one\r\nX-Other: middle\r\nx-FIRST: two\r\nTransfer-Encoding: chunked\r\n\r\n";
+    let mut decoder = Decoder::new(Mode::Request, Limits::default());
+    let step = decoder.receive(input).unwrap();
+    let Some(Event::Head(head)) = step.event else {
+        panic!("missing head")
+    };
+    assert_eq!(
+        head.headers
+            .iter()
+            .map(|h| h.name.as_str())
+            .collect::<Vec<_>>(),
+        ["HoSt", "X-First", "X-Other", "x-FIRST", "Transfer-Encoding"]
+    );
+    assert_eq!(
+        head.values("x-first").collect::<Vec<_>>(),
+        [b"one".as_slice(), b"two".as_slice()]
+    );
+    let mut wire = Vec::new();
+    let mut encoder = Encoder::start(&head, BodyLength::Chunked, &mut wire).unwrap();
+    assert_eq!(wire, input);
+    let trailer = Header::new_preserving_case("X-Trailer", "done");
+    wire.clear();
+    encoder
+        .finish(std::slice::from_ref(&trailer), &mut wire)
+        .unwrap();
+    assert_eq!(wire, b"0\r\nX-Trailer: done\r\n\r\n");
+    let mut remaining = wire.as_slice();
+    let mut saw_trailers = false;
+    while !remaining.is_empty() {
+        let step = decoder.receive(remaining).unwrap();
+        assert!(step.consumed > 0);
+        remaining = &remaining[step.consumed..];
+        if let Some(Event::Trailers(fields)) = step.event {
+            assert_eq!(fields.as_slice(), std::slice::from_ref(&trailer));
+            saw_trailers = true;
+        }
+    }
+    assert!(saw_trailers);
+    let duplicate = b"GET / HTTP/1.1\r\nHost: a\r\nhOST: b\r\n\r\n";
+    assert!(
+        Decoder::new(Mode::Request, Limits::default())
+            .receive(duplicate)
+            .is_err()
+    );
+    for name in [
+        "Content-Length",
+        "TRANSFER-ENCODING",
+        "Host",
+        "Connection",
+        "Trailer",
+        "Upgrade",
+    ] {
+        let mut decoder = Decoder::new(Mode::Request, Limits::default());
+        decoder.receive(input).unwrap();
+        decoder.receive(b"0\r\n").unwrap();
+        assert!(
+            decoder
+                .receive(format!("{name}: bad\r\n\r\n").as_bytes())
+                .is_err(),
+            "{name}"
+        );
+        let mut wire = Vec::new();
+        let mut encoder = Encoder::start(&head, BodyLength::Chunked, &mut wire).unwrap();
+        assert!(
+            encoder
+                .finish(&[Header::new_preserving_case(name, "bad")], &mut wire)
+                .is_err(),
+            "{name}"
+        );
+    }
+}
