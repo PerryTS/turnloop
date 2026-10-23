@@ -30,3 +30,11 @@ version = "1.0.10"
 advisory = "RUSTSEC-2026-0381"
 reason = "Remove the distrusted emSign ECC Root CA - G3; upstream rustls/webpki-roots#133. Published 2026-10-19T20:11:32Z; normal soak resumes 2026-10-26T20:11:32Z."
 expires = 2026-10-26
+
+# RUSTSEC-2026-0385: reviewed RustCrypto/utils#1567 and #1568 via release #1569.
+[[security-exceptions]]
+crate = "ctutils"
+version = "0.4.4"
+advisory = "RUSTSEC-2026-0385"
+reason = "Restore constant-time Choice masks and 32-bit u128 comparisons; upstream RustCrypto/utils#1567 and #1568. Published 2026-10-23T01:04:28Z; normal soak resumes 2026-10-30T01:04:28Z."
+expires = 2026-10-30
