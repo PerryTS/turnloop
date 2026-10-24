@@ -104,3 +104,14 @@ pub use executor::{
 
 #[cfg(all(test, not(loom)))]
 mod portable_tests;
+
+#[cfg(all(
+    test,
+    not(loom),
+    any(
+        turnloop_backend = "epoll",
+        turnloop_backend = "kqueue",
+        turnloop_backend = "iocp"
+    )
+))]
+mod bound_connect_tests;

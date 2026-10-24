@@ -940,6 +940,33 @@ unsafe impl Backend for Unix {
     fn attach(&mut self, h: Handle, transport: Detached) -> Result<()> {
         self.install(h, transport, None)
     }
+    fn attach_tcp_connect(
+        &mut self,
+        h: Handle,
+        transport: Detached,
+        destination: SocketAddr,
+    ) -> Result<()> {
+        if transport.kind != Kind::Tcp {
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
+        let fd = transport.fd.as_raw_fd();
+        let local = socket::local_addr(fd)?;
+        if local.port() == 0 || local.is_ipv4() != destination.is_ipv4() {
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
+        let mut peer = Addr::empty();
+        // SAFETY: the transport owns fd; peer is correctly sized writable storage.
+        let connected = unsafe { libc::getpeername(fd, peer.mut_ptr(), &mut peer.len) };
+        if connected == 0 {
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
+        if std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOTCONN) {
+            return Err(last_error());
+        }
+        let mut transport = transport;
+        transport.kind = Kind::Tcp;
+        self.install(h, transport, Some(Addr::new(destination)))
+    }
     fn integration(&mut self) -> Result<Integration> {
         Ok(Integration::Fd(self.poller.fd()))
     }
@@ -1607,4 +1634,18 @@ mod process_races {
         );
         assert_eq!(last_error().os, Some(libc::ECHILD));
     }
+}
+
+/// Construct an explicitly bound socket for the portable adoption contract.
+#[cfg(test)]
+pub(crate) fn bound_tcp_for_test(address: SocketAddr) -> (Detached, SocketAddr) {
+    let fd = socket::create(address, false).unwrap();
+    let addr = Addr::new(address);
+    // SAFETY: owned socket and address storage valid for its recorded length.
+    assert_eq!(
+        unsafe { libc::bind(fd.as_raw_fd(), addr.ptr(), addr.len) },
+        0
+    );
+    let local = socket::local_addr(fd.as_raw_fd()).unwrap();
+    (Detached::from_fd(fd).unwrap(), local)
 }
