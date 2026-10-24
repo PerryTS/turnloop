@@ -724,6 +724,15 @@ unsafe impl Backend for Unix {
         super::sockopt::set_listen_backlog(self.socket_fd(h)?, backlog)
     }
     fn shutdown_read(&mut self, h: Handle) -> Result<()> {
+        let cancelled_read = self.cancelled.iter().any(|op| {
+            self.ops
+                .get(op.index())
+                .and_then(Option::as_ref)
+                .is_some_and(|p| p.request.handle == h && direction(&p.request.operation) == 0)
+        });
+        if self.get(h)?.heads[0].is_some() || cancelled_read {
+            return Err(Error::new(crate::ErrorKind::WouldBlock));
+        }
         super::sockopt::shutdown_read(self.socket_fd(h)?)
     }
     fn set_option(&mut self, h: Handle, option: SocketOption) -> Result<()> {

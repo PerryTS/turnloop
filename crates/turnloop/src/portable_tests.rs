@@ -306,6 +306,26 @@ mod socket_controls {
         }
     }
     #[test]
+    fn receive_shutdown_does_not_wait_for_a_backpressured_write() {
+        let (mut l, _, client, _) = pair();
+        l.set_option(client, SocketOption::SendBufferSize(1024))
+            .unwrap();
+        let write = l
+            .write(client, WriteBuf::Owned(vec![7; 8 * 1024 * 1024]), Token(7))
+            .unwrap();
+        l.shutdown_read(client).unwrap();
+        assert!(l.cancel(write));
+        let mut out = Completions::default();
+        let until = l.now() + Duration::from_secs(5);
+        loop {
+            assert!(l.now() < until);
+            l.turn(Timeout::Until(until), &mut out).unwrap();
+            if out.drain().any(|c| c.op == Some(write) && c.terminal) {
+                break;
+            }
+        }
+    }
+    #[test]
     fn receive_shutdown_requires_acknowledgement_and_preserves_write() {
         let (mut l, _, client, peer) = pair();
         let read = l.read(client, ReadBuf::Pooled, Token(3)).unwrap();

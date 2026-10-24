@@ -440,7 +440,8 @@ pub unsafe trait Backend: Sized + 'static {
     fn set_listen_backlog(&mut self, _handle: Handle, _backlog: u32) -> Result<()> {
         Err(Error::new(crate::ErrorKind::Unsupported))
     }
-    /// Shut down receive on a quiescent stream socket.
+    /// Shut down receive after read operations have been acknowledged.
+    /// Pending writes remain valid. A pending receive returns WouldBlock.
     fn shutdown_read(&mut self, _handle: Handle) -> Result<()> {
         Err(Error::new(crate::ErrorKind::Unsupported))
     }

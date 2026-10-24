@@ -949,18 +949,19 @@ impl<B: Backend> Driver<B> {
         }
         self.backend.set_listen_backlog(h, backlog)
     }
-    /// Shut down the receive direction of a quiescent stream socket.
+    /// Shut down the receive direction of a stream socket.
     ///
-    /// The write direction remains open. Pending operations or queued
-    /// completions return WouldBlock without changing the socket: first cancel
-    /// operations as needed and consume their terminal acknowledgements.
+    /// The write direction remains open, including pending writes. Pending
+    /// receive operations or queued completions return WouldBlock without
+    /// changing the socket: first cancel reads as needed and consume their
+    /// terminal acknowledgements.
     /// This synchronous control produces no completion of its own.
     pub fn shutdown_read(&mut self, h: Handle) -> Result<()> {
         let r = self.resource(h)?;
         if r.closing.is_some() || !matches!(r.kind, Kind::Socket) {
             return Err(Error::new(ErrorKind::InvalidInput));
         }
-        if r.pending != 0 || self.queued.iter().any(|c| c.handle == Some(h)) {
+        if self.queued.iter().any(|c| c.handle == Some(h)) {
             return Err(Error::new(ErrorKind::WouldBlock));
         }
         self.backend.shutdown_read(h)

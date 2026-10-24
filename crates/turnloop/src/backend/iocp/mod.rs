@@ -1461,6 +1461,9 @@ unsafe impl Backend for Iocp {
         sockopt::set_listen_backlog(self.socket_of(h)?, backlog)
     }
     fn shutdown_read(&mut self, h: Handle) -> Result<()> {
+        if self.get(h)?.heads[0].is_some() {
+            return Err(Error::new(crate::ErrorKind::WouldBlock));
+        }
         sockopt::shutdown_read(self.socket_of(h)?)
     }
     fn set_option(&mut self, h: Handle, option: SocketOption) -> Result<()> {

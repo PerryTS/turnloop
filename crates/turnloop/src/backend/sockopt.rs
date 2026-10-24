@@ -228,7 +228,7 @@ pub(super) fn set_listen_backlog(fd: RawFd, backlog: u32) -> Result<()> {
     check(unsafe { libc::listen(fd, backlog) })
 }
 pub(super) fn shutdown_read(fd: RawFd) -> Result<()> {
-    // SAFETY: the driver owns this live socket and has drained all pending operations.
+    // SAFETY: the driver owns this live socket and has drained pending receive operations.
     check(unsafe { libc::shutdown(fd, libc::SHUT_RD) })
 }
 fn positive_seconds(value: Duration) -> Result<i32> {

@@ -177,7 +177,7 @@ pub(super) fn set_listen_backlog(socket: usize, backlog: u32) -> Result<()> {
     super::socket::check(unsafe { listen(socket, backlog) })
 }
 pub(super) fn shutdown_read(socket: usize) -> Result<()> {
-    // SAFETY: the driver owns this live socket and has drained all pending operations.
+    // SAFETY: the driver owns this live socket and has drained pending receive operations.
     super::socket::check(unsafe { shutdown(socket, SD_RECEIVE) })
 }
 
