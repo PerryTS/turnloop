@@ -115,21 +115,39 @@ fn set_keep_alive(socket: usize, value: Option<KeepAlive>) -> Result<()> {
     let Some(schedule) = value else {
         return set_int(socket, SOL_SOCKET, SO_KEEPALIVE, 0);
     };
-    let idle = schedule.idle.map(positive_seconds).transpose()?;
-    let interval = schedule.interval.map(positive_seconds).transpose()?;
+    validate_keepalive(schedule)?;
+    set_int(socket, SOL_SOCKET, SO_KEEPALIVE, 1)?;
+    set_keepalive_parameters(socket, schedule)
+}
+fn validate_keepalive(schedule: KeepAlive) -> Result<(Option<i32>, Option<i32>, Option<i32>)> {
+    let idle = schedule
+        .idle
+        .map(positive_seconds)
+        .transpose()?
+        .map(bounded)
+        .transpose()?;
+    let interval = schedule
+        .interval
+        .map(positive_seconds)
+        .transpose()?
+        .map(bounded)
+        .transpose()?;
     let count = schedule.count.map(bounded).transpose()?;
     if count == Some(0) {
         return Err(invalid());
     }
-    set_int(socket, SOL_SOCKET, SO_KEEPALIVE, 1)?;
-    if let Some(idle) = idle {
-        set_int(socket, IPPROTO_TCP, TCP_KEEPIDLE, bounded(idle)?)?;
+    Ok((idle, interval, count))
+}
+pub(super) fn set_keepalive_parameters(socket: usize, schedule: KeepAlive) -> Result<()> {
+    let (idle, interval, count) = validate_keepalive(schedule)?;
+    if let Some(value) = idle {
+        set_int(socket, IPPROTO_TCP, TCP_KEEPIDLE, value)?;
     }
-    if let Some(interval) = interval {
-        set_int(socket, IPPROTO_TCP, TCP_KEEPINTVL, bounded(interval)?)?;
+    if let Some(value) = interval {
+        set_int(socket, IPPROTO_TCP, TCP_KEEPINTVL, value)?;
     }
-    if let Some(count) = count {
-        set_int(socket, IPPROTO_TCP, TCP_KEEPCNT, count)?;
+    if let Some(value) = count {
+        set_int(socket, IPPROTO_TCP, TCP_KEEPCNT, value)?;
     }
     Ok(())
 }
@@ -137,7 +155,10 @@ fn get_keep_alive(socket: usize) -> Result<Option<KeepAlive>> {
     if get_int(socket, SOL_SOCKET, SO_KEEPALIVE)? == 0 {
         return Ok(None);
     }
-    Ok(Some(KeepAlive {
+    keepalive_parameters(socket).map(Some)
+}
+pub(super) fn keepalive_parameters(socket: usize) -> Result<KeepAlive> {
+    Ok(KeepAlive {
         idle: Some(Duration::from_secs(
             get_int(socket, IPPROTO_TCP, TCP_KEEPIDLE)?.max(0) as u64,
         )),
@@ -145,8 +166,21 @@ fn get_keep_alive(socket: usize) -> Result<Option<KeepAlive>> {
             get_int(socket, IPPROTO_TCP, TCP_KEEPINTVL)?.max(0) as u64,
         )),
         count: Some(get_int(socket, IPPROTO_TCP, TCP_KEEPCNT)?.max(0) as u32),
-    }))
+    })
 }
+pub(super) fn set_listen_backlog(socket: usize, backlog: u32) -> Result<()> {
+    let backlog = bounded(backlog)?;
+    if backlog == 0 {
+        return Err(invalid());
+    }
+    // SAFETY: this live socket was verified to be a listener; no pointer is passed.
+    super::socket::check(unsafe { listen(socket, backlog) })
+}
+pub(super) fn shutdown_read(socket: usize) -> Result<()> {
+    // SAFETY: the driver owns this live socket and has drained all pending operations.
+    super::socket::check(unsafe { shutdown(socket, SD_RECEIVE) })
+}
+
 fn membership(socket: usize, group: MulticastGroup, join: bool) -> Result<()> {
     match (group.group, ipv6(socket)?) {
         (IpAddr::V6(address), true) => {

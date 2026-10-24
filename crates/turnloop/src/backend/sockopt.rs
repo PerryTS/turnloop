@@ -176,35 +176,40 @@ fn set_keep_alive(fd: RawFd, value: Option<KeepAlive>) -> Result<()> {
     let Some(schedule) = value else {
         return set_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, 0);
     };
+    validate_keepalive(schedule)?;
+    set_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1)?;
+    set_keepalive_parameters(fd, schedule)
+}
+fn validate_keepalive(schedule: KeepAlive) -> Result<(Option<i32>, Option<i32>, Option<i32>)> {
     let idle = schedule.idle.map(positive_seconds).transpose()?;
     let interval = schedule.interval.map(positive_seconds).transpose()?;
     let count = schedule.count.map(bounded).transpose()?;
     if count == Some(0) {
         return Err(invalid());
     }
-    set_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1)?;
-    if let Some(idle) = idle {
-        set_int(fd, libc::IPPROTO_TCP, KEEPIDLE, idle)?;
+    Ok((idle, interval, count))
+}
+pub(super) fn set_keepalive_parameters(fd: RawFd, schedule: KeepAlive) -> Result<()> {
+    let (idle, interval, count) = validate_keepalive(schedule)?;
+    if let Some(value) = idle {
+        set_int(fd, libc::IPPROTO_TCP, KEEPIDLE, value)?;
     }
-    if let Some(interval) = interval {
-        set_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, interval)?;
+    if let Some(value) = interval {
+        set_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, value)?;
     }
-    if let Some(count) = count {
-        set_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT, count)?;
+    if let Some(value) = count {
+        set_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT, value)?;
     }
     Ok(())
-}
-fn positive_seconds(value: Duration) -> Result<i32> {
-    match whole_seconds(value)? {
-        0 => Err(invalid()),
-        seconds => Ok(seconds),
-    }
 }
 fn get_keep_alive(fd: RawFd) -> Result<Option<KeepAlive>> {
     if get_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE)? == 0 {
         return Ok(None);
     }
-    Ok(Some(KeepAlive {
+    keepalive_parameters(fd).map(Some)
+}
+pub(super) fn keepalive_parameters(fd: RawFd) -> Result<KeepAlive> {
+    Ok(KeepAlive {
         idle: Some(Duration::from_secs(
             get_int(fd, libc::IPPROTO_TCP, KEEPIDLE)?.max(0) as u64,
         )),
@@ -212,8 +217,27 @@ fn get_keep_alive(fd: RawFd) -> Result<Option<KeepAlive>> {
             get_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL)?.max(0) as u64,
         )),
         count: Some(get_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT)?.max(0) as u32),
-    }))
+    })
 }
+pub(super) fn set_listen_backlog(fd: RawFd, backlog: u32) -> Result<()> {
+    let backlog = bounded(backlog)?;
+    if backlog == 0 {
+        return Err(invalid());
+    }
+    // SAFETY: this live socket was verified to be a listener; no pointer is passed.
+    check(unsafe { libc::listen(fd, backlog) })
+}
+pub(super) fn shutdown_read(fd: RawFd) -> Result<()> {
+    // SAFETY: the driver owns this live socket and has drained all pending operations.
+    check(unsafe { libc::shutdown(fd, libc::SHUT_RD) })
+}
+fn positive_seconds(value: Duration) -> Result<i32> {
+    match whole_seconds(value)? {
+        0 => Err(invalid()),
+        seconds => Ok(seconds),
+    }
+}
+
 fn membership(fd: RawFd, group: MulticastGroup, join: bool) -> Result<()> {
     match (group.group, ipv6(fd)?) {
         (IpAddr::V6(address), true) => {

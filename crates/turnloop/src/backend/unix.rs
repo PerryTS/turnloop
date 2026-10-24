@@ -711,6 +711,21 @@ unsafe impl Backend for Unix {
     fn local_addr(&self, h: Handle) -> Result<SocketAddr> {
         socket::local_addr(self.get(h)?.transport.fd.as_raw_fd())
     }
+    fn set_keepalive_parameters(&mut self, h: Handle, value: crate::KeepAlive) -> Result<()> {
+        super::sockopt::set_keepalive_parameters(self.socket_fd(h)?, value)
+    }
+    fn keepalive_parameters(&self, h: Handle) -> Result<crate::KeepAlive> {
+        super::sockopt::keepalive_parameters(self.socket_fd(h)?)
+    }
+    fn set_listen_backlog(&mut self, h: Handle, backlog: u32) -> Result<()> {
+        if self.get(h)?.transport.kind != Kind::Listener {
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
+        super::sockopt::set_listen_backlog(self.socket_fd(h)?, backlog)
+    }
+    fn shutdown_read(&mut self, h: Handle) -> Result<()> {
+        super::sockopt::shutdown_read(self.socket_fd(h)?)
+    }
     fn set_option(&mut self, h: Handle, option: SocketOption) -> Result<()> {
         super::sockopt::set(self.socket_fd(h)?, option)
     }

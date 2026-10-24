@@ -424,6 +424,26 @@ pub unsafe trait Backend: Sized + 'static {
     ) -> Result<crate::SocketOption> {
         Err(Error::new(crate::ErrorKind::Unsupported))
     }
+    /// Set TCP keep-alive timing without changing SO_KEEPALIVE.
+    fn set_keepalive_parameters(
+        &mut self,
+        _handle: Handle,
+        _value: crate::KeepAlive,
+    ) -> Result<()> {
+        Err(Error::new(crate::ErrorKind::Unsupported))
+    }
+    /// Query TCP keep-alive timing even while SO_KEEPALIVE is disabled.
+    fn keepalive_parameters(&self, _handle: Handle) -> Result<crate::KeepAlive> {
+        Err(Error::new(crate::ErrorKind::Unsupported))
+    }
+    /// Change an already-listening TCP socket's backlog.
+    fn set_listen_backlog(&mut self, _handle: Handle, _backlog: u32) -> Result<()> {
+        Err(Error::new(crate::ErrorKind::Unsupported))
+    }
+    /// Shut down receive on a quiescent stream socket.
+    fn shutdown_read(&mut self, _handle: Handle) -> Result<()> {
+        Err(Error::new(crate::ErrorKind::Unsupported))
+    }
     /// Report the native identity of a live transport, for the host only.
     ///
     /// The core never acts on the value and never stores it: it reads it out of

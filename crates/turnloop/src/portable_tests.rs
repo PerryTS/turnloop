@@ -195,3 +195,182 @@ fn tables_timers_posts_and_completion_leases_reuse_storage() {
     poster.close();
     assert!(poster.post(Token(1001), Payload::U64(1)).is_err());
 }
+
+#[cfg(any(unix, windows))]
+mod socket_controls {
+    use super::*;
+    fn pair() -> (Loop, Handle, Handle, Handle) {
+        let mut l = Loop::new(Config::default()).unwrap();
+        let listener = l
+            .tcp_listen("127.0.0.1:0".parse().unwrap(), &ListenOpts::default())
+            .unwrap();
+        l.accept(listener, Token(1)).unwrap();
+        let client = l
+            .tcp_connect(
+                l.local_addr(listener).unwrap(),
+                &TcpOpts::default(),
+                Token(2),
+            )
+            .unwrap();
+        let mut accepted = None;
+        let mut connected = false;
+        let mut out = Completions::default();
+        let until = l.now() + Duration::from_secs(5);
+        while accepted.is_none() || !connected {
+            assert!(l.now() < until);
+            l.turn(Timeout::Until(until), &mut out).unwrap();
+            for c in out.drain() {
+                match c.result {
+                    OpResult::Accepted { conn, .. } => accepted = Some(conn),
+                    OpResult::Connected => connected = true,
+                    other => panic!("{other:?}"),
+                }
+            }
+        }
+        (l, listener, client, accepted.unwrap())
+    }
+    #[test]
+    fn keepalive_schedule_is_independent_of_enable_switch() {
+        let (mut l, _, client, _) = pair();
+        l.set_option(client, SocketOption::KeepAlive(None)).unwrap();
+        let parameters = KeepAlive {
+            idle: Some(Duration::from_secs(7)),
+            interval: Some(Duration::from_secs(3)),
+            count: Some(4),
+        };
+        l.set_keepalive_parameters(client, parameters).unwrap();
+        assert!(matches!(
+            l.get_option(client, SocketOptionKind::KeepAlive).unwrap(),
+            SocketOption::KeepAlive(None)
+        ));
+        let actual = l.keepalive_parameters(client).unwrap();
+        assert_eq!(actual.idle, parameters.idle);
+        assert_eq!(actual.interval, parameters.interval);
+        assert_eq!(actual.count, parameters.count);
+        l.set_option(client, SocketOption::KeepAlive(Some(KeepAlive::default())))
+            .unwrap();
+        assert!(matches!(
+            l.get_option(client, SocketOptionKind::KeepAlive).unwrap(),
+            SocketOption::KeepAlive(Some(_))
+        ));
+        let error = l
+            .set_keepalive_parameters(
+                client,
+                KeepAlive {
+                    idle: Some(Duration::from_secs(9)),
+                    count: Some(0),
+                    ..KeepAlive::default()
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::InvalidInput);
+        assert_eq!(
+            l.keepalive_parameters(client).unwrap().idle,
+            parameters.idle
+        );
+        assert!(matches!(
+            l.get_option(client, SocketOptionKind::KeepAlive).unwrap(),
+            SocketOption::KeepAlive(Some(_))
+        ));
+    }
+    #[test]
+    fn backlog_changes_only_an_existing_listener() {
+        let (mut l, listener, client, _) = pair();
+        l.set_listen_backlog(listener, 2).unwrap();
+        l.set_listen_backlog(listener, 128).unwrap();
+        assert_eq!(
+            l.set_listen_backlog(listener, 0).unwrap_err().kind,
+            ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            l.set_listen_backlog(listener, u32::MAX).unwrap_err().kind,
+            ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            l.set_listen_backlog(client, 8).unwrap_err().kind,
+            ErrorKind::InvalidInput
+        );
+        l.accept(listener, Token(3)).unwrap();
+        let _peer = std::net::TcpStream::connect(l.local_addr(listener).unwrap()).unwrap();
+        let mut out = Completions::default();
+        let until = l.now() + Duration::from_secs(5);
+        loop {
+            assert!(l.now() < until);
+            l.turn(Timeout::Until(until), &mut out).unwrap();
+            if out
+                .drain()
+                .any(|c| matches!(c.result, OpResult::Accepted { .. }))
+            {
+                break;
+            }
+        }
+    }
+    #[test]
+    fn receive_shutdown_requires_acknowledgement_and_preserves_write() {
+        let (mut l, _, client, peer) = pair();
+        let read = l.read(client, ReadBuf::Pooled, Token(3)).unwrap();
+        assert_eq!(
+            l.shutdown_read(client).unwrap_err().kind,
+            ErrorKind::WouldBlock
+        );
+        assert!(l.cancel(read));
+        assert_eq!(
+            l.shutdown_read(client).unwrap_err().kind,
+            ErrorKind::WouldBlock
+        );
+        let mut out = Completions::default();
+        let until = l.now() + Duration::from_secs(5);
+        loop {
+            assert!(l.now() < until);
+            l.turn(Timeout::Until(until), &mut out).unwrap();
+            if out.drain().any(|c| c.op == Some(read)) {
+                break;
+            }
+        }
+        l.shutdown_read(client).unwrap();
+        match l.read(client, ReadBuf::Pooled, Token(6)) {
+            Err(error) => assert_eq!(error.os, Some(10058), "receive must be shut down"),
+            Ok(read) => loop {
+                assert!(l.now() < until);
+                l.turn(Timeout::Until(until), &mut out).unwrap();
+                let mut terminal = false;
+                for c in out.drain() {
+                    assert_eq!(c.op, Some(read));
+                    match c.result {
+                        OpResult::Eof => terminal = true,
+                        OpResult::Err(error) => {
+                            assert_eq!(error.os, Some(10058));
+                            terminal = true;
+                        }
+                        other => panic!("receive after shutdown: {other:?}"),
+                    }
+                }
+                if terminal {
+                    break;
+                }
+            },
+        }
+        l.write(client, WriteBuf::Owned(b"x".to_vec()), Token(4))
+            .unwrap();
+        l.read(peer, ReadBuf::Pooled, Token(5)).unwrap();
+        let mut written = false;
+        let mut received = false;
+        while !written || !received {
+            assert!(l.now() < until);
+            l.turn(Timeout::Until(until), &mut out).unwrap();
+            for c in out.drain() {
+                match c.result {
+                    OpResult::Wrote(1) => written = true,
+                    OpResult::Read {
+                        n: 1,
+                        lease: Some(b),
+                    } => {
+                        assert_eq!(b.as_slice(), b"x");
+                        received = true;
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+        }
+    }
+}
