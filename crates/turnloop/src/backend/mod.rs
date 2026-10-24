@@ -521,6 +521,18 @@ pub unsafe trait Backend: Sized + 'static {
     ) -> Result<()> {
         Err(Error::new(crate::ErrorKind::Unsupported))
     }
+    /// Adopt an unbound TCP socket and install its connection destination.
+    /// Unix must not bind before Connect; Windows binds inside adoption for
+    /// ConnectEx. Reject bound/non-TCP/mismatched-family transports and retain
+    /// nothing on failure. Subsequent Connect owns completion and cancellation.
+    fn attach_tcp_connect_unbound(
+        &mut self,
+        _handle: Handle,
+        _transport: Self::Detached,
+        _destination: SocketAddr,
+    ) -> Result<()> {
+        Err(Error::new(crate::ErrorKind::Unsupported))
+    }
     /// Opt into external host waiting and return the borrowed integration primitive.
     fn integration(&mut self) -> Result<Integration>;
 }

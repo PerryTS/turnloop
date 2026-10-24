@@ -967,6 +967,23 @@ unsafe impl Backend for Unix {
         transport.kind = Kind::Tcp;
         self.install(h, transport, Some(Addr::new(destination)))
     }
+    fn attach_tcp_connect_unbound(
+        &mut self,
+        h: Handle,
+        transport: Detached,
+        destination: SocketAddr,
+    ) -> Result<()> {
+        if transport.kind != Kind::Tcp {
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
+        let local = socket::local_addr(transport.fd.as_raw_fd())?;
+        if local.port() != 0 || local.is_ipv4() != destination.is_ipv4() {
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
+        // The kernel chooses a local endpoint when Connect executes. An early
+        // bind(0) would reserve a port before the destination is known.
+        self.install(h, transport, Some(Addr::new(destination)))
+    }
     fn integration(&mut self) -> Result<Integration> {
         Ok(Integration::Fd(self.poller.fd()))
     }
@@ -1646,4 +1663,12 @@ pub(crate) fn bound_tcp_for_test(address: SocketAddr) -> (Detached, SocketAddr) 
     assert_eq!(result, 0);
     let local = socket::local_addr(fd.as_raw_fd()).unwrap();
     (Detached::from_fd(fd).unwrap(), local)
+}
+
+/// Unbound socket with a non-default kernel option for adoption tests.
+#[cfg(test)]
+pub(crate) fn unbound_tcp_for_test(address: SocketAddr) -> Detached {
+    let stream = std::net::TcpStream::from(socket::create(address, false).unwrap());
+    stream.set_nodelay(true).unwrap();
+    Detached::from_fd(stream.into()).unwrap()
 }

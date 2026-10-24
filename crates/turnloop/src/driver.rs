@@ -894,8 +894,32 @@ impl<B: Backend> Driver<B> {
         destination: SocketAddr,
         token: Token,
     ) -> Result<(Handle, OpId)> {
+        self.tcp_connect_adopted(transport, destination, token, B::attach_tcp_connect)
+    }
+    /// Adopt an unbound TCP socket and submit its connection.
+    ///
+    /// Preserves its kernel socket options. The socket must be unbound and have
+    /// the destination's address family. Unix leaves local endpoint allocation
+    /// to connect; Windows binds inside adoption as required by ConnectEx.
+    /// Failure drops the transport. Completion, cancellation and close obey the
+    /// same ownership rules as [Driver::tcp_connect_bound].
+    pub fn tcp_connect_unbound(
+        &mut self,
+        transport: B::Detached,
+        destination: SocketAddr,
+        token: Token,
+    ) -> Result<(Handle, OpId)> {
+        self.tcp_connect_adopted(transport, destination, token, B::attach_tcp_connect_unbound)
+    }
+    fn tcp_connect_adopted(
+        &mut self,
+        transport: B::Detached,
+        destination: SocketAddr,
+        token: Token,
+        attach: fn(&mut B, Handle, B::Detached, SocketAddr) -> Result<()>,
+    ) -> Result<(Handle, OpId)> {
         let h = self.new_handle(Kind::Socket)?;
-        if let Err(error) = self.backend.attach_tcp_connect(h, transport, destination) {
+        if let Err(error) = attach(&mut self.backend, h, transport, destination) {
             self.handles.remove(h.key);
             self.refs -= 1;
             return Err(error);
