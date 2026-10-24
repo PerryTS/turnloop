@@ -51,7 +51,7 @@ ring = "0.17"
 rustls-pki-types = "1"
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
-zstd = { version = "0.13", default-features = false }
+zstd = { version = "0.14", default-features = false }
 twox-hash = { version = "2", default-features = false, features = ["xxhash64"] }
 fastrand = "2"
 rand = { version = "0.8", features = ["small_rng"] }
