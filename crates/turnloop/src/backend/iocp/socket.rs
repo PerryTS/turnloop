@@ -188,6 +188,9 @@ pub(super) fn loopback_connect(socket: usize) {
     };
 }
 pub(super) fn ifs(socket: usize) -> Result<bool> {
+    Ok(protocol_info(socket)?.dwServiceFlags1 & XP1_IFS_HANDLES != 0)
+}
+pub(super) fn protocol_info(socket: usize) -> Result<WSAPROTOCOL_INFOW> {
     let mut info = WSAPROTOCOL_INFOW::default();
     let mut len = size_of::<WSAPROTOCOL_INFOW>() as i32;
     // SAFETY: option output has its documented layout and exact length.
@@ -200,7 +203,7 @@ pub(super) fn ifs(socket: usize) -> Result<bool> {
             &mut len,
         )
     })?;
-    Ok(info.dwServiceFlags1 & XP1_IFS_HANDLES != 0)
+    Ok(info)
 }
 /// Resolve per-provider extension pointers rather than assuming one Winsock provider.
 pub(super) unsafe fn extension<T: Copy>(socket: usize, guid: &GUID) -> Result<T> {

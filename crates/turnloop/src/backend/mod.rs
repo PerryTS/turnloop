@@ -509,6 +509,30 @@ pub unsafe trait Backend: Sized + 'static {
     fn detach(&mut self, handle: Handle) -> Result<Self::Detached>;
     /// Register an owning transport on this loop; failure drops the rejected transport.
     fn attach(&mut self, handle: Handle, transport: Self::Detached) -> Result<()>;
+    /// Adopt an explicitly bound TCP socket and install its connection destination.
+    /// No connection is initiated here; the subsequent Connect request owns it.
+    /// Reject non-TCP, already connected, unbound, or mismatched-family sockets.
+    /// On failure retain nothing and drop the rejected transport.
+    fn attach_tcp_connect(
+        &mut self,
+        _handle: Handle,
+        _transport: Self::Detached,
+        _destination: SocketAddr,
+    ) -> Result<()> {
+        Err(Error::new(crate::ErrorKind::Unsupported))
+    }
+    /// Adopt an unbound TCP socket and install its connection destination.
+    /// Unix must not bind before Connect; Windows binds inside adoption for
+    /// ConnectEx. Reject bound/non-TCP/mismatched-family transports and retain
+    /// nothing on failure. Subsequent Connect owns completion and cancellation.
+    fn attach_tcp_connect_unbound(
+        &mut self,
+        _handle: Handle,
+        _transport: Self::Detached,
+        _destination: SocketAddr,
+    ) -> Result<()> {
+        Err(Error::new(crate::ErrorKind::Unsupported))
+    }
     /// Opt into external host waiting and return the borrowed integration primitive.
     fn integration(&mut self) -> Result<Integration>;
 }

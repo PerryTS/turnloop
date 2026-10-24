@@ -1680,6 +1680,63 @@ unsafe impl Backend for Iocp {
     fn attach(&mut self, h: Handle, transport: Detached) -> Result<()> {
         self.install(h, transport, None, None)
     }
+    fn attach_tcp_connect(
+        &mut self,
+        h: Handle,
+        transport: Detached,
+        destination: SocketAddr,
+    ) -> Result<()> {
+        if transport.kind != Kind::Tcp {
+            return Err(invalid());
+        }
+        let raw = transport.native.raw() as usize;
+        let local = socket::address(raw, false)?;
+        if local.port() == 0 || local.is_ipv4() != destination.is_ipv4() {
+            return Err(invalid());
+        }
+        match socket::address(raw, true) {
+            Ok(_) => return Err(invalid()),
+            Err(error) if error.os == Some(WSAENOTCONN) => {}
+            Err(error) => return Err(error),
+        }
+        if destination.ip().is_loopback() {
+            socket::loopback_connect(raw);
+        }
+        self.install(h, transport, Some(destination), None)
+    }
+    fn attach_tcp_connect_unbound(
+        &mut self,
+        h: Handle,
+        transport: Detached,
+        destination: SocketAddr,
+    ) -> Result<()> {
+        if transport.kind != Kind::Tcp {
+            return Err(invalid());
+        }
+        let raw = transport.native.raw() as usize;
+        let expected = if destination.is_ipv4() {
+            AF_INET
+        } else {
+            AF_INET6
+        };
+        if socket::protocol_info(raw)?.iAddressFamily != i32::from(expected) {
+            return Err(invalid());
+        }
+        match socket::address(raw, false) {
+            Ok(local) if local.port() == 0 => {}
+            // Winsock getsockname rejects a socket before its first bind.
+            Err(error) if error.os == Some(WSAEINVAL) => {}
+            Ok(_) => return Err(invalid()),
+            Err(error) => return Err(error),
+        }
+        let wildcard = if destination.is_ipv4() {
+            SocketAddr::from(([0, 0, 0, 0], 0))
+        } else {
+            SocketAddr::from(([0u16; 8], 0))
+        };
+        socket::bind_to(raw, wildcard)?;
+        self.attach_tcp_connect(h, transport, destination)
+    }
     fn integration(&mut self) -> Result<Integration> {
         if let Some(event) = &self.event {
             event.check()?;
@@ -1945,4 +2002,22 @@ mod tests {
         );
         fixture.assert_delivered();
     }
+}
+
+/// Construct an explicitly bound socket for the portable adoption contract.
+#[cfg(test)]
+pub(crate) fn bound_tcp_for_test(address: SocketAddr) -> (Detached, SocketAddr) {
+    let socket = socket::create(address.is_ipv6(), false).unwrap();
+    let raw = socket.as_raw_socket() as usize;
+    socket::bind_to(raw, address).unwrap();
+    let local = socket::address(raw, false).unwrap();
+    (Detached::from_socket(socket).unwrap(), local)
+}
+
+/// Unbound socket with a non-default kernel option for adoption tests.
+#[cfg(test)]
+pub(crate) fn unbound_tcp_for_test(address: SocketAddr) -> Detached {
+    let stream = std::net::TcpStream::from(socket::create(address.is_ipv6(), false).unwrap());
+    stream.set_nodelay(true).unwrap();
+    Detached::from_socket(stream.into()).unwrap()
 }

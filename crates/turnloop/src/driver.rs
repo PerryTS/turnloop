@@ -881,6 +881,59 @@ impl<B: Backend> Driver<B> {
             }
         }
     }
+    /// Adopt an explicitly bound, unconnected TCP socket and submit its connection.
+    ///
+    /// Preserves the socket's local endpoint and options. The socket must have
+    /// a nonzero bound port and the same address family as the destination.
+    /// Failure drops the rejected transport; success returns the owning handle
+    /// and full operation identity for cancellation or completion matching.
+    /// No host callback runs here. The ordinary turn/cancel/close rules apply.
+    pub fn tcp_connect_bound(
+        &mut self,
+        transport: B::Detached,
+        destination: SocketAddr,
+        token: Token,
+    ) -> Result<(Handle, OpId)> {
+        self.tcp_connect_adopted(transport, destination, token, B::attach_tcp_connect)
+    }
+    /// Adopt an unbound TCP socket and submit its connection.
+    ///
+    /// Preserves its kernel socket options. The socket must be unbound and have
+    /// the destination's address family. Unix leaves local endpoint allocation
+    /// to connect; Windows binds inside adoption as required by ConnectEx.
+    /// Failure drops the transport. Completion, cancellation and close obey the
+    /// same ownership rules as [Driver::tcp_connect_bound].
+    pub fn tcp_connect_unbound(
+        &mut self,
+        transport: B::Detached,
+        destination: SocketAddr,
+        token: Token,
+    ) -> Result<(Handle, OpId)> {
+        self.tcp_connect_adopted(transport, destination, token, B::attach_tcp_connect_unbound)
+    }
+    fn tcp_connect_adopted(
+        &mut self,
+        transport: B::Detached,
+        destination: SocketAddr,
+        token: Token,
+        attach: fn(&mut B, Handle, B::Detached, SocketAddr) -> Result<()>,
+    ) -> Result<(Handle, OpId)> {
+        let h = self.new_handle(Kind::Socket)?;
+        if let Err(error) = attach(&mut self.backend, h, transport, destination) {
+            self.handles.remove(h.key);
+            self.refs -= 1;
+            return Err(error);
+        }
+        match self.submit(h, Operation::Connect, token) {
+            Ok(op) => Ok((h, op)),
+            Err(error) => {
+                self.backend.release(h);
+                self.handles.remove(h.key);
+                self.refs -= 1;
+                Err(error)
+            }
+        }
+    }
     /// Return the local IP endpoint of a bound socket.
     pub fn local_addr(&self, h: Handle) -> Result<SocketAddr> {
         self.resource(h)?;
