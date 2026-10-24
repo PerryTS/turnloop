@@ -1642,10 +1642,8 @@ pub(crate) fn bound_tcp_for_test(address: SocketAddr) -> (Detached, SocketAddr) 
     let fd = socket::create(address, false).unwrap();
     let addr = Addr::new(address);
     // SAFETY: owned socket and address storage valid for its recorded length.
-    assert_eq!(
-        unsafe { libc::bind(fd.as_raw_fd(), addr.ptr(), addr.len) },
-        0
-    );
+    let result = unsafe { libc::bind(fd.as_raw_fd(), addr.ptr(), addr.len) };
+    assert_eq!(result, 0);
     let local = socket::local_addr(fd.as_raw_fd()).unwrap();
     (Detached::from_fd(fd).unwrap(), local)
 }

@@ -68,6 +68,8 @@ fn bound_connect_preserves_endpoint_and_transfers_bytes() {
         listener.set_nonblocking(true).unwrap();
         let (mut peer, observed) = listener.accept().unwrap();
         assert_eq!(observed, local);
+        // Accepted streams inherit O_NONBLOCK on macOS/BSD.
+        peer.set_nonblocking(false).unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let op = driver
             .write(handle, WriteBuf::Owned(b"bound".to_vec()), Token(42))
@@ -77,17 +79,21 @@ fn bound_connect_preserves_endpoint_and_transfers_bytes() {
         peer.read_exact(&mut bytes).unwrap();
         assert_eq!(&bytes, b"bound");
         peer.write_all(b"reply").unwrap();
-        let op = driver.read(handle, ReadBuf::Pooled, Token(43)).unwrap();
-        match take(&mut driver, op) {
-            OpResult::Read {
-                n,
-                lease: Some(lease),
-            } => {
-                assert_eq!(n, 5);
-                assert_eq!(&lease.as_slice()[..n], b"reply");
+        let mut reply = Vec::new();
+        while reply.len() < 5 {
+            let op = driver.read(handle, ReadBuf::Pooled, Token(43)).unwrap();
+            match take(&mut driver, op) {
+                OpResult::Read {
+                    n,
+                    lease: Some(lease),
+                } => {
+                    assert!(n > 0);
+                    reply.extend_from_slice(&lease.as_slice()[..n]);
+                }
+                result => panic!("unexpected receive: {result:?}"),
             }
-            result => panic!("unexpected receive: {result:?}"),
         }
+        assert_eq!(reply, b"reply");
         drain_close(&mut driver, handle);
     }
 }
