@@ -1448,6 +1448,24 @@ unsafe impl Backend for Iocp {
         }
         socket::address(r.transport.native.raw() as usize, false)
     }
+    fn set_keepalive_parameters(&mut self, h: Handle, value: crate::KeepAlive) -> Result<()> {
+        sockopt::set_keepalive_parameters(self.socket_of(h)?, value)
+    }
+    fn keepalive_parameters(&self, h: Handle) -> Result<crate::KeepAlive> {
+        sockopt::keepalive_parameters(self.socket_of(h)?)
+    }
+    fn set_listen_backlog(&mut self, h: Handle, backlog: u32) -> Result<()> {
+        if self.get(h)?.transport.kind != Kind::Listener {
+            return Err(invalid());
+        }
+        sockopt::set_listen_backlog(self.socket_of(h)?, backlog)
+    }
+    fn shutdown_read(&mut self, h: Handle) -> Result<()> {
+        if self.get(h)?.heads[0].is_some() {
+            return Err(Error::new(crate::ErrorKind::WouldBlock));
+        }
+        sockopt::shutdown_read(self.socket_of(h)?)
+    }
     fn set_option(&mut self, h: Handle, option: SocketOption) -> Result<()> {
         sockopt::set(self.socket_of(h)?, option)
     }

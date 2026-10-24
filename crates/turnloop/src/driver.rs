@@ -915,6 +915,57 @@ impl<B: Backend> Driver<B> {
         }
         self.backend.get_option(h, kind)
     }
+    /// Set TCP keep-alive timing independently of its enable switch.
+    ///
+    /// Omitted fields remain unchanged. Values are validated before any write;
+    /// OS failures are returned and may leave earlier fields applied. The socket
+    /// remains enabled or disabled exactly as it was before this call.
+    pub fn set_keepalive_parameters(&mut self, h: Handle, value: KeepAlive) -> Result<()> {
+        let r = self.resource(h)?;
+        if r.closing.is_some() || !matches!(r.kind, Kind::Socket) {
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
+        self.backend.set_keepalive_parameters(h, value)
+    }
+    /// Read the kernel's TCP keep-alive timing, including while probing is disabled.
+    pub fn keepalive_parameters(&self, h: Handle) -> Result<KeepAlive> {
+        let r = self.resource(h)?;
+        if r.closing.is_some() || !matches!(r.kind, Kind::Socket) {
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
+        self.backend.keepalive_parameters(h)
+    }
+    /// Change the backlog of an already-listening TCP socket.
+    ///
+    /// Zero or an unrepresentable backlog is InvalidInput. This does not turn
+    /// a merely bound socket into a listener. The kernel may cap the value.
+    pub fn set_listen_backlog(&mut self, h: Handle, backlog: u32) -> Result<()> {
+        let r = self.resource(h)?;
+        if r.closing.is_some() || !matches!(r.kind, Kind::Socket) {
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
+        if backlog == 0 || backlog > i32::MAX as u32 {
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
+        self.backend.set_listen_backlog(h, backlog)
+    }
+    /// Shut down the receive direction of a stream socket.
+    ///
+    /// The write direction remains open, including pending writes. Pending
+    /// receive operations or queued completions return WouldBlock without
+    /// changing the socket: first cancel reads as needed and consume their
+    /// terminal acknowledgements.
+    /// This synchronous control produces no completion of its own.
+    pub fn shutdown_read(&mut self, h: Handle) -> Result<()> {
+        let r = self.resource(h)?;
+        if r.closing.is_some() || !matches!(r.kind, Kind::Socket) {
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
+        if self.queued.iter().any(|c| c.handle == Some(h)) {
+            return Err(Error::new(ErrorKind::WouldBlock));
+        }
+        self.backend.shutdown_read(h)
+    }
     /// Report the native identity of a live transport handle, for the host's own
     /// bookkeeping. This is Node's `socket._handle.fd`.
     ///
