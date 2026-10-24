@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0-alpha.10](https://github.com/PerryTS/turnloop/compare/turnloop-v0.1.0-alpha.9...turnloop-v0.1.0-alpha.10) - 2026-10-24
+
+### Other
+
+- Connect owned bound and unbound TCP sockets through the existing driver ([#125](https://github.com/PerryTS/turnloop/pull/125))
+- Expose independent TCP socket controls for native hosts ([#127](https://github.com/PerryTS/turnloop/pull/127))
+
 ## [0.1.0-alpha.9](https://github.com/PerryTS/turnloop/compare/turnloop-v0.1.0-alpha.8...turnloop-v0.1.0-alpha.9) - 2026-10-16
 
 ### Fixed
