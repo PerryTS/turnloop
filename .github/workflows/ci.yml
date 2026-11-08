@@ -315,7 +315,7 @@ jobs:
       - name: Install and verify Redis 8.4.0 with TLS
         run: python3 scripts/ci/install-redis.py
       - name: Pull MongoDB before the bounded fixture startup wait
-        run: docker pull mongo:8
+        run: docker pull mongo:7.0  # 8.x refuses Linux 6.19+ (SERVER-121912)
       - name: Install WASI 0.2 adapter runtime and C toolchain
         run: |
           rustup target add --toolchain nightly-2026-08-20 wasm32-wasip2

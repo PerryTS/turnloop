@@ -414,7 +414,7 @@ class Fixtures(unittest.TestCase):
             self.assertEqual(args[args.index('--label') + 1], 'turnloop.fixture=' + str(tools))
             self.assertEqual(args[args.index('--volume') + 1], str(root) + ':' + str(root))
             self.assertEqual(args[args.index('--user') + 1], f'{os.getuid()}:{os.getgid()}')
-            self.assertEqual(args[-4:], ['mongod', 'mongo:8', '--port', '32123'])
+            self.assertEqual(args[-4:], ['mongod', 'mongo:7.0', '--port', '32123'])
             recorded = json.loads((tools / 'docker-fixtures.json').read_text())
             self.assertEqual(recorded, [args[args.index('--name') + 1]])
             self.assertTrue(recorded[0].startswith('turnloop-fixture-'))
