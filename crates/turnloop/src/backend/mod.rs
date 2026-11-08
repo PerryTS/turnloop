@@ -357,6 +357,20 @@ pub unsafe trait Backend: Sized + 'static {
     };
     /// Construct backend storage and native wait resources with the supplied shared read pool.
     fn new(config: &Config, pool: BufferPool) -> Result<Self>;
+    /// Adopt an exclusively owned, bound but unconnected TCP transport and
+    /// configure its peer before a Connect request. Preserve the local binding
+    /// and existing socket options; apply nodelay when requested. On error,
+    /// retain no resource or native registration. Backends without native
+    /// transport adoption return Unsupported.
+    fn open_bound_tcp(
+        &mut self,
+        _handle: Handle,
+        _transport: Self::Detached,
+        _peer: SocketAddr,
+        _opts: crate::TcpOpts,
+    ) -> Result<()> {
+        Err(Error::new(crate::ErrorKind::Unsupported))
+    }
     /// Accept a typed filesystem request (only with `Filesystem::Backend`). `handle`
     /// is the request's file handle, or the new handle for an open.
     fn fs(&mut self, _op: OpId, _handle: Option<Handle>, _request: crate::FsRequest) -> Result<()> {
@@ -412,6 +426,13 @@ pub unsafe trait Backend: Sized + 'static {
     /// equivalent returns Unsupported; silently ignoring an option is forbidden,
     /// because a host cannot tell an ignored option from an applied one.
     fn set_option(&mut self, _handle: Handle, _option: crate::SocketOption) -> Result<()> {
+        Err(Error::new(crate::ErrorKind::Unsupported))
+    }
+    /// Synchronously request native receive-side shutdown without closing the
+    /// send direction. Existing accepted requests retain their normal buffer
+    /// ownership and terminal acknowledgement requirements. Unsupported transports
+    /// must fail without changing either direction.
+    fn shutdown_receive(&mut self, _handle: Handle) -> Result<()> {
         Err(Error::new(crate::ErrorKind::Unsupported))
     }
     /// Read one socket option from the OS. Backends never answer from a cache of
@@ -580,6 +601,8 @@ pub use wasi_p3::WasiP3 as Platform;
 mod ipc;
 #[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
 mod process;
+#[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
+mod stdio;
 
 #[cfg(any(turnloop_backend = "kqueue", turnloop_backend = "epoll"))]
 mod services;

@@ -271,9 +271,10 @@ impl Config {
 /// receive buffer set that way is applied after the handshake has started, so it
 /// cannot change the window scale the peers negotiate.
 ///
-/// Not offered at all, on any backend: binding the connecting socket to a
-/// chosen local address or port before it connects. `IPV6_V6ONLY` is not needed
-/// here: a connecting socket's family is the destination's.
+/// To preserve a local address/port or pre-handshake options set by the host,
+/// use [`crate::Driver::tcp_connect_bound`] with a bound native transport.
+/// `IPV6_V6ONLY` is not needed for fresh connections here: their socket family
+/// is the destination's.
 ///
 /// [`Loop::tcp_connect`]: crate::Driver::tcp_connect
 /// [`Loop::set_option`]: crate::Driver::set_option
@@ -421,7 +422,7 @@ impl AcceptDefaults {
     }
 }
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-/// TCP keep-alive probe schedule. Each `None` keeps the platform default.
+/// TCP keep-alive probe schedule. Each `None` leaves that kernel setting unchanged.
 ///
 /// Native platforms express the schedule in whole seconds, so a duration is
 /// rounded **up** to the next whole second and a zero duration is rejected as
@@ -469,6 +470,16 @@ pub enum SocketOption {
     /// whatever the OS left: read it back rather than assuming a rollback.
     /// Disabling clears the switch and leaves the schedule alone, as the OS does.
     KeepAlive(Option<KeepAlive>),
+    /// Change only the keep-alive switch, preserving the kernel's probe schedule.
+    KeepAliveEnabled(bool),
+    /// Change the provided schedule fields without enabling/disabling probing.
+    /// Omitted fields remain unchanged; getters return all three native values,
+    /// including while probing is disabled. Validation precedes every write.
+    KeepAliveSettings(KeepAlive),
+    /// Update an existing TCP listener's backlog without replacing its socket.
+    /// Zero, values above i32::MAX, and non-listener handles are InvalidInput.
+    /// This option has no getter: kernels do not expose a portable backlog query.
+    ListenBacklog(u32),
     /// `SO_LINGER`: `Some(d)` blocks the close until queued data is delivered or
     /// `d` elapses, and `Some(Duration::ZERO)` discards it and resets the
     /// connection. `None` restores the platform default (a graceful background
@@ -521,6 +532,10 @@ pub enum SocketOptionKind {
     NoDelay,
     /// Read [`SocketOption::KeepAlive`], including the schedule the OS holds.
     KeepAlive,
+    /// Read only the keep-alive switch.
+    KeepAliveEnabled,
+    /// Read the probe schedule, even when keep-alive is disabled.
+    KeepAliveSettings,
     /// Read [`SocketOption::Linger`].
     Linger,
     /// Read [`SocketOption::RecvBufferSize`] as the OS actually kept it.

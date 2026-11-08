@@ -37,6 +37,7 @@ pub struct Detached {
     pub(super) kind: Kind,
     pub(super) original_flags: Option<i32>,
     original_mode: Option<libc::termios>,
+    stdio_lease: Option<super::stdio::Lease>,
     /// A listener's per-connection defaults, applied to each socket it accepts.
     /// It travels with the listener across detach/attach, so a listener handed to
     /// another loop keeps configuring its connections there.
@@ -63,21 +64,29 @@ impl Detached {
     /// settings captured when the descriptor was adopted are restored first,
     /// exactly as they would be on close, and then the close is *not* performed.
     ///
+    /// For standard I/O, restoration waits until the last managed standard-I/O
+    /// transport is released, including duplicates held by other loops. A handed
+    /// off duplicate shares those flags and must not reconfigure them meanwhile.
+    ///
     /// A descriptor turnloop created itself was created non-blocking with
     /// `FD_CLOEXEC`, and it is handed over that way: nothing is restored,
     /// because nothing was changed. Call `fcntl(F_SETFL)` (or
     /// `TcpStream::set_nonblocking(false)`) if the receiving code wants blocking
     /// I/O, which is what a synchronous TLS handshake on the descriptor needs.
-    pub fn into_fd(self) -> OwnedFd {
+    pub fn into_fd(mut self) -> OwnedFd {
         self.restore();
+        drop(self.stdio_lease.take());
         let this = std::mem::ManuallyDrop::new(self);
         // SAFETY: `this` is never dropped, so this move of the single owning
-        // field cannot be observed twice; the remaining fields are Copy/plain
-        // data whose Drop is a no-op. `restore` already ran, and it is the only
-        // thing this type's Drop does besides releasing `fd`.
+        // field cannot be observed twice; the lease was released above and
+        // all other remaining fields are Copy/plain data whose Drop is a no-op.
+        // Restoration and lease release have already run.
         unsafe { std::ptr::read(&this.fd) }
     }
     fn restore(&self) {
+        if self.stdio_lease.is_some() {
+            return;
+        }
         if let Some(mode) = &self.original_mode {
             // SAFETY: descriptor is still owned; restore before OwnedFd drops.
             unsafe {
@@ -102,8 +111,14 @@ impl Detached {
             kind,
             original_flags: None,
             original_mode,
+            stdio_lease: None,
             accept_defaults: AcceptDefaults::EMPTY,
         }
+    }
+    pub(super) fn share_stdio(&mut self, lease: super::stdio::Lease, mode: Option<libc::termios>) {
+        self.original_flags = None;
+        self.original_mode = mode;
+        self.stdio_lease = Some(lease);
     }
     /// Adopt an owned Unix descriptor, classifying stream/file/TTY or socket.
     /// The descriptor must have no concurrent I/O users. Status flags and terminal
@@ -711,6 +726,35 @@ unsafe impl Backend for Unix {
     fn local_addr(&self, h: Handle) -> Result<SocketAddr> {
         socket::local_addr(self.get(h)?.transport.fd.as_raw_fd())
     }
+    fn open_bound_tcp(
+        &mut self,
+        h: Handle,
+        transport: Detached,
+        peer: SocketAddr,
+        opts: TcpOpts,
+    ) -> Result<()> {
+        if transport.kind != Kind::Tcp {
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
+        let fd = transport.fd.as_raw_fd();
+        let local = socket::local_addr(fd)?;
+        if local.port() == 0 || local.is_ipv4() != peer.is_ipv4() {
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
+        let mut address = Addr::empty();
+        // SAFETY: exclusively owned socket and initialized writable address storage.
+        if unsafe { libc::getpeername(fd, address.mut_ptr(), &mut address.len) } == 0 {
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
+        let error = last_error();
+        if error.os != Some(libc::ENOTCONN) {
+            return Err(error);
+        }
+        if opts.nodelay {
+            socket::option(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, 1)?;
+        }
+        self.install(h, transport, Some(Addr::new(peer)))
+    }
     fn set_keepalive_parameters(&mut self, h: Handle, value: crate::KeepAlive) -> Result<()> {
         super::sockopt::set_keepalive_parameters(self.socket_fd(h)?, value)
     }
@@ -736,10 +780,27 @@ unsafe impl Backend for Unix {
         super::sockopt::shutdown_read(self.socket_fd(h)?)
     }
     fn set_option(&mut self, h: Handle, option: SocketOption) -> Result<()> {
+        if matches!(option, SocketOption::ListenBacklog(_))
+            && self.get(h)?.transport.kind != Kind::Listener
+        {
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
         super::sockopt::set(self.socket_fd(h)?, option)
     }
     fn get_option(&self, h: Handle, kind: SocketOptionKind) -> Result<SocketOption> {
         super::sockopt::get(self.socket_fd(h)?, kind)
+    }
+    fn shutdown_receive(&mut self, h: Handle) -> Result<()> {
+        let transport = &self.get(h)?.transport;
+        if !matches!(transport.kind, Kind::Tcp | Kind::Pipe) {
+            return Err(Error::new(ErrorKind::Unsupported));
+        }
+        // SAFETY: live owned TCP/Unix stream socket; receive shutdown does not
+        // close it or release any buffer held by accepted native requests.
+        if unsafe { libc::shutdown(transport.fd.as_raw_fd(), libc::SHUT_RD) } < 0 {
+            return Err(last_error());
+        }
+        Ok(())
     }
     fn submit(&mut self, request: Request) -> Result<()> {
         let h = request.handle;
