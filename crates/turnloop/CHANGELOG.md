@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0-beta.2](https://github.com/PerryTS/turnloop/compare/turnloop-v0.1.0-alpha.10...turnloop-v0.1.0-beta.2) - 2026-11-08
+
+### Added
+
+- *(turnloop)* bound TCP connect, receive shutdown, UDP datagrams and shared stdio
+
+### Fixed
+
+- *(turnloop)* drop the IOCP test helpers the merge duplicated
+
 ## [0.1.0-alpha.10](https://github.com/PerryTS/turnloop/compare/turnloop-v0.1.0-alpha.9...turnloop-v0.1.0-alpha.10) - 2026-10-24
 
 ### Other
