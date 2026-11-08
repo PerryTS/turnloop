@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0-beta.2](https://github.com/PerryTS/turnloop/compare/turnloop-zstd-decoder-v0.1.0-beta.1...turnloop-zstd-decoder-v0.1.0-beta.2) - 2026-11-08
+
+### Other
+
+- update Cargo.toml dependencies
+
 ## [0.1.0-alpha.3](https://github.com/PerryTS/turnloop/compare/turnloop-zstd-decoder-v0.1.0-alpha.2...turnloop-zstd-decoder-v0.1.0-alpha.3) - 2026-09-15
 
 ### Other
