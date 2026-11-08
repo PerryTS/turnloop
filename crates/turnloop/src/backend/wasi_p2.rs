@@ -575,11 +575,28 @@ unsafe impl Backend for WasiP2 {
         self.install(h, transport, (kind == Kind::Tcp).then_some(addr))
     }
     fn set_option(&mut self, h: Handle, option: SocketOption) -> Result<()> {
+        if matches!(option, SocketOption::ListenBacklog(_))
+            && self.get(h)?.transport.kind != Kind::Listener
+        {
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
         let socket = &self.get(h)?.transport.socket;
         sockopt::set(socket, option)
     }
     fn get_option(&self, h: Handle, kind: SocketOptionKind) -> Result<SocketOption> {
         sockopt::get(&self.get(h)?.transport.socket, kind)
+    }
+    fn shutdown_receive(&mut self, h: Handle) -> Result<()> {
+        let transport = &self.get(h)?.transport;
+        if transport.kind != Kind::Tcp {
+            return Err(Error::new(ErrorKind::Unsupported));
+        }
+        let Socket::Tcp(socket) = &transport.socket else {
+            return Err(Error::new(ErrorKind::Unsupported));
+        };
+        socket
+            .shutdown(wasip2::sockets::tcp::ShutdownType::Receive)
+            .map_err(error)
     }
     fn local_addr(&self, h: Handle) -> Result<SocketAddr> {
         let a = match &self.get(h)?.transport.socket {

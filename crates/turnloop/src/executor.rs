@@ -43,6 +43,9 @@ use std::{
     task::{Context, Poll, Wake, Waker},
     time::Duration,
 };
+mod datagram;
+pub use datagram::AsyncDatagram;
+
 const TAG: u64 = 1 << 63;
 /// Token for executor-owned closes that no future awaits by token. It carries the
 /// executor's tag, so its completion is claimed rather than handed to the host,
@@ -491,6 +494,26 @@ impl<B: Backend> ExecutorHandle<B> {
             opts,
             key: None,
             handle: None,
+            transport: None,
+        }
+    }
+    /// Connect an already-bound native TCP transport without replacing its
+    /// socket, local endpoint or pre-handshake options. Dropping the future
+    /// before polling drops the transport; dropping a pending attempt closes
+    /// it through the driver. See [`Driver::tcp_connect_bound_with_options`].
+    pub fn connect_bound(
+        &self,
+        transport: B::Detached,
+        addr: SocketAddr,
+        opts: TcpOpts,
+    ) -> Connect<B> {
+        Connect {
+            executor: self.clone(),
+            address: addr,
+            opts,
+            key: None,
+            handle: None,
+            transport: Some(transport),
         }
     }
     /// Apply an absolute deadline without resetting it between I/O operations.
@@ -509,6 +532,7 @@ impl<B: Backend> ExecutorHandle<B> {
             read: None,
             write: None,
             shutdown: None,
+            read_shut: false,
             write_shut: false,
             closed: false,
         }
@@ -687,6 +711,7 @@ pub struct AsyncIo<B: Backend> {
     read: Option<Key>,
     write: Option<Key>,
     shutdown: Option<Key>,
+    read_shut: bool,
     write_shut: bool,
     closed: bool,
 }
@@ -707,6 +732,41 @@ impl<B: Backend> AsyncIo<B> {
     /// `BrokenPipe`, while reads continue until the peer's EOF.
     pub fn is_write_shut(&self) -> bool {
         self.write_shut
+    }
+    /// Whether receive shutdown completed for this adapter.
+    pub fn is_read_shut(&self) -> bool {
+        self.read_shut
+    }
+    /// Stop receiving, discard this adapter's buffered input, and preserve sends.
+    ///
+    /// Calls native receive shutdown first; an unsupported transport leaves the
+    /// adapter unchanged. After success all reads return EOF, including when a
+    /// previous read was Pending or retained a partially consumed completion.
+    /// Pending native access is cancelled, but its internal buffer remains owned
+    /// by the executor until terminal acknowledgement. Repeated calls succeed.
+    /// Supports TCP on Unix, Windows and WASI 0.2 and Unix-domain streams. WASI
+    /// 0.3 and web currently return Unsupported; they require asynchronous stream
+    /// cancellation before dropping the receive endpoint.
+    pub fn shutdown_receive(&mut self) -> io::Result<()> {
+        if self.read_shut {
+            return Ok(());
+        }
+        if self.closed {
+            return Err(io::ErrorKind::NotConnected.into());
+        }
+        if self.peer.is_some() {
+            return Err(io::ErrorKind::Unsupported.into());
+        }
+        self.shared
+            .driver
+            .borrow_mut()
+            .shutdown_receive(self.handle)
+            .map_err(shutdown_error)?;
+        self.read_shut = true;
+        if let Some(key) = self.read.take() {
+            self.shared.abandon(key);
+        }
+        Ok(())
     }
     /// Gracefully end the write direction without closing the handle.
     ///
@@ -832,7 +892,7 @@ impl<B: Backend> AsyncRead for AsyncIo<B> {
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
-        if buf.is_empty() {
+        if this.read_shut || buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
         let key = match this.read {
@@ -1094,6 +1154,7 @@ pub struct Connect<B: Backend> {
     opts: TcpOpts,
     key: Option<Key>,
     handle: Option<Handle>,
+    transport: Option<B::Detached>,
 }
 
 /// A cancellable asynchronous name lookup.
@@ -1279,11 +1340,19 @@ impl<B: Backend> Future for Connect<B> {
             Some(key) => key,
             None => {
                 let key = shared.reserve(cx)?;
-                let result =
-                    shared
-                        .driver
-                        .borrow_mut()
-                        .tcp_connect(this.address, &this.opts, key.token());
+                let result = match this.transport.take() {
+                    Some(transport) => shared.driver.borrow_mut().tcp_connect_bound_with_options(
+                        transport,
+                        this.address,
+                        &this.opts,
+                        key.token(),
+                    ),
+                    None => shared.driver.borrow_mut().tcp_connect(
+                        this.address,
+                        &this.opts,
+                        key.token(),
+                    ),
+                };
                 match result {
                     Ok(handle) => {
                         this.handle = Some(handle);

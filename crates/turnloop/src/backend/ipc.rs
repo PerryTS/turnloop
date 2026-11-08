@@ -90,12 +90,16 @@ pub(super) fn accept(fd: RawFd) -> Result<Detached> {
 
 pub(super) fn stdio(raw: RawFd) -> Result<Detached> {
     // SAFETY: integer fcntl command duplicates the borrowed host fd with CLOEXEC.
-    let dup = unsafe { libc::fcntl(raw, libc::F_DUPFD_CLOEXEC, 0) };
+    let dup = unsafe { libc::fcntl(raw, libc::F_DUPFD_CLOEXEC, 3) };
     if dup < 0 {
         return Err(last_error());
     }
     // SAFETY: successful fcntl returns a fresh owned descriptor.
-    classify(unsafe { OwnedFd::from_raw_fd(dup) })
+    let fd = unsafe { OwnedFd::from_raw_fd(dup) };
+    let (lease, mode) = super::stdio::Lease::acquire(raw)?;
+    let mut transport = classify(fd)?;
+    transport.share_stdio(lease, mode);
+    Ok(transport)
 }
 
 pub(super) fn classify(fd: OwnedFd) -> Result<Detached> {

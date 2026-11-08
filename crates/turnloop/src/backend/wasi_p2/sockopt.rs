@@ -40,12 +40,17 @@ fn set_keep_alive(socket: &TcpSocket, value: Option<KeepAlive>) -> Result<()> {
     let Some(schedule) = value else {
         return socket.set_keep_alive_enabled(false).map_err(error);
     };
+    set_keep_alive_settings(socket, schedule, true)
+}
+fn set_keep_alive_settings(socket: &TcpSocket, schedule: KeepAlive, enable: bool) -> Result<()> {
     let idle = schedule.idle.map(nonzero).transpose()?;
     let interval = schedule.interval.map(nonzero).transpose()?;
     if schedule.count == Some(0) {
         return invalid();
     }
-    socket.set_keep_alive_enabled(true).map_err(error)?;
+    if enable {
+        socket.set_keep_alive_enabled(true).map_err(error)?;
+    }
     if let Some(idle) = idle {
         socket.set_keep_alive_idle_time(idle).map_err(error)?;
     }
@@ -61,7 +66,10 @@ fn get_keep_alive(socket: &TcpSocket) -> Result<Option<KeepAlive>> {
     if !socket.keep_alive_enabled().map_err(error)? {
         return Ok(None);
     }
-    Ok(Some(KeepAlive {
+    get_keep_alive_settings(socket).map(Some)
+}
+fn get_keep_alive_settings(socket: &TcpSocket) -> Result<KeepAlive> {
+    Ok(KeepAlive {
         idle: Some(Duration::from_nanos(
             socket.keep_alive_idle_time().map_err(error)?,
         )),
@@ -69,7 +77,7 @@ fn get_keep_alive(socket: &TcpSocket) -> Result<Option<KeepAlive>> {
             socket.keep_alive_interval().map_err(error)?,
         )),
         count: Some(socket.keep_alive_count().map_err(error)?),
-    }))
+    })
 }
 fn bytes(value: u64) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
@@ -79,6 +87,20 @@ fn bytes(value: u64) -> u32 {
 pub(super) fn set(socket: &Socket, option: SocketOption) -> Result<()> {
     match option {
         SocketOption::KeepAlive(schedule) => set_keep_alive(tcp(socket)?, schedule),
+        SocketOption::KeepAliveEnabled(on) => {
+            tcp(socket)?.set_keep_alive_enabled(on).map_err(error)
+        }
+        SocketOption::KeepAliveSettings(schedule) => {
+            set_keep_alive_settings(tcp(socket)?, schedule, false)
+        }
+        SocketOption::ListenBacklog(value) => {
+            if value == 0 || value > i32::MAX as u32 {
+                return invalid();
+            }
+            tcp(socket)?
+                .set_listen_backlog_size(u64::from(value))
+                .map_err(error)
+        }
         SocketOption::RecvBufferSize(size) => match socket {
             Socket::Tcp(socket) => socket.set_receive_buffer_size(u64::from(size)),
             Socket::Udp(socket) => socket.set_receive_buffer_size(u64::from(size)),
@@ -115,6 +137,12 @@ pub(super) fn set(socket: &Socket, option: SocketOption) -> Result<()> {
 pub(super) fn get(socket: &Socket, kind: SocketOptionKind) -> Result<SocketOption> {
     Ok(match kind {
         SocketOptionKind::KeepAlive => SocketOption::KeepAlive(get_keep_alive(tcp(socket)?)?),
+        SocketOptionKind::KeepAliveEnabled => {
+            SocketOption::KeepAliveEnabled(tcp(socket)?.keep_alive_enabled().map_err(error)?)
+        }
+        SocketOptionKind::KeepAliveSettings => {
+            SocketOption::KeepAliveSettings(get_keep_alive_settings(tcp(socket)?)?)
+        }
         SocketOptionKind::RecvBufferSize => SocketOption::RecvBufferSize(bytes(
             match socket {
                 Socket::Tcp(socket) => socket.receive_buffer_size(),
