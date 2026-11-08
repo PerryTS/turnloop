@@ -153,7 +153,11 @@ impl Codec {
                 let bytes = BytePool::default();
                 let ints = IntPool::default();
                 let codes = CodePool::default();
-                let state = Box::new(BrotliState::new(bytes.clone(), ints.clone(), codes.clone()));
+                let state = Box::new(BrotliState::new_strict(
+                    bytes.clone(),
+                    ints.clone(),
+                    codes.clone(),
+                ));
                 Engine::Brotli {
                     state,
                     bytes,
@@ -209,7 +213,7 @@ impl Codec {
                 ints,
                 codes,
             } => {
-                **state = BrotliState::new(bytes.clone(), ints.clone(), codes.clone());
+                **state = BrotliState::new_strict(bytes.clone(), ints.clone(), codes.clone());
             }
             #[cfg(not(any(target_arch = "wasm32", feature = "pure-rust-zstd")))]
             Engine::Zstd { decoder, boundary } => {

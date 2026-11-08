@@ -431,6 +431,36 @@ fn gzip_deflate_br_zstd_decoding() {
     }
 }
 
+/// Large-window Brotli is not RFC 7932 and not `Content-Encoding: br`: its
+/// window can reach 1 GiB, which a tiny body could make the decoder allocate
+/// before the decoded-size limit applies (the actix-http RUSTSEC-2026-0455
+/// shape). Node's decoder rejects it by default, and so does this one.
+#[test]
+fn large_window_brotli_is_rejected() {
+    use std::io::{Read, Write};
+    let body = b"large window brotli is not content-encoding br";
+    let params = brotli::enc::BrotliEncoderParams {
+        large_window: true,
+        lgwin: 30,
+        quality: 5,
+        ..Default::default()
+    };
+    let mut encoded = Vec::new();
+    {
+        let mut encoder = brotli::CompressorWriter::with_params(&mut encoded, 4096, &params);
+        encoder.write_all(body).unwrap();
+    }
+    // The stream is valid large-window Brotli: a permissive decoder reads it.
+    let mut permissive = Vec::new();
+    brotli::Decompressor::new(encoded.as_slice(), 4096)
+        .read_to_end(&mut permissive)
+        .unwrap();
+    assert_eq!(permissive, body);
+
+    let mut out = Vec::new();
+    assert!(turnloop_http::compression::decode("br", &encoded, &mut out, 1 << 20).is_err());
+}
+
 #[test]
 fn vendored_hpack_interop_corpus() {
     use std::io::Read;
