@@ -766,6 +766,84 @@ fn proxy_credentials_and_cross_origin_mixed_case_headers() {
     );
 }
 
+#[test]
+fn https_proxy_is_opt_in_and_its_tls_comes_first() {
+    let env = ProxyEnvironment {
+        http_proxy: Some("https://proxy.test".into()),
+        https_proxy: Some("https://us%65r:p%61ss@proxy.test:8443".into()),
+        no_proxy: String::new(),
+    };
+    let secure = url::Url::parse("https://origin.test/x").unwrap();
+    let plain = url::Url::parse("http://origin.test/x").unwrap();
+    // The original entry point still refuses a proxy it cannot be told to secure.
+    assert_eq!(
+        env.proxy_for(&secure).unwrap_err().code,
+        "UND_ERR_NOT_SUPPORTED"
+    );
+    let proxy = env.proxy_for_tls_capable(&secure).unwrap().unwrap();
+    assert_eq!(proxy.scheme(), "https");
+    let ftp = ProxyEnvironment {
+        https_proxy: Some("socks5://proxy.test".into()),
+        ..Default::default()
+    };
+    assert!(ftp.proxy_for_tls_capable(&secure).is_err());
+
+    // https target: TLS to the proxy, CONNECT inside it, then the target's TLS.
+    let mut route = Route::new(secure.clone(), Some(proxy));
+    assert_eq!(
+        route.resolve(),
+        TransportRequest::Resolve {
+            hostname: "proxy.test".into(),
+            port: 8443
+        }
+    );
+    assert_eq!(
+        route.proxy_tls(),
+        Some(TransportRequest::UpgradeTls {
+            server_name: "proxy.test".into()
+        })
+    );
+    let connect = route.connect_head(None).unwrap();
+    assert_eq!(connect.target, "origin.test:443");
+    assert_eq!(
+        connect.get("proxy-authorization"),
+        Some(b"Basic dXNlcjpwYXNz".as_slice())
+    );
+    assert_eq!(route.connected(), None);
+    assert_eq!(
+        route.tunnel_response(200).unwrap(),
+        TransportRequest::UpgradeTls {
+            server_name: "origin.test".into()
+        }
+    );
+
+    // http target: TLS to the proxy, then an absolute-form request, no CONNECT.
+    let proxy = env.proxy_for_tls_capable(&plain).unwrap().unwrap();
+    let route = Route::new(plain.clone(), Some(proxy));
+    assert_eq!(
+        route.resolve(),
+        TransportRequest::Resolve {
+            hostname: "proxy.test".into(),
+            port: 443
+        }
+    );
+    assert!(route.proxy_tls().is_some());
+    assert!(route.connect_head(None).is_none());
+    let request = Request::new(plain.as_str(), "GET").unwrap();
+    assert_eq!(
+        route.request_head(&request, None).target,
+        "http://origin.test/x"
+    );
+
+    // An http proxy, or none, needs no proxy TLS.
+    let route = Route::new(
+        secure.clone(),
+        Some(url::Url::parse("http://p.test").unwrap()),
+    );
+    assert_eq!(route.proxy_tls(), None);
+    assert_eq!(Route::new(secure, None).proxy_tls(), None);
+}
+
 // --- HTTP/2 stream-lifetime contract -----------------------------------------
 //
 // h2spec's strict suite drives the subject from the peer side only: every
