@@ -499,10 +499,29 @@ fn push_is_refused_once_the_client_disabled_it() {
     assert!(server.push(id, &promised_request()).is_err());
 }
 
-/// A PING acknowledgement with no PING outstanding is an INTERNAL_ERROR.
+/// By default a PING acknowledgement with no PING outstanding is only
+/// reported (RFC 9113 §6.7; h2spec 6.7/2 requires the connection to survive).
 #[test]
-fn an_unsolicited_ping_ack_fails_the_connection() {
+fn an_unsolicited_ping_ack_is_reported_by_default() {
     let (mut client, mut server) = handshake();
+    client.ping([7; 8]).unwrap();
+    drive(&mut server, &mut ship(&mut client)).unwrap();
+    let wire = ship(&mut server);
+    drive(&mut client, &mut wire.clone()).unwrap();
+    let events = drive(&mut client, &mut wire.clone()).unwrap();
+    assert_eq!(events, [Seen::Other], "only the PING event");
+    assert!(ship(&mut client).is_empty(), "no GOAWAY and no reply");
+    client.ping([8; 8]).unwrap();
+    drive(&mut server, &mut ship(&mut client)).unwrap();
+    drive(&mut client, &mut ship(&mut server)).unwrap();
+}
+
+/// With the Node policy on, a PING acknowledgement with no PING outstanding is
+/// an INTERNAL_ERROR.
+#[test]
+fn an_unsolicited_ping_ack_fails_the_connection_when_rejected() {
+    let (mut client, mut server) = handshake();
+    client.set_reject_unsolicited_ping_ack(true);
     client.ping([7; 8]).unwrap();
     drive(&mut server, &mut ship(&mut client)).unwrap();
     let wire = ship(&mut server);

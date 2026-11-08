@@ -428,6 +428,8 @@ pub struct Connection {
     /// PINGs sent and not yet acknowledged. An acknowledgement with none
     /// outstanding answers nothing this endpoint sent.
     pings: usize,
+    /// Whether an acknowledgement with no PING outstanding fails the connection.
+    reject_unsolicited_ping_ack: bool,
     /// The PUSH_PROMISE whose header block is being assembled: the promised
     /// stream and whether the block is only to be decoded and dropped (the
     /// associated stream is gone).
@@ -494,6 +496,7 @@ impl Connection {
             continuation: None,
             disposal: None,
             pings: 0,
+            reject_unsolicited_ping_ack: false,
             promise: None,
             output: Vec::new(),
             output_pos: 0,
@@ -992,6 +995,13 @@ impl Connection {
         self.streams.swap_remove(i);
         self.frame(3, 0, id, &code.to_be_bytes())
     }
+    /// RFC 9113 leaves a PING acknowledgement that answers nothing this
+    /// endpoint sent without a required reaction, and by default it is only
+    /// reported as [`Event::Ping`]. With `reject` set it fails the connection
+    /// with GOAWAY(INTERNAL_ERROR), as Node does: no legitimate peer sends one.
+    pub fn set_reject_unsolicited_ping_ack(&mut self, reject: bool) {
+        self.reject_unsolicited_ping_ack = reject;
+    }
     pub fn ping(&mut self, data: [u8; 8]) -> Result<()> {
         self.frame(6, 0, 0, &data)?;
         self.pings += 1;
@@ -1380,12 +1390,12 @@ impl Connection {
                 let ack = f.flags & 1 != 0;
                 if !ack {
                     self.frame(6, 1, 0, f.payload)?;
-                } else if self.pings == 0 {
+                } else if self.pings > 0 {
+                    self.pings -= 1;
+                } else if self.reject_unsolicited_ping_ack {
                     // Node answers GOAWAY(INTERNAL_ERROR) and drops the
                     // connection (measured against a raw peer).
                     return Err(error("INTERNAL_ERROR", "unsolicited PING acknowledgement"));
-                } else {
-                    self.pings -= 1;
                 }
                 step.event = Some(Event::Ping { ack, data });
             }
