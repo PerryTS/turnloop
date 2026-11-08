@@ -29,13 +29,14 @@ http.workspace = true
 url.workspace = true
 httparse.workspace = true
 flate2.workspace = true
-brotli.workspace = true
+brotli-decompressor.workspace = true
 base64.workspace = true
 percent-encoding.workspace = true
 # Not the workspace entry, so that the host decides whether ring is linked.
 turnloop-tls = { path = "../turnloop-tls", version = "0.1.0-alpha.10", default-features = false }
 
 [dev-dependencies]
+brotli.workspace = true
 rcgen.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

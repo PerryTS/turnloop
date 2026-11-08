@@ -7,12 +7,12 @@ impl<T> Default for Memory<T> {
         Self(Vec::new())
     }
 }
-impl<T> brotli::SliceWrapper<T> for Memory<T> {
+impl<T> brotli_decompressor::SliceWrapper<T> for Memory<T> {
     fn slice(&self) -> &[T] {
         &self.0
     }
 }
-impl<T> brotli::SliceWrapperMut<T> for Memory<T> {
+impl<T> brotli_decompressor::SliceWrapperMut<T> for Memory<T> {
     fn slice_mut(&mut self) -> &mut [T] {
         &mut self.0
     }
@@ -28,7 +28,7 @@ impl<T> Default for Pool<T> {
         Self(Arc::new(Mutex::new(Vec::new())))
     }
 }
-impl<T: Default + Clone> brotli::Allocator<T> for Pool<T> {
+impl<T: Default + Clone> brotli_decompressor::Allocator<T> for Pool<T> {
     type AllocatedMemory = Memory<T>;
     fn alloc_cell(&mut self, len: usize) -> Memory<T> {
         let mut pool = self.0.lock().expect("scratch pool poisoned");
