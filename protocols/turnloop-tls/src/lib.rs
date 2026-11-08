@@ -176,6 +176,14 @@ impl ClientConfig {
     pub fn rustls_config(&self) -> &Arc<rustls::ClientConfig> {
         &self.config
     }
+    /// The same roots, verifier and host time, offering `alpn` instead. A hop
+    /// that only speaks one protocol (an HTTP/1.1 proxy) must not let the peer
+    /// pick another; the copy has its own session cache.
+    pub fn with_alpn(&self, alpn: Vec<Vec<u8>>) -> Self {
+        let mut config = (*self.config).clone();
+        config.alpn_protocols = alpn;
+        Self::from_rustls(Arc::new(config), self.time.clone())
+    }
     /// Reuse this configuration across connections to share the session cache.
     pub fn connect(&self, name: ServerName<'static>) -> Result<Client, Error> {
         Ok(Client {

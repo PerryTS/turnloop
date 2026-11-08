@@ -49,11 +49,14 @@ impl Default for Options {
         }
     }
 }
-enum Transport<B: Backend> {
-    Plain(AsyncIo<B>),
-    Tls(Box<TlsStream<AsyncIo<B>>>),
+/// One plaintext-or-TLS layer. A connection through an `https://` proxy stacks
+/// two: TLS to the proxy, then the target's own session inside the tunnel.
+enum Layer<S> {
+    Plain(S),
+    Tls(Box<TlsStream<S>>),
 }
-impl<B: Backend> AsyncRead for Transport<B> {
+type Transport<B> = Layer<Layer<AsyncIo<B>>>;
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for Layer<S> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -65,7 +68,7 @@ impl<B: Backend> AsyncRead for Transport<B> {
         }
     }
 }
-impl<B: Backend> AsyncWrite for Transport<B> {
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for Layer<S> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -206,7 +209,7 @@ impl<B: Backend> Client<B> {
         let proxy = self
             .options
             .proxy
-            .proxy_for(&request.url)
+            .proxy_for_tls_capable(&request.url)
             .map_err(io::Error::other)?;
         let key = PoolKey::new(&request.url, proxy.as_ref());
         let mut route = Route::new(request.url.clone(), proxy);
@@ -239,6 +242,20 @@ impl<B: Backend> Client<B> {
         turnloop_io::deadline(&executor, at, async {
             if lease.connection.is_none() {
                 let stream = connect(&executor, &route).await?;
+                let stream = match route.proxy_tls() {
+                    Some(TransportRequest::UpgradeTls { server_name }) => {
+                        let name =
+                            turnloop_tls::rustls::pki_types::ServerName::try_from(server_name)
+                                .map_err(io::Error::other)?;
+                        // CONNECT and absolute-form requests are HTTP/1.1.
+                        let proxy_tls = tls.with_alpn(vec![b"http/1.1".to_vec()]);
+                        Layer::Tls(Box::new(
+                            TlsStream::connect(stream, &proxy_tls, name, &executor, at, time)
+                                .await?,
+                        ))
+                    }
+                    _ => Layer::Plain(stream),
+                };
                 let stream = if let Some(head) = route.connect_head(None) {
                     let mut tunnel = Http1::new(stream, Mode::Response);
                     tunnel.response_to("CONNECT");
@@ -277,10 +294,10 @@ impl<B: Backend> Client<B> {
                     let stream = TlsStream::connect(stream, tls, name, &executor, at, time).await?;
                     let protocol =
                         client::from_alpn(stream.alpn_protocol()).map_err(io::Error::other)?;
-                    (Transport::Tls(Box::new(stream)), protocol)
+                    (Layer::Tls(Box::new(stream)), protocol)
                 } else {
                     (
-                        Transport::Plain(stream),
+                        Layer::Plain(stream),
                         if options.http2_prior_knowledge {
                             Protocol::Http2
                         } else {

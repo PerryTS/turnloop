@@ -926,6 +926,128 @@ origin.listen(0, '127.0.0.1', () => proxy.listen(0, '127.0.0.1', () => {
     assert!(node.0.wait().expect("Node exit").success());
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn node_https_via_authenticated_https_proxy_nests_tls() {
+    use std::{
+        io::{BufRead, BufReader},
+        process::{Command, Stdio},
+    };
+    use turnloop_http::client::ProxyEnvironment;
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("certificate");
+    let script = r#"
+const assert = require('node:assert/strict');
+const https = require('node:https'), http = require('node:http'), net = require('node:net');
+let connects = 0, requests = 0;
+const watchdog = setTimeout(() => process.exit(7), 10000);
+const origin = https.createServer({key: process.env.KEY, cert: process.env.CERT}, (req, res) => {
+  assert.equal(req.method, 'POST'); assert.equal(req.url, '/through-proxy');
+  let body = ''; req.on('data', b => body += b); req.on('end', () => {
+    assert.equal(body, 'verified TLS upload'); requests++;
+    res.setHeader('connection', 'close'); res.end('verified TLS response');
+  });
+});
+// The proxy prefers h2: only the client's http/1.1-only offer keeps CONNECT on HTTP/1.1.
+const proxy = https.createServer({key: process.env.KEY, cert: process.env.CERT, ALPNProtocols: ['h2', 'http/1.1']});
+let proxyTls = 0;
+proxy.on('secureConnection', s => { proxyTls++; assert.equal(s.alpnProtocol, 'http/1.1'); });
+proxy.on('connect', (req, client, head) => {
+  assert.equal(req.url, 'localhost:' + origin.address().port);
+  assert.equal(req.headers['proxy-authorization'], 'Basic dXNlcjpwYXNz'); assert.equal(req.socket.encrypted, true); connects++;
+  const upstream = net.connect(origin.address().port, '127.0.0.1', () => {
+    client.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+    if (head.length) upstream.write(head);
+    client.pipe(upstream); upstream.pipe(client);
+  });
+  client.on('error', () => upstream.destroy()); upstream.on('error', () => client.destroy());
+  client.on('close', () => {
+    upstream.destroy(); assert.equal(connects, 1); assert.equal(requests, 1); assert.equal(proxyTls, 1);
+    proxy.close(); origin.close(); clearTimeout(watchdog);
+  });
+});
+origin.listen(0, '127.0.0.1', () => proxy.listen(0, '127.0.0.1', () => {
+  console.log(origin.address().port + ' ' + proxy.address().port);
+}));
+"#;
+    struct OwnedChild(std::process::Child);
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut node = OwnedChild(
+        Command::new("node")
+            .args(["-e", script])
+            .env("KEY", cert.key_pair.serialize_pem())
+            .env("CERT", cert.cert.pem())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("Node required"),
+    );
+    let mut ports = String::new();
+    BufReader::new(node.0.stdout.take().expect("stdout"))
+        .read_line(&mut ports)
+        .expect("listener ports");
+    let ports: Vec<u16> = ports
+        .split_whitespace()
+        .map(|p| p.parse().expect("port"))
+        .collect();
+    assert_eq!(ports.len(), 2);
+    let mut executor = LocalExecutor::<Platform>::new(Config::default()).expect("executor");
+    let h = executor.handle();
+    let mut task = executor
+        .spawn_local(async move {
+            let tls = turnloop_tls::ClientConfig::new(
+                turnloop_tls::ClientOptions {
+                    ca: Some(vec![cert.cert.der().clone()]),
+                    alpn: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+                    ..Default::default()
+                },
+                1_789_344_000,
+            )
+            .expect("trusted TLS config");
+            let mut client = Client::new(
+                h,
+                tls,
+                1_789_344_000,
+                Options {
+                    proxy: ProxyEnvironment {
+                        https_proxy: Some(format!("https://user:pass@localhost:{}", ports[1])),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            );
+            let mut req = Request::new(
+                &format!("https://localhost:{}/through-proxy", ports[0]),
+                "POST",
+            )
+            .expect("request");
+            req.body = b"verified TLS upload".to_vec();
+            let mut body = Vec::new();
+            let head = client
+                .request(&mut req, |bytes| {
+                    body.extend_from_slice(bytes);
+                    Ok(())
+                })
+                .await
+                .expect("TLS to the proxy, CONNECT, then TLS to the origin");
+            assert_eq!(head.status, 200);
+            assert_eq!(body, b"verified TLS response");
+            body.len()
+        })
+        .expect("spawn");
+    let end = executor.driver().now() + Duration::from_secs(10);
+    while !task.is_finished() {
+        assert!(executor.driver().now() < end);
+        executor.turn(Timeout::Until(end)).expect("turn");
+    }
+    assert_eq!(finish(&mut task), 21);
+    executor.turn(Timeout::Now).expect("close delivery");
+    assert!(node.0.wait().expect("Node exit").success());
+}
+
 #[test]
 fn cancelled_pooled_request_never_reuses_partial_response() {
     use std::cell::Cell;

@@ -201,7 +201,17 @@ pub struct ProxyEnvironment {
 }
 impl ProxyEnvironment {
     /// Values are supplied by the host from HTTP_PROXY/HTTPS_PROXY/NO_PROXY (or lowercase overrides).
+    /// Only `http://` proxies are accepted; see [`Self::proxy_for_tls_capable`].
     pub fn proxy_for(&self, url: &Url) -> Result<Option<Url>> {
+        self.select(url, false)
+    }
+    /// [`Self::proxy_for`], also accepting `https://` proxies. The caller must
+    /// then secure the hop to the proxy itself: after connecting, perform the
+    /// [`Route::proxy_tls`] upgrade before anything else is written.
+    pub fn proxy_for_tls_capable(&self, url: &Url) -> Result<Option<Url>> {
+        self.select(url, true)
+    }
+    fn select(&self, url: &Url, https: bool) -> Result<Option<Url>> {
         if bypass(url, &self.no_proxy) {
             return Ok(None);
         }
@@ -215,10 +225,15 @@ impl ProxyEnvironment {
             .map(|p| {
                 let parsed =
                     Url::parse(p).map_err(|_| Error::new("ERR_INVALID_URL", "invalid proxy"))?;
-                if parsed.scheme() != "http" || parsed.host_str().is_none() {
+                let scheme_ok = parsed.scheme() == "http" || (https && parsed.scheme() == "https");
+                if !scheme_ok || parsed.host_str().is_none() {
                     return Err(Error::new(
                         "UND_ERR_NOT_SUPPORTED",
-                        "only HTTP proxies are supported",
+                        if https {
+                            "only HTTP and HTTPS proxies are supported"
+                        } else {
+                            "only HTTP proxies are supported"
+                        },
                     ));
                 }
                 Ok(parsed)
@@ -658,6 +673,16 @@ impl Route {
             hostname: peer.host_str().unwrap_or("").into(),
             port: peer.port_or_known_default().unwrap_or(80),
         }
+    }
+    /// For an `https://` proxy, the TLS upgrade to the proxy itself. It comes
+    /// first, right after the connection is established: the CONNECT tunnel or
+    /// the absolute-form request then runs inside it, and an `https` target's
+    /// own TLS session nests within that tunnel.
+    pub fn proxy_tls(&self) -> Option<TransportRequest> {
+        let proxy = self.proxy.as_ref().filter(|p| p.scheme() == "https")?;
+        Some(TransportRequest::UpgradeTls {
+            server_name: proxy.host_str().unwrap_or("").into(),
+        })
     }
     pub fn connect_head(&self, authorization: Option<&[u8]>) -> Option<Head> {
         if self.proxy.is_none() || self.target.scheme() != "https" {
