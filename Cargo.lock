@@ -1808,6 +1808,7 @@ version = "0.1.0-alpha.10"
 dependencies = [
  "base64",
  "brotli",
+ "brotli-decompressor",
  "bytes",
  "flate2",
  "http",

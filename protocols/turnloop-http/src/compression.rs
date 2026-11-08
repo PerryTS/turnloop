@@ -55,8 +55,8 @@ enum Stage {
 }
 type BytePool = crate::recycling::Pool<u8>;
 type IntPool = crate::recycling::Pool<u32>;
-type CodePool = crate::recycling::Pool<brotli::HuffmanCode>;
-type BrotliState = brotli::BrotliState<BytePool, IntPool, CodePool>;
+type CodePool = crate::recycling::Pool<brotli_decompressor::HuffmanCode>;
+type BrotliState = brotli_decompressor::BrotliState<BytePool, IntPool, CodePool>;
 // Keep the WASM decoder inline: 480 bytes avoids another per-response allocation.
 #[allow(clippy::large_enum_variant)]
 enum Engine {
@@ -371,7 +371,7 @@ impl Codec {
                 let mut available_in = input.len();
                 let mut available_out = output.len();
                 let mut total = self.total;
-                let result = brotli::BrotliDecompressStream(
+                let result = brotli_decompressor::BrotliDecompressStream(
                     &mut available_in,
                     &mut consumed,
                     input,
@@ -382,14 +382,16 @@ impl Codec {
                     state,
                 );
                 match result {
-                    brotli::BrotliResult::ResultSuccess => {
+                    brotli_decompressor::BrotliResult::ResultSuccess => {
                         if consumed != input.len() {
                             return Err(corrupt());
                         }
                         finished = true;
                     }
-                    brotli::BrotliResult::ResultFailure => return Err(corrupt()),
-                    brotli::BrotliResult::NeedsMoreInput if end => return Err(corrupt()),
+                    brotli_decompressor::BrotliResult::ResultFailure => return Err(corrupt()),
+                    brotli_decompressor::BrotliResult::NeedsMoreInput if end => {
+                        return Err(corrupt());
+                    }
                     _ => {}
                 }
             }
