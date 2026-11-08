@@ -1936,21 +1936,3 @@ pub(crate) fn unbound_tcp_for_test(address: SocketAddr) -> Detached {
     stream.set_nodelay(true).unwrap();
     Detached::from_socket(stream.into()).unwrap()
 }
-
-/// Construct an explicitly bound socket for the portable adoption contract.
-#[cfg(test)]
-pub(crate) fn bound_tcp_for_test(address: SocketAddr) -> (Detached, SocketAddr) {
-    let socket = socket::create(address.is_ipv6(), false).unwrap();
-    let raw = socket.as_raw_socket() as usize;
-    socket::bind_to(raw, address).unwrap();
-    let local = socket::address(raw, false).unwrap();
-    (Detached::from_socket(socket).unwrap(), local)
-}
-
-/// Unbound socket with a non-default kernel option for adoption tests.
-#[cfg(test)]
-pub(crate) fn unbound_tcp_for_test(address: SocketAddr) -> Detached {
-    let stream = std::net::TcpStream::from(socket::create(address.is_ipv6(), false).unwrap());
-    stream.set_nodelay(true).unwrap();
-    Detached::from_socket(stream.into()).unwrap()
-}
