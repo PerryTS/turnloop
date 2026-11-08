@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.1.0-beta.2](https://github.com/PerryTS/turnloop/compare/turnloop-http-v0.1.0-alpha.10...turnloop-http-v0.1.0-beta.2) - 2026-11-08
+## [0.1.0-beta.1](https://github.com/PerryTS/turnloop/compare/turnloop-http-v0.1.0-alpha.10...turnloop-http-v0.1.0-beta.1) - 2026-11-08
 
 ### Added
 
@@ -19,10 +19,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - *(turnloop-http)* reject large-window Brotli; brotli-decompressor 6.2
 - *(turnloop-http)* depend on brotli-decompressor, not the brotli encoder
 - *(turnloop-http)* reject an unsolicited PING acknowledgement only on request
-
-### Other
-
-- move the workspace to 0.1.0-beta.1
 
 ## [0.1.0-alpha.7](https://github.com/PerryTS/turnloop/compare/turnloop-http-v0.1.0-alpha.6...turnloop-http-v0.1.0-alpha.7) - 2026-09-22
 
