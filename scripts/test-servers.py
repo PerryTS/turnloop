@@ -848,7 +848,9 @@ def prepare_docker_wrappers():
 import json, os, pathlib, subprocess, sys, uuid
 root = pathlib.Path(__file__).resolve().parents[1]
 name = pathlib.Path(sys.argv[0]).name
-image = 'mongo:8'
+# MongoDB 8.x refuses to start on Linux 6.19+ (SERVER-121912, TCMalloc rseq);
+# 7.0 has no such check and covers every feature the suite uses.
+image = 'mongo:7.0'
 container = 'turnloop-fixture-' + uuid.uuid4().hex
 record = root / 'docker-fixtures.json'
 existing = json.loads(record.read_text()) if record.exists() else []
