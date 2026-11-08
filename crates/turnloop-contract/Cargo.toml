@@ -51,7 +51,7 @@ path = "tests/web/node.rs"
 
 
 [target.'cfg(all(target_os = "wasi", target_env = "p2"))'.dev-dependencies]
-wasip2 = "=1.0.3"
+wasip2 = "=2.0.0"
 
 [target.'cfg(all(target_os = "wasi", target_env = "p3"))'.dev-dependencies]
 turnloop-wasi-random.workspace = true
